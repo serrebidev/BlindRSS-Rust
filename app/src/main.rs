@@ -37,6 +37,8 @@ enum RefreshMsg {
     Added(String, Result<ParsedFeed, String>),
     /// Result of a hosted-provider sync: (provider name, (feeds, new)).
     ProviderDone(String, Result<(usize, usize), String>),
+    /// Fetched article page HTML for full-text extraction.
+    FullText(String, Result<String, String>),
 }
 
 const ID_OK: i32 = 5100;
@@ -106,6 +108,7 @@ fn main() {
         let search_box = TextCtrl::builder(&frame).build();
         let search_btn = Button::builder(&frame).with_label("Search").build();
         let sync_btn = Button::builder(&frame).with_label("Sync Providers").build();
+        let fulltext_btn = Button::builder(&frame).with_label("Read Full Text").build();
         let refresh_btn = Button::builder(&frame)
             .with_label("Refresh All Feeds")
             .build();
@@ -134,6 +137,7 @@ fn main() {
         btn_row.add(&import_btn, 0, SizerFlag::All, 4);
         btn_row.add(&export_btn, 0, SizerFlag::All, 4);
         btn_row.add(&sync_btn, 0, SizerFlag::All, 4);
+        btn_row.add(&fulltext_btn, 0, SizerFlag::All, 4);
         sizer.add_sizer(&btn_row, 0, SizerFlag::All, 0);
         let btn_row2 = BoxSizer::builder(Orientation::Horizontal).build();
         btn_row2.add(&delete_btn, 0, SizerFlag::All, 4);
@@ -490,6 +494,36 @@ fn main() {
             }
         });
 
+        // Read Full Text: fetch the selected article's page on a
+        // worker thread; extraction runs on the main thread when the
+        // HTML lands (feed body is the fallback, per the cascade).
+        let state_ft = state.clone();
+        let frame_ft = frame;
+        let tx_ft = tx.clone();
+        fulltext_btn.on_click(move |_| {
+            let st = state_ft.borrow();
+            let Some(article) = st
+                .selected_article
+                .and_then(|i| st.articles.get(i))
+                .cloned()
+            else {
+                frame_ft.set_status_text("No article selected", 0);
+                return;
+            };
+            if article.url.is_empty() {
+                frame_ft.set_status_text("Article has no link", 0);
+                return;
+            }
+            frame_ft.set_status_text("Fetching full text...", 0);
+            let tx = tx_ft.clone();
+            let id = article.id.clone();
+            let url = article.url.clone();
+            std::thread::spawn(move || {
+                let result = blindrss_core::extract::fetch_html(&url);
+                let _ = tx.send(RefreshMsg::FullText(id, result));
+            });
+        });
+
         // Add Feed: prompt for a URL, fetch it on a worker thread to
         // learn its title, then subscribe + store its current articles.
         let state_add = state.clone();
@@ -677,6 +711,43 @@ fn main() {
                                 );
                             }
                             Err(e) => frame_tick.set_status_text(&format!("{name}: {e}"), 0),
+                        }
+                    }
+                    Ok(RefreshMsg::FullText(id, result)) => {
+                        let st = state_tick.borrow();
+                        let article = st.articles.iter().find(|a| a.id == id).cloned();
+                        match (article, result) {
+                            (Some(article), Ok(html)) => {
+                                let outcome = blindrss_core::extract::extract_article(
+                                    &html,
+                                    &article.url,
+                                    article.content.as_deref(),
+                                );
+                                use blindrss_core::extract::ExtractOutcome as EO;
+                                match outcome {
+                                    EO::Article { text, source, .. } => {
+                                        reader.set_value(&format!("{}\n\n{}", article.title, text));
+                                        frame_tick
+                                            .set_status_text(&format!("Full text ({source})"), 0);
+                                    }
+                                    EO::Gate { reason } => {
+                                        frame_tick.set_status_text(
+                                            &format!("Full text unavailable: {reason}"),
+                                            0,
+                                        );
+                                    }
+                                    EO::Empty => {
+                                        frame_tick.set_status_text(
+                                            "Full text unavailable: nothing extracted",
+                                            0,
+                                        );
+                                    }
+                                }
+                            }
+                            (_, Err(e)) => {
+                                frame_tick.set_status_text(&format!("Full text: {e}"), 0)
+                            }
+                            _ => {}
                         }
                     }
                     Ok(RefreshMsg::AllDone) => {

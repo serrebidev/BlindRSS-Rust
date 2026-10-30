@@ -186,10 +186,14 @@ fn blocks(html: &str, tag: &str, open_hint: &str) -> Vec<String> {
     let mut idx = 0;
     while let Some(pos) = lower[idx..].find(&open) {
         let start = idx + pos;
-        let Some(gt) = lower[start..].find('>') else { break };
+        let Some(gt) = lower[start..].find('>') else {
+            break;
+        };
         let open_tag = &lower[start..start + gt + 1];
         let inner_start = start + gt + 1;
-        let Some(end) = lower[inner_start..].find(&close) else { break };
+        let Some(end) = lower[inner_start..].find(&close) else {
+            break;
+        };
         if open_hint.is_empty() || open_tag.contains(open_hint) {
             out.push(html[inner_start..inner_start + end].to_string());
         }
@@ -336,16 +340,17 @@ fn looks_like_link_list(text: &str) -> bool {
     if text.chars().count() > 1500 {
         return false;
     }
-    let lines: Vec<&str> = text.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
     if lines.len() < 4 {
         return false;
     }
     let linky = lines
         .iter()
-        .filter(|l| {
-            l.chars().count() <= 90
-                && !l.ends_with(['.', '!', '?', '…'])
-        })
+        .filter(|l| l.chars().count() <= 90 && !l.ends_with(['.', '!', '?', '…']))
         .count();
     linky * 10 >= lines.len() * 7
 }
@@ -354,7 +359,12 @@ fn looks_like_link_list(text: &str) -> bool {
 /// they corrupt word matching and trip screen readers).
 fn strip_zero_width(s: &str) -> String {
     s.chars()
-        .filter(|c| !matches!(c, '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{2060}' | '\u{FEFF}'))
+        .filter(|c| {
+            !matches!(
+                c,
+                '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{2060}' | '\u{FEFF}'
+            )
+        })
         .collect()
 }
 
@@ -393,7 +403,21 @@ fn strip_tags(html: &str) -> String {
 ///
 /// `feed_text` is the article body the feed itself supplied, if any; the
 /// prefer-feed-content rule can keep it when the scrape is worse.
-pub fn extract_article(html: &str, url: &str, feed_text: Option<&str>) -> ExtractOutcome {
+pub fn extract_article(html_in: &str, url: &str, feed_text: Option<&str>) -> ExtractOutcome {
+    // Pre-clean zero-width characters from the page itself: engines
+    // can mangle them into mojibake before the output strip can run.
+    let cleaned;
+    let html = if html_in.chars().any(|c| {
+        matches!(
+            c,
+            '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{2060}' | '\u{FEFF}'
+        )
+    }) {
+        cleaned = strip_zero_width(html_in);
+        &cleaned
+    } else {
+        html_in
+    };
     let html_lower = html.to_lowercase();
     let marker = gate_marker(&html_lower);
 
@@ -443,13 +467,56 @@ pub fn extract_article(html: &str, url: &str, feed_text: Option<&str>) -> Extrac
         }
     }
 
+    // Dedicated site extractors and structured data run before the
+    // generic pick (Python order): The Register and Axios have
+    // canonical bodies the generic engines miss; JSON-LD articleBody
+    // recovers bodies when the DOM scrape is thin.
+    let host = host_of(url);
+    let site_text = if host.contains("theregister.com") || host.contains("theregister.co.uk") {
+        register_text(html)
+    } else if host.contains("axios.com") {
+        axios_text(html)
+    } else {
+        String::new()
+    };
+    let jsonld = if site_text.is_empty() {
+        json_ld_text(html)
+    } else {
+        String::new()
+    };
+
     // Pick the better candidate: the longer one, unless the second is
     // only marginally longer (base wins ties; it keeps tables better).
-    let (title, mut text, source) = if second_chars > base_chars.saturating_add(base_chars / 4) {
+    let (title, mut text, source) = if !site_text.is_empty() {
+        (base.0.clone(), site_text, "site")
+    } else if char_count(&jsonld) > base_chars.max(second_chars) {
+        (base.0.clone(), jsonld, "jsonld")
+    } else if second_chars > base_chars.saturating_add(base_chars / 4) {
         (second.0, second.1, "second")
     } else {
         (base.0, base.1, "base")
     };
+
+    // Stub rejections (Python `_looks_like_paywall_stub` /
+    // `_looks_like_link_list`): never present a stub as the article;
+    // fall back to substantial feed content, else report the gate.
+    if looks_like_paywall_stub(&text) || looks_like_link_list(&text) {
+        if let Some(feed) = feed_text
+            && char_count(feed) >= 200
+        {
+            return ExtractOutcome::Article {
+                title,
+                text: feed.trim().to_string(),
+                source: "feed",
+            };
+        }
+        let reason = if looks_like_paywall_stub(&text) {
+            PAYWALL_NOTICE.to_string()
+        } else {
+            "page is a link list, not an article".to_string()
+        };
+        return ExtractOutcome::Gate { reason };
+    }
 
     // Prefer-feed-content: a clearly more substantial feed body wins.
     if let Some(feed) = feed_text {
@@ -477,6 +544,14 @@ pub fn extract_article(html: &str, url: &str, feed_text: Option<&str>) -> Extrac
 
     if char_count(&text) == 0 {
         return ExtractOutcome::Empty;
+    }
+    // Reuters-style zero-width injection is stripped for clean
+    // word matching and screen-reader output.
+    text = strip_zero_width(&text);
+    // Metered preview: say so instead of trailing off mid-story.
+    if METERED_MARKERS.iter().any(|m| html_lower.contains(m)) {
+        text.push_str("\n\n");
+        text.push_str(METERED_NOTICE);
     }
     ExtractOutcome::Article {
         title,
