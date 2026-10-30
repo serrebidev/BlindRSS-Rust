@@ -5,6 +5,8 @@
 //! is a Stage 0/6 acceptance item); layout follows BlindFB's proven
 //! patterns: sizer-based, labelled controls, status bar announcements.
 
+mod help;
+mod keys;
 mod player;
 mod settings;
 
@@ -247,13 +249,59 @@ fn refill_articles(state: &mut State, list: &ListCtrl) {
     }
 }
 
+/// UI language: config `language` ("auto"/missing = OS locale),
+/// normalised to a primary tag ("de_DE.UTF-8" -> "de").
+fn ui_language() -> String {
+    let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+    let chosen = cfg.get_str("language", "auto").to_string();
+    let raw = if chosen.is_empty() || chosen == "auto" {
+        std::env::var("LANG").unwrap_or_else(|_| "en".to_string())
+    } else {
+        chosen
+    };
+    let primary = raw
+        .split(['_', '-', '.'])
+        .next()
+        .unwrap_or("en")
+        .to_lowercase();
+    if primary.is_empty() {
+        "en".to_string()
+    } else {
+        primary
+    }
+}
+
+fn locale_root() -> PathBuf {
+    if let Ok(p) = std::env::var("BLINDRSS_LOCALE") {
+        return PathBuf::from(p);
+    }
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../blindrss-work/locale")
+}
+
 fn main() {
     let _ = wxdragon::main(|_| {
+        let language = ui_language();
+        let catalog = blindrss_core::i18n::Catalog::load(&locale_root(), &language);
+        let refresh_label = catalog.get("Refresh All Feeds").to_string();
         let frame = Frame::builder()
             .with_title("BlindRSS")
             .with_size(Size::new(1100, 700))
             .build();
         frame.create_status_bar(1, 0, -1, "status");
+
+        // Tray icon (orange square placeholder artwork; the real
+        // app icon ships with the release packaging).
+        {
+            let tray = TaskBarIcon::builder().build();
+            let mut rgba = Vec::with_capacity(32 * 32 * 4);
+            for _ in 0..32 * 32 {
+                rgba.extend_from_slice(&[240, 130, 20, 255]);
+            }
+            if let Some(bmp) = Bitmap::from_rgba(&rgba, 32, 32) {
+                tray.set_icon(&bmp, "BlindRSS");
+            }
+            Box::leak(Box::new(tray));
+        }
 
         let add_btn = Button::builder(&frame).with_label("Add Feed...").build();
         let remove_btn = Button::builder(&frame).with_label("Remove Feed").build();
@@ -299,9 +347,9 @@ fn main() {
             .with_label("Check for Updates")
             .build();
         let settings_btn = Button::builder(&frame).with_label("Settings...").build();
-        let refresh_btn = Button::builder(&frame)
-            .with_label("Refresh All Feeds")
-            .build();
+        let refresh_btn = Button::builder(&frame).with_label(&refresh_label).build();
+        let help_btn = Button::builder(&frame).with_label("Help").build();
+        let keys_btn = Button::builder(&frame).with_label("Shortcuts...").build();
 
         let splitter = SplitterWindow::builder(&frame).build();
         let tree = TreeCtrl::builder(&splitter).build();
@@ -344,6 +392,8 @@ fn main() {
         btn_row.add(&prune_btn, 0, SizerFlag::All, 4);
         btn_row.add(&update_btn, 0, SizerFlag::All, 4);
         btn_row.add(&settings_btn, 0, SizerFlag::All, 4);
+        btn_row.add(&help_btn, 0, SizerFlag::All, 4);
+        btn_row.add(&keys_btn, 0, SizerFlag::All, 4);
         sizer.add_sizer(&btn_row, 0, SizerFlag::All, 0);
         let btn_row2 = BoxSizer::builder(Orientation::Horizontal).build();
         btn_row2.add(&delete_btn, 0, SizerFlag::All, 4);
@@ -1292,6 +1342,17 @@ fn main() {
         let frame_set = frame;
         settings_btn.on_click(move |_| {
             settings::show_settings(&frame_set, &config_path());
+        });
+
+        // Help viewer + shortcuts registry dialogs.
+        let frame_help = frame;
+        let language_help = language.clone();
+        help_btn.on_click(move |_| {
+            help::show_help(&frame_help, &language_help);
+        });
+        let frame_keys = frame;
+        keys_btn.on_click(move |_| {
+            keys::show_shortcuts(&frame_keys, &config_path());
         });
 
         // Add Feed: prompt for a URL, fetch it on a worker thread to

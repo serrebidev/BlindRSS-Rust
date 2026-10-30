@@ -93,9 +93,9 @@ Base-interface method groups (54) and where they stand in Rust core:
 | Single instance, runtime env, self-test | single_instance.py; runtime_env.py; runtime_self_test.py | **missing** |
 | Platform integration (Windows/macOS) | windows_integration.py; macos_integration.py | **missing** |
 | Screen-reader announcements | screen_reader_announce.py | **partial** — status-bar text; no dedicated announce channel yet |
-| i18n (17 locales) + po compile | i18n.py; po_compile.py | **missing** (slice 8 scaffolding) |
-| Help system (92 topics; guide in 17 locales) | help_topics.py; docs/help/*.md | **missing** |
-| Shortcuts registry (~50 actions, remappable) | shortcuts.py 439; gui/shortcut_keys.py; gui/hotkeys.py | **missing** |
+| i18n (17 locales) + po compile | i18n.py; po_compile.py | **partial** — PO parser + catalog load + language resolution done, main-window labels wired (Refresh); full string sweep + .mo compile step missing |
+| Help system (92 topics; guide in 17 locales) | help_topics.py; docs/help/*.md | **done** — guide loader with locale fallback, topic split, plain-text viewer dialog |
+| Shortcuts registry (70 actions, remappable) | shortcuts.py 439; gui/shortcut_keys.py; gui/hotkeys.py | **partial** — full registry extracted from Python, normalisation/conflicts, overrides dialog; live key dispatch for wired actions missing |
 
 ## 3. GUI surface (Python `gui/`)
 
@@ -128,7 +128,7 @@ Base-interface method groups (54) and where they stand in Rust core:
   PersistentSearchDialog, FilterRulesDialog + editor,
   AddFeedDialog, FeedPropertiesDialog, OpenMediaUrlDialog,
   ChooseCategoryDialog — all **missing** except basic prompts.
-- Tray icon + global hotkeys — **missing** (hotkeys are wxDragon's
+- Tray icon — **done** (TaskBarIcon, placeholder bitmap; menu/actions missing). Global hotkeys — **missing** (hotkeys are wxDragon's
   one binding gap; needs a platform layer).
 
 ## 4. Port queue (derived from this audit, in order)

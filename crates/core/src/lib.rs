@@ -16,6 +16,8 @@ pub mod discovery;
 pub mod download;
 pub mod extract;
 pub mod feeds;
+pub mod help;
+pub mod i18n;
 pub mod maintenance;
 pub mod media;
 pub mod oauth;
@@ -23,6 +25,8 @@ pub mod opml;
 pub mod providers;
 pub mod refresh;
 pub mod rules;
+pub mod shortcuts;
+pub mod shortcuts_data;
 pub mod takeout;
 
 pub use db::{Article, Category, Chapter, Db, Feed, PlaybackState};
