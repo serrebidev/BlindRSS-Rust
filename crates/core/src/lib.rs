@@ -7,6 +7,7 @@
 
 pub mod config;
 pub mod db;
+pub mod discovery;
 pub mod extract;
 pub mod feeds;
 pub mod media;

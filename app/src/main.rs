@@ -127,7 +127,7 @@ enum RefreshMsg {
     FeedDone(Feed, Result<ParsedFeed, String>),
     AllDone,
     /// Result of adding a feed by URL: (url, fetch result).
-    Added(String, Result<ParsedFeed, String>),
+    Added(String, Result<(String, ParsedFeed), String>),
     /// Result of a hosted-provider sync: (provider name, (feeds, new)).
     ProviderDone(String, Result<(usize, usize), String>),
     /// Fetched article page HTML for full-text extraction.
@@ -879,7 +879,9 @@ fn main() {
             frame_add.set_status_text(&format!("Adding {url}..."), 0);
             let tx = tx_add.clone();
             std::thread::spawn(move || {
-                let result = fetch_and_parse(&url);
+                // Discovery chain: social transforms, direct feed,
+                // then HTML alternate links.
+                let result = blindrss_core::discovery::resolve_subscribe_url(&url);
                 let _ = tx.send(RefreshMsg::Added(url, result));
             });
         });
@@ -1000,15 +1002,15 @@ fn main() {
                     Ok(RefreshMsg::FeedDone(feed, Err(e))) => {
                         frame_tick.set_status_text(&format!("{}: {e}", feed.title), 0);
                     }
-                    Ok(RefreshMsg::Added(url, Ok(parsed))) => {
+                    Ok(RefreshMsg::Added(_url, Ok((feed_url, parsed)))) => {
                         let mut st = state_tick.borrow_mut();
                         if let Some(db) = st.db.as_ref() {
                             let title = if parsed.title.trim().is_empty() {
-                                url.clone()
+                                feed_url.clone()
                             } else {
                                 parsed.title.clone()
                             };
-                            match db.add_feed(&url, &title, None) {
+                            match db.add_feed(&feed_url, &title, None) {
                                 Ok(feed) => {
                                     let _ = store_parsed(db, &feed, &parsed);
                                     st.feeds.push(feed);
