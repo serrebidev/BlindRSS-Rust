@@ -1,0 +1,171 @@
+//! Data layer over the existing BlindRSS `rss.db`.
+//!
+//! Schema is owned by Python `core/db.py`; this module only reads and
+//! writes rows in that schema. No tables are created or altered here
+//! (additive migrations, if ever needed, are a separate deliberate step).
+
+use rusqlite::{Connection, params};
+use std::path::Path;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Feed {
+    pub id: String,
+    pub url: String,
+    pub title: String,
+    pub title_is_custom: bool,
+    pub category: Option<String>,
+    pub icon_url: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Category {
+    pub id: String,
+    pub title: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Article {
+    pub id: String,
+    pub feed_id: String,
+    pub title: String,
+    pub url: String,
+    pub content: Option<String>,
+    pub description: Option<String>,
+    pub date: Option<String>,
+    pub author: Option<String>,
+    pub is_read: bool,
+    pub is_favorite: bool,
+    pub media_url: Option<String>,
+    pub media_type: Option<String>,
+}
+
+pub struct Db {
+    conn: Connection,
+}
+
+impl Db {
+    /// Open an existing BlindRSS database. Fails if the file is missing:
+    /// silently creating an empty database would hide a wrong path and
+    /// look like data loss to the user.
+    pub fn open(path: &Path) -> rusqlite::Result<Self> {
+        if !path.exists() {
+            return Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CANTOPEN),
+                Some(format!("database not found: {}", path.display())),
+            ));
+        }
+        let conn = Connection::open(path)?;
+        conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+        Ok(Self { conn })
+    }
+
+    pub fn categories(&self) -> rusqlite::Result<Vec<Category>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, title FROM categories ORDER BY title")?;
+        let rows = stmt.query_map([], |r| {
+            Ok(Category {
+                id: r.get(0)?,
+                title: r.get(1)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    pub fn feeds(&self) -> rusqlite::Result<Vec<Feed>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, url, title, title_is_custom, category, icon_url \
+             FROM feeds ORDER BY title",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(Feed {
+                id: r.get(0)?,
+                url: r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                title: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                title_is_custom: r.get::<_, i64>(3)? != 0,
+                category: r.get(4)?,
+                icon_url: r.get(5)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// Articles for one feed, newest first (Python orders by date in its
+    /// list views). `feed_id == None` returns articles across all feeds.
+    pub fn articles(&self, feed_id: Option<&str>, limit: usize) -> rusqlite::Result<Vec<Article>> {
+        let sql = "SELECT id, feed_id, title, url, content, description, date, \
+                   author, is_read, is_favorite, media_url, media_type \
+                   FROM articles \
+                   WHERE (?1 IS NULL OR feed_id = ?1) \
+                   ORDER BY date DESC, id DESC LIMIT ?2";
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map(params![feed_id, limit as i64], |r| {
+            Ok(Article {
+                id: r.get(0)?,
+                feed_id: r.get(1)?,
+                title: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                url: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                content: r.get(4)?,
+                description: r.get(5)?,
+                date: r.get(6)?,
+                author: r.get(7)?,
+                is_read: r.get::<_, i64>(8)? != 0,
+                is_favorite: r.get::<_, i64>(9)? != 0,
+                media_url: r.get(10)?,
+                media_type: r.get(11)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    pub fn unread_count(&self, feed_id: Option<&str>) -> rusqlite::Result<i64> {
+        self.conn.query_row(
+            "SELECT COUNT(*) FROM articles WHERE is_read = 0 \
+             AND (?1 IS NULL OR feed_id = ?1)",
+            params![feed_id],
+            |r| r.get(0),
+        )
+    }
+
+    pub fn mark_read(&self, article_id: &str, read: bool) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE articles SET is_read = ?1 WHERE id = ?2",
+            params![read as i64, article_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_favorite(&self, article_id: &str, favorite: bool) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE articles SET is_favorite = ?1 WHERE id = ?2",
+            params![favorite as i64, article_id],
+        )?;
+        Ok(())
+    }
+
+    /// Insert an article if its id is new; returns true when inserted.
+    /// Refresh dedupes on the article id, mirroring the Python store.
+    pub fn insert_article_if_new(&self, a: &Article) -> rusqlite::Result<bool> {
+        let n = self.conn.execute(
+            "INSERT OR IGNORE INTO articles \
+             (id, feed_id, title, url, content, description, date, author, \
+              is_read, is_favorite, media_url, media_type) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                a.id,
+                a.feed_id,
+                a.title,
+                a.url,
+                a.content,
+                a.description,
+                a.date,
+                a.author,
+                a.is_read as i64,
+                a.is_favorite as i64,
+                a.media_url,
+                a.media_type
+            ],
+        )?;
+        Ok(n > 0)
+    }
+}
