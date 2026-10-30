@@ -143,6 +143,10 @@ enum RefreshMsg {
     YoutubeText(String, Result<String, String>),
     /// Archive rescan for a feed: (feed title, new count).
     ArchiveDone(String, Result<usize, String>),
+    /// A finished cast attempt.
+    CastDone(Result<String, String>),
+    /// Update check: latest release tag.
+    UpdateChecked(Result<(String, Option<String>), String>),
 }
 
 const ID_OK: i32 = 5100;
@@ -284,6 +288,15 @@ fn main() {
             .with_label("Import YouTube Takeout")
             .build();
         let archive_btn = Button::builder(&frame).with_label("Rescan Archive").build();
+        let cast_btn = Button::builder(&frame).with_label("Cast").build();
+        let backup_btn = Button::builder(&frame).with_label("Backup").build();
+        let restore_btn = Button::builder(&frame).with_label("Restore").build();
+        let prune_btn = Button::builder(&frame)
+            .with_label("Prune Old Articles")
+            .build();
+        let update_btn = Button::builder(&frame)
+            .with_label("Check for Updates")
+            .build();
         let refresh_btn = Button::builder(&frame)
             .with_label("Refresh All Feeds")
             .build();
@@ -323,6 +336,11 @@ fn main() {
         btn_row.add(&download_btn, 0, SizerFlag::All, 4);
         btn_row.add(&takeout_btn, 0, SizerFlag::All, 4);
         btn_row.add(&archive_btn, 0, SizerFlag::All, 4);
+        btn_row.add(&cast_btn, 0, SizerFlag::All, 4);
+        btn_row.add(&backup_btn, 0, SizerFlag::All, 4);
+        btn_row.add(&restore_btn, 0, SizerFlag::All, 4);
+        btn_row.add(&prune_btn, 0, SizerFlag::All, 4);
+        btn_row.add(&update_btn, 0, SizerFlag::All, 4);
         sizer.add_sizer(&btn_row, 0, SizerFlag::All, 0);
         let btn_row2 = BoxSizer::builder(Orientation::Horizontal).build();
         btn_row2.add(&delete_btn, 0, SizerFlag::All, 4);
@@ -710,7 +728,9 @@ fn main() {
                     let result = blindrss_core::download::youtube_full_text(&url);
                     let _ = tx.send(RefreshMsg::YoutubeText(id, result));
                 } else {
-                    let result = blindrss_core::extract::fetch_html(&url);
+                    let jar = blindrss_core::cookies::load_jar_beside(&config_path());
+                    let header = blindrss_core::cookies::cookie_header_for(&jar, &url);
+                    let result = blindrss_core::extract::fetch_html_with_cookies(&url, &header);
                     let _ = tx.send(RefreshMsg::FullText(id, result));
                 }
             });
@@ -1074,7 +1094,6 @@ fn main() {
             match blindrss_core::takeout::parse_takeout_zip(&bytes) {
                 Ok(feeds) => {
                     let mut st = state_to.borrow_mut();
-                    let mut added = 0;
                     let new_feeds: Vec<Feed> = {
                         let existing: Vec<String> =
                             st.feeds.iter().map(|x| x.url.clone()).collect();
@@ -1091,7 +1110,7 @@ fn main() {
                         }
                         acc
                     };
-                    added = new_feeds.len();
+                    let added = new_feeds.len();
                     st.feeds.extend(new_feeds);
                     rebuild_tree(&mut st, &tree_to);
                     refill_articles(&mut st, &list_to);
@@ -1125,6 +1144,143 @@ fn main() {
                     .map_err(|e| format!("{e}"))
                     .and_then(|db| blindrss_core::archive::rescan_archive(&db, &feed));
                 let _ = tx.send(RefreshMsg::ArchiveDone(feed.title.clone(), result));
+            });
+        });
+
+        // Cast: resolve the article's stream, discover Chromecasts,
+        // launch the default receiver and load the media — all on a
+        // worker thread (SSDP + TLS would block the UI).
+        let state_cast = state.clone();
+        let frame_cast = frame;
+        let tx_cast = tx.clone();
+        cast_btn.on_click(move |_| {
+            let article = {
+                let st = state_cast.borrow();
+                st.selected_article
+                    .and_then(|i| st.articles.get(i))
+                    .cloned()
+            };
+            let Some(article) = article else {
+                frame_cast.set_status_text("No article selected", 0);
+                return;
+            };
+            frame_cast.set_status_text("Looking for cast devices...", 0);
+            let tx = tx_cast.clone();
+            std::thread::spawn(move || {
+                let result = (|| -> Result<String, String> {
+                    let url = if let Some(m) = article.media_url.clone().filter(|u| !u.is_empty()) {
+                        m
+                    } else if !article.url.is_empty() {
+                        blindrss_core::media::stream_url(&article.url)?
+                    } else {
+                        return Err("Article has no playable media".to_string());
+                    };
+                    let devices = blindrss_core::cast::discover_chromecasts(
+                        std::time::Duration::from_secs(3),
+                    );
+                    let device = devices
+                        .first()
+                        .ok_or("No Chromecast found on this network")?;
+                    let mut session = blindrss_core::castsession::CastSession::connect(
+                        &device.host,
+                        device.port,
+                    )?;
+                    session.launch_default_receiver()?;
+                    let ctype = article
+                        .media_type
+                        .clone()
+                        .filter(|t| t.contains('/'))
+                        .unwrap_or_else(|| "audio/mpeg".to_string());
+                    session.load_media(&url, &ctype, &article.title)?;
+                    Ok(format!("Casting {} to {}", article.title, device.name))
+                })();
+                let _ = tx.send(RefreshMsg::CastDone(result));
+            });
+        });
+
+        // Backup / Restore / Prune / Updates.
+        let frame_bk = frame;
+        backup_btn.on_click(move |_| {
+            let dlg = FileDialog::builder(&frame_bk)
+                .with_message("Save backup")
+                .with_wildcard("ZIP files (*.zip)|*.zip")
+                .with_style(FileDialogStyle::Save)
+                .build();
+            if dlg.show_modal() != 5100 {
+                return;
+            }
+            if let Some(path) = dlg.get_path() {
+                match blindrss_core::maintenance::create_backup(
+                    &db_path(),
+                    &config_path(),
+                    &PathBuf::from(&path),
+                ) {
+                    Ok(()) => frame_bk.set_status_text(&format!("Backup saved to {path}"), 0),
+                    Err(e) => frame_bk.set_status_text(&format!("Backup: {e}"), 0),
+                }
+            }
+        });
+        let state_rs = state.clone();
+        let frame_rs = frame;
+        let tree_rs = tree;
+        let list_rs = list;
+        let reader_rs = reader;
+        restore_btn.on_click(move |_| {
+            let dlg = FileDialog::builder(&frame_rs)
+                .with_message("Restore backup")
+                .with_wildcard("ZIP files (*.zip)|*.zip")
+                .with_style(FileDialogStyle::Open)
+                .build();
+            if dlg.show_modal() != 5100 {
+                return;
+            }
+            if let Some(path) = dlg.get_path() {
+                match blindrss_core::maintenance::restore_backup(
+                    &PathBuf::from(&path),
+                    &db_path(),
+                    &config_path(),
+                ) {
+                    Ok(()) => {
+                        let mut st = state_rs.borrow_mut();
+                        st.db = Db::open(&db_path()).ok();
+                        st.feeds = st
+                            .db
+                            .as_ref()
+                            .and_then(|db| db.feeds().ok())
+                            .unwrap_or_default();
+                        st.articles.clear();
+                        rebuild_tree(&mut st, &tree_rs);
+                        refill_articles(&mut st, &list_rs);
+                        reader_rs.set_value("");
+                        frame_rs.set_status_text("Backup restored", 0);
+                    }
+                    Err(e) => frame_rs.set_status_text(&format!("Restore: {e}"), 0),
+                }
+            }
+        });
+        let state_pr = state.clone();
+        let frame_pr = frame;
+        let list_pr = list;
+        prune_btn.on_click(move |_| {
+            let mut st = state_pr.borrow_mut();
+            match st.db.as_ref().map(|db| db.prune_old_articles(30)) {
+                Some(Ok(n)) => {
+                    refill_articles(&mut st, &list_pr);
+                    frame_pr.set_status_text(&format!("Pruned {n} old article(s)"), 0);
+                }
+                Some(Err(e)) => frame_pr.set_status_text(&format!("Prune: {e}"), 0),
+                None => frame_pr.set_status_text("No database", 0),
+            }
+        });
+        let frame_up = frame;
+        let tx_up = tx.clone();
+        update_btn.on_click(move |_| {
+            frame_up.set_status_text("Checking for updates...", 0);
+            let tx = tx_up.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(RefreshMsg::UpdateChecked(
+                    blindrss_core::maintenance::check_update(),
+                ));
             });
         });
 
@@ -1419,6 +1575,20 @@ fn main() {
                             Err(e) => frame_tick.set_status_text(&format!("{title}: {e}"), 0),
                         }
                     }
+                    Ok(RefreshMsg::CastDone(result)) => match result {
+                        Ok(msg) => frame_tick.set_status_text(&msg, 0),
+                        Err(e) => frame_tick.set_status_text(&format!("Cast: {e}"), 0),
+                    },
+                    Ok(RefreshMsg::UpdateChecked(result)) => match result {
+                        Ok((tag, _)) => {
+                            if tag.trim_start_matches('v') == env!("CARGO_PKG_VERSION") {
+                                frame_tick.set_status_text("BlindRSS is up to date", 0);
+                            } else {
+                                frame_tick.set_status_text(&format!("Update available: {tag}"), 0);
+                            }
+                        }
+                        Err(e) => frame_tick.set_status_text(&format!("Updates: {e}"), 0),
+                    },
                     Ok(RefreshMsg::AllDone) => {
                         finished = true;
                         break;

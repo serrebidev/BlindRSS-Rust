@@ -64,18 +64,18 @@ Base-interface method groups (54) and where they stand in Rust core:
 | Article extraction (layered cascade) | article_extractor.py 5,098 | **partial** — cascade + full gate-marker list, paywall/link-list rejection, JSON-LD, Register + Axios dedicated extractors, metered notice, zero-width strip (slices 1, 6); remaining: BBC/Sky/Bloomberg/GSMArena fixes, thread rebuilds (Reddit/Lemmy/forums), fetch fallback chain, lead recovery |
 | HTML rendering of articles | article_html.py 1,190 | **missing** (native TextCtrl reader instead; rich view is a Phase-6 manual gate) |
 | Utilities (dates, text, URLs) | utils.py 2,893 | **partial** — pulled in as needed |
-| Browser cookies (Chromium) + site cookies + clearance | chromium_cookies.py 2,184; site_cookies.py 1,533 | **missing** |
+| Browser cookies (Chromium) + site cookies + clearance | chromium_cookies.py 2,184; site_cookies.py 1,533 | **partial** — Netscape jar + matching + 8KB budget + fetch wiring done; Chromium import/clearance harvest missing |
 | Range cache proxy / stream proxy / play cache | range_cache_proxy.py 2,000; stream_proxy.py 818; play_cache.py | **missing** |
 | Dependency check (yt-dlp, ffmpeg, VLC…) | dependency_check.py 1,868 | **missing** |
-| Casting adapter | casting.py 1,609 (+ Caster engine, see Phase 5 report) | **missing** — caster-core crate planned |
-| Updater + translation updates | updater.py 1,283; translation_updates.py | **missing** |
+| Casting adapter | casting.py 1,609 (+ Caster engine, see Phase 5 report) | **partial** — caster-core in core: SSDP discovery, hand-rolled CASTv2 wire + TLS session, receiver launch, media load/control, Cast button; DLNA/AirPlay/queue missing |
+| Updater + translation updates | updater.py 1,283; translation_updates.py | **partial** — GitHub latest-release check + app button done; download/apply + translation updates missing |
 | Translation (LLM clients) | translation.py 1,020 | **missing** |
 | Browser feed detection | browser_feed.py 963 | **missing** |
 | GitHub-as-source feeds | github_source.py 946 | **missing** |
-| Podcast archive | podcast_archive.py 716 | **missing** |
-| YouTube full text (description/chapters/transcript) | youtube_fulltext.py 755; youtube_pytubefix.py | **missing** |
+| Podcast archive | podcast_archive.py 716 | **partial** — rescan (live + Wayback union) done; dialog/lineage depth missing |
+| YouTube full text (description/chapters/transcript) | youtube_fulltext.py 755; youtube_pytubefix.py | **done** — description + chapters + VTT transcript via yt-dlp (slice 12) |
 | YouTube account + browser session | youtube_account.py; youtube_browser_session.py | **missing** |
-| YouTube Takeout import | youtube_takeout.py | **missing** |
+| YouTube Takeout import | youtube_takeout.py | **done** — ZIP subscriptions/playlists/history import (slice 12) |
 | Forum sources (Reddit/Lemmy/Groups.io) | forum_sources.py 551; groups_io.py 448 | **missing** |
 | Rumble / Odysee / NPR / Sky sources | rumble.py 582; odysee.py; npr.py; sky.py | **missing** |
 | SponsorBlock | sponsorblock.py | **missing** |
@@ -83,11 +83,11 @@ Base-interface method groups (54) and where they stand in Rust core:
 | Playback state persistence | playback_state.py | **done** (slice 7: get/upsert/delete against the Python table) |
 | Equalizer (libVLC 10-band presets) | equalizer.py | **missing** |
 | User agents / fetch identity | user_agents.py 540; http_headers.py | **partial** — UA set on full-text fetch; presets + per-feed identity missing |
-| Backup/restore | backup.py | **missing** |
-| Retention/purge | retention.py | **missing** |
+| Backup/restore | backup.py | **done** — ZIP backup (VACUUM INTO + config) + restore + app buttons |
+| Retention/purge | retention.py | **partial** — prune read non-favorites + old tombstones (30d button) done; policy options missing |
 | Smart folders / filters logic | smart_folders.py; filters.py | **partial** — rule tree evaluator + action pipeline ported and tested (tag field awaits articles.tags) |
 | Metadata enrichment | metadata_enrich.py | **missing** |
-| Media URL resolution | media_url.py; download_formats.py | **missing** |
+| Media URL resolution | media_url.py; download_formats.py | **partial** — yt-dlp info/stream resolution + download presets done; media_url.py rules missing |
 | Article language detect | article_lang.py | **missing** |
 | Announcements | announcements.py | **missing** |
 | Single instance, runtime env, self-test | single_instance.py; runtime_env.py; runtime_self_test.py | **missing** |

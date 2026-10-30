@@ -370,13 +370,22 @@ fn strip_zero_width(s: &str) -> String {
 
 /// Fetch a page's HTML for full-text reading.
 pub fn fetch_html(url: &str) -> Result<String, String> {
-    let mut resp = ureq::get(url)
-        .header(
-            "User-Agent",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
-        )
-        .call()
-        .map_err(|e| format!("fetch failed: {e}"))?;
+    fetch_html_with_cookies(url, "")
+}
+
+/// Like `fetch_html`, sending a site-cookies header when one is
+/// provided (from the Netscape jar beside the config).
+pub fn fetch_html_with_cookies(url: &str, cookie_header: &str) -> Result<String, String> {
+    let req = ureq::get(url).header(
+        "User-Agent",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+    );
+    let req = if cookie_header.is_empty() {
+        req
+    } else {
+        req.header("Cookie", cookie_header)
+    };
+    let mut resp = req.call().map_err(|e| format!("fetch failed: {e}"))?;
     resp.body_mut()
         .read_to_string()
         .map_err(|e| format!("read failed: {e}"))

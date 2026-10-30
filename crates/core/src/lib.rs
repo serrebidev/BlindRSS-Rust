@@ -6,12 +6,17 @@
 //! parallel and must stay able to read any database the Python app writes.
 
 pub mod archive;
+pub mod cast;
+pub mod castsession;
+pub mod castwire;
 pub mod config;
+pub mod cookies;
 pub mod db;
 pub mod discovery;
 pub mod download;
 pub mod extract;
 pub mod feeds;
+pub mod maintenance;
 pub mod media;
 pub mod opml;
 pub mod providers;

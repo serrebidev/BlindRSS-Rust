@@ -119,6 +119,7 @@ dependencies = [
  "opml",
  "rusqlite",
  "rust-trafilatura",
+ "rustls",
  "serde",
  "serde_json",
  "ureq",
