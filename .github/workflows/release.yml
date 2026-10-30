@@ -1,0 +1,97 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    name: Package (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+
+      - name: Install wxWidgets build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libclang-dev pkg-config libgtk-3-dev libpng-dev libjpeg-dev \
+            libgl1-mesa-dev libglu1-mesa-dev libxkbcommon-dev libexpat1-dev libtiff-dev \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            libgstreamer-plugins-bad1.0-dev libwebkit2gtk-4.1-dev \
+            libsecret-1-dev libnotify-dev libsdl2-dev \
+            gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-libav gstreamer1.0-x
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Validate release
+        shell: bash
+        run: |
+          cargo fmt --all --check
+          cargo clippy --locked --workspace --all-targets -- -D warnings
+          cargo test --locked --workspace
+
+      - name: Build release binary
+        run: cargo build --release --locked -p blindrss
+
+      - name: Package (zip)
+        shell: bash
+        run: |
+          mkdir -p dist/BlindRSS
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            cp target/release/blindrss.exe dist/BlindRSS/
+          else
+            cp target/release/blindrss dist/BlindRSS/
+          fi
+          cp README.md dist/BlindRSS/
+          cp docs/PARITY.md dist/BlindRSS/
+          cd dist
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            7z a "BlindRSS-${{ github.ref_name }}-${{ runner.os }}.zip" BlindRSS
+          else
+            zip -r "BlindRSS-${{ github.ref_name }}-${{ runner.os }}.zip" BlindRSS
+          fi
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: BlindRSS-${{ github.ref_name }}-${{ runner.os }}
+          path: dist/*.zip
+
+  publish:
+    name: Publish release
+    needs: package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*.zip
+          generate_release_notes: true
