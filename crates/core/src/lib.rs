@@ -9,7 +9,9 @@ pub mod config;
 pub mod db;
 pub mod extract;
 pub mod feeds;
+pub mod refresh;
 
 pub use db::{Article, Category, Db, Feed};
 pub use extract::{ExtractOutcome, extract_article};
 pub use feeds::{ParsedEntry, ParsedFeed, parse_feed};
+pub use refresh::{refresh_all, refresh_feed, store_parsed};
