@@ -6,6 +6,7 @@
 //! patterns: sizer-based, labelled controls, status bar announcements.
 
 mod player;
+mod settings;
 
 use blindrss_core::feeds::fetch_and_parse;
 use blindrss_core::{Article, Db, Feed, ParsedFeed, store_parsed};
@@ -297,6 +298,7 @@ fn main() {
         let update_btn = Button::builder(&frame)
             .with_label("Check for Updates")
             .build();
+        let settings_btn = Button::builder(&frame).with_label("Settings...").build();
         let refresh_btn = Button::builder(&frame)
             .with_label("Refresh All Feeds")
             .build();
@@ -341,6 +343,7 @@ fn main() {
         btn_row.add(&restore_btn, 0, SizerFlag::All, 4);
         btn_row.add(&prune_btn, 0, SizerFlag::All, 4);
         btn_row.add(&update_btn, 0, SizerFlag::All, 4);
+        btn_row.add(&settings_btn, 0, SizerFlag::All, 4);
         sizer.add_sizer(&btn_row, 0, SizerFlag::All, 0);
         let btn_row2 = BoxSizer::builder(Orientation::Horizontal).build();
         btn_row2.add(&delete_btn, 0, SizerFlag::All, 4);
@@ -1282,6 +1285,13 @@ fn main() {
                     blindrss_core::maintenance::check_update(),
                 ));
             });
+        });
+
+        // Settings: provider accounts + download folder + Inoreader
+        // OAuth connect, in a modal dialog.
+        let frame_set = frame;
+        settings_btn.on_click(move |_| {
+            settings::show_settings(&frame_set, &config_path());
         });
 
         // Add Feed: prompt for a URL, fetch it on a worker thread to

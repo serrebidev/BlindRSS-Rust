@@ -43,4 +43,36 @@ impl Config {
     pub fn raw(&self) -> &Value {
         &self.raw
     }
+
+    /// Mutable access for the settings writer; the object shape is
+    /// created on demand.
+    pub fn raw_mut(&mut self) -> &mut Value {
+        if !self.raw.is_object() {
+            self.raw = Value::Object(serde_json::Map::new());
+        }
+        &mut self.raw
+    }
+
+    /// Set a dotted path (`providers.miniflux.url`) to a JSON value.
+    pub fn set_path(&mut self, path: &str, value: Value) {
+        let parts: Vec<&str> = path.split('.').collect();
+        let mut cur = self.raw_mut();
+        for part in &parts[..parts.len() - 1] {
+            if !cur.get(*part).is_some_and(|v| v.is_object()) {
+                cur.as_object_mut()
+                    .unwrap()
+                    .insert(part.to_string(), Value::Object(serde_json::Map::new()));
+            }
+            cur = cur.get_mut(*part).unwrap();
+        }
+        cur.as_object_mut()
+            .unwrap()
+            .insert(parts[parts.len() - 1].to_string(), value);
+    }
+
+    /// Persist to disk in the Python format (pretty JSON).
+    pub fn save(&self, path: &Path) -> std::io::Result<()> {
+        let text = serde_json::to_string_pretty(&self.raw).unwrap_or_else(|_| "{}".to_string());
+        std::fs::write(path, text)
+    }
 }

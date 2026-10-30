@@ -147,7 +147,9 @@ Base-interface method groups (54) and where they stand in Rust core:
 7. Cookies (browser import + site cookies) and fetch identity.
 8. Casting via caster-core (slice 8).
 9. Settings dialog (provider accounts incl. OAuth), backup/restore,
-   updater, retention.
+   updater, retention. — DONE (slice 8): settings dialog with
+   Inoreader paste-redirect OAuth; remaining settings depth in the
+   dialogs row.
 10. i18n (17 locales), help viewer (92 topics), shortcuts registry,
     tray.
 11. CI + release (slice 9).

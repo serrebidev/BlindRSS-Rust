@@ -18,6 +18,7 @@ pub mod extract;
 pub mod feeds;
 pub mod maintenance;
 pub mod media;
+pub mod oauth;
 pub mod opml;
 pub mod providers;
 pub mod refresh;
