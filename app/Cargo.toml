@@ -6,4 +6,5 @@ license.workspace = true
 
 [dependencies]
 blindrss-core = { path = "../crates/core" }
+serde_json = "1"
 wxdragon = { version = "0.9.24", features = ["media-ctrl", "richtext", "stc", "webview"] }

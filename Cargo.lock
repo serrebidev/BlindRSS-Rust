@@ -106,6 +106,7 @@ name = "blindrss"
 version = "0.1.0"
 dependencies = [
  "blindrss-core",
+ "serde_json",
  "wxdragon",
 ]
 

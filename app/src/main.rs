@@ -35,6 +35,8 @@ enum RefreshMsg {
     AllDone,
     /// Result of adding a feed by URL: (url, fetch result).
     Added(String, Result<ParsedFeed, String>),
+    /// Result of a hosted-provider sync: (provider name, (feeds, new)).
+    ProviderDone(String, Result<(usize, usize), String>),
 }
 
 const ID_OK: i32 = 5100;
@@ -103,6 +105,7 @@ fn main() {
         let deleted_btn = Button::builder(&frame).with_label("Deleted...").build();
         let search_box = TextCtrl::builder(&frame).build();
         let search_btn = Button::builder(&frame).with_label("Search").build();
+        let sync_btn = Button::builder(&frame).with_label("Sync Providers").build();
         let refresh_btn = Button::builder(&frame)
             .with_label("Refresh All Feeds")
             .build();
@@ -130,6 +133,7 @@ fn main() {
         btn_row.add(&remove_btn, 0, SizerFlag::All, 4);
         btn_row.add(&import_btn, 0, SizerFlag::All, 4);
         btn_row.add(&export_btn, 0, SizerFlag::All, 4);
+        btn_row.add(&sync_btn, 0, SizerFlag::All, 4);
         sizer.add_sizer(&btn_row, 0, SizerFlag::All, 0);
         let btn_row2 = BoxSizer::builder(Orientation::Horizontal).build();
         btn_row2.add(&delete_btn, 0, SizerFlag::All, 4);
@@ -393,6 +397,99 @@ fn main() {
             dlg.show_modal();
         });
 
+        // Sync Providers: for each hosted provider configured in
+        // config.json, run its sync on a worker thread with its own
+        // database connection (SQLite allows concurrent connections;
+        // the main thread reloads when the result lands).
+        let frame_sync = frame;
+        let tx_sync = tx.clone();
+        sync_btn.on_click(move |_| {
+            let cfg_path = std::env::var("BLINDRSS_CONFIG")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| {
+                    db_path()
+                        .parent()
+                        .map(|p| p.join("config.json"))
+                        .unwrap_or_else(|| PathBuf::from("config.json"))
+                });
+            let cfg = blindrss_core::config::Config::load(&cfg_path).unwrap_or_default();
+            let providers = cfg.raw().get("providers").cloned();
+            let Some(providers) = providers else {
+                frame_sync.set_status_text("No providers configured", 0);
+                return;
+            };
+            let get = |obj: &serde_json::Value, key: &str| -> String {
+                obj.get(key)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string()
+            };
+            let mut started = 0;
+            for (key, service) in [
+                (
+                    "theoldreader",
+                    blindrss_core::providers::GReaderService::TheOldReader,
+                ),
+                ("bazqux", blindrss_core::providers::GReaderService::BazQux),
+            ] {
+                let Some(section) = providers.get(key) else {
+                    continue;
+                };
+                let (email, password) = (get(section, "email"), get(section, "password"));
+                if email.is_empty() || password.is_empty() {
+                    continue;
+                }
+                started += 1;
+                let tx = tx_sync.clone();
+                let path = db_path();
+                std::thread::spawn(move || {
+                    let result = Db::open(&path).map_err(|e| format!("{e}")).and_then(|db| {
+                        blindrss_core::providers::GReaderClient::new(service, &email, &password)
+                            .sync(&db, 100)
+                    });
+                    let _ = tx.send(RefreshMsg::ProviderDone(key.to_string(), result));
+                });
+            }
+            if let Some(section) = providers.get("inoreader") {
+                let token = get(section, "token");
+                if !token.is_empty() {
+                    started += 1;
+                    let tx = tx_sync.clone();
+                    let path = db_path();
+                    std::thread::spawn(move || {
+                        let result = Db::open(&path).map_err(|e| format!("{e}")).and_then(|db| {
+                            blindrss_core::providers::GReaderClient::with_oauth(
+                                blindrss_core::providers::GReaderService::Inoreader,
+                                &token,
+                            )
+                            .sync(&db, 100)
+                        });
+                        let _ = tx.send(RefreshMsg::ProviderDone("inoreader".to_string(), result));
+                    });
+                }
+            }
+            if let Some(section) = providers.get("miniflux") {
+                let (url, api_key) = (get(section, "url"), get(section, "api_key"));
+                if !url.is_empty() && !api_key.is_empty() {
+                    started += 1;
+                    let tx = tx_sync.clone();
+                    let path = db_path();
+                    std::thread::spawn(move || {
+                        let result = Db::open(&path).map_err(|e| format!("{e}")).and_then(|db| {
+                            blindrss_core::providers::MinifluxClient::new(&url, &api_key)
+                                .sync(&db, 100)
+                        });
+                        let _ = tx.send(RefreshMsg::ProviderDone("miniflux".to_string(), result));
+                    });
+                }
+            }
+            if started == 0 {
+                frame_sync.set_status_text("No providers configured", 0);
+            } else {
+                frame_sync.set_status_text(&format!("Syncing {started} provider(s)..."), 0);
+            }
+        });
+
         // Add Feed: prompt for a URL, fetch it on a worker thread to
         // learn its title, then subscribe + store its current articles.
         let state_add = state.clone();
@@ -562,6 +659,25 @@ fn main() {
                     }
                     Ok(RefreshMsg::Added(url, Err(e))) => {
                         frame_tick.set_status_text(&format!("Could not add {url}: {e}"), 0);
+                    }
+                    Ok(RefreshMsg::ProviderDone(name, result)) => {
+                        let mut st = state_tick.borrow_mut();
+                        match result {
+                            Ok((feeds, new)) => {
+                                st.feeds = st
+                                    .db
+                                    .as_ref()
+                                    .and_then(|db| db.feeds().ok())
+                                    .unwrap_or_default();
+                                rebuild_tree(&mut st, &tree);
+                                refill_articles(&mut st, &list);
+                                frame_tick.set_status_text(
+                                    &format!("{name}: {feeds} feeds, {new} new articles"),
+                                    0,
+                                );
+                            }
+                            Err(e) => frame_tick.set_status_text(&format!("{name}: {e}"), 0),
+                        }
                     }
                     Ok(RefreshMsg::AllDone) => {
                         finished = true;

@@ -10,6 +10,7 @@ pub mod db;
 pub mod extract;
 pub mod feeds;
 pub mod opml;
+pub mod providers;
 pub mod refresh;
 
 pub use db::{Article, Category, Db, Feed};

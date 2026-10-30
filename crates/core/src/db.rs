@@ -167,6 +167,24 @@ impl Db {
         Ok(feed)
     }
 
+    /// Insert a feed with a caller-chosen id if missing (hosted
+    /// providers key feeds by their remote stream/entry ids).
+    pub fn insert_feed_if_missing(&self, feed: &Feed) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO feeds (id, url, title, title_is_custom, category, icon_url) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                feed.id,
+                feed.url,
+                feed.title,
+                feed.title_is_custom as i64,
+                feed.category,
+                feed.icon_url
+            ],
+        )?;
+        Ok(())
+    }
+
     /// True when a feed with this URL is already subscribed.
     pub fn feed_url_exists(&self, url: &str) -> rusqlite::Result<bool> {
         let n: i64 = self.conn.query_row(
