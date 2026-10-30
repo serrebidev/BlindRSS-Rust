@@ -13,6 +13,97 @@ use std::rc::Rc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use wxdragon::prelude::*;
 
+fn config_path() -> PathBuf {
+    std::env::var("BLINDRSS_CONFIG")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            db_path()
+                .parent()
+                .map(|p| p.join("config.json"))
+                .unwrap_or_else(|| PathBuf::from("config.json"))
+        })
+}
+
+/// Best-effort remote read-state propagation for hosted-provider
+/// articles (Python providers push mark_read/mark_unread to the
+/// server the same way). Runs on a worker thread; failures are
+/// silent because the local state is already correct.
+fn propagate_read_state(article: &blindrss_core::db::Article, read: bool) {
+    let article = article.clone();
+    std::thread::spawn(move || {
+        let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+        let Some(providers) = cfg.raw().get("providers").cloned() else {
+            return;
+        };
+        let get = |obj: &serde_json::Value, key: &str| -> String {
+            obj.get(key)
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        };
+        if article.feed_id.starts_with("miniflux:") {
+            if let Some(section) = providers.get("miniflux") {
+                let (url, key) = (get(section, "url"), get(section, "api_key"));
+                if let Some(entry) = article
+                    .id
+                    .strip_prefix("miniflux-entry:")
+                    .and_then(|s| s.parse::<i64>().ok())
+                    && !url.is_empty()
+                    && !key.is_empty()
+                {
+                    let status = if read { "read" } else { "unread" };
+                    let _ = blindrss_core::providers::MinifluxClient::new(&url, &key)
+                        .set_status_remote(&[entry], status);
+                }
+            }
+            return;
+        }
+        if article.feed_id.starts_with("feed/") {
+            use blindrss_core::providers::{GReaderClient, GReaderService};
+            for (key, service) in [
+                ("theoldreader", GReaderService::TheOldReader),
+                ("bazqux", GReaderService::BazQux),
+            ] {
+                if let Some(section) = providers.get(key) {
+                    let (email, password) = (get(section, "email"), get(section, "password"));
+                    if !email.is_empty()
+                        && !password.is_empty()
+                        && GReaderClient::new(service, &email, &password)
+                            .set_read_remote(&article.id, read)
+                            .is_ok()
+                    {
+                        return;
+                    }
+                }
+            }
+            if let Some(section) = providers.get("inoreader") {
+                let token = get(section, "token");
+                if !token.is_empty() {
+                    let _ = GReaderClient::with_oauth(GReaderService::Inoreader, &token)
+                        .set_read_remote(&article.id, read);
+                }
+            }
+        }
+    });
+}
+
+/// Modal text prompt; None when cancelled.
+fn prompt_text(
+    parent: &impl WxWidget,
+    message: &str,
+    caption: &str,
+    default: &str,
+) -> Option<String> {
+    let dlg = TextEntryDialog::builder(parent, message, caption)
+        .with_default_value(default)
+        .build();
+    if dlg.show_modal() == 5100 {
+        dlg.get_value()
+    } else {
+        None
+    }
+}
+
 fn db_path() -> PathBuf {
     if let Ok(p) = std::env::var("BLINDRSS_DB") {
         return PathBuf::from(p);
@@ -109,6 +200,14 @@ fn main() {
         let search_btn = Button::builder(&frame).with_label("Search").build();
         let sync_btn = Button::builder(&frame).with_label("Sync Providers").build();
         let fulltext_btn = Button::builder(&frame).with_label("Read Full Text").build();
+        let toggle_read_btn = Button::builder(&frame).with_label("Toggle Read").build();
+        let edit_feed_btn = Button::builder(&frame).with_label("Edit Feed").build();
+        let rename_cat_btn = Button::builder(&frame)
+            .with_label("Rename Category")
+            .build();
+        let set_cat_btn = Button::builder(&frame)
+            .with_label("Set Feed Category")
+            .build();
         let refresh_btn = Button::builder(&frame)
             .with_label("Refresh All Feeds")
             .build();
@@ -138,6 +237,10 @@ fn main() {
         btn_row.add(&export_btn, 0, SizerFlag::All, 4);
         btn_row.add(&sync_btn, 0, SizerFlag::All, 4);
         btn_row.add(&fulltext_btn, 0, SizerFlag::All, 4);
+        btn_row.add(&toggle_read_btn, 0, SizerFlag::All, 4);
+        btn_row.add(&edit_feed_btn, 0, SizerFlag::All, 4);
+        btn_row.add(&rename_cat_btn, 0, SizerFlag::All, 4);
+        btn_row.add(&set_cat_btn, 0, SizerFlag::All, 4);
         sizer.add_sizer(&btn_row, 0, SizerFlag::All, 0);
         let btn_row2 = BoxSizer::builder(Orientation::Horizontal).build();
         btn_row2.add(&delete_btn, 0, SizerFlag::All, 4);
@@ -522,6 +625,182 @@ fn main() {
                 let result = blindrss_core::extract::fetch_html(&url);
                 let _ = tx.send(RefreshMsg::FullText(id, result));
             });
+        });
+
+        // Toggle Read: flips the selected article locally and
+        // propagates to the hosted provider when it came from one.
+        let state_tr = state.clone();
+        let frame_tr = frame;
+        let list_tr = list;
+        toggle_read_btn.on_click(move |_| {
+            let mut st = state_tr.borrow_mut();
+            let Some(article) = st
+                .selected_article
+                .and_then(|i| st.articles.get(i))
+                .cloned()
+            else {
+                frame_tr.set_status_text("No article selected", 0);
+                return;
+            };
+            let new_state = !article.is_read;
+            if let Some(db) = &st.db {
+                let _ = db.mark_read(&article.id, new_state);
+            }
+            if let Some(row) = st.articles.iter_mut().find(|a| a.id == article.id) {
+                row.is_read = new_state;
+            }
+            refill_articles(&mut st, &list_tr);
+            frame_tr.set_status_text(
+                &format!("Marked {}", if new_state { "read" } else { "unread" }),
+                0,
+            );
+            drop(st);
+            propagate_read_state(&article, new_state);
+        });
+
+        // Edit Feed: title + URL prompts for the tree-selected feed.
+        let state_ef = state.clone();
+        let frame_ef = frame;
+        let tree_ef = tree;
+        let list_ef = list;
+        edit_feed_btn.on_click(move |_| {
+            let (feed, db_ok) = {
+                let st = state_ef.borrow();
+                (
+                    st.selected_feed
+                        .as_ref()
+                        .and_then(|id| st.feeds.iter().find(|f| &f.id == id).cloned()),
+                    st.db.is_some(),
+                )
+            };
+            let Some(feed) = feed else {
+                frame_ef.set_status_text("Select a feed in the tree first", 0);
+                return;
+            };
+            if !db_ok {
+                return;
+            }
+            let Some(title) = prompt_text(&frame_ef, "Feed title:", "Edit Feed", &feed.title)
+            else {
+                return;
+            };
+            let Some(url) = prompt_text(&frame_ef, "Feed URL:", "Edit Feed", &feed.url) else {
+                return;
+            };
+            let mut st = state_ef.borrow_mut();
+            if let Some(db) = &st.db {
+                let _ = db.update_feed(
+                    &feed.id,
+                    if title.trim().is_empty() {
+                        None
+                    } else {
+                        Some(title.trim())
+                    },
+                    if url.trim().is_empty() {
+                        None
+                    } else {
+                        Some(url.trim())
+                    },
+                );
+                st.feeds = db.feeds().unwrap_or_default();
+            }
+            rebuild_tree(&mut st, &tree_ef);
+            refill_articles(&mut st, &list_ef);
+            frame_ef.set_status_text("Feed updated", 0);
+        });
+
+        // Rename Category: renames the selected feed's category
+        // everywhere (category row + all feeds in it).
+        let state_rc = state.clone();
+        let frame_rc = frame;
+        let tree_rc = tree;
+        let list_rc = list;
+        rename_cat_btn.on_click(move |_| {
+            let (category, db_ok) = {
+                let st = state_rc.borrow();
+                (
+                    st.selected_feed.as_ref().and_then(|id| {
+                        st.feeds
+                            .iter()
+                            .find(|f| &f.id == id)
+                            .and_then(|f| f.category.clone())
+                    }),
+                    st.db.is_some(),
+                )
+            };
+            let Some(category) = category else {
+                frame_rc.set_status_text("Selected feed has no category", 0);
+                return;
+            };
+            if !db_ok {
+                return;
+            }
+            let Some(new_name) = prompt_text(
+                &frame_rc,
+                "New category name:",
+                "Rename Category",
+                &category,
+            ) else {
+                return;
+            };
+            if new_name.trim().is_empty() || new_name.trim() == category {
+                return;
+            }
+            let mut st = state_rc.borrow_mut();
+            if let Some(db) = &st.db {
+                let _ = db.rename_category(&category, new_name.trim());
+                st.feeds = db.feeds().unwrap_or_default();
+            }
+            rebuild_tree(&mut st, &tree_rc);
+            refill_articles(&mut st, &list_rc);
+            frame_rc.set_status_text("Category renamed", 0);
+        });
+
+        // Set Feed Category: prompt (blank = uncategorized); a new
+        // name creates the category.
+        let state_sc = state.clone();
+        let frame_sc = frame;
+        let tree_sc = tree;
+        let list_sc = list;
+        set_cat_btn.on_click(move |_| {
+            let (feed, db_ok) = {
+                let st = state_sc.borrow();
+                (
+                    st.selected_feed
+                        .as_ref()
+                        .and_then(|id| st.feeds.iter().find(|f| &f.id == id).cloned()),
+                    st.db.is_some(),
+                )
+            };
+            let Some(feed) = feed else {
+                frame_sc.set_status_text("Select a feed in the tree first", 0);
+                return;
+            };
+            if !db_ok {
+                return;
+            }
+            let Some(name) = prompt_text(
+                &frame_sc,
+                "Category (blank for none):",
+                "Set Feed Category",
+                feed.category.as_deref().unwrap_or(""),
+            ) else {
+                return;
+            };
+            let name = name.trim();
+            let mut st = state_sc.borrow_mut();
+            if let Some(db) = &st.db {
+                if name.is_empty() {
+                    let _ = db.set_feed_category(&feed.id, None);
+                } else {
+                    let _ = db.add_category(name);
+                    let _ = db.set_feed_category(&feed.id, Some(name));
+                }
+                st.feeds = db.feeds().unwrap_or_default();
+            }
+            rebuild_tree(&mut st, &tree_sc);
+            refill_articles(&mut st, &list_sc);
+            frame_sc.set_status_text("Feed category set", 0);
         });
 
         // Add Feed: prompt for a URL, fetch it on a worker thread to

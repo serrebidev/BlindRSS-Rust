@@ -290,6 +290,12 @@ impl GReaderClient {
 
     /// Mark one item read on the server (edit-tag with an action token).
     pub fn mark_read_remote(&self, item_id: &str) -> Result<(), String> {
+        self.set_read_remote(item_id, true)
+    }
+
+    /// Set one item's read state on the server: edit-tag adds the
+    /// read state to mark read, removes it to mark unread.
+    pub fn set_read_remote(&self, item_id: &str, read: bool) -> Result<(), String> {
         let mut token_resp = ureq::get(&format!("{}/token", self.api_base))
             .header("Authorization", &self.auth_header()?)
             .call()
@@ -298,13 +304,14 @@ impl GReaderClient {
             .body_mut()
             .read_to_string()
             .map_err(|e| format!("token read failed: {e}"))?;
+        let (verb, state) = if read {
+            ("a", "user/-/state/com.google/read")
+        } else {
+            ("r", "user/-/state/com.google/read")
+        };
         ureq::post(&format!("{}/edit-tag", self.api_base))
             .header("Authorization", &self.auth_header()?)
-            .send_form([
-                ("i", item_id),
-                ("a", "user/-/state/com.google/read"),
-                ("T", edit_token.trim()),
-            ])
+            .send_form([("i", item_id), (verb, state), ("T", edit_token.trim())])
             .map_err(|e| format!("edit-tag failed: {e}"))?;
         Ok(())
     }
@@ -455,7 +462,11 @@ impl MinifluxClient {
     }
 
     pub fn mark_read_remote(&self, entry_ids: &[i64]) -> Result<(), String> {
-        let body = serde_json::json!({"entry_ids": entry_ids, "status": "read"});
+        self.set_status_remote(entry_ids, "read")
+    }
+
+    pub fn set_status_remote(&self, entry_ids: &[i64], status: &str) -> Result<(), String> {
+        let body = serde_json::json!({"entry_ids": entry_ids, "status": status});
         ureq::put(&format!("{}/v1/entries", self.base_url))
             .header("X-Auth-Token", &self.api_key)
             .header("Content-Type", "application/json")

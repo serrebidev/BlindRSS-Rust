@@ -42,7 +42,7 @@ Base-interface method groups (54) and where they stand in Rust core:
 - Categories: get_categories, add/rename/delete, move_category,
   supports_subcategories, get_category_hierarchy,
   uncategorized_is_real_category — **partial** (flat add/remove done;
-  rename, move, hierarchy/subcategories missing)
+  rename + move done (provider depth pass); hierarchy/subcategories missing)
 - Full text: fetch_full_content — **partial** (cascade wired into
   the app via Read Full Text, slice 6; fetch fallback chain missing)
 - Media/chapters: get_article_chapters, HostedArticleMediaMixin

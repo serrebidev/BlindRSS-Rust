@@ -127,6 +127,35 @@ impl Db {
         )
     }
 
+    /// One article by id (provider `get_article_by_id`).
+    pub fn article_by_id(&self, article_id: &str) -> rusqlite::Result<Option<Article>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, feed_id, title, url, content, description, date, author, \
+             is_read, is_favorite, media_url, media_type \
+             FROM articles WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![article_id], |row| {
+            Ok(Article {
+                id: row.get(0)?,
+                feed_id: row.get(1)?,
+                title: row.get(2)?,
+                url: row.get(3)?,
+                content: row.get(4)?,
+                description: row.get(5)?,
+                date: row.get(6)?,
+                author: row.get(7)?,
+                is_read: row.get::<_, i64>(8)? != 0,
+                is_favorite: row.get::<_, i64>(9)? != 0,
+                media_url: row.get(10)?,
+                media_type: row.get(11)?,
+            })
+        })?;
+        match rows.next() {
+            Some(r) => Ok(Some(r?)),
+            None => Ok(None),
+        }
+    }
+
     pub fn mark_read(&self, article_id: &str, read: bool) -> rusqlite::Result<()> {
         self.conn.execute(
             "UPDATE articles SET is_read = ?1 WHERE id = ?2",
@@ -201,6 +230,63 @@ impl Db {
             .execute("DELETE FROM articles WHERE feed_id = ?1", params![feed_id])?;
         self.conn
             .execute("DELETE FROM feeds WHERE id = ?1", params![feed_id])?;
+        Ok(())
+    }
+
+    /// Rename a category: the categories row and every feed's
+    /// category title string move together (Python semantics).
+    pub fn rename_category(&self, old_title: &str, new_title: &str) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE categories SET title = ?2 WHERE title = ?1",
+            params![old_title, new_title],
+        )?;
+        self.conn.execute(
+            "UPDATE feeds SET category = ?2 WHERE category = ?1",
+            params![old_title, new_title],
+        )?;
+        Ok(())
+    }
+
+    /// Move one feed into a category (None = uncategorized).
+    pub fn set_feed_category(&self, feed_id: &str, category: Option<&str>) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE feeds SET category = ?2 WHERE id = ?1",
+            params![feed_id, category],
+        )?;
+        Ok(())
+    }
+
+    /// Edit a feed's title and/or URL. Setting a title marks it
+    /// custom (Python `update_feed`); the URL is the subscription
+    /// address used at refresh.
+    pub fn update_feed(
+        &self,
+        feed_id: &str,
+        title: Option<&str>,
+        url: Option<&str>,
+    ) -> rusqlite::Result<()> {
+        if let Some(t) = title {
+            self.conn.execute(
+                "UPDATE feeds SET title = ?2, title_is_custom = 1 WHERE id = ?1",
+                params![feed_id, t],
+            )?;
+        }
+        if let Some(u) = url {
+            self.conn.execute(
+                "UPDATE feeds SET url = ?2 WHERE id = ?1",
+                params![feed_id, u],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Reset a feed's title to the feed's own title and clear the
+    /// custom flag (Python `reset_feed_title`).
+    pub fn reset_feed_title(&self, feed_id: &str, feed_title: &str) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE feeds SET title = ?2, title_is_custom = 0 WHERE id = ?1",
+            params![feed_id, feed_title],
+        )?;
         Ok(())
     }
 
