@@ -18,15 +18,89 @@ use std::rc::Rc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use wxdragon::prelude::*;
 
+fn home_dir() -> PathBuf {
+    std::env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("."))
+}
+
+/// Per-user data directory, mirroring Python's `_user_data_dir`:
+/// Windows %APPDATA%\BlindRSS, macOS ~/Library/Application
+/// Support/BlindRSS, Linux $XDG_CONFIG_HOME/BlindRSS (or ~/.config).
+fn user_data_dir() -> PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        std::env::var("APPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| home_dir().join("AppData").join("Roaming"))
+            .join("BlindRSS")
+    }
+    #[cfg(target_os = "macos")]
+    {
+        home_dir()
+            .join("Library")
+            .join("Application Support")
+            .join("BlindRSS")
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        std::env::var("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| home_dir().join(".config"))
+            .join("BlindRSS")
+    }
+}
+
+/// The folder the executable runs from (Python's APP_DIR).
+fn app_dir() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// Resolve the data directory the way Python's ConfigManager does:
+/// the user dir wins when config.json exists there, then the app
+/// folder when config.json exists beside the executable, otherwise
+/// the user dir (which may not exist yet).
+fn data_dir() -> PathBuf {
+    let user = user_data_dir();
+    if user.join("config.json").exists() {
+        return user;
+    }
+    let app = app_dir();
+    if app.join("config.json").exists() {
+        return app;
+    }
+    user
+}
+
 fn config_path() -> PathBuf {
     std::env::var("BLINDRSS_CONFIG")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            db_path()
-                .parent()
-                .map(|p| p.join("config.json"))
-                .unwrap_or_else(|| PathBuf::from("config.json"))
-        })
+        .unwrap_or_else(|_| data_dir().join("config.json"))
+}
+
+/// Append one line to blindrss.log in the data dir (startup and
+/// panic diagnostics, the BlindFB startup.log pattern). Never fails
+/// the caller.
+fn log_line(msg: &str) {
+    let path = data_dir().join("blindrss.log");
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        use std::io::Write;
+        let _ = writeln!(f, "[{secs}] {msg}");
+    }
 }
 
 /// Best-effort remote read-state propagation for hosted-provider
@@ -113,8 +187,25 @@ fn db_path() -> PathBuf {
     if let Ok(p) = std::env::var("BLINDRSS_DB") {
         return PathBuf::from(p);
     }
-    // Dev default: the Python checkout's rss.db beside this workspace.
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../blindrss-work/rss.db")
+    // Python parity: rss.db lives in the resolved data dir. When it
+    // is missing there but exists in the other location (user dir vs
+    // app folder), copy it across so a data-location switch never
+    // starts the user with an empty database.
+    let dir = data_dir();
+    let target = dir.join("rss.db");
+    if !target.exists() {
+        let user = user_data_dir();
+        let alt = if dir == user {
+            app_dir().join("rss.db")
+        } else {
+            user.join("rss.db")
+        };
+        if alt.exists() {
+            let _ = std::fs::create_dir_all(&dir);
+            let _ = std::fs::copy(&alt, &target);
+        }
+    }
+    target
 }
 
 struct State {
@@ -275,10 +366,38 @@ fn locale_root() -> PathBuf {
     if let Ok(p) = std::env::var("BLINDRSS_LOCALE") {
         return PathBuf::from(p);
     }
+    // Release layout: locale/ ships beside the executable.
+    let beside_exe = app_dir().join("locale");
+    if beside_exe.exists() {
+        return beside_exe;
+    }
+    // Dev fallback: the Python checkout's locale tree.
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../blindrss-work/locale")
 }
 
 fn main() {
+    // Panics land in blindrss.log in the data dir instead of dying
+    // silently (a screen reader user gets no console to read).
+    std::panic::set_hook(Box::new(|info| {
+        let msg = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            s.to_string()
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "unknown panic".to_string()
+        };
+        let loc = info
+            .location()
+            .map(|l| format!("{}:{}", l.file(), l.line()))
+            .unwrap_or_default();
+        log_line(&format!("PANIC {msg} at {loc}"));
+    }));
+    log_line(&format!(
+        "BlindRSS {} starting; db={} config={}",
+        env!("CARGO_PKG_VERSION"),
+        db_path().display(),
+        config_path().display()
+    ));
     let _ = wxdragon::main(|_| {
         let language = ui_language();
         let catalog = blindrss_core::i18n::Catalog::load(&locale_root(), &language);

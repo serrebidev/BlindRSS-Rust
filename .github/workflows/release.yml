@@ -67,6 +67,7 @@ jobs:
           fi
           cp README.md dist/BlindRSS/
           cp docs/PARITY.md dist/BlindRSS/
+          cp -r locale dist/BlindRSS/
           cd dist
           if [ "$RUNNER_OS" = "Windows" ]; then
             7z a "BlindRSS-${{ github.ref_name }}-${{ runner.os }}.zip" BlindRSS
