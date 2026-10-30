@@ -43,8 +43,8 @@ Base-interface method groups (54) and where they stand in Rust core:
   supports_subcategories, get_category_hierarchy,
   uncategorized_is_real_category — **partial** (flat add/remove done;
   rename, move, hierarchy/subcategories missing)
-- Full text: fetch_full_content — **partial** (extraction cascade
-  exists; not yet wired into the app)
+- Full text: fetch_full_content — **partial** (cascade wired into
+  the app via Read Full Text, slice 6; fetch fallback chain missing)
 - Media/chapters: get_article_chapters, HostedArticleMediaMixin
   (update_article_media) — **missing**
 - Delete/restore: supports_article_delete, delete_article,
@@ -61,7 +61,7 @@ Base-interface method groups (54) and where they stand in Rust core:
 | Database (schema, counts, chapters, playback state, smart folders, filter rules) | db.py 2,656 | **partial** — feeds/articles/categories/deleted done; chapters, playback_state, smart_folders, filter_rules tables unread |
 | Config (defaults incl. providers, shortcuts, columns) | config.py 886 | **partial** — reader with defaults; no writer/settings model yet |
 | Feed discovery + site search | discovery.py 5,530 | **missing** |
-| Article extraction (layered cascade) | article_extractor.py 5,098 | **partial** — cascade v1 + gates (slices 1, 6); site fixes and thread rebuilds in progress |
+| Article extraction (layered cascade) | article_extractor.py 5,098 | **partial** — cascade + full gate-marker list, paywall/link-list rejection, JSON-LD, Register + Axios dedicated extractors, metered notice, zero-width strip (slices 1, 6); remaining: BBC/Sky/Bloomberg/GSMArena fixes, thread rebuilds (Reddit/Lemmy/forums), fetch fallback chain, lead recovery |
 | HTML rendering of articles | article_html.py 1,190 | **missing** (native TextCtrl reader instead; rich view is a Phase-6 manual gate) |
 | Utilities (dates, text, URLs) | utils.py 2,893 | **partial** — pulled in as needed |
 | Browser cookies (Chromium) + site cookies + clearance | chromium_cookies.py 2,184; site_cookies.py 1,533 | **missing** |
