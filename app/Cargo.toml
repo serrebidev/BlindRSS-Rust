@@ -1,6 +1,6 @@
 [package]
 name = "blindrss"
-version = "0.1.0"
+version = "0.1.1"
 edition.workspace = true
 license.workspace = true
 
@@ -8,3 +8,6 @@ license.workspace = true
 blindrss-core = { path = "../crates/core" }
 serde_json = "1"
 wxdragon = { version = "0.9.24", features = ["media-ctrl", "richtext", "stc", "webview"] }
+
+[build-dependencies]
+shipfitter = { version = "0.2.4", features = ["windows-resources"] }
