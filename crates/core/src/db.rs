@@ -143,6 +143,67 @@ impl Db {
         Ok(())
     }
 
+    /// Add a feed with a fresh uuid id, as Python's add_feed does.
+    /// Returns the stored feed (with its generated id).
+    pub fn add_feed(
+        &self,
+        url: &str,
+        title: &str,
+        category: Option<&str>,
+    ) -> rusqlite::Result<Feed> {
+        let feed = Feed {
+            id: uuid::Uuid::new_v4().to_string(),
+            url: url.to_string(),
+            title: title.to_string(),
+            title_is_custom: false,
+            category: category.map(str::to_string),
+            icon_url: None,
+        };
+        self.conn.execute(
+            "INSERT INTO feeds (id, url, title, title_is_custom, category, icon_url) \
+             VALUES (?1, ?2, ?3, 0, ?4, NULL)",
+            params![feed.id, feed.url, feed.title, feed.category],
+        )?;
+        Ok(feed)
+    }
+
+    /// True when a feed with this URL is already subscribed.
+    pub fn feed_url_exists(&self, url: &str) -> rusqlite::Result<bool> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM feeds WHERE url = ?1",
+            params![url],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Remove a feed and all its articles.
+    pub fn remove_feed(&self, feed_id: &str) -> rusqlite::Result<()> {
+        self.conn
+            .execute("DELETE FROM articles WHERE feed_id = ?1", params![feed_id])?;
+        self.conn
+            .execute("DELETE FROM feeds WHERE id = ?1", params![feed_id])?;
+        Ok(())
+    }
+
+    pub fn add_category(&self, title: &str) -> rusqlite::Result<Category> {
+        let cat = Category {
+            id: uuid::Uuid::new_v4().to_string(),
+            title: title.to_string(),
+        };
+        self.conn.execute(
+            "INSERT INTO categories (id, title) VALUES (?1, ?2)",
+            params![cat.id, cat.title],
+        )?;
+        Ok(cat)
+    }
+
+    pub fn remove_category(&self, category_id: &str) -> rusqlite::Result<()> {
+        self.conn
+            .execute("DELETE FROM categories WHERE id = ?1", params![category_id])?;
+        Ok(())
+    }
+
     /// Insert an article if its id is new; returns true when inserted.
     /// Refresh dedupes on the article id, mirroring the Python store.
     pub fn insert_article_if_new(&self, a: &Article) -> rusqlite::Result<bool> {

@@ -32,7 +32,12 @@ struct State {
 enum RefreshMsg {
     FeedDone(Feed, Result<ParsedFeed, String>),
     AllDone,
+    /// Result of adding a feed by URL: (url, fetch result).
+    Added(String, Result<ParsedFeed, String>),
 }
+
+const ID_OK: i32 = 5100;
+const ID_YES: i32 = 5103;
 
 fn feed_label(db: &Db, feed: &Feed) -> String {
     match db.unread_count(Some(&feed.id)) {
@@ -85,6 +90,10 @@ fn main() {
             .build();
         frame.create_status_bar(1, 0, -1, "status");
 
+        let add_btn = Button::builder(&frame).with_label("Add Feed...").build();
+        let remove_btn = Button::builder(&frame).with_label("Remove Feed").build();
+        let import_btn = Button::builder(&frame).with_label("Import OPML...").build();
+        let export_btn = Button::builder(&frame).with_label("Export OPML...").build();
         let refresh_btn = Button::builder(&frame)
             .with_label("Refresh All Feeds")
             .build();
@@ -106,7 +115,13 @@ fn main() {
         splitter.split_vertically(&tree, &right, 280);
 
         let sizer = BoxSizer::builder(Orientation::Vertical).build();
-        sizer.add(&refresh_btn, 0, SizerFlag::All, 4);
+        let btn_row = BoxSizer::builder(Orientation::Horizontal).build();
+        btn_row.add(&refresh_btn, 0, SizerFlag::All, 4);
+        btn_row.add(&add_btn, 0, SizerFlag::All, 4);
+        btn_row.add(&remove_btn, 0, SizerFlag::All, 4);
+        btn_row.add(&import_btn, 0, SizerFlag::All, 4);
+        btn_row.add(&export_btn, 0, SizerFlag::All, 4);
+        sizer.add_sizer(&btn_row, 0, SizerFlag::All, 0);
         sizer.add(&splitter, 1, SizerFlag::Expand | SizerFlag::All, 0);
         frame.set_sizer(sizer, true);
 
@@ -190,6 +205,7 @@ fn main() {
         let rx = Rc::new(RefCell::new(rx));
         let state_btn = state.clone();
         let frame_btn = frame;
+        let tx_refresh = tx.clone();
         refresh_btn.on_click(move |_| {
             let feeds = {
                 let mut st = state_btn.borrow_mut();
@@ -200,7 +216,7 @@ fn main() {
                 st.feeds.clone()
             };
             frame_btn.set_status_text(&format!("Refreshing {} feeds...", feeds.len()), 0);
-            let tx = tx.clone();
+            let tx = tx_refresh.clone();
             std::thread::spawn(move || {
                 for feed in feeds {
                     let result = fetch_and_parse(&feed.url);
@@ -208,6 +224,126 @@ fn main() {
                 }
                 let _ = tx.send(RefreshMsg::AllDone);
             });
+        });
+
+        // Add Feed: prompt for a URL, fetch it on a worker thread to
+        // learn its title, then subscribe + store its current articles.
+        let state_add = state.clone();
+        let frame_add = frame;
+        let tx_add = tx.clone();
+        add_btn.on_click(move |_| {
+            let dlg = TextEntryDialog::builder(&frame_add, "Feed URL:", "Add Feed").build();
+            if dlg.show_modal() != ID_OK {
+                return;
+            }
+            let Some(url) = dlg.get_value().filter(|v| !v.trim().is_empty()) else {
+                return;
+            };
+            let url = url.trim().to_string();
+            {
+                let st = state_add.borrow();
+                if st.feeds.iter().any(|f| f.url == url) {
+                    frame_add.set_status_text("That feed is already subscribed", 0);
+                    return;
+                }
+            }
+            frame_add.set_status_text(&format!("Adding {url}..."), 0);
+            let tx = tx_add.clone();
+            std::thread::spawn(move || {
+                let result = fetch_and_parse(&url);
+                let _ = tx.send(RefreshMsg::Added(url, result));
+            });
+        });
+
+        // Remove Feed: removes the feed selected in the tree, after a
+        // confirmation (it also deletes that feed's stored articles).
+        let state_rm = state.clone();
+        let frame_rm = frame;
+        remove_btn.on_click(move |_| {
+            let feed = {
+                let st = state_rm.borrow();
+                let Some(id) = st.selected_feed.clone() else {
+                    frame_rm.set_status_text("Select a feed in the tree first", 0);
+                    return;
+                };
+                st.feeds.iter().find(|f| f.id == id).cloned()
+            };
+            let Some(feed) = feed else { return };
+            let dlg = MessageDialog::builder(
+                &frame_rm,
+                &format!("Remove {} and its stored articles?", feed.title),
+                "Remove Feed",
+            )
+            .with_style(MessageDialogStyle::YesNo)
+            .build();
+            if dlg.show_modal() != ID_YES {
+                return;
+            }
+            let mut st = state_rm.borrow_mut();
+            if let Some(db) = st.db.as_ref() {
+                let _ = db.remove_feed(&feed.id);
+            }
+            st.feeds.retain(|f| f.id != feed.id);
+            st.selected_feed = None;
+            rebuild_tree(&mut st, &tree);
+            refill_articles(&mut st, &list);
+            frame_rm.set_status_text(&format!("Removed {}", feed.title), 0);
+        });
+
+        // OPML import/export.
+        let state_imp = state.clone();
+        let frame_imp = frame;
+        import_btn.on_click(move |_| {
+            let dlg = FileDialog::builder(&frame_imp)
+                .with_message("Import OPML")
+                .with_wildcard("OPML files (*.opml;*.xml)|*.opml;*.xml")
+                .with_style(FileDialogStyle::Open)
+                .build();
+            if dlg.show_modal() != ID_OK {
+                return;
+            }
+            let Some(path) = dlg.get_path() else { return };
+            let text = match std::fs::read_to_string(&path) {
+                Ok(t) => t,
+                Err(e) => {
+                    frame_imp.set_status_text(&format!("Could not read file: {e}"), 0);
+                    return;
+                }
+            };
+            let mut st = state_imp.borrow_mut();
+            let Some(db) = st.db.as_ref() else { return };
+            match blindrss_core::opml::import_opml(db, &text) {
+                Ok(n) => {
+                    st.feeds = db.feeds().unwrap_or_default();
+                    rebuild_tree(&mut st, &tree);
+                    refill_articles(&mut st, &list);
+                    frame_imp.set_status_text(&format!("Imported {n} feeds"), 0);
+                }
+                Err(e) => frame_imp.set_status_text(&format!("Import failed: {e}"), 0),
+            }
+        });
+
+        let state_exp = state.clone();
+        let frame_exp = frame;
+        export_btn.on_click(move |_| {
+            let dlg = FileDialog::builder(&frame_exp)
+                .with_message("Export OPML")
+                .with_wildcard("OPML files (*.opml)|*.opml")
+                .with_style(FileDialogStyle::Save)
+                .build();
+            if dlg.show_modal() != ID_OK {
+                return;
+            }
+            let Some(path) = dlg.get_path() else { return };
+            let st = state_exp.borrow();
+            let Some(db) = st.db.as_ref() else { return };
+            match blindrss_core::opml::export_opml(db) {
+                Ok(xml) => match std::fs::write(&path, xml) {
+                    Ok(()) => frame_exp.set_status_text(&format!("Exported to {path}"), 0),
+                    Err(e) => frame_exp.set_status_text(&format!("Could not write file: {e}"), 0),
+                },
+                Err(e) => frame_exp.set_status_text(&format!("Export failed: {e}"), 0),
+            }
         });
 
         let timer = Box::leak(Box::new(Timer::new(&frame)));
@@ -234,6 +370,31 @@ fn main() {
                     }
                     Ok(RefreshMsg::FeedDone(feed, Err(e))) => {
                         frame_tick.set_status_text(&format!("{}: {e}", feed.title), 0);
+                    }
+                    Ok(RefreshMsg::Added(url, Ok(parsed))) => {
+                        let mut st = state_tick.borrow_mut();
+                        if let Some(db) = st.db.as_ref() {
+                            let title = if parsed.title.trim().is_empty() {
+                                url.clone()
+                            } else {
+                                parsed.title.clone()
+                            };
+                            match db.add_feed(&url, &title, None) {
+                                Ok(feed) => {
+                                    let _ = store_parsed(db, &feed, &parsed);
+                                    st.feeds.push(feed);
+                                    rebuild_tree(&mut st, &tree);
+                                    refill_articles(&mut st, &list);
+                                    frame_tick.set_status_text(&format!("Added {title}"), 0);
+                                }
+                                Err(e) => {
+                                    frame_tick.set_status_text(&format!("Add failed: {e}"), 0)
+                                }
+                            }
+                        }
+                    }
+                    Ok(RefreshMsg::Added(url, Err(e))) => {
+                        frame_tick.set_status_text(&format!("Could not add {url}: {e}"), 0);
                     }
                     Ok(RefreshMsg::AllDone) => {
                         finished = true;
