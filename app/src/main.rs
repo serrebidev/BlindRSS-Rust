@@ -5,6 +5,8 @@
 //! is a Stage 0/6 acceptance item); layout follows BlindFB's proven
 //! patterns: sizer-based, labelled controls, status bar announcements.
 
+mod player;
+
 use blindrss_core::feeds::fetch_and_parse;
 use blindrss_core::{Article, Db, Feed, ParsedFeed, store_parsed};
 use std::cell::RefCell;
@@ -130,6 +132,11 @@ enum RefreshMsg {
     ProviderDone(String, Result<(usize, usize), String>),
     /// Fetched article page HTML for full-text extraction.
     FullText(String, Result<String, String>),
+    /// yt-dlp resolution for playback: (stream URL, info if fetched).
+    MediaReady(
+        String,
+        Result<(String, Option<blindrss_core::media::MediaInfo>), String>,
+    ),
 }
 
 const ID_OK: i32 = 5100;
@@ -208,6 +215,7 @@ fn main() {
         let set_cat_btn = Button::builder(&frame)
             .with_label("Set Feed Category")
             .build();
+        let play_btn = Button::builder(&frame).with_label("Play Media").build();
         let refresh_btn = Button::builder(&frame)
             .with_label("Refresh All Feeds")
             .build();
@@ -241,6 +249,7 @@ fn main() {
         btn_row.add(&edit_feed_btn, 0, SizerFlag::All, 4);
         btn_row.add(&rename_cat_btn, 0, SizerFlag::All, 4);
         btn_row.add(&set_cat_btn, 0, SizerFlag::All, 4);
+        btn_row.add(&play_btn, 0, SizerFlag::All, 4);
         sizer.add_sizer(&btn_row, 0, SizerFlag::All, 0);
         let btn_row2 = BoxSizer::builder(Orientation::Horizontal).build();
         btn_row2.add(&delete_btn, 0, SizerFlag::All, 4);
@@ -803,6 +812,49 @@ fn main() {
             frame_sc.set_status_text("Feed category set", 0);
         });
 
+        // Play Media: direct media URL plays immediately; a page
+        // URL (YouTube etc.) resolves through yt-dlp on a worker
+        // thread first.
+        let state_pm = state.clone();
+        let frame_pm = frame;
+        let tx_pm = tx.clone();
+        play_btn.on_click(move |_| {
+            let st = state_pm.borrow();
+            let Some(article) = st
+                .selected_article
+                .and_then(|i| st.articles.get(i))
+                .cloned()
+            else {
+                frame_pm.set_status_text("No article selected", 0);
+                return;
+            };
+            if let Some(media_url) = article.media_url.clone().filter(|u| !u.is_empty()) {
+                let chapters = st
+                    .db
+                    .as_ref()
+                    .and_then(|db| db.chapters(&article.id).ok())
+                    .unwrap_or_default();
+                drop(st);
+                player::open_player(&frame_pm, article, media_url, chapters);
+                return;
+            }
+            if article.url.is_empty() {
+                frame_pm.set_status_text("Article has no media or link", 0);
+                return;
+            }
+            frame_pm.set_status_text("Resolving media with yt-dlp...", 0);
+            let tx = tx_pm.clone();
+            let id = article.id.clone();
+            let url = article.url.clone();
+            std::thread::spawn(move || {
+                let result = blindrss_core::media::stream_url(&url).map(|stream| {
+                    let info = blindrss_core::media::info(&url).ok();
+                    (stream, info)
+                });
+                let _ = tx.send(RefreshMsg::MediaReady(id, result));
+            });
+        });
+
         // Add Feed: prompt for a URL, fetch it on a worker thread to
         // learn its title, then subscribe + store its current articles.
         let state_add = state.clone();
@@ -1026,6 +1078,31 @@ fn main() {
                             (_, Err(e)) => {
                                 frame_tick.set_status_text(&format!("Full text: {e}"), 0)
                             }
+                            _ => {}
+                        }
+                    }
+                    Ok(RefreshMsg::MediaReady(id, result)) => {
+                        let st = state_tick.borrow();
+                        let article = st.articles.iter().find(|a| a.id == id).cloned();
+                        match (article, result) {
+                            (Some(article), Ok((stream, info))) => {
+                                let mut chapters = st
+                                    .db
+                                    .as_ref()
+                                    .and_then(|db| db.chapters(&article.id).ok())
+                                    .unwrap_or_default();
+                                if let Some(info) = info
+                                    && !info.chapters.is_empty()
+                                {
+                                    if let Some(db) = &st.db {
+                                        let _ = db.replace_chapters(&article.id, &info.chapters);
+                                    }
+                                    chapters = info.chapters;
+                                }
+                                drop(st);
+                                player::open_player(&frame_tick, article, stream, chapters);
+                            }
+                            (_, Err(e)) => frame_tick.set_status_text(&format!("Play: {e}"), 0),
                             _ => {}
                         }
                     }

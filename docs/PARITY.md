@@ -80,7 +80,7 @@ Base-interface method groups (54) and where they stand in Rust core:
 | Rumble / Odysee / NPR / Sky sources | rumble.py 582; odysee.py; npr.py; sky.py | **missing** |
 | SponsorBlock | sponsorblock.py | **missing** |
 | Audio silence detection + skip | audio_silence.py 534 | **missing** |
-| Playback state persistence | playback_state.py | **missing** (slice 7) |
+| Playback state persistence | playback_state.py | **done** (slice 7: get/upsert/delete against the Python table) |
 | Equalizer (libVLC 10-band presets) | equalizer.py | **missing** |
 | User agents / fetch identity | user_agents.py 540; http_headers.py | **partial** — UA set on full-text fetch; presets + per-feed identity missing |
 | Backup/restore | backup.py | **missing** |
@@ -114,7 +114,9 @@ Base-interface method groups (54) and where they stand in Rust core:
   user guide/about, keyboard shortcuts dialog, tray, global hotkeys.
 - PlayerFrame: 20 handlers (play/pause/stop, seek slider, rewind/
   forward, volume, speed, chapters menu + prev/next/jump, cast) +
-  CastDialog — **missing** (slice 7).
+  CastDialog — **partial** (slice 7 player window: play/pause/stop,
+  +-30s seek, volume, chapter list with seek, resume; speed,
+  slider, cast missing).
 - Dialogs: SettingsDialog (24 handlers: provider accounts incl.
   Inoreader OAuth, translation provider + OpenRouter models,
   notifications, paths for downloads/cookies/backups/play cache,

@@ -17,7 +17,24 @@ pub struct Feed {
     pub icon_url: Option<String>,
 }
 
+/// One chapter mark (chapters table; start in seconds).
 #[derive(Debug, Clone, PartialEq)]
+pub struct Chapter {
+    pub start: f64,
+    pub title: Option<String>,
+    pub href: Option<String>,
+}
+
+/// Saved playback position (playback_state table).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct PlaybackState {
+    pub position_ms: i64,
+    pub duration_ms: Option<i64>,
+    pub completed: bool,
+    pub seek_supported: Option<bool>,
+    pub title: Option<String>,
+}
+
 pub struct Category {
     pub id: String,
     pub title: String,
@@ -210,6 +227,95 @@ impl Db {
                 feed.category,
                 feed.icon_url
             ],
+        )?;
+        Ok(())
+    }
+
+    /// Chapters for an article, ordered by start (seconds).
+    pub fn chapters(&self, article_id: &str) -> rusqlite::Result<Vec<Chapter>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT start, title, href FROM chapters WHERE article_id = ?1 ORDER BY start",
+        )?;
+        let rows = stmt.query_map(params![article_id], |row| {
+            Ok(Chapter {
+                start: row.get(0)?,
+                title: row.get(1)?,
+                href: row.get(2)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// Replace an article's chapters (from a podcast chapter file or
+    /// yt-dlp info), keyed deterministically by position.
+    pub fn replace_chapters(&self, article_id: &str, chapters: &[Chapter]) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "DELETE FROM chapters WHERE article_id = ?1",
+            params![article_id],
+        )?;
+        for (i, ch) in chapters.iter().enumerate() {
+            self.conn.execute(
+                "INSERT INTO chapters (id, article_id, start, title, href) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![format!("{article_id}#{i}"), article_id, ch.start, ch.title, ch.href],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Saved playback position for a playback id (article id).
+    pub fn playback_state(&self, playback_id: &str) -> rusqlite::Result<Option<PlaybackState>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT position_ms, duration_ms, completed, seek_supported, title \
+             FROM playback_state WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![playback_id], |row| {
+            Ok(PlaybackState {
+                position_ms: row.get(0)?,
+                duration_ms: row.get(1)?,
+                completed: row.get::<_, i64>(2)? != 0,
+                seek_supported: row.get::<_, Option<i64>>(3)?.map(|v| v != 0),
+                title: row.get(4)?,
+            })
+        })?;
+        match rows.next() {
+            Some(r) => Ok(Some(r?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Insert or update a playback position (Python
+    /// `upsert_playback_state`); updated_at is unix seconds.
+    pub fn upsert_playback_state(
+        &self,
+        playback_id: &str,
+        state: &PlaybackState,
+    ) -> rusqlite::Result<()> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        self.conn.execute(
+            "INSERT INTO playback_state (id, position_ms, duration_ms, updated_at, completed, seek_supported, title) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+             ON CONFLICT(id) DO UPDATE SET position_ms = ?2, duration_ms = ?3, \
+             updated_at = ?4, completed = ?5, seek_supported = ?6, title = ?7",
+            params![
+                playback_id,
+                state.position_ms,
+                state.duration_ms,
+                now,
+                state.completed as i64,
+                state.seek_supported.map(|b| b as i64),
+                state.title
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_playback_state(&self, playback_id: &str) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "DELETE FROM playback_state WHERE id = ?1",
+            params![playback_id],
         )?;
         Ok(())
     }
