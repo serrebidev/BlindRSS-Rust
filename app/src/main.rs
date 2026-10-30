@@ -164,6 +164,19 @@ fn rebuild_tree(state: &mut State, tree: &TreeCtrl) {
         let label = feed_label(db, f);
         tree.append_item_with_data(&root, &label, f.id.clone(), None, None);
     }
+    // Smart folders: item data is "smart:<id>".
+    if let Ok(folders) = db.smart_folders()
+        && !folders.is_empty()
+    {
+        let Some(sf_root) =
+            tree.append_item_with_data(&root, "Smart Folders", "smart:".to_string(), None, None)
+        else {
+            return;
+        };
+        for (id, name, _rule, _pos) in &folders {
+            tree.append_item_with_data(&sf_root, name, format!("smart:{id}"), None, None);
+        }
+    }
     tree.expand(&root);
 }
 
@@ -175,6 +188,44 @@ fn refill_articles(state: &mut State, list: &ListCtrl) {
     state.articles.clear();
     let Some(db) = state.db.as_ref() else { return };
     let filter = state.selected_feed.as_deref();
+    // Smart folder selection: evaluate the folder's rule over all
+    // articles instead of a feed filter.
+    if let Some(smart_id) = filter.and_then(|f| f.strip_prefix("smart:"))
+        && !smart_id.is_empty()
+    {
+        let folders = db.smart_folders().unwrap_or_default();
+        if let Some((_, _, rule_json, _)) = folders.iter().find(|(id, ..)| id == smart_id) {
+            let rule: serde_json::Value =
+                serde_json::from_str(rule_json).unwrap_or(serde_json::Value::Null);
+            let feed_titles: std::collections::HashMap<&str, &str> = state
+                .feeds
+                .iter()
+                .map(|f| (f.id.as_str(), f.title.as_str()))
+                .collect();
+            if let Ok(all) = db.articles(None, 500) {
+                let matched: Vec<Article> = all
+                    .into_iter()
+                    .filter(|a| {
+                        let view = blindrss_core::rules::RuleArticle {
+                            article: a,
+                            feed_title: feed_titles.get(a.feed_id.as_str()).copied().unwrap_or(""),
+                            opened: false,
+                            updated: false,
+                            tags: &[],
+                        };
+                        blindrss_core::rules::rule_matches(&rule, &view)
+                    })
+                    .collect();
+                for (i, a) in matched.iter().enumerate() {
+                    list.insert_item(i as i64, &a.title, None);
+                    list.set_item_text_by_column(i as i64, 1, a.date.as_deref().unwrap_or(""));
+                    list.set_item_text_by_column(i as i64, 2, &a.feed_id);
+                }
+                state.articles = matched;
+            }
+        }
+        return;
+    }
     if let Ok(articles) = db.articles(filter, 300) {
         for (i, a) in articles.iter().enumerate() {
             list.insert_item(i as i64, &a.title, None);
@@ -216,6 +267,12 @@ fn main() {
             .with_label("Set Feed Category")
             .build();
         let play_btn = Button::builder(&frame).with_label("Play Media").build();
+        let new_sf_btn = Button::builder(&frame)
+            .with_label("New Smart Folder")
+            .build();
+        let del_sf_btn = Button::builder(&frame)
+            .with_label("Delete Smart Folder")
+            .build();
         let refresh_btn = Button::builder(&frame)
             .with_label("Refresh All Feeds")
             .build();
@@ -250,6 +307,8 @@ fn main() {
         btn_row.add(&rename_cat_btn, 0, SizerFlag::All, 4);
         btn_row.add(&set_cat_btn, 0, SizerFlag::All, 4);
         btn_row.add(&play_btn, 0, SizerFlag::All, 4);
+        btn_row.add(&new_sf_btn, 0, SizerFlag::All, 4);
+        btn_row.add(&del_sf_btn, 0, SizerFlag::All, 4);
         sizer.add_sizer(&btn_row, 0, SizerFlag::All, 0);
         let btn_row2 = BoxSizer::builder(Orientation::Horizontal).build();
         btn_row2.add(&delete_btn, 0, SizerFlag::All, 4);
@@ -853,6 +912,71 @@ fn main() {
                 });
                 let _ = tx.send(RefreshMsg::MediaReady(id, result));
             });
+        });
+
+        // New Smart Folder: name + a simple title-contains rule
+        // (blank matches everything). Full rule editing is a later
+        // dialog; the rule engine already handles the full tree.
+        let state_nsf = state.clone();
+        let frame_nsf = frame;
+        let tree_nsf = tree;
+        let list_nsf = list;
+        new_sf_btn.on_click(move |_| {
+            let Some(name) = prompt_text(&frame_nsf, "Smart folder name:", "New Smart Folder", "")
+            else {
+                return;
+            };
+            if name.trim().is_empty() {
+                return;
+            }
+            let needle = prompt_text(
+                &frame_nsf,
+                "Show articles whose title contains (blank = all):",
+                "New Smart Folder",
+                "",
+            )
+            .unwrap_or_default();
+            let rule = if needle.trim().is_empty() {
+                serde_json::json!({"match": "all", "conditions": []})
+            } else {
+                serde_json::json!({"match": "all", "conditions": [
+                    {"field": "title", "op": "contains", "value": needle.trim()}
+                ]})
+            };
+            let mut st = state_nsf.borrow_mut();
+            if let Some(db) = &st.db {
+                let _ = db.create_smart_folder(name.trim(), &rule.to_string());
+            }
+            rebuild_tree(&mut st, &tree_nsf);
+            refill_articles(&mut st, &list_nsf);
+            frame_nsf.set_status_text("Smart folder created", 0);
+        });
+
+        // Delete Smart Folder: deletes the smart folder selected in
+        // the tree.
+        let state_dsf = state.clone();
+        let frame_dsf = frame;
+        let tree_dsf = tree;
+        let list_dsf = list;
+        del_sf_btn.on_click(move |_| {
+            let mut st = state_dsf.borrow_mut();
+            let Some(id) = st
+                .selected_feed
+                .as_ref()
+                .and_then(|f| f.strip_prefix("smart:"))
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+            else {
+                frame_dsf.set_status_text("Select a smart folder in the tree first", 0);
+                return;
+            };
+            if let Some(db) = &st.db {
+                let _ = db.delete_smart_folder(&id);
+            }
+            st.selected_feed = None;
+            rebuild_tree(&mut st, &tree_dsf);
+            refill_articles(&mut st, &list_dsf);
+            frame_dsf.set_status_text("Smart folder deleted", 0);
         });
 
         // Add Feed: prompt for a URL, fetch it on a worker thread to

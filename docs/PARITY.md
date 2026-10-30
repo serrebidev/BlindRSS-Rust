@@ -50,9 +50,9 @@ Base-interface method groups (54) and where they stand in Rust core:
 - Delete/restore: supports_article_delete, delete_article,
   supports_restore_deleted, restore_article — **done** (local)
 - Smart folders: supports_smart_folders, get/create/update/delete —
-  **missing** (schema present in DB)
+  **partial** (CRUD + rule evaluation + tree display done; update/rename + full rule editor dialog missing)
 - Filter rules (LocalProvider extension): get/create/update/delete,
-  reorder, apply to existing — **missing**
+  reorder, apply to existing — **partial** (CRUD + pipeline applied on store done; reorder, apply-to-existing, editor dialog missing)
 
 ## 2. Core feature areas (Python `core/`, 46k lines)
 
@@ -85,7 +85,7 @@ Base-interface method groups (54) and where they stand in Rust core:
 | User agents / fetch identity | user_agents.py 540; http_headers.py | **partial** — UA set on full-text fetch; presets + per-feed identity missing |
 | Backup/restore | backup.py | **missing** |
 | Retention/purge | retention.py | **missing** |
-| Smart folders / filters logic | smart_folders.py; filters.py | **missing** |
+| Smart folders / filters logic | smart_folders.py; filters.py | **partial** — rule tree evaluator + action pipeline ported and tested (tag field awaits articles.tags) |
 | Metadata enrichment | metadata_enrich.py | **missing** |
 | Media URL resolution | media_url.py; download_formats.py | **missing** |
 | Article language detect | article_lang.py | **missing** |

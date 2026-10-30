@@ -47,6 +47,9 @@ pub fn store_parsed(
     // Deleted articles must not resurrect on refresh (Python checks
     // tombstones the same way).
     let tombstones = db.deleted_article_ids().unwrap_or_default();
+    // Filter-rule pipeline (Python applies enabled rules to articles
+    // as they arrive). Missing table (older fixtures) = no rules.
+    let rules = db.filter_rules().unwrap_or_default();
     let mut inserted = 0;
     for entry in &parsed.entries {
         if tombstones.contains(&entry.id) {
@@ -58,9 +61,44 @@ pub fn store_parsed(
             .map_err(|e| format!("store failed: {e}"))?
         {
             inserted += 1;
+            if !rules.is_empty() {
+                apply_filter_pipeline(db, &rules, &article, &parsed.title);
+            }
         }
     }
     Ok(inserted)
+}
+
+/// Apply the filter-rule pipeline to one freshly stored article.
+fn apply_filter_pipeline(
+    db: &Db,
+    rules: &[crate::rules::FilterRule],
+    article: &Article,
+    feed_title: &str,
+) {
+    let view = crate::rules::RuleArticle {
+        article,
+        feed_title,
+        opened: false,
+        updated: false,
+        tags: &[],
+    };
+    let eff = crate::rules::evaluate_pipeline(rules, &view);
+    if eff.mark_read {
+        let _ = db.mark_read(&article.id, true);
+    }
+    if eff.mark_favorite {
+        let _ = db.set_favorite(&article.id, true);
+    }
+    for label in &eff.labels {
+        let _ = db.add_article_label(&article.id, label);
+    }
+    if let Some(target) = &eff.move_to {
+        let _ = db.set_article_category_override(&article.id, Some(target));
+    }
+    if eff.delete {
+        let _ = db.delete_article(&article.id);
+    }
 }
 
 /// Refresh one feed; returns how many new articles were stored.

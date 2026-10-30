@@ -320,6 +320,131 @@ impl Db {
         Ok(())
     }
 
+    // ---- Smart folders + filter rules ----------------------------
+
+    pub fn smart_folders(&self) -> rusqlite::Result<Vec<(String, String, String, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, rule_json, position FROM smart_folders ORDER BY position, name",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })?;
+        rows.collect()
+    }
+
+    pub fn create_smart_folder(&self, name: &str, rule_json: &str) -> rusqlite::Result<String> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let pos: i64 = self.conn.query_row(
+            "SELECT COALESCE(MAX(position), -1) + 1 FROM smart_folders",
+            [],
+            |r| r.get(0),
+        )?;
+        self.conn.execute(
+            "INSERT INTO smart_folders (id, name, rule_json, position) VALUES (?1, ?2, ?3, ?4)",
+            params![id, name, rule_json, pos],
+        )?;
+        Ok(id)
+    }
+
+    pub fn delete_smart_folder(&self, id: &str) -> rusqlite::Result<()> {
+        self.conn
+            .execute("DELETE FROM smart_folders WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    pub fn filter_rules(&self) -> rusqlite::Result<Vec<crate::rules::FilterRule>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, rule_json, actions_json, enabled, stop, position \
+             FROM filter_rules ORDER BY position",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let rule_json: String = row.get(2)?;
+            let actions_json: String = row.get(3)?;
+            Ok(crate::rules::FilterRule {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                rule: serde_json::from_str(&rule_json).unwrap_or(serde_json::Value::Null),
+                actions: serde_json::from_str(&actions_json).unwrap_or(serde_json::Value::Null),
+                enabled: row.get::<_, i64>(4)? != 0,
+                stop: row.get::<_, i64>(5)? != 0,
+                position: row.get(6)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    pub fn create_filter_rule(
+        &self,
+        name: &str,
+        rule_json: &str,
+        actions_json: &str,
+        enabled: bool,
+        stop: bool,
+    ) -> rusqlite::Result<String> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let pos: i64 = self.conn.query_row(
+            "SELECT COALESCE(MAX(position), -1) + 1 FROM filter_rules",
+            [],
+            |r| r.get(0),
+        )?;
+        self.conn.execute(
+            "INSERT INTO filter_rules (id, name, rule_json, actions_json, enabled, stop, position) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                id,
+                name,
+                rule_json,
+                actions_json,
+                enabled as i64,
+                stop as i64,
+                pos
+            ],
+        )?;
+        Ok(id)
+    }
+
+    pub fn delete_filter_rule(&self, id: &str) -> rusqlite::Result<()> {
+        self.conn
+            .execute("DELETE FROM filter_rules WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    /// Add a label (extra category membership) to an article.
+    pub fn add_article_label(&self, article_id: &str, category: &str) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO article_labels (article_id, category) VALUES (?1, ?2)",
+            params![article_id, category],
+        )?;
+        Ok(())
+    }
+
+    /// Articles carrying a label (category view membership).
+    pub fn article_ids_with_label(&self, category: &str) -> rusqlite::Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT article_id FROM article_labels WHERE category = ?1")?;
+        let rows = stmt.query_map(params![category], |row| row.get::<_, String>(0))?;
+        rows.collect()
+    }
+
+    /// Move an article to a category (articles.category_override).
+    pub fn set_article_category_override(
+        &self,
+        article_id: &str,
+        category: Option<&str>,
+    ) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE articles SET category_override = ?2 WHERE id = ?1",
+            params![article_id, category],
+        )?;
+        Ok(())
+    }
+
     /// True when a feed with this URL is already subscribed.
     pub fn feed_url_exists(&self, url: &str) -> rusqlite::Result<bool> {
         let n: i64 = self.conn.query_row(

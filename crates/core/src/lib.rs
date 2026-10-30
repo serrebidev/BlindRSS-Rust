@@ -14,6 +14,7 @@ pub mod media;
 pub mod opml;
 pub mod providers;
 pub mod refresh;
+pub mod rules;
 
 pub use db::{Article, Category, Chapter, Db, Feed, PlaybackState};
 pub use extract::{ExtractOutcome, extract_article};
