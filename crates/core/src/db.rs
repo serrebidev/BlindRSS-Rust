@@ -204,6 +204,155 @@ impl Db {
         Ok(())
     }
 
+    /// Delete an article, keeping a tombstone copy in deleted_articles
+    /// (Python schema) so it can be restored and so refresh does not
+    /// resurrect it. Returns false when the article does not exist.
+    pub fn delete_article(&self, article_id: &str) -> rusqlite::Result<bool> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        let copied = self.conn.execute(
+            "INSERT INTO deleted_articles \
+             (feed_id, article_id, url, deleted_at, title, content, description, \
+              date, author, media_url, media_type, chapter_url) \
+             SELECT feed_id, id, url, ?1, title, content, description, date, \
+                    author, media_url, media_type, chapter_url \
+             FROM articles WHERE id = ?2",
+            params![now, article_id],
+        )?;
+        if copied == 0 {
+            return Ok(false);
+        }
+        self.conn
+            .execute("DELETE FROM articles WHERE id = ?1", params![article_id])?;
+        Ok(true)
+    }
+
+    /// Restore a deleted article from its tombstone. Read/favorite state
+    /// is not part of the tombstone schema, so a restored article comes
+    /// back unread and unfavorited (same as Python).
+    pub fn restore_article(&self, article_id: &str) -> rusqlite::Result<bool> {
+        let restored = self.conn.execute(
+            "INSERT OR IGNORE INTO articles \
+             (id, feed_id, title, url, content, description, date, author, \
+              is_read, is_favorite, media_url, media_type, chapter_url) \
+             SELECT article_id, feed_id, title, url, content, description, \
+                    date, author, 0, 0, media_url, media_type, chapter_url \
+             FROM deleted_articles WHERE article_id = ?1",
+            params![article_id],
+        )?;
+        if restored == 0 {
+            return Ok(false);
+        }
+        self.conn.execute(
+            "DELETE FROM deleted_articles WHERE article_id = ?1",
+            params![article_id],
+        )?;
+        Ok(true)
+    }
+
+    /// Tombstoned article ids, for the refresh resurrection check.
+    pub fn deleted_article_ids(&self) -> rusqlite::Result<std::collections::HashSet<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT article_id FROM deleted_articles")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        rows.collect()
+    }
+
+    pub fn deleted_articles(&self) -> rusqlite::Result<Vec<Article>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT article_id, feed_id, title, url, content, description, date, \
+             author, media_url, media_type FROM deleted_articles \
+             ORDER BY deleted_at DESC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(Article {
+                id: r.get(0)?,
+                feed_id: r.get(1)?,
+                title: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                url: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                content: r.get(4)?,
+                description: r.get(5)?,
+                date: r.get(6)?,
+                author: r.get(7)?,
+                is_read: false,
+                is_favorite: false,
+                media_url: r.get(8)?,
+                media_type: r.get(9)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    pub fn mark_all_read(&self, feed_id: Option<&str>) -> rusqlite::Result<usize> {
+        let n = self.conn.execute(
+            "UPDATE articles SET is_read = 1 WHERE is_read = 0 \
+             AND (?1 IS NULL OR feed_id = ?1)",
+            params![feed_id],
+        )?;
+        Ok(n)
+    }
+
+    pub fn favorites(&self, limit: usize) -> rusqlite::Result<Vec<Article>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, feed_id, title, url, content, description, date, \
+             author, is_read, is_favorite, media_url, media_type \
+             FROM articles WHERE is_favorite = 1 ORDER BY date DESC, id DESC \
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |r| {
+            Ok(Article {
+                id: r.get(0)?,
+                feed_id: r.get(1)?,
+                title: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                url: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                content: r.get(4)?,
+                description: r.get(5)?,
+                date: r.get(6)?,
+                author: r.get(7)?,
+                is_read: r.get::<_, i64>(8)? != 0,
+                is_favorite: r.get::<_, i64>(9)? != 0,
+                media_url: r.get(10)?,
+                media_type: r.get(11)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// Plain substring search over title, content, and description
+    /// (case-insensitive via LIKE). Python's full search has more
+    /// ranking rules; this is the portable core of it.
+    pub fn search_articles(&self, query: &str, limit: usize) -> rusqlite::Result<Vec<Article>> {
+        let like = format!("%{}%", query.replace('%', "\\%").replace('_', "\\_"));
+        let mut stmt = self.conn.prepare(
+            "SELECT id, feed_id, title, url, content, description, date, \
+             author, is_read, is_favorite, media_url, media_type \
+             FROM articles \
+             WHERE title LIKE ?1 ESCAPE '\\' OR content LIKE ?1 ESCAPE '\\' \
+                OR description LIKE ?1 ESCAPE '\\' \
+             ORDER BY date DESC, id DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![like, limit as i64], |r| {
+            Ok(Article {
+                id: r.get(0)?,
+                feed_id: r.get(1)?,
+                title: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                url: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                content: r.get(4)?,
+                description: r.get(5)?,
+                date: r.get(6)?,
+                author: r.get(7)?,
+                is_read: r.get::<_, i64>(8)? != 0,
+                is_favorite: r.get::<_, i64>(9)? != 0,
+                media_url: r.get(10)?,
+                media_type: r.get(11)?,
+            })
+        })?;
+        rows.collect()
+    }
+
     /// Insert an article if its id is new; returns true when inserted.
     /// Refresh dedupes on the article id, mirroring the Python store.
     pub fn insert_article_if_new(&self, a: &Article) -> rusqlite::Result<bool> {

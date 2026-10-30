@@ -44,8 +44,14 @@ pub fn store_parsed(
     feed: &Feed,
     parsed: &crate::feeds::ParsedFeed,
 ) -> Result<usize, String> {
+    // Deleted articles must not resurrect on refresh (Python checks
+    // tombstones the same way).
+    let tombstones = db.deleted_article_ids().unwrap_or_default();
     let mut inserted = 0;
     for entry in &parsed.entries {
+        if tombstones.contains(&entry.id) {
+            continue;
+        }
         let article = entry_to_article(&feed.id, entry);
         if db
             .insert_article_if_new(&article)

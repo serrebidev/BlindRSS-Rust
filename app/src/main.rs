@@ -26,6 +26,7 @@ struct State {
     feeds: Vec<Feed>,
     articles: Vec<Article>,
     selected_feed: Option<String>,
+    selected_article: Option<usize>,
     refreshing: bool,
 }
 
@@ -94,6 +95,14 @@ fn main() {
         let remove_btn = Button::builder(&frame).with_label("Remove Feed").build();
         let import_btn = Button::builder(&frame).with_label("Import OPML...").build();
         let export_btn = Button::builder(&frame).with_label("Export OPML...").build();
+        let delete_btn = Button::builder(&frame).with_label("Delete Article").build();
+        let fav_btn = Button::builder(&frame)
+            .with_label("Toggle Favorite")
+            .build();
+        let markall_btn = Button::builder(&frame).with_label("Mark All Read").build();
+        let deleted_btn = Button::builder(&frame).with_label("Deleted...").build();
+        let search_box = TextCtrl::builder(&frame).build();
+        let search_btn = Button::builder(&frame).with_label("Search").build();
         let refresh_btn = Button::builder(&frame)
             .with_label("Refresh All Feeds")
             .build();
@@ -122,6 +131,14 @@ fn main() {
         btn_row.add(&import_btn, 0, SizerFlag::All, 4);
         btn_row.add(&export_btn, 0, SizerFlag::All, 4);
         sizer.add_sizer(&btn_row, 0, SizerFlag::All, 0);
+        let btn_row2 = BoxSizer::builder(Orientation::Horizontal).build();
+        btn_row2.add(&delete_btn, 0, SizerFlag::All, 4);
+        btn_row2.add(&fav_btn, 0, SizerFlag::All, 4);
+        btn_row2.add(&markall_btn, 0, SizerFlag::All, 4);
+        btn_row2.add(&deleted_btn, 0, SizerFlag::All, 4);
+        btn_row2.add(&search_box, 1, SizerFlag::All, 4);
+        btn_row2.add(&search_btn, 0, SizerFlag::All, 4);
+        sizer.add_sizer(&btn_row2, 0, SizerFlag::All, 0);
         sizer.add(&splitter, 1, SizerFlag::Expand | SizerFlag::All, 0);
         frame.set_sizer(sizer, true);
 
@@ -130,6 +147,7 @@ fn main() {
             feeds: Vec::new(),
             articles: Vec::new(),
             selected_feed: None,
+            selected_article: None,
             refreshing: false,
         }));
 
@@ -177,6 +195,7 @@ fn main() {
                 return;
             }
             let mut st = state_list.borrow_mut();
+            st.selected_article = Some(idx as usize);
             let Some(a) = st.articles.get(idx as usize).cloned() else {
                 return;
             };
@@ -224,6 +243,154 @@ fn main() {
                 }
                 let _ = tx.send(RefreshMsg::AllDone);
             });
+        });
+
+        // Article actions: delete (tombstoned), favorite, mark all
+        // read, restore-deleted dialog, and search.
+        let state_del = state.clone();
+        let frame_del = frame;
+        delete_btn.on_click(move |_| {
+            let mut st = state_del.borrow_mut();
+            let Some(idx) = st.selected_article else {
+                frame_del.set_status_text("Select an article first", 0);
+                return;
+            };
+            let Some(a) = st.articles.get(idx).cloned() else {
+                return;
+            };
+            if let Some(db) = st.db.as_ref() {
+                let _ = db.delete_article(&a.id);
+            }
+            st.selected_article = None;
+            refill_articles(&mut st, &list);
+            frame_del.set_status_text(&format!("Deleted {}", a.title), 0);
+        });
+
+        let state_fav = state.clone();
+        let frame_fav = frame;
+        fav_btn.on_click(move |_| {
+            let mut st = state_fav.borrow_mut();
+            let Some(idx) = st.selected_article else {
+                frame_fav.set_status_text("Select an article first", 0);
+                return;
+            };
+            let Some(a) = st.articles.get(idx).cloned() else {
+                return;
+            };
+            let new_value = !a.is_favorite;
+            if let Some(db) = st.db.as_ref() {
+                let _ = db.set_favorite(&a.id, new_value);
+            }
+            if let Some(slot) = st.articles.get_mut(idx) {
+                slot.is_favorite = new_value;
+            }
+            frame_fav.set_status_text(
+                &format!(
+                    "{} {}",
+                    if new_value {
+                        "Favorited"
+                    } else {
+                        "Unfavorited"
+                    },
+                    a.title
+                ),
+                0,
+            );
+        });
+
+        let state_ma = state.clone();
+        let frame_ma = frame;
+        markall_btn.on_click(move |_| {
+            let mut st = state_ma.borrow_mut();
+            let filter = st.selected_feed.clone();
+            let mut count = 0;
+            if let Some(db) = st.db.as_ref() {
+                count = db.mark_all_read(filter.as_deref()).unwrap_or(0);
+                for a in st.articles.iter_mut() {
+                    a.is_read = true;
+                }
+            }
+            frame_ma.set_status_text(&format!("Marked {count} articles read"), 0);
+        });
+
+        let state_s = state.clone();
+        let frame_s = frame;
+        search_btn.on_click(move |_| {
+            let query = search_box.get_value();
+            let mut st = state_s.borrow_mut();
+            if query.trim().is_empty() {
+                refill_articles(&mut st, &list);
+                return;
+            }
+            let Some(db) = st.db.as_ref() else { return };
+            match db.search_articles(query.trim(), 300) {
+                Ok(results) => {
+                    list.clear_all();
+                    list.insert_column(0, "Title", ListColumnFormat::Left, 420);
+                    list.insert_column(1, "Date", ListColumnFormat::Left, 160);
+                    list.insert_column(2, "Feed", ListColumnFormat::Left, 160);
+                    for (i, a) in results.iter().enumerate() {
+                        list.insert_item(i as i64, &a.title, None);
+                        list.set_item_text_by_column(i as i64, 1, a.date.as_deref().unwrap_or(""));
+                        list.set_item_text_by_column(i as i64, 2, &a.feed_id);
+                    }
+                    let n = results.len();
+                    st.articles = results;
+                    st.selected_article = None;
+                    frame_s.set_status_text(&format!("{n} matches"), 0);
+                }
+                Err(e) => frame_s.set_status_text(&format!("Search failed: {e}"), 0),
+            }
+        });
+
+        let state_deleted = state.clone();
+        let frame_deleted = frame;
+        deleted_btn.on_click(move |_| {
+            let deleted = {
+                let st = state_deleted.borrow();
+                let Some(db) = st.db.as_ref() else { return };
+                db.deleted_articles().unwrap_or_default()
+            };
+            if deleted.is_empty() {
+                frame_deleted.set_status_text("No deleted articles", 0);
+                return;
+            }
+            let dlg = Dialog::builder(&frame_deleted, "Deleted Articles").build();
+            dlg.set_size(Size::new(560, 380));
+            let lb = ListBox::builder(&dlg).build();
+            for a in &deleted {
+                lb.append(&a.title);
+            }
+            let restore_btn = Button::builder(&dlg).with_label("Restore Selected").build();
+            let close_btn = Button::builder(&dlg).with_label("Close").build();
+            let ds = BoxSizer::builder(Orientation::Vertical).build();
+            ds.add(&lb, 1, SizerFlag::Expand | SizerFlag::All, 4);
+            let drow = BoxSizer::builder(Orientation::Horizontal).build();
+            drow.add(&restore_btn, 0, SizerFlag::All, 4);
+            drow.add(&close_btn, 0, SizerFlag::All, 4);
+            ds.add_sizer(&drow, 0, SizerFlag::All, 0);
+            dlg.set_sizer(ds, true);
+            let ids: Vec<String> = deleted.iter().map(|a| a.id.clone()).collect();
+            let state_r = state_deleted.clone();
+            restore_btn.on_click(move |_| {
+                let Some(sel) = lb.get_selection() else {
+                    return;
+                };
+                let Some(id) = ids.get(sel as usize) else {
+                    return;
+                };
+                let mut st = state_r.borrow_mut();
+                if let Some(db) = st.db.as_ref() {
+                    let _ = db.restore_article(id);
+                }
+                lb.delete(sel);
+                refill_articles(&mut st, &list);
+                frame_deleted.set_status_text("Article restored", 0);
+            });
+            close_btn.on_click(move |_| {
+                dlg.end_modal(ID_OK);
+            });
+            dlg.show_modal();
         });
 
         // Add Feed: prompt for a URL, fetch it on a worker thread to
