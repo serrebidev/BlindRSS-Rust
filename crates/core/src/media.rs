@@ -16,6 +16,7 @@ pub struct MediaInfo {
     pub duration_secs: Option<f64>,
     pub chapters: Vec<Chapter>,
     pub webpage_url: String,
+    pub description: String,
 }
 
 #[derive(Deserialize)]
@@ -28,6 +29,8 @@ struct RawInfo {
     chapters: Vec<RawChapter>,
     #[serde(default)]
     webpage_url: String,
+    #[serde(default)]
+    description: String,
 }
 
 #[derive(Deserialize)]
@@ -58,6 +61,7 @@ pub fn parse_info(json: &str) -> Result<MediaInfo, String> {
             })
             .collect(),
         webpage_url: raw.webpage_url,
+        description: raw.description,
     })
 }
 

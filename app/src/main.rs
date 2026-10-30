@@ -137,6 +137,12 @@ enum RefreshMsg {
         String,
         Result<(String, Option<blindrss_core::media::MediaInfo>), String>,
     ),
+    /// A finished download: description of what landed where.
+    DownloadDone(Result<String, String>),
+    /// YouTube full text for an article.
+    YoutubeText(String, Result<String, String>),
+    /// Archive rescan for a feed: (feed title, new count).
+    ArchiveDone(String, Result<usize, String>),
 }
 
 const ID_OK: i32 = 5100;
@@ -273,6 +279,11 @@ fn main() {
         let del_sf_btn = Button::builder(&frame)
             .with_label("Delete Smart Folder")
             .build();
+        let download_btn = Button::builder(&frame).with_label("Download").build();
+        let takeout_btn = Button::builder(&frame)
+            .with_label("Import YouTube Takeout")
+            .build();
+        let archive_btn = Button::builder(&frame).with_label("Rescan Archive").build();
         let refresh_btn = Button::builder(&frame)
             .with_label("Refresh All Feeds")
             .build();
@@ -309,6 +320,9 @@ fn main() {
         btn_row.add(&play_btn, 0, SizerFlag::All, 4);
         btn_row.add(&new_sf_btn, 0, SizerFlag::All, 4);
         btn_row.add(&del_sf_btn, 0, SizerFlag::All, 4);
+        btn_row.add(&download_btn, 0, SizerFlag::All, 4);
+        btn_row.add(&takeout_btn, 0, SizerFlag::All, 4);
+        btn_row.add(&archive_btn, 0, SizerFlag::All, 4);
         sizer.add_sizer(&btn_row, 0, SizerFlag::All, 0);
         let btn_row2 = BoxSizer::builder(Orientation::Horizontal).build();
         btn_row2.add(&delete_btn, 0, SizerFlag::All, 4);
@@ -690,8 +704,15 @@ fn main() {
             let id = article.id.clone();
             let url = article.url.clone();
             std::thread::spawn(move || {
-                let result = blindrss_core::extract::fetch_html(&url);
-                let _ = tx.send(RefreshMsg::FullText(id, result));
+                // YouTube articles use the dedicated full-text path
+                // (description + chapters + transcript), like Python.
+                if url.contains("youtube.com") || url.contains("youtu.be") {
+                    let result = blindrss_core::download::youtube_full_text(&url);
+                    let _ = tx.send(RefreshMsg::YoutubeText(id, result));
+                } else {
+                    let result = blindrss_core::extract::fetch_html(&url);
+                    let _ = tx.send(RefreshMsg::FullText(id, result));
+                }
             });
         });
 
@@ -979,6 +1000,134 @@ fn main() {
             frame_dsf.set_status_text("Smart folder deleted", 0);
         });
 
+        // Download: the selected article's media (direct) or page
+        // (yt-dlp) into the configured download directory.
+        let state_dl = state.clone();
+        let frame_dl = frame;
+        let tx_dl = tx.clone();
+        download_btn.on_click(move |_| {
+            let st = state_dl.borrow();
+            let Some(article) = st
+                .selected_article
+                .and_then(|i| st.articles.get(i))
+                .cloned()
+            else {
+                frame_dl.set_status_text("No article selected", 0);
+                return;
+            };
+            let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+            let dir = cfg
+                .raw()
+                .get("download_path")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| {
+                    std::env::var("HOME")
+                        .map(|h| PathBuf::from(h).join("Downloads").join("BlindRSS"))
+                        .unwrap_or_else(|_| PathBuf::from("Downloads"))
+                });
+            frame_dl.set_status_text("Downloading...", 0);
+            let tx = tx_dl.clone();
+            std::thread::spawn(move || {
+                let result =
+                    if let Some(media) = article.media_url.clone().filter(|u| !u.is_empty()) {
+                        blindrss_core::download::download_direct(&media, &dir, &article.title)
+                            .map(|p| format!("Downloaded {}", p.display()))
+                    } else if !article.url.is_empty() {
+                        blindrss_core::download::download_with_ytdlp(
+                            &article.url,
+                            &dir,
+                            blindrss_core::download::DownloadPreset::Best,
+                        )
+                        .map(|d| format!("Downloaded to {}", d.display()))
+                    } else {
+                        Err("Article has nothing to download".to_string())
+                    };
+                let _ = tx.send(RefreshMsg::DownloadDone(result));
+            });
+        });
+
+        // Import YouTube Takeout: pick the ZIP, subscribe every
+        // channel/playlist feed not already present.
+        let state_to = state.clone();
+        let frame_to = frame;
+        let tree_to = tree;
+        let list_to = list;
+        takeout_btn.on_click(move |_| {
+            let dlg = FileDialog::builder(&frame_to)
+                .with_message("Select YouTube Takeout ZIP")
+                .with_wildcard("ZIP files (*.zip)|*.zip")
+                .with_style(FileDialogStyle::Open)
+                .build();
+            if dlg.show_modal() != 5100 {
+                return;
+            }
+            let Some(path) = dlg.get_path() else { return };
+            let bytes = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(e) => {
+                    frame_to.set_status_text(&format!("Takeout read failed: {e}"), 0);
+                    return;
+                }
+            };
+            match blindrss_core::takeout::parse_takeout_zip(&bytes) {
+                Ok(feeds) => {
+                    let mut st = state_to.borrow_mut();
+                    let mut added = 0;
+                    let new_feeds: Vec<Feed> = {
+                        let existing: Vec<String> =
+                            st.feeds.iter().map(|x| x.url.clone()).collect();
+                        let mut acc = Vec::new();
+                        if let Some(db) = &st.db {
+                            for f in &feeds {
+                                if existing.contains(&f.url) {
+                                    continue;
+                                }
+                                if let Ok(feed) = db.add_feed(&f.url, &f.title, Some("YouTube")) {
+                                    acc.push(feed);
+                                }
+                            }
+                        }
+                        acc
+                    };
+                    added = new_feeds.len();
+                    st.feeds.extend(new_feeds);
+                    rebuild_tree(&mut st, &tree_to);
+                    refill_articles(&mut st, &list_to);
+                    frame_to
+                        .set_status_text(&format!("Takeout: {added} new subscription(s) added"), 0);
+                }
+                Err(e) => frame_to.set_status_text(&format!("Takeout: {e}"), 0),
+            }
+        });
+
+        // Rescan Archive: live document + newest Wayback snapshot
+        // for the selected feed, on a worker thread/connection.
+        let state_ar = state.clone();
+        let frame_ar = frame;
+        let tx_ar = tx.clone();
+        archive_btn.on_click(move |_| {
+            let feed = {
+                let st = state_ar.borrow();
+                st.selected_feed
+                    .as_ref()
+                    .and_then(|id| st.feeds.iter().find(|f| &f.id == id).cloned())
+            };
+            let Some(feed) = feed else {
+                frame_ar.set_status_text("Select a feed in the tree first", 0);
+                return;
+            };
+            frame_ar.set_status_text("Rescanning archive...", 0);
+            let tx = tx_ar.clone();
+            std::thread::spawn(move || {
+                let result = Db::open(&db_path())
+                    .map_err(|e| format!("{e}"))
+                    .and_then(|db| blindrss_core::archive::rescan_archive(&db, &feed));
+                let _ = tx.send(RefreshMsg::ArchiveDone(feed.title.clone(), result));
+            });
+        });
+
         // Add Feed: prompt for a URL, fetch it on a worker thread to
         // learn its title, then subscribe + store its current articles.
         let state_add = state.clone();
@@ -1230,6 +1379,44 @@ fn main() {
                             }
                             (_, Err(e)) => frame_tick.set_status_text(&format!("Play: {e}"), 0),
                             _ => {}
+                        }
+                    }
+                    Ok(RefreshMsg::DownloadDone(result)) => match result {
+                        Ok(msg) => frame_tick.set_status_text(&msg, 0),
+                        Err(e) => frame_tick.set_status_text(&format!("Download: {e}"), 0),
+                    },
+                    Ok(RefreshMsg::YoutubeText(id, result)) => {
+                        let st = state_tick.borrow();
+                        let title = st
+                            .articles
+                            .iter()
+                            .find(|a| a.id == id)
+                            .map(|a| a.title.clone())
+                            .unwrap_or_default();
+                        match result {
+                            Ok(text) => {
+                                reader.set_value(&format!("{title}\n\n{text}"));
+                                frame_tick.set_status_text("Full text (YouTube)", 0);
+                            }
+                            Err(e) => frame_tick.set_status_text(&format!("Full text: {e}"), 0),
+                        }
+                    }
+                    Ok(RefreshMsg::ArchiveDone(title, result)) => {
+                        let mut st = state_tick.borrow_mut();
+                        match result {
+                            Ok(new) => {
+                                st.feeds = st
+                                    .db
+                                    .as_ref()
+                                    .and_then(|db| db.feeds().ok())
+                                    .unwrap_or_default();
+                                refill_articles(&mut st, &list);
+                                frame_tick.set_status_text(
+                                    &format!("{title}: archive rescan added {new}"),
+                                    0,
+                                );
+                            }
+                            Err(e) => frame_tick.set_status_text(&format!("{title}: {e}"), 0),
                         }
                     }
                     Ok(RefreshMsg::AllDone) => {
