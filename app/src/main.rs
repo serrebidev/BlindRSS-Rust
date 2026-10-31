@@ -302,10 +302,7 @@ fn find_item_by_data(tree: &TreeCtrl, item: &TreeItemId, data: &str) -> Option<T
         if let Some(found) = find_item_by_data(tree, &child, data) {
             return Some(found);
         }
-        match tree.get_next_child(item, &mut cookie) {
-            Some(next) => child = next,
-            None => return None,
-        }
+        child = tree.get_next_child(item, &mut cookie)?;
     }
 }
 
