@@ -110,14 +110,23 @@ pub fn find_on_path(names: &[&str]) -> Option<std::path::PathBuf> {
     None
 }
 
-/// Locate ffprobe: user-configured path first, then PATH.
+/// Locate ffprobe: user-configured path, then the managed
+/// install's env pointer, then PATH.
 pub fn find_ffprobe() -> Option<std::path::PathBuf> {
     let names: &[&str] = if cfg!(windows) {
         &["ffprobe.exe", "ffprobe"]
     } else {
         &["ffprobe"]
     };
-    user_tool_path("ffprobe", names).or_else(|| find_on_path(names))
+    if let Some(p) = user_tool_path("ffprobe", names) {
+        return Some(p);
+    }
+    if let Ok(p) = std::env::var("BLINDRSS_FFPROBE")
+        && !p.is_empty()
+    {
+        return Some(std::path::PathBuf::from(p));
+    }
+    find_on_path(names)
 }
 
 fn version_of(path: &std::path::Path) -> Option<String> {
@@ -205,4 +214,305 @@ pub fn update_ytdlp(data_dir: &std::path::Path) -> Result<std::path::PathBuf, St
     }
     std::fs::rename(&tmp, &dest).map_err(|e| format!("install: {e}"))?;
     Ok(dest)
+}
+
+// ---------------------------------------------------------------------------
+// Managed ffmpeg/ffprobe install (Python `install_media_tools` +
+// `_install_ffmpeg_fallback`). The pair ships together in every
+// distribution channel, so one install resolves both. Windows:
+// winget (Python's first choice) with the gyan.dev essentials zip
+// as fallback, extracted under <data_dir>/ffmpeg — the same
+// layout Python uses under %LOCALAPPDATA%\BlindRSS. macOS:
+// Homebrew, as Python. Linux: a static build (an extension —
+// Python has no automated Linux path).
+// ---------------------------------------------------------------------------
+
+fn exe_name(tool: &str) -> String {
+    if cfg!(windows) {
+        format!("{tool}.exe")
+    } else {
+        tool.to_string()
+    }
+}
+
+fn dir_has_pair(dir: &std::path::Path) -> bool {
+    dir.join(exe_name("ffmpeg")).is_file() && dir.join(exe_name("ffprobe")).is_file()
+}
+
+/// Like dir_has_pair but suffix-agnostic: the Windows zip's
+/// .exe names also count. Used only when locating a fresh
+/// extraction (the zip route is Windows-only in production);
+/// managed-install detection stays platform-exact so a copied
+/// Windows tree never shadows working tools elsewhere.
+fn dir_has_pair_loose(dir: &std::path::Path) -> bool {
+    ["ffmpeg", "ffmpeg.exe"]
+        .iter()
+        .any(|n| dir.join(n).is_file())
+        && ["ffprobe", "ffprobe.exe"]
+            .iter()
+            .any(|n| dir.join(n).is_file())
+}
+
+/// A directory holding BOTH ffmpeg and ffprobe executables,
+/// searching `root` and up to three levels below it (the gyan
+/// zip nests them under <version>/bin, the static Linux build
+/// keeps them at the top level).
+fn find_bin_dir_matching(
+    root: &std::path::Path,
+    complete: &dyn Fn(&std::path::Path) -> bool,
+) -> Option<std::path::PathBuf> {
+    fn visit(
+        dir: &std::path::Path,
+        depth: usize,
+        complete: &dyn Fn(&std::path::Path) -> bool,
+    ) -> Option<std::path::PathBuf> {
+        if complete(dir) {
+            return Some(dir.to_path_buf());
+        }
+        if depth == 0 {
+            return None;
+        }
+        let mut subs: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+            .ok()?
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect();
+        subs.sort();
+        for sub in subs {
+            if let Some(found) = visit(&sub, depth - 1, complete) {
+                return Some(found);
+            }
+        }
+        None
+    }
+    visit(root, 3, complete)
+}
+
+fn find_bin_dir(root: &std::path::Path) -> Option<std::path::PathBuf> {
+    find_bin_dir_matching(root, &dir_has_pair)
+}
+
+/// The bin directory of the managed ffmpeg install inside the
+/// data dir, when a previous install landed there.
+pub fn managed_ffmpeg_bin_dir(data_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    find_bin_dir(&data_dir.join("ffmpeg"))
+}
+
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+fn download_bytes(url: &str) -> Result<Vec<u8>, String> {
+    let mut resp = crate::http::agent()
+        .get(url)
+        .call()
+        .map_err(|e| format!("download: {e}"))?;
+    resp.body_mut()
+        .read_to_vec()
+        .map_err(|e| format!("download: {e}"))
+}
+
+/// Extract an ffmpeg zip archive into `dest` (wiped first) and
+/// return the directory holding ffmpeg + ffprobe.
+pub fn extract_ffmpeg_zip(
+    bytes: &[u8],
+    dest: &std::path::Path,
+) -> Result<std::path::PathBuf, String> {
+    if dest.exists() {
+        std::fs::remove_dir_all(dest).map_err(|e| format!("clean extract dir: {e}"))?;
+    }
+    std::fs::create_dir_all(dest).map_err(|e| format!("extract dir: {e}"))?;
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))
+        .map_err(|e| format!("ffmpeg zip: {e}"))?;
+    for i in 0..archive.len() {
+        let mut file = archive
+            .by_index(i)
+            .map_err(|e| format!("ffmpeg zip: {e}"))?;
+        let Some(rel) = file.enclosed_name() else {
+            continue;
+        };
+        let out = dest.join(rel);
+        if file.is_dir() {
+            std::fs::create_dir_all(&out).map_err(|e| format!("extract: {e}"))?;
+            continue;
+        }
+        if let Some(parent) = out.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("extract: {e}"))?;
+        }
+        let mut f = std::fs::File::create(&out).map_err(|e| format!("extract: {e}"))?;
+        std::io::copy(&mut file, &mut f).map_err(|e| format!("extract: {e}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let name = out.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if name == "ffmpeg" || name == "ffprobe" {
+                let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755));
+            }
+        }
+    }
+    find_bin_dir_matching(dest, &dir_has_pair_loose)
+        .ok_or_else(|| "ffmpeg/ffprobe not found after extraction".to_string())
+}
+
+/// The gyan.dev essentials download (Python
+/// `_install_ffmpeg_fallback`): fetch, extract under
+/// <data_dir>/ffmpeg/extract, return the bin directory.
+#[cfg(target_os = "windows")]
+fn install_ffmpeg_from_zip(data_dir: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    let url = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip";
+    let bytes = download_bytes(url)?;
+    if bytes.len() < 1_000_000 {
+        return Err("ffmpeg download looks truncated".to_string());
+    }
+    let base = data_dir.join("ffmpeg");
+    std::fs::create_dir_all(&base).map_err(|e| format!("ffmpeg dir: {e}"))?;
+    std::fs::write(base.join("ffmpeg.zip"), &bytes).map_err(|e| format!("write zip: {e}"))?;
+    extract_ffmpeg_zip(&bytes, &base.join("extract"))
+}
+
+#[cfg(windows)]
+fn winget_ffmpeg() -> Option<std::path::PathBuf> {
+    // Python's exact invocation: user scope first, then default.
+    let present = std::process::Command::new("winget")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !present {
+        return None;
+    }
+    for scope in [Some("user"), None] {
+        let mut cmd = std::process::Command::new("winget");
+        cmd.args([
+            "install",
+            "-e",
+            "--id",
+            "Gyan.FFmpeg",
+            "--accept-package-agreements",
+            "--accept-source-agreements",
+            "--no-upgrade",
+            "--disable-interactivity",
+        ]);
+        if let Some(s) = scope {
+            cmd.args(["--scope", s]);
+        }
+        if cmd.output().map(|o| o.status.success()).unwrap_or(false) {
+            break;
+        }
+    }
+    // The running process PATH does not learn about a fresh
+    // winget install; probe the locations winget uses directly.
+    let local = std::env::var_os("LOCALAPPDATA")?;
+    let base = std::path::PathBuf::from(local)
+        .join("Microsoft")
+        .join("WinGet");
+    if let Some(dir) = find_bin_dir(&base.join("Links")) {
+        return Some(dir);
+    }
+    find_bin_dir(&base.join("Packages"))
+}
+
+#[cfg(target_os = "macos")]
+fn brew_ffmpeg() -> Option<std::path::PathBuf> {
+    let brew = find_on_path(&["brew"]).or_else(|| {
+        ["/opt/homebrew/bin/brew", "/usr/local/bin/brew"]
+            .iter()
+            .map(std::path::PathBuf::from)
+            .find(|p| p.is_file())
+    })?;
+    let ok = std::process::Command::new(&brew)
+        .args(["install", "ffmpeg"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !ok {
+        return None;
+    }
+    for dir in ["/opt/homebrew/bin", "/usr/local/bin"] {
+        let d = std::path::PathBuf::from(dir);
+        if d.join("ffmpeg").is_file() && d.join("ffprobe").is_file() {
+            return Some(d);
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn static_ffmpeg(data_dir: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    let arch = if cfg!(target_arch = "aarch64") {
+        "arm64"
+    } else {
+        "amd64"
+    };
+    let url =
+        format!("https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-{arch}-static.tar.xz");
+    let bytes = download_bytes(&url)?;
+    if bytes.len() < 1_000_000 {
+        return Err("ffmpeg download looks truncated".to_string());
+    }
+    let base = data_dir.join("ffmpeg");
+    let extract = base.join("extract");
+    if extract.exists() {
+        std::fs::remove_dir_all(&extract).map_err(|e| format!("clean extract dir: {e}"))?;
+    }
+    std::fs::create_dir_all(&extract).map_err(|e| format!("extract dir: {e}"))?;
+    let tarball = base.join("ffmpeg.tar.xz");
+    std::fs::write(&tarball, &bytes).map_err(|e| format!("write tarball: {e}"))?;
+    let ok = std::process::Command::new("tar")
+        .args(["-xJf"])
+        .arg(&tarball)
+        .arg("-C")
+        .arg(&extract)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !ok {
+        return Err("could not extract the ffmpeg static build (tar failed)".to_string());
+    }
+    find_bin_dir(&extract).ok_or_else(|| "ffmpeg/ffprobe not found after extraction".to_string())
+}
+
+/// Ensure ffmpeg and ffprobe are usable, installing them when
+/// they are missing (the platform routes above). Returns the
+/// directory holding both executables. Both must actually run
+/// before success is reported (Python validates the same way).
+pub fn install_ffmpeg(data_dir: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    if let (Some(f), Some(_p)) = (crate::silence::find_ffmpeg(), find_ffprobe())
+        && let Some(dir) = f.parent()
+    {
+        return Ok(dir.to_path_buf());
+    }
+    if let Some(dir) = managed_ffmpeg_bin_dir(data_dir) {
+        return Ok(dir);
+    }
+    let dir = {
+        #[cfg(windows)]
+        {
+            winget_ffmpeg()
+                .map(Ok)
+                .or_else(|| Some(install_ffmpeg_from_zip(data_dir)))
+                .unwrap()?
+        }
+        #[cfg(target_os = "macos")]
+        {
+            brew_ffmpeg().ok_or_else(|| {
+                "Homebrew is not available; install ffmpeg manually or set a custom path in Settings".to_string()
+            })?
+        }
+        #[cfg(target_os = "linux")]
+        {
+            static_ffmpeg(data_dir)?
+        }
+        #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+        {
+            return Err("no automated ffmpeg install on this platform".to_string());
+        }
+    };
+    let ffmpeg = dir.join(exe_name("ffmpeg"));
+    let ffprobe = dir.join(exe_name("ffprobe"));
+    if version_of(&ffmpeg).is_none() || version_of(&ffprobe).is_none() {
+        return Err(format!(
+            "installed ffmpeg/ffprobe in {} but they do not run",
+            dir.display()
+        ));
+    }
+    Ok(dir)
 }

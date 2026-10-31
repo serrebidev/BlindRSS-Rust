@@ -577,6 +577,24 @@ fn apply_http_config() {
                 std::env::set_var("BLINDRSS_YTDLP", &managed);
             }
         }
+        // Same for the managed ffmpeg/ffprobe install: point the
+        // finders at its bin dir when the user has not pinned
+        // their own binaries.
+        if let Some(bin) = blindrss_core::dependency::managed_ffmpeg_bin_dir(&data_dir()) {
+            let exe = |tool: &str| {
+                if cfg!(windows) {
+                    bin.join(format!("{tool}.exe"))
+                } else {
+                    bin.join(tool)
+                }
+            };
+            if std::env::var_os("BLINDRSS_FFMPEG").is_none() {
+                std::env::set_var("BLINDRSS_FFMPEG", exe("ffmpeg"));
+            }
+            if std::env::var_os("BLINDRSS_FFPROBE").is_none() {
+                std::env::set_var("BLINDRSS_FFPROBE", exe("ffprobe"));
+            }
+        }
     }
 }
 
@@ -1197,6 +1215,8 @@ enum RefreshMsg {
     DepsMissing(Vec<String>),
     /// Managed yt-dlp download finished.
     YtdlpUpdated(Result<std::path::PathBuf, String>),
+    /// Automatic ffmpeg/ffprobe install finished (bin dir).
+    FfmpegInstalled(Result<std::path::PathBuf, String>),
 }
 
 const ID_OK: i32 = 5100;
@@ -6424,49 +6444,61 @@ fn main() {
                         }
                     }
                     Ok(RefreshMsg::DepsMissing(missing)) => {
-                        let mut msg = "Missing recommended tools:\n".to_string();
-                        for name in &missing {
-                            let why = if name == "yt-dlp" {
-                                "required for YouTube and many media sources"
-                            } else {
-                                "required for some downloads and silence detection"
-                            };
-                            msg.push_str(&format!("- {name} ({why})\n"));
-                        }
-                        // yt-dlp is the one tool BlindRSS can
-                        // fetch itself (managed copy in the data
-                        // dir); ffmpeg needs a manual install.
+                        // Missing tools resolve automatically —
+                        // no prompt (Brandon's order): yt-dlp via
+                        // the managed download, ffmpeg/ffprobe via
+                        // dependency::install_ffmpeg. Progress and
+                        // outcomes land in the status bar through
+                        // YtdlpUpdated / FfmpegInstalled.
+                        frame_tick.set_status_text(
+                            &format!("Installing missing tools: {}...", missing.join(", ")),
+                            0,
+                        );
                         if missing.iter().any(|n| n == "yt-dlp") {
-                            msg.push_str("\nDownload yt-dlp now?");
-                            let md =
-                                MessageDialog::builder(&frame_tick, &msg, "Missing Dependencies")
-                                    .with_style(
-                                        MessageDialogStyle::YesNo
-                                            | MessageDialogStyle::IconQuestion,
-                                    )
-                                    .build();
-                            let answer = md.show_modal();
-                            md.destroy();
-                            if answer == ID_YES {
-                                frame_tick.set_status_text("Downloading yt-dlp...", 0);
-                                let tx = tx_tick.clone();
-                                std::thread::spawn(move || {
-                                    let _ = tx.send(RefreshMsg::YtdlpUpdated(
-                                        blindrss_core::dependency::update_ytdlp(&data_dir()),
-                                    ));
-                                });
-                            }
-                        } else {
-                            let md =
-                                MessageDialog::builder(&frame_tick, &msg, "Missing Dependencies")
-                                    .with_style(
-                                        MessageDialogStyle::OK | MessageDialogStyle::IconWarning,
-                                    )
-                                    .build();
-                            md.show_modal();
-                            md.destroy();
+                            let tx = tx_tick.clone();
+                            std::thread::spawn(move || {
+                                let _ = tx.send(RefreshMsg::YtdlpUpdated(
+                                    blindrss_core::dependency::update_ytdlp(&data_dir()),
+                                ));
+                            });
+                        }
+                        if missing.iter().any(|n| n == "ffmpeg" || n == "ffprobe") {
+                            let tx = tx_tick.clone();
+                            std::thread::spawn(move || {
+                                let _ = tx.send(RefreshMsg::FfmpegInstalled(
+                                    blindrss_core::dependency::install_ffmpeg(&data_dir()),
+                                ));
+                            });
                         }
                     }
+                    Ok(RefreshMsg::FfmpegInstalled(result)) => match result {
+                        Ok(bin_dir) => {
+                            // SAFETY: UI thread, same trade-off
+                            // as apply_http_config's env writes.
+                            // PATH first so the finders below (and
+                            // yt-dlp later) see the managed pair.
+                            unsafe {
+                                let sep = if cfg!(windows) { ";" } else { ":" };
+                                let cur = std::env::var("PATH").unwrap_or_default();
+                                let bd = bin_dir.to_string_lossy().to_string();
+                                if !cur.split(sep).any(|d| d == bd) {
+                                    std::env::set_var("PATH", format!("{bd}{sep}{cur}"));
+                                }
+                                if let Some(f) = blindrss_core::silence::find_ffmpeg() {
+                                    std::env::set_var("BLINDRSS_FFMPEG", &f);
+                                }
+                                if let Some(p) = blindrss_core::dependency::find_ffprobe() {
+                                    std::env::set_var("BLINDRSS_FFPROBE", &p);
+                                }
+                            }
+                            frame_tick.set_status_text(
+                                &format!("ffmpeg and ffprobe installed: {}", bin_dir.display()),
+                                0,
+                            );
+                            announce("general", "ffmpeg installed");
+                        }
+                        Err(e) => frame_tick.set_status_text(&format!("ffmpeg install: {e}"), 0),
+                    },
                     Ok(RefreshMsg::YtdlpUpdated(result)) => match result {
                         Ok(path) => {
                             // SAFETY: UI thread, same trade-off

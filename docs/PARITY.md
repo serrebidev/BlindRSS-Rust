@@ -763,3 +763,31 @@ rebuilds, with category_tree_default_expanded as the default
 for untouched nodes (previously every rebuild reset all
 categories to the default). Tests: batch26_slice (sanitizer
 and cleaner) and batch27_slice (membership clause).
+
+Batch 27 resolution (v0.1.27, Brandon's order: missing tools
+must resolve automatically, not via a prompt): the startup
+dependency check no longer ends at a "Missing recommended
+tools" dialog. dependency::install_ffmpeg resolves the
+ffmpeg/ffprobe pair on its own, following Python's
+install_media_tools routes: Windows winget (Gyan.FFmpeg,
+user scope then default scope, Python's exact flags) with
+the gyan.dev essentials zip as fallback, extracted under
+<data_dir>/ffmpeg/extract in Python's %LOCALAPPDATA%\BlindRSS
+layout; macOS Homebrew (brew located via PATH or the two
+standard prefixes, as Python's _brew_path); Linux takes a
+johnvansickle static build — a deliberate extension, since
+Python has no automated Linux path. Installed binaries are
+validated by running them before success is reported, as
+Python validates. Detection learned the managed install:
+find_ffmpeg/find_ffprobe probe it through BLINDRSS_FFMPEG /
+BLINDRSS_FFPROBE pointers seeded at startup from
+managed_ffmpeg_bin_dir (mirroring the managed yt-dlp
+pattern), and a successful in-session install prepends the
+bin dir to the process PATH so yt-dlp finds the matching
+ffprobe (Python's stated reason for the same move). The
+DepsMissing flow now installs in the background and reports
+through the status bar; a dialog remains nowhere in the
+flow — a failed install reports its reason in the status
+bar, and the Settings custom-path fields stay as the manual
+override. Tests: batch28_slice (managed layout detection,
+zip extraction).
