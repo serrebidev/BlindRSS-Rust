@@ -5,6 +5,7 @@
 //! is a Stage 0/6 acceptance item); layout follows BlindFB's proven
 //! patterns: sizer-based, labelled controls, status bar announcements.
 
+mod dialogs;
 mod help;
 mod keys;
 mod player;
@@ -166,6 +167,49 @@ fn propagate_read_state(article: &blindrss_core::db::Article, read: bool) {
     });
 }
 
+/// Build an article stub from a play-queue entry (config
+/// "play_queue" object). The entry's media_url is both the
+/// playback target and, for page URLs, the yt-dlp input.
+fn queue_entry_article(e: &serde_json::Value) -> Article {
+    let media_url = e
+        .get("media_url")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    Article {
+        id: e
+            .get("article_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&media_url)
+            .to_string(),
+        feed_id: e
+            .get("feed_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        title: e
+            .get("title")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&media_url)
+            .to_string(),
+        url: media_url.clone(),
+        content: None,
+        description: None,
+        date: None,
+        author: None,
+        is_read: true,
+        is_favorite: false,
+        media_url: Some(media_url),
+        media_type: e
+            .get("media_type")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string()),
+    }
+}
+
 /// Modal text prompt; None when cancelled.
 /// Speak/braille a configured announcement for an event
 /// (PARITY 7.4). Config is re-read per event so Settings changes
@@ -287,6 +331,12 @@ struct State {
     /// True while the search text box has keyboard focus; the
     /// Backspace toggle-read shortcut must not eat its editing.
     search_focused: bool,
+    /// Article stub for an in-flight queue playback resolve (the
+    /// article may not be in the current list).
+    pending_play: Option<Article>,
+    /// Queue context for the in-flight queue playback: the
+    /// entry articles and the index being started.
+    pending_queue: Option<(Vec<Article>, usize)>,
 }
 
 enum RefreshMsg {
@@ -313,6 +363,8 @@ enum RefreshMsg {
     CastDone(Result<String, String>),
     /// Update check: latest release tag.
     UpdateChecked(Result<(String, Option<String>), String>),
+    /// Open-article-by-URL result: (page title, plain text).
+    OpenedArticle(Result<(String, String), String>),
 }
 
 const ID_OK: i32 = 5100;
@@ -363,6 +415,20 @@ const M_DEL_CAT: i32 = 2158;
 const M_IMPORT_HERE: i32 = 2159;
 const M_EXPORT_CAT: i32 = 2160;
 const M_FEED_ERRORS: i32 = 2161;
+const M_EDIT_SF: i32 = 2190;
+const M_FILTER_RULES: i32 = 2191;
+const M_FEED_PROPS: i32 = 2192;
+const M_OPEN_ARTICLE: i32 = 2193;
+const M_OPEN_MEDIA: i32 = 2194;
+const M_PERSISTENT: i32 = 2195;
+const M_ABOUT: i32 = 2196;
+const M_ARTICLE_WINDOW: i32 = 2197;
+const M_PODCAST_ARCHIVE: i32 = 2198;
+const M_QUEUE_TOGGLE: i32 = 2199;
+const M_QUEUE_OPEN: i32 = 2200;
+const M_QUEUE_NEXT: i32 = 2201;
+const M_QUEUE_PREV: i32 = 2202;
+const M_FEED_SEARCH: i32 = 2203;
 const M_FILTER_ALL: i32 = 2170;
 const M_FILTER_UNREAD: i32 = 2171;
 const M_FILTER_READ: i32 = 2172;
@@ -917,6 +983,8 @@ fn main() {
             sort_by: "date".to_string(),
             sort_ascending: false,
             find_query: String::new(),
+            pending_play: None,
+            pending_queue: None,
             search_focused: false,
         }));
 
@@ -1727,57 +1795,451 @@ fn main() {
             play_btn.on_click(move |_| a());
         }
 
-        // New Smart Folder: name + a simple title-contains rule
-        // (blank matches everything). Full rule editing is a later
-        // dialog; the rule engine already handles the full tree.
+        // New Smart Folder: the full condition editor dialog
+        // (Python's SmartFolderDialog).
         let state_nsf = state.clone();
         let frame_nsf = frame;
         let tree_nsf = tree;
         let list_nsf = list;
         let act_new_sf: Rc<dyn Fn()> = Rc::new(move || {
-            let Some(name) = prompt_focus(
-                &frame_nsf,
-                "Smart folder name:",
-                "New Smart Folder",
-                "",
-                &state_nsf.borrow(),
-                &tree_nsf,
-                &list_nsf,
-            ) else {
+            let empty = serde_json::json!({"match": "all", "conditions": []});
+            let Some((name, rule)) =
+                dialogs::edit_smart_folder(&frame_nsf, "New Smart Folder", "", &empty)
+            else {
+                restore_focus(&state_nsf.borrow(), &tree_nsf, &list_nsf);
                 return;
-            };
-            if name.trim().is_empty() {
-                return;
-            }
-            let needle = prompt_focus(
-                &frame_nsf,
-                "Show articles whose title contains (blank = all):",
-                "New Smart Folder",
-                "",
-                &state_nsf.borrow(),
-                &tree_nsf,
-                &list_nsf,
-            )
-            .unwrap_or_default();
-            let rule = if needle.trim().is_empty() {
-                serde_json::json!({"match": "all", "conditions": []})
-            } else {
-                serde_json::json!({"match": "all", "conditions": [
-                    {"field": "title", "op": "contains", "value": needle.trim()}
-                ]})
             };
             let mut st = state_nsf.borrow_mut();
             if let Some(db) = &st.db {
-                let _ = db.create_smart_folder(name.trim(), &rule.to_string());
+                let _ = db.create_smart_folder(&name, &rule.to_string());
             }
             rebuild_tree(&mut st, &tree_nsf);
             refill_articles(&mut st, &list_nsf);
             frame_nsf.set_status_text("Smart folder created", 0);
+            restore_focus(&st, &tree_nsf, &list_nsf);
         });
         {
             let a = act_new_sf.clone();
             new_sf_btn.on_click(move |_| a());
         }
+
+        // Edit Smart Folder: the same editor over the selected
+        // smart folder's stored rule.
+        let state_esf = state.clone();
+        let frame_esf = frame;
+        let tree_esf = tree;
+        let list_esf = list;
+        let act_edit_sf: Rc<dyn Fn()> = Rc::new(move || {
+            let folder = {
+                let st = state_esf.borrow();
+                let Some(id) = st
+                    .selected_feed
+                    .as_ref()
+                    .and_then(|f| f.strip_prefix("smart:"))
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
+                else {
+                    frame_esf.set_status_text("Select a smart folder in the tree first", 0);
+                    return;
+                };
+                st.db.as_ref().and_then(|db| {
+                    db.smart_folders().ok().and_then(|folders| {
+                        folders
+                            .into_iter()
+                            .find(|(fid, ..)| *fid == id)
+                            .map(|(_, name, rule_json, _)| (id, name, rule_json))
+                    })
+                })
+            };
+            let Some((id, name0, rule_json)) = folder else {
+                return;
+            };
+            let rule0: serde_json::Value =
+                serde_json::from_str(&rule_json).unwrap_or(serde_json::Value::Null);
+            let Some((name, rule)) =
+                dialogs::edit_smart_folder(&frame_esf, "Edit Smart Folder", &name0, &rule0)
+            else {
+                restore_focus(&state_esf.borrow(), &tree_esf, &list_esf);
+                return;
+            };
+            let mut st = state_esf.borrow_mut();
+            if let Some(db) = &st.db {
+                let _ = db.update_smart_folder(&id, &name, &rule.to_string());
+            }
+            rebuild_tree(&mut st, &tree_esf);
+            refill_articles(&mut st, &list_esf);
+            frame_esf.set_status_text("Smart folder updated", 0);
+            restore_focus(&st, &tree_esf, &list_esf);
+        });
+
+        // Filter Rules manager (Tools): list/editor/reorder/
+        // apply-to-existing dialog; it works on its own database
+        // connections, modal, then we refill (Apply may have
+        // changed article states).
+        let state_fr = state.clone();
+        let frame_fr = frame;
+        let tree_fr = tree;
+        let list_fr = list;
+        let act_filter_rules: Rc<dyn Fn()> = Rc::new(move || {
+            {
+                let st = state_fr.borrow();
+                let Some(db) = st.db.as_ref() else { return };
+                dialogs::show_filter_rules(&frame_fr, db);
+            }
+            let mut st = state_fr.borrow_mut();
+            refill_articles(&mut st, &list_fr);
+            restore_focus(&st, &tree_fr, &list_fr);
+        });
+
+        // Feed Properties (Feeds menu / tree context menu).
+        let state_fp = state.clone();
+        let frame_fp = frame;
+        let tree_fp = tree;
+        let list_fp = list;
+        let act_feed_props: Rc<dyn Fn()> = Rc::new(move || {
+            let feed = {
+                let st = state_fp.borrow();
+                st.selected_feed
+                    .as_ref()
+                    .and_then(|id| st.feeds.iter().find(|f| &f.id == id).cloned())
+            };
+            let Some(feed) = feed else {
+                frame_fp.set_status_text("Select a feed in the tree first", 0);
+                return;
+            };
+            let changed = {
+                let st = state_fp.borrow();
+                match st.db.as_ref() {
+                    Some(db) => dialogs::show_feed_properties(&frame_fp, db, &feed),
+                    None => false,
+                }
+            };
+            if changed {
+                let mut st = state_fp.borrow_mut();
+                st.feeds = st
+                    .db
+                    .as_ref()
+                    .and_then(|db| db.feeds().ok())
+                    .unwrap_or_default();
+                rebuild_tree(&mut st, &tree_fp);
+                refill_articles(&mut st, &list_fp);
+            }
+            restore_focus(&state_fp.borrow(), &tree_fp, &list_fp);
+        });
+
+        // About BlindRSS (Help menu).
+        let frame_about = frame;
+        let state_about = state.clone();
+        let tree_about = tree;
+        let list_about = list;
+        let act_about: Rc<dyn Fn()> = Rc::new(move || {
+            dialogs::show_about(&frame_about);
+            restore_focus(&state_about.borrow(), &tree_about, &list_about);
+        });
+
+        // Open Article from URL (Tools): fetch + extract on a
+        // worker, then show the ArticleWindow from the drain.
+        let frame_oa = frame;
+        let state_oa = state.clone();
+        let tree_oa = tree;
+        let list_oa = list;
+        let tx_oa = tx.clone();
+        let act_open_article: Rc<dyn Fn()> = Rc::new(move || {
+            let Some(url) = prompt_focus(
+                &frame_oa,
+                "Article URL:",
+                "Open Article from URL",
+                "",
+                &state_oa.borrow(),
+                &tree_oa,
+                &list_oa,
+            ) else {
+                return;
+            };
+            let url = url.trim().to_string();
+            if url.is_empty() {
+                return;
+            }
+            frame_oa.set_status_text("Fetching article...", 0);
+            let tx = tx_oa.clone();
+            std::thread::spawn(move || {
+                let result = blindrss_core::extract::fetch_html(&url).and_then(|html| {
+                    match blindrss_core::extract::extract_article(&html, &url, None) {
+                        blindrss_core::extract::ExtractOutcome::Article { title, text, .. } => {
+                            Ok((title, text))
+                        }
+                        blindrss_core::extract::ExtractOutcome::Gate { reason } => {
+                            Err(format!("page blocked: {reason}"))
+                        }
+                        blindrss_core::extract::ExtractOutcome::Empty => {
+                            Err("nothing extractable on that page".to_string())
+                        }
+                    }
+                });
+                let _ = tx.send(RefreshMsg::OpenedArticle(result));
+            });
+        });
+
+        // Open Media URL (Tools): play an arbitrary media URL in
+        // the player.
+        let frame_om = frame;
+        let state_om = state.clone();
+        let tree_om = tree;
+        let list_om = list;
+        let act_open_media: Rc<dyn Fn()> = Rc::new(move || {
+            let Some(url) = prompt_focus(
+                &frame_om,
+                "Media URL:",
+                "Open Media URL",
+                "",
+                &state_om.borrow(),
+                &tree_om,
+                &list_om,
+            ) else {
+                return;
+            };
+            let url = url.trim().to_string();
+            if url.is_empty() {
+                return;
+            }
+            let article = blindrss_core::Article {
+                id: url.clone(),
+                feed_id: String::new(),
+                title: url.clone(),
+                url: url.clone(),
+                content: None,
+                description: None,
+                date: None,
+                author: None,
+                is_read: true,
+                is_favorite: false,
+                media_url: Some(url.clone()),
+                media_type: None,
+            };
+            player::open_player(&frame_om, article, url, Vec::new());
+        });
+
+        // Persistent Search (Tools): manage saved searches and
+        // run one into the article list via the existing search.
+        let frame_ps = frame;
+        let act_search_ps = act_search.clone();
+        let act_persistent: Rc<dyn Fn()> = Rc::new(move || {
+            if let Some(query) = dialogs::show_persistent_searches(&frame_ps, &config_path()) {
+                search_box.set_value(&query);
+                act_search_ps();
+            }
+        });
+
+        // Article Window (Article menu): the selected article in
+        // its own window.
+        let state_aw = state.clone();
+        let frame_aw = frame;
+        let act_article_window: Rc<dyn Fn()> = Rc::new(move || {
+            let st = state_aw.borrow();
+            let Some(article) = st
+                .selected_article
+                .and_then(|i| st.articles.get(i))
+                .cloned()
+            else {
+                frame_aw.set_status_text("No article selected", 0);
+                return;
+            };
+            let body = reader.get_value();
+            let body = if body.trim().is_empty() {
+                article
+                    .content
+                    .clone()
+                    .or(article.description.clone())
+                    .unwrap_or_default()
+            } else {
+                body
+            };
+            dialogs::show_article_window(&article.title, &body);
+        });
+
+        // Podcast Archive (Tools): pick a podcast feed, rescan
+        // it against the Wayback Machine (same worker flow as
+        // the tree's Rescan Archive).
+        let state_pa = state.clone();
+        let frame_pa = frame;
+        let tree_pa = tree;
+        let list_pa = list;
+        let tx_pa = tx.clone();
+        let act_podcast_archive: Rc<dyn Fn()> = Rc::new(move || {
+            let feed = {
+                let st = state_pa.borrow();
+                let Some(db) = st.db.as_ref() else { return };
+                dialogs::show_podcast_archive(&frame_pa, db)
+            };
+            restore_focus(&state_pa.borrow(), &tree_pa, &list_pa);
+            let Some(feed) = feed else { return };
+            frame_pa.set_status_text("Rescanning archive...", 0);
+            let tx = tx_pa.clone();
+            std::thread::spawn(move || {
+                let result = Db::open(&db_path())
+                    .map_err(|e| format!("{e}"))
+                    .and_then(|db| blindrss_core::archive::rescan_archive(&db, &feed));
+                let _ = tx.send(RefreshMsg::ArchiveDone(feed.title.clone(), result));
+            });
+        });
+
+        // Play queue (config "play_queue", Python's model):
+        // start playback at an entry, resolving on a worker
+        // exactly like Play; the player advances on finish.
+        let state_qp = state.clone();
+        let frame_qp = frame;
+        let tx_qp = tx.clone();
+        let act_play_queue_index: Rc<dyn Fn(usize)> = Rc::new(move |index: usize| {
+            let entries = dialogs::load_queue(&config_path());
+            let Some(_entry) = entries.get(index) else {
+                return;
+            };
+            let stubs: Vec<Article> = entries.iter().map(queue_entry_article).collect();
+            let article = stubs[index].clone();
+            {
+                let mut st = state_qp.borrow_mut();
+                st.pending_play = Some(article.clone());
+                st.pending_queue = Some((stubs, index));
+            }
+            frame_qp.set_status_text("Loading queue entry...", 0);
+            let tx = tx_qp.clone();
+            std::thread::spawn(move || {
+                let id = article.id.clone();
+                let result = blindrss_core::media::resolve_for_play(
+                    article.media_url.as_deref(),
+                    article.media_type.as_deref(),
+                    &article.url,
+                    article.content.as_deref(),
+                )
+                .map(|r| {
+                    let info = if r.via_ytdlp {
+                        blindrss_core::media::info(&article.url).ok()
+                    } else {
+                        None
+                    };
+                    (r.url, info)
+                });
+                let _ = tx.send(RefreshMsg::MediaReady(id, result));
+            });
+        });
+
+        // Toggle Queue: add or remove the selected article.
+        let state_tq = state.clone();
+        let frame_tq = frame;
+        let act_toggle_queue: Rc<dyn Fn()> = Rc::new(move || {
+            let article = {
+                let st = state_tq.borrow();
+                st.selected_article
+                    .and_then(|i| st.articles.get(i))
+                    .cloned()
+            };
+            let Some(article) = article else {
+                frame_tq.set_status_text("No article selected", 0);
+                return;
+            };
+            let mut entries = dialogs::load_queue(&config_path());
+            if let Some(pos) = entries.iter().position(|e| {
+                e.get("article_id").and_then(|v| v.as_str()) == Some(article.id.as_str())
+            }) {
+                entries.remove(pos);
+                dialogs::save_queue(&config_path(), &entries);
+                frame_tq.set_status_text("Removed from play queue", 0);
+                return;
+            }
+            let media_url = article
+                .media_url
+                .clone()
+                .unwrap_or_else(|| article.url.clone());
+            let feed_title = {
+                let st = state_tq.borrow();
+                st.feeds
+                    .iter()
+                    .find(|f| f.id == article.feed_id)
+                    .map(|f| f.title.clone())
+                    .unwrap_or_default()
+            };
+            entries.push(serde_json::json!({
+                "article_id": article.id,
+                "media_url": media_url,
+                "use_ytdlp": article.media_url.is_none(),
+                "title": article.title,
+                "media_type": article.media_type.clone().unwrap_or_default(),
+                "feed_id": article.feed_id,
+                "feed_title": feed_title,
+            }));
+            dialogs::save_queue(&config_path(), &entries);
+            frame_tq.set_status_text("Added to play queue", 0);
+        });
+
+        // Play Queue dialog (Article menu / queue.open).
+        let frame_qo = frame;
+        let state_qo = state.clone();
+        let tree_qo = tree;
+        let list_qo = list;
+        let play_q = act_play_queue_index.clone();
+        let act_queue_open: Rc<dyn Fn()> = Rc::new(move || {
+            let picked = dialogs::show_queue(&frame_qo, &config_path());
+            restore_focus(&state_qo.borrow(), &tree_qo, &list_qo);
+            if let Some(index) = picked {
+                play_q(index);
+            }
+        });
+
+        // Queue Next / Previous: start from the mirrored
+        // play_queue_index (the player keeps it current).
+        let play_q2 = act_play_queue_index.clone();
+        let frame_qn = frame;
+        let act_queue_next: Rc<dyn Fn()> = Rc::new(move || {
+            let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+            let cur = cfg.get_i64("play_queue_index", -1);
+            let len = dialogs::load_queue(&config_path()).len() as i64;
+            let next = cur + 1;
+            if next >= 0 && next < len {
+                play_q2(next as usize);
+            } else {
+                frame_qn.set_status_text("No next queue entry", 0);
+            }
+        });
+        let play_q3 = act_play_queue_index.clone();
+        let frame_qv = frame;
+        let act_queue_prev: Rc<dyn Fn()> = Rc::new(move || {
+            let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+            let cur = cfg.get_i64("play_queue_index", -1);
+            let prev = cur - 1;
+            if prev >= 0 {
+                play_q3(prev as usize);
+            } else {
+                frame_qv.set_status_text("No previous queue entry", 0);
+            }
+        });
+
+        // Feed Search (Tools): discovery dialog; subscribing
+        // runs the same resolve-and-add flow as Add Feed.
+        let state_fs = state.clone();
+        let frame_fs = frame;
+        let tree_fs = tree;
+        let list_fs = list;
+        let tx_fs = tx.clone();
+        let act_feed_search: Rc<dyn Fn()> = Rc::new(move || {
+            let Some(url) = dialogs::show_feed_search(&frame_fs) else {
+                restore_focus(&state_fs.borrow(), &tree_fs, &list_fs);
+                return;
+            };
+            restore_focus(&state_fs.borrow(), &tree_fs, &list_fs);
+            {
+                let st = state_fs.borrow();
+                if st.feeds.iter().any(|f| f.url == url) {
+                    frame_fs.set_status_text("That feed is already subscribed", 0);
+                    return;
+                }
+            }
+            frame_fs.set_status_text(&format!("Adding {url}..."), 0);
+            let tx = tx_fs.clone();
+            std::thread::spawn(move || {
+                let result = blindrss_core::discovery::resolve_subscribe_url(&url);
+                let _ = tx.send(RefreshMsg::Added(url, result));
+            });
+        });
 
         // Delete Smart Folder: deletes the smart folder selected in
         // the tree.
@@ -1909,6 +2371,11 @@ fn main() {
             };
             match blindrss_core::takeout::parse_takeout_zip(&bytes) {
                 Ok(feeds) => {
+                    let Some(feeds) = dialogs::select_takeout_feeds(&frame_to, &feeds) else {
+                        restore_focus(&state_to.borrow(), &tree_to, &list_to);
+                        return;
+                    };
+                    restore_focus(&state_to.borrow(), &tree_to, &list_to);
                     let mut st = state_to.borrow_mut();
                     let new_feeds: Vec<Feed> = {
                         let existing: Vec<String> =
@@ -2837,6 +3304,11 @@ fn main() {
                 "Edit the selected feed's title and URL",
             )
             .append_item(
+                M_FEED_PROPS,
+                "Feed &Properties...",
+                "Title, URL and category for the selected feed",
+            )
+            .append_item(
                 M_RENAME_CAT,
                 "Rename &Category...",
                 "Rename the selected feed's category",
@@ -2891,6 +3363,27 @@ fn main() {
                 M_FAVORITE,
                 "Toggle &Favorite",
                 "Favorite or unfavorite the selected article",
+            )
+            .append_item(
+                M_ARTICLE_WINDOW,
+                "Open in Article &Window",
+                "Show the selected article in its own window",
+            )
+            .append_item(
+                M_QUEUE_TOGGLE,
+                "Add to Play &Queue",
+                "Add or remove the selected article from the play queue",
+            )
+            .append_item(
+                M_QUEUE_OPEN,
+                "Play &Queue...",
+                "View and edit the play queue",
+            )
+            .append_item(M_QUEUE_NEXT, "Queue &Next", "Play the next queue entry")
+            .append_item(
+                M_QUEUE_PREV,
+                "Queue Pre&vious",
+                "Play the previous queue entry",
             )
             .append_separator()
             .append_item(M_MARKALL, "Mark All Read", "Mark every shown article read")
@@ -2973,9 +3466,40 @@ fn main() {
                 "Feed &Errors...",
                 "Feeds whose latest refresh failed",
             )
+            .append_item(
+                M_FILTER_RULES,
+                "Filter &Rules...",
+                "Rules that act on new articles",
+            )
+            .append_item(
+                M_PERSISTENT,
+                "&Persistent Search...",
+                "Saved searches across all articles",
+            )
+            .append_item(
+                M_OPEN_ARTICLE,
+                "Open &Article from URL...",
+                "Fetch and read a web article by URL",
+            )
+            .append_item(
+                M_OPEN_MEDIA,
+                "Open &Media URL...",
+                "Play a media URL in the player",
+            )
+            .append_item(
+                M_PODCAST_ARCHIVE,
+                "Podcast &Archive...",
+                "Recover old podcast episodes from the Wayback Machine",
+            )
+            .append_item(
+                M_FEED_SEARCH,
+                "&Find Feeds...",
+                "Search a site for feeds to subscribe to",
+            )
             .build();
         let help_menu = Menu::builder()
             .append_item(M_HELP, "&User Guide", "Open the BlindRSS user guide")
+            .append_item(M_ABOUT, "&About BlindRSS", "About this program")
             .build();
         let menu_bar = MenuBar::builder()
             .append(file_menu, "&File")
@@ -3038,6 +3562,20 @@ fn main() {
             (M_SORT_DIR, act_sort_dir.clone()),
             (M_FIND, act_find.clone()),
             (M_FIND_NEXT, act_find_next.clone()),
+            (M_EDIT_SF, act_edit_sf.clone()),
+            (M_FILTER_RULES, act_filter_rules.clone()),
+            (M_FEED_PROPS, act_feed_props.clone()),
+            (M_OPEN_ARTICLE, act_open_article.clone()),
+            (M_OPEN_MEDIA, act_open_media.clone()),
+            (M_PERSISTENT, act_persistent.clone()),
+            (M_ABOUT, act_about.clone()),
+            (M_ARTICLE_WINDOW, act_article_window.clone()),
+            (M_PODCAST_ARCHIVE, act_podcast_archive.clone()),
+            (M_QUEUE_TOGGLE, act_toggle_queue.clone()),
+            (M_QUEUE_OPEN, act_queue_open.clone()),
+            (M_QUEUE_NEXT, act_queue_next.clone()),
+            (M_QUEUE_PREV, act_queue_prev.clone()),
+            (M_FEED_SEARCH, act_feed_search.clone()),
             (M_COPY_URL, act_copy_url.clone()),
             (M_COPY_MEDIA, act_copy_media.clone()),
             (M_COPY_FEED_URL, act_copy_feed_url.clone()),
@@ -3072,6 +3610,8 @@ fn main() {
                 .append_item(M_EXPORT_CAT, "&Export Category OPML...", "")
                 .append_separator()
                 .append_item(M_EDIT_FEED, "&Edit Feed...", "")
+                .append_item(M_FEED_PROPS, "Feed &Properties...", "")
+                .append_item(M_EDIT_SF, "Edit Smart &Folder...", "")
                 .append_item(M_REMOVE_FEED, "Re&move Feed", "")
                 .append_item(M_RENAME_CAT, "Rename &Category...", "")
                 .append_item(M_SET_CAT, "Set Feed Categor&y...", "")
@@ -3138,6 +3678,10 @@ fn main() {
             let h_errors = act_feed_errors.clone();
             let h_toggle_read = act_toggle_read.clone();
             let h_fav = act_fav.clone();
+            let h_toggle_queue = act_toggle_queue.clone();
+            let h_queue_open = act_queue_open.clone();
+            let h_queue_next = act_queue_next.clone();
+            let h_queue_prev = act_queue_prev.clone();
             let h_play = act_play.clone();
             let h_f_all = act_filter_all.clone();
             let h_f_unread = act_filter_unread.clone();
@@ -3234,6 +3778,22 @@ fn main() {
                     }
                     Some("article.toggle_favorite") => {
                         h_fav();
+                        true
+                    }
+                    Some("article.toggle_queue") => {
+                        h_toggle_queue();
+                        true
+                    }
+                    Some("queue.open") => {
+                        h_queue_open();
+                        true
+                    }
+                    Some("queue.next") => {
+                        h_queue_next();
+                        true
+                    }
+                    Some("queue.prev") => {
+                        h_queue_prev();
                         true
                     }
                     Some("player.play_pause") => {
@@ -3408,8 +3968,17 @@ fn main() {
                         }
                     }
                     Ok(RefreshMsg::MediaReady(id, result)) => {
-                        let st = state_tick.borrow();
-                        let article = st.articles.iter().find(|a| a.id == id).cloned();
+                        let mut st = state_tick.borrow_mut();
+                        let article = st
+                            .pending_play
+                            .as_ref()
+                            .filter(|a| a.id == id)
+                            .cloned()
+                            .or_else(|| st.articles.iter().find(|a| a.id == id).cloned());
+                        let queue_ctx = st.pending_queue.take();
+                        if article.is_some() {
+                            st.pending_play = None;
+                        }
                         match (article, result) {
                             (Some(article), Ok((stream, info))) => {
                                 let mut chapters = st
@@ -3426,7 +3995,18 @@ fn main() {
                                     chapters = info.chapters;
                                 }
                                 drop(st);
-                                player::open_player(&frame_tick, article, stream, chapters);
+                                match queue_ctx {
+                                    Some((entries, index)) => player::open_player_queue(
+                                        &frame_tick,
+                                        article,
+                                        stream,
+                                        entries,
+                                        index,
+                                    ),
+                                    None => {
+                                        player::open_player(&frame_tick, article, stream, chapters)
+                                    }
+                                }
                             }
                             (_, Err(e)) => frame_tick.set_status_text(&format!("Play: {e}"), 0),
                             _ => {}
@@ -3473,6 +4053,13 @@ fn main() {
                     Ok(RefreshMsg::CastDone(result)) => match result {
                         Ok(msg) => frame_tick.set_status_text(&msg, 0),
                         Err(e) => frame_tick.set_status_text(&format!("Cast: {e}"), 0),
+                    },
+                    Ok(RefreshMsg::OpenedArticle(result)) => match result {
+                        Ok((title, text)) => {
+                            dialogs::show_article_window(&title, &text);
+                            frame_tick.set_status_text("Article opened in its own window", 0);
+                        }
+                        Err(e) => frame_tick.set_status_text(&format!("Open article: {e}"), 0),
                     },
                     Ok(RefreshMsg::UpdateChecked(result)) => match result {
                         Ok((tag, _)) => {

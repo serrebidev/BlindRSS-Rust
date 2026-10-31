@@ -254,17 +254,27 @@ Show Chapters + Previous/Next Chapter (main window), in-player
 Cast to Device..., Open Chapter Link, Cut/Copy/Paste/Select All.
 
 ### 5D. Dialogs: 31 Python classes vs Rust
-No Rust equivalent yet: AboutDialog, AccessibleBrowserFrame,
-AddShortcutsDialog, CategoryPropertiesDialog, FeedPropertiesDialog,
-FeedSearchDialog (discovery UI), FilterRulesDialog +
-FilterRuleEditorDialog, OpenArticleDialog (open-by-URL,
-core/open_article.py), OpenMediaUrlDialog (core/media_url.py),
-PersistentSearchDialog, PodcastArchiveDialog, QueueDialog,
-SmartFolderDialog (Rust has a name prompt only),
-TakeoutImportSelectionDialog (Rust imports the whole ZIP),
-YtdlpGlobalSearchDialog (18 handlers), ExcludeNotificationFeedsDialog,
-ShortcutCaptureDialog, ArticleWindow (separate reading window with
-HTML View menu; Rust reads in the main window only).
+Landed v0.1.15 (app/dialogs.rs unless noted): AboutDialog,
+FeedPropertiesDialog (title/URL/category + title reset by
+re-fetch), FeedSearchDialog (discovery UI with worker fetch),
+FilterRulesDialog + FilterRuleEditorDialog (list, reorder,
+apply-to-existing), OpenArticleDialog (open-by-URL, worker
+fetch + extract into the ArticleWindow), OpenMediaUrlDialog,
+PersistentSearchDialog (saved searches, run into the article
+list), PodcastArchiveDialog (media-feed picker feeding the
+rescan worker), QueueDialog (config play_queue; the player
+advances on media-finished, index mirrored in config),
+SmartFolderDialog (full condition editor: name, All/Any,
+field/operator/value rows incl. Python's boolean rows),
+TakeoutImportSelectionDialog (check list, all checked by
+default), ShortcutCaptureDialog (app/keys.rs, CHAR_HOOK
+capture in the dispatcher's normalized format), ArticleWindow
+(plain-text window; Python's HTML View menu waits on the
+WebView decision in §7.3).
+No Rust equivalent yet: AccessibleBrowserFrame (§7.3),
+AddShortcutsDialog, CategoryPropertiesDialog (rename-by-prompt
+exists since batch 1), YtdlpGlobalSearchDialog (18 handlers),
+ExcludeNotificationFeedsDialog (batch 5, with notifications).
 
 ### 5E. Module-level gaps not itemised in §2
 - article_columns.py — configurable article-list columns: **missing**.

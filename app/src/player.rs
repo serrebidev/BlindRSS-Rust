@@ -42,6 +42,31 @@ struct PlayerState {
     /// True while the tick sets the seek slider programmatically,
     /// so the slider's change event doesn't seek in a loop.
     slider_guard: bool,
+    /// Play-queue context when this player was opened from the
+    /// queue: media-finished advances through the entries.
+    queue: Option<QueueCtx>,
+}
+
+/// The play queue inside a player window (config "play_queue"
+/// entries as article stubs). The main window mirrors the
+/// current index in config "play_queue_index" for its own
+/// Next/Previous commands.
+struct QueueCtx {
+    entries: Vec<Article>,
+    index: usize,
+    rx: std::sync::mpsc::Receiver<(usize, Result<String, String>)>,
+    tx: std::sync::mpsc::Sender<(usize, Result<String, String>)>,
+    /// A resolve for the next entry is in flight.
+    loading: bool,
+}
+
+/// Mirror the queue position for the main window (its
+/// queue.next / queue.prev commands start from it).
+fn set_queue_index(index: i64) {
+    let path = crate::config_path();
+    let mut cfg = blindrss_core::config::Config::load(&path).unwrap_or_default();
+    cfg.set_path("play_queue_index", serde_json::json!(index));
+    let _ = cfg.save(&path);
 }
 
 fn fmt_ms(ms: i64) -> String {
@@ -99,7 +124,108 @@ fn chapter_label(chapters: &[Chapter], idx: usize) -> String {
         .unwrap_or_else(|| format!("Chapter {}", idx + 1))
 }
 
+/// Spawn the SponsorBlock and silence workers for one article
+/// and return the channel their skip ranges arrive on. Called
+/// at open and again on every queue advance.
+fn spawn_skip_workers(
+    cfg: &blindrss_core::config::Config,
+    article: &Article,
+    stream_url: &str,
+) -> std::sync::mpsc::Receiver<Vec<SkipRange>> {
+    let (skip_tx, skip_rx) = std::sync::mpsc::channel::<Vec<SkipRange>>();
+    if cfg.get_bool("sponsorblock_enabled", true) {
+        let cats: Vec<String> = cfg
+            .raw()
+            .get("sponsorblock_categories")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_else(|| {
+                ["sponsor", "selfpromo", "interaction"]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect()
+            });
+        let vid = blindrss_core::sponsorblock::youtube_video_id(&article.url).or_else(|| {
+            article
+                .media_url
+                .as_deref()
+                .and_then(blindrss_core::sponsorblock::youtube_video_id)
+        });
+        if let Some(vid) = vid {
+            let tx = skip_tx.clone();
+            std::thread::spawn(move || {
+                if let Ok(segs) = blindrss_core::sponsorblock::fetch_segments(&vid, &cats) {
+                    let ranges = segs
+                        .iter()
+                        .map(|s| SkipRange {
+                            start_ms: (s.start * 1000.0) as i64,
+                            end_ms: (s.end * 1000.0) as i64,
+                            label: format!("Skipped {}", s.category),
+                        })
+                        .collect();
+                    let _ = tx.send(ranges);
+                }
+            });
+        }
+    }
+    if cfg.get_bool("skip_silence", true) && blindrss_core::silence::find_ffmpeg().is_some() {
+        let threshold = cfg_f64(cfg, "silence_skip_threshold_db", -38.0);
+        let min_silence = cfg.get_i64("silence_skip_min_ms", 700) as f64 / 1000.0;
+        let url = stream_url.to_string();
+        let tx = skip_tx.clone();
+        std::thread::spawn(move || {
+            if let Ok(ranges) = blindrss_core::silence::detect_silence(&url, threshold, min_silence)
+            {
+                let ranges = ranges
+                    .iter()
+                    .map(|(s, e)| SkipRange {
+                        start_ms: (s * 1000.0) as i64,
+                        end_ms: (e * 1000.0) as i64,
+                        label: "Skipped silence".to_string(),
+                    })
+                    .collect();
+                let _ = tx.send(ranges);
+            }
+        });
+    }
+
+    skip_rx
+}
+
 pub fn open_player(_parent: &Frame, article: Article, stream_url: String, chapters: Vec<Chapter>) {
+    open_player_impl(_parent, article, stream_url, chapters, None);
+}
+
+/// Open the player on one queue entry, advancing through the
+/// rest of the queue as each entry finishes.
+pub fn open_player_queue(
+    _parent: &Frame,
+    article: Article,
+    stream_url: String,
+    entries: Vec<Article>,
+    index: usize,
+) {
+    set_queue_index(index as i64);
+    open_player_impl(
+        _parent,
+        article,
+        stream_url,
+        Vec::new(),
+        Some((entries, index)),
+    );
+}
+
+fn open_player_impl(
+    _parent: &Frame,
+    article: Article,
+    stream_url: String,
+    chapters: Vec<Chapter>,
+    queue: Option<(Vec<Article>, usize)>,
+) {
     let db_path = crate::db_path();
     let cfg = blindrss_core::config::Config::load(&crate::config_path()).unwrap_or_default();
     let saved = Db::open(&db_path)
@@ -123,6 +249,10 @@ pub fn open_player(_parent: &Frame, article: Article, stream_url: String, chapte
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     let starts: Vec<i64> = chapters.iter().map(|c| (c.start * 1000.0) as i64).collect();
+    // Shared with every handler so a queue switch (which clears
+    // the chapters, like Python's load_media([])) is seen by the
+    // navigation buttons and the tick alike.
+    let chapters_live = Rc::new(RefCell::new((chapters.clone(), starts.clone())));
 
     let frame = Frame::builder()
         .with_title(&format!("Playing: {}", article.title))
@@ -182,66 +312,7 @@ pub fn open_player(_parent: &Frame, article: Article, stream_url: String, chapte
     // Skip-range workers: SponsorBlock (YouTube) and ffmpeg
     // silence detection report ranges over one channel; the tick
     // drains and applies them.
-    let (skip_tx, skip_rx) = std::sync::mpsc::channel::<Vec<SkipRange>>();
-    if cfg.get_bool("sponsorblock_enabled", true) {
-        let cats: Vec<String> = cfg
-            .raw()
-            .get("sponsorblock_categories")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_else(|| {
-                ["sponsor", "selfpromo", "interaction"]
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect()
-            });
-        let vid = blindrss_core::sponsorblock::youtube_video_id(&article.url).or_else(|| {
-            article
-                .media_url
-                .as_deref()
-                .and_then(blindrss_core::sponsorblock::youtube_video_id)
-        });
-        if let Some(vid) = vid {
-            let tx = skip_tx.clone();
-            std::thread::spawn(move || {
-                if let Ok(segs) = blindrss_core::sponsorblock::fetch_segments(&vid, &cats) {
-                    let ranges = segs
-                        .iter()
-                        .map(|s| SkipRange {
-                            start_ms: (s.start * 1000.0) as i64,
-                            end_ms: (s.end * 1000.0) as i64,
-                            label: format!("Skipped {}", s.category),
-                        })
-                        .collect();
-                    let _ = tx.send(ranges);
-                }
-            });
-        }
-    }
-    if cfg.get_bool("skip_silence", true) && blindrss_core::silence::find_ffmpeg().is_some() {
-        let threshold = cfg_f64(&cfg, "silence_skip_threshold_db", -38.0);
-        let min_silence = cfg.get_i64("silence_skip_min_ms", 700) as f64 / 1000.0;
-        let url = stream_url.clone();
-        let tx = skip_tx.clone();
-        std::thread::spawn(move || {
-            if let Ok(ranges) = blindrss_core::silence::detect_silence(&url, threshold, min_silence)
-            {
-                let ranges = ranges
-                    .iter()
-                    .map(|(s, e)| SkipRange {
-                        start_ms: (s * 1000.0) as i64,
-                        end_ms: (e * 1000.0) as i64,
-                        label: "Skipped silence".to_string(),
-                    })
-                    .collect();
-                let _ = tx.send(ranges);
-            }
-        });
-    }
+    let skip_rx = spawn_skip_workers(&cfg, &article, &stream_url);
 
     let state = Rc::new(RefCell::new(PlayerState {
         article_id: article.id.clone(),
@@ -254,6 +325,16 @@ pub fn open_player(_parent: &Frame, article: Article, stream_url: String, chapte
         skipped: HashSet::new(),
         last_chapter: None,
         slider_guard: false,
+        queue: queue.map(|(entries, index)| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            QueueCtx {
+                entries,
+                index,
+                rx,
+                tx,
+                loading: false,
+            }
+        }),
     }));
 
     let loaded = media.load_uri(&stream_url);
@@ -265,6 +346,38 @@ pub fn open_player(_parent: &Frame, article: Article, stream_url: String, chapte
         frame.set_status_text("Playing", 0);
     } else {
         frame.set_status_text("Could not load media", 0);
+    }
+
+    // Queue advance: media finished -> resolve the next queue
+    // entry on a worker; the tick performs the switch.
+    {
+        let st = state.clone();
+        media.on_finished(move |_| {
+            let mut s = st.borrow_mut();
+            let Some(q) = s.queue.as_mut() else { return };
+            if q.index + 1 >= q.entries.len() {
+                set_queue_index(-1);
+                return;
+            }
+            if q.loading {
+                return;
+            }
+            q.loading = true;
+            let next = q.index + 1;
+            let entry = q.entries[next].clone();
+            let tx = q.tx.clone();
+            drop(s);
+            std::thread::spawn(move || {
+                let result = blindrss_core::media::resolve_for_play(
+                    entry.media_url.as_deref(),
+                    entry.media_type.as_deref(),
+                    &entry.url,
+                    entry.content.as_deref(),
+                )
+                .map(|r| r.url);
+                let _ = tx.send((next, result));
+            });
+        });
     }
 
     let m = media;
@@ -323,9 +436,9 @@ pub fn open_player(_parent: &Frame, article: Article, stream_url: String, chapte
     {
         let m = media;
         let frame_ch = frame;
-        let chapters_nav = chapters.clone();
-        let starts_nav = starts.clone();
+        let chapters_live_c = chapters_live.clone();
         prev_ch_btn.on_click(move |_| {
+            let (chapters_nav, starts_nav) = chapters_live_c.borrow().clone();
             let pos = m.tell();
             let Some(idx) = chapter_index(&starts_nav, pos) else {
                 frame_ch.set_status_text("No chapters", 0);
@@ -349,9 +462,9 @@ pub fn open_player(_parent: &Frame, article: Article, stream_url: String, chapte
     {
         let m = media;
         let frame_ch = frame;
-        let chapters_nav = chapters.clone();
-        let starts_nav = starts.clone();
+        let chapters_live_c = chapters_live.clone();
         next_ch_btn.on_click(move |_| {
+            let (chapters_nav, starts_nav) = chapters_live_c.borrow().clone();
             let pos = m.tell();
             let next = chapter_index(&starts_nav, pos).map(|i| i + 1).unwrap_or(0);
             if next >= starts_nav.len() {
@@ -366,9 +479,9 @@ pub fn open_player(_parent: &Frame, article: Article, stream_url: String, chapte
         });
     }
     let m = media;
-    let chapters_dl = chapters.clone();
-    let starts_dl = starts.clone();
+    let chapters_live_dl = chapters_live.clone();
     chapter_list.on_item_double_clicked(move |_| {
+        let (chapters_dl, starts_dl) = chapters_live_dl.borrow().clone();
         if let Some(sel) = chapter_list.get_selection()
             && let Some(ms) = starts_dl.get(sel as usize)
         {
@@ -405,14 +518,58 @@ pub fn open_player(_parent: &Frame, article: Article, stream_url: String, chapte
     let m = media;
     let st = state.clone();
     let frame_tick = frame;
-    let starts_tick = starts.clone();
-    let chapters_tick = chapters.clone();
+    let chapters_tick = chapters_live.clone();
     timer.on_tick(move |_| {
         let len = m.length();
         let pos = m.tell();
         let mut seek_to: Option<(i64, String)> = None;
+        let mut queue_load: Option<(String, String)> = None;
+        let mut queue_error: Option<String> = None;
         {
             let mut s = st.borrow_mut();
+            // Queue advance: a resolved next entry switches the
+            // loaded media (frame title + chapters follow). The
+            // queue is taken out of the state while processed so
+            // the rest of the state stays mutable.
+            if let Some(mut q) = s.queue.take() {
+                let mut msgs = Vec::new();
+                while let Ok(msg) = q.rx.try_recv() {
+                    msgs.push(msg);
+                }
+                for (idx, res) in msgs {
+                    if idx != q.index + 1 || !q.loading {
+                        continue;
+                    }
+                    q.loading = false;
+                    match res {
+                        Ok(stream) => {
+                            q.index = idx;
+                            let entry = q.entries[idx].clone();
+                            s.article_id = entry.id.clone();
+                            s.title = entry.title.clone();
+                            s.skips.clear();
+                            s.skipped.clear();
+                            s.last_chapter = None;
+                            let cfg2 = blindrss_core::config::Config::load(&crate::config_path())
+                                .unwrap_or_default();
+                            s.skip_rx = spawn_skip_workers(&cfg2, &entry, &stream);
+                            s.saved_position_ms = Db::open(&s.db_path)
+                                .ok()
+                                .and_then(|db| db.playback_state(&entry.id).ok().flatten())
+                                .filter(|saved| !saved.completed)
+                                .map(|saved| saved.position_ms)
+                                .unwrap_or(0);
+                            s.seeked = s.saved_position_ms <= 0;
+                            *chapters_tick.borrow_mut() = (Vec::new(), Vec::new());
+                            chapter_list.clear();
+                            set_queue_index(idx as i64);
+                            queue_load = Some((stream, entry.title.clone()));
+                        }
+                        Err(e) => queue_error = Some(e),
+                    }
+                }
+                s.queue = Some(q);
+            }
             while let Ok(ranges) = s.skip_rx.try_recv() {
                 s.skips.extend(ranges);
             }
@@ -432,12 +589,13 @@ pub fn open_player(_parent: &Frame, article: Article, stream_url: String, chapte
                 seek_to = Some((end, label));
             }
             // Chapter crossing announcements while playing.
+            let (chapters_now, starts_now) = chapters_tick.borrow().clone();
             if m.get_state() == MediaState::Playing
-                && let Some(cur) = chapter_index(&starts_tick, pos)
+                && let Some(cur) = chapter_index(&starts_now, pos)
                 && s.last_chapter != Some(cur)
             {
                 if s.last_chapter.is_some() {
-                    crate::announce("media_navigation", &chapter_label(&chapters_tick, cur));
+                    crate::announce("media_navigation", &chapter_label(&chapters_now, cur));
                 }
                 s.last_chapter = Some(cur);
             }
@@ -446,6 +604,17 @@ pub fn open_player(_parent: &Frame, article: Article, stream_url: String, chapte
             m.seek(end, SeekMode::FromStart);
             frame_tick.set_status_text(&label, 0);
             crate::announce("sponsor_skip", &label);
+        }
+        if let Some((stream, title)) = queue_load
+            && m.load_uri(&stream)
+        {
+            m.play();
+            frame_tick.set_title(&format!("Playing: {title}"));
+            frame_tick.set_status_text(&format!("Queue: {title}"), 0);
+            crate::announce("general", &format!("Now playing: {title}"));
+        }
+        if let Some(e) = queue_error {
+            frame_tick.set_status_text(&format!("Queue: {e}"), 0);
         }
         pos_label.set_label(&format!("{} / {}", fmt_ms(m.tell()), fmt_ms(len)));
         if len > 0 {
