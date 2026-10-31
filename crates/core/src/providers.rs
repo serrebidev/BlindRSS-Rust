@@ -320,6 +320,60 @@ impl GReaderClient {
         Ok(())
     }
 
+    /// Set one item's starred state on the server (the GReader
+    /// starred state is the hosted favorite).
+    pub fn set_starred_remote(&self, item_id: &str, starred: bool) -> Result<(), String> {
+        let mut token_resp = crate::http::agent()
+            .get(&format!("{}/token", self.api_base))
+            .header("Authorization", &self.auth_header()?)
+            .call()
+            .map_err(|e| format!("token fetch failed: {e}"))?;
+        let edit_token = token_resp
+            .body_mut()
+            .read_to_string()
+            .map_err(|e| format!("token read failed: {e}"))?;
+        let (verb, state) = if starred {
+            ("a", "user/-/state/com.google/starred")
+        } else {
+            ("r", "user/-/state/com.google/starred")
+        };
+        crate::http::agent()
+            .post(&format!("{}/edit-tag", self.api_base))
+            .header("Authorization", &self.auth_header()?)
+            .send_form([("i", item_id), (verb, state), ("T", edit_token.trim())])
+            .map_err(|e| format!("edit-tag failed: {e}"))?;
+        Ok(())
+    }
+
+    /// Subscribe to a feed URL on the server
+    /// (POST /subscription/edit, ac=subscribe).
+    pub fn subscribe_remote(&self, feed_url: &str) -> Result<(), String> {
+        self.subscription_edit(&format!("feed/{feed_url}"), "subscribe")
+    }
+
+    /// Unsubscribe a stream ("feed/<url>" or a stream id).
+    pub fn unsubscribe_remote(&self, stream_id: &str) -> Result<(), String> {
+        self.subscription_edit(stream_id, "unsubscribe")
+    }
+
+    fn subscription_edit(&self, stream: &str, action: &str) -> Result<(), String> {
+        let mut token_resp = crate::http::agent()
+            .get(&format!("{}/token", self.api_base))
+            .header("Authorization", &self.auth_header()?)
+            .call()
+            .map_err(|e| format!("token fetch failed: {e}"))?;
+        let edit_token = token_resp
+            .body_mut()
+            .read_to_string()
+            .map_err(|e| format!("token read failed: {e}"))?;
+        crate::http::agent()
+            .post(&format!("{}/subscription/edit", self.api_base))
+            .header("Authorization", &self.auth_header()?)
+            .send_form([("s", stream), ("ac", action), ("T", edit_token.trim())])
+            .map_err(|e| format!("subscription edit failed: {e}"))?;
+        Ok(())
+    }
+
     /// Full sync: import subscriptions as local feeds, then store the
     /// reading-list stream's articles. Returns (feeds, new articles).
     pub fn sync(&self, db: &Db, per_feed_items: usize) -> Result<(usize, usize), String> {
@@ -472,11 +526,54 @@ impl MinifluxClient {
 
     pub fn set_status_remote(&self, entry_ids: &[i64], status: &str) -> Result<(), String> {
         let body = serde_json::json!({"entry_ids": entry_ids, "status": status});
-        ureq::put(&format!("{}/v1/entries", self.base_url))
+        crate::http::agent()
+            .put(&format!("{}/v1/entries", self.base_url))
             .header("X-Auth-Token", &self.api_key)
             .header("Content-Type", "application/json")
             .send(body.to_string())
             .map_err(|e| format!("mark read failed: {e}"))?;
+        Ok(())
+    }
+
+    /// Create a feed on the server (POST /v1/feeds); returns
+    /// the new feed's id.
+    pub fn create_feed_remote(&self, feed_url: &str) -> Result<i64, String> {
+        let body = serde_json::json!({"feed_url": feed_url});
+        let mut resp = crate::http::agent()
+            .post(&format!("{}/v1/feeds", self.base_url))
+            .header("X-Auth-Token", &self.api_key)
+            .header("Content-Type", "application/json")
+            .send(body.to_string())
+            .map_err(|e| format!("create feed failed: {e}"))?;
+        let text = resp
+            .body_mut()
+            .read_to_string()
+            .map_err(|e| format!("read failed: {e}"))?;
+        let value: serde_json::Value =
+            serde_json::from_str(&text).map_err(|e| format!("bad JSON: {e}"))?;
+        value
+            .get("feed_id")
+            .and_then(|v| v.as_i64())
+            .ok_or_else(|| "no feed_id in create response".to_string())
+    }
+
+    /// Delete a feed on the server (DELETE /v1/feeds/{id}).
+    pub fn delete_feed_remote(&self, feed_id: i64) -> Result<(), String> {
+        crate::http::agent()
+            .delete(&format!("{}/v1/feeds/{feed_id}", self.base_url))
+            .header("X-Auth-Token", &self.api_key)
+            .call()
+            .map_err(|e| format!("delete feed failed: {e}"))?;
+        Ok(())
+    }
+
+    /// Toggle an entry's bookmark (Miniflux's favorite).
+    pub fn toggle_bookmark_remote(&self, entry_id: i64) -> Result<(), String> {
+        crate::http::agent()
+            .put(&format!("{}/v1/entries/{entry_id}/bookmark", self.base_url))
+            .header("X-Auth-Token", &self.api_key)
+            .send_empty()
+            .map_err(|e| format!("bookmark failed: {e}"))?;
         Ok(())
     }
 

@@ -24,6 +24,7 @@ pub mod maintenance;
 pub mod media;
 pub mod oauth;
 pub mod opml;
+pub mod provider;
 pub mod providers;
 pub mod refresh;
 pub mod retention;

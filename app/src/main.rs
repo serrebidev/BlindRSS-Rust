@@ -676,6 +676,9 @@ enum RefreshMsg {
     OpenedArticle(Result<(String, String), String>),
     /// A downloaded + verified update awaiting a restart.
     UpdateStaged(Result<String, String>),
+    /// A finished active-provider action (hosted refresh,
+    /// subscribe, unsubscribe): a human summary or an error.
+    ProviderAction(Result<String, String>),
 }
 
 const ID_OK: i32 = 5100;
@@ -1583,6 +1586,31 @@ fn main() {
         let frame_btn = frame;
         let tx_refresh = tx.clone();
         let act_refresh: Rc<dyn Fn()> = Rc::new(move || {
+            // Active-provider routing (PARITY 5A): when a hosted
+            // provider is the backend, Refresh syncs that
+            // provider instead of fetching local feeds.
+            {
+                let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+                if blindrss_core::provider::active_name(&cfg) != "local" {
+                    {
+                        let mut st = state_btn.borrow_mut();
+                        if st.refreshing {
+                            return;
+                        }
+                        st.refreshing = true;
+                    }
+                    frame_btn.set_status_text("Syncing provider...", 0);
+                    announce("start_update", "Refresh Feeds");
+                    let tx = tx_refresh.clone();
+                    std::thread::spawn(move || {
+                        let cfg =
+                            blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+                        let provider = blindrss_core::provider::get_provider(&cfg, db_path());
+                        let _ = tx.send(RefreshMsg::ProviderAction(provider.refresh()));
+                    });
+                    return;
+                }
+            }
             let (feeds, cancel, stopped) = {
                 let mut st = state_btn.borrow_mut();
                 if st.refreshing {
@@ -1736,6 +1764,21 @@ fn main() {
             }
             if let Some(slot) = st.articles.get_mut(idx) {
                 slot.is_favorite = new_value;
+            }
+            // Hosted backend: favorites are the server's
+            // starred/bookmarked state — push through the
+            // active provider (cache write is idempotent).
+            {
+                let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+                if blindrss_core::provider::active_name(&cfg) != "local" {
+                    let a2 = a.clone();
+                    std::thread::spawn(move || {
+                        let cfg =
+                            blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+                        let provider = blindrss_core::provider::get_provider(&cfg, db_path());
+                        let _ = provider.set_favorite(&a2, new_value);
+                    });
+                }
             }
             frame_fav.set_status_text(
                 &format!(
@@ -3179,6 +3222,20 @@ fn main() {
             }
             frame_add.set_status_text(&format!("Adding {url}..."), 0);
             let tx = tx_add.clone();
+            {
+                let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+                if blindrss_core::provider::active_name(&cfg) != "local" {
+                    // Hosted backend: subscribe on the server,
+                    // then pull it into the cache.
+                    std::thread::spawn(move || {
+                        let cfg =
+                            blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+                        let provider = blindrss_core::provider::get_provider(&cfg, db_path());
+                        let _ = tx.send(RefreshMsg::ProviderAction(provider.add_feed(&url)));
+                    });
+                    return;
+                }
+            }
             std::thread::spawn(move || {
                 // Discovery chain: social transforms, direct feed,
                 // then HTML alternate links.
@@ -3195,6 +3252,7 @@ fn main() {
         // confirmation (it also deletes that feed's stored articles).
         let state_rm = state.clone();
         let frame_rm = frame;
+        let tx_rm = tx.clone();
         let act_remove: Rc<dyn Fn()> = Rc::new(move || {
             let feed = {
                 let st = state_rm.borrow();
@@ -3216,6 +3274,24 @@ fn main() {
             restore_focus(&state_rm.borrow(), &tree, &list);
             if rc != ID_YES {
                 return;
+            }
+            {
+                let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+                if blindrss_core::provider::active_name(&cfg) != "local" {
+                    let tx = tx_rm.clone();
+                    let feed2 = feed.clone();
+                    std::thread::spawn(move || {
+                        let cfg =
+                            blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+                        let provider = blindrss_core::provider::get_provider(&cfg, db_path());
+                        let _ = tx.send(RefreshMsg::ProviderAction(
+                            provider
+                                .remove_feed(&feed2)
+                                .map(|_| format!("Removed {}", feed2.title)),
+                        ));
+                    });
+                    return;
+                }
             }
             let mut st = state_rm.borrow_mut();
             if let Some(db) = st.db.as_ref() {
@@ -4438,6 +4514,27 @@ fn main() {
                     }
                     Ok(RefreshMsg::Added(url, Err(e))) => {
                         frame_tick.set_status_text(&format!("Could not add {url}: {e}"), 0);
+                    }
+                    Ok(RefreshMsg::ProviderAction(result)) => {
+                        let mut st = state_tick.borrow_mut();
+                        st.refreshing = false;
+                        st.last_refresh_end = Some(std::time::Instant::now());
+                        st.feeds = st
+                            .db
+                            .as_ref()
+                            .and_then(|db| db.feeds().ok())
+                            .unwrap_or_default();
+                        rebuild_tree(&mut st, &tree);
+                        refill_articles(&mut st, &list);
+                        match result {
+                            Ok(msg) => {
+                                frame_tick.set_status_text(&msg, 0);
+                                announce("general", &msg);
+                                drop(st);
+                                refresh_side_effects(&tray, &[], false);
+                            }
+                            Err(e) => frame_tick.set_status_text(&format!("Provider: {e}"), 0),
+                        }
                     }
                     Ok(RefreshMsg::ProviderDone(name, result)) => {
                         let mut st = state_tick.borrow_mut();

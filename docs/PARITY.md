@@ -181,10 +181,29 @@ module, 42 app UI labels, 13 config paths. Findings beyond §1–§4:
 Python runs against ONE active provider (`active_provider` config +
 `core/factory.py::get_provider`): Local, Miniflux, Inoreader,
 BazQux or The Old Reader can each be the live backend the whole UI
-reads/writes through the 54-method interface. Rust today is
-local-DB-only with a manual Sync Providers button. Porting the
-switchable-backend model is a design slice of its own; until then
-every "partial" provider row above understates the gap.
+reads/writes through the 54-method interface.
+
+**Landed v0.1.17** (core/provider.rs): the factory
+(`get_provider`, same fallback-to-Local semantics), the
+app-facing Provider trait (feeds / articles / mark_read /
+set_favorite / add_feed / remove_feed / refresh), LocalProvider
+over the database, and HostedProvider for the four hosted
+backends. Hosted providers are cache-backed: sync pulls remote
+content into the local database, reads serve from the cache,
+and writes go to the cache AND the server — read state
+(edit-tag / entry status), favorites (GReader starred state,
+Miniflux bookmark toggle), subscriptions (GReader
+subscription/edit, Miniflux POST/DELETE /v1/feeds). The app
+routes through the active provider for Refresh (hosted =
+sync that provider only), Add Feed (hosted = remote
+subscribe + pull), Remove Feed (hosted = remote unsubscribe +
+cache removal), and favorite toggles; read-state pushes keep
+the earlier per-service propagation. Settings gained the
+Active Provider choice. Remaining depth (batch 8): the rest
+of the 54-method surface as live remote calls (remote
+categories, OPML via API, server-side fetch-content), the
+youtube_account wrapper Python's factory always applies, and
+per-provider article caches with TTLs.
 
 ### 5B. Settings surface: 189 default keys + dynamic keys
 Rust's settings dialog covers provider credentials + download

@@ -126,6 +126,21 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
     let dialog = Dialog::builder(frame, "BlindRSS Settings").build();
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
 
+    // Active provider (Python's Provider page + factory.py):
+    // the backend the whole UI reads/writes through.
+    add_heading(&dialog, &sizer, "Provider");
+    let active_sel = blindrss_core::provider::PROVIDER_NAMES
+        .iter()
+        .position(|n| *n == cfg.get_str("active_provider", "local"))
+        .unwrap_or(0);
+    let active_choice = add_choice(
+        &dialog,
+        &sizer,
+        "Active provider",
+        &blindrss_core::provider::PROVIDER_LABELS,
+        active_sel,
+    );
+
     let tor_email = add_field(
         &dialog,
         &sizer,
@@ -697,6 +712,11 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
         let path_s = cfg_path_buf.clone();
         std::rc::Rc::new(move || {
             let mut cfg = cfg_s.borrow_mut();
+            if let Some(sel) = active_choice.get_selection()
+                && let Some(name) = blindrss_core::provider::PROVIDER_NAMES.get(sel as usize)
+            {
+                cfg.set_path("active_provider", serde_json::json!(name));
+            }
             cfg.set_path(
                 "providers.theoldreader.email",
                 serde_json::json!(tor_email.get_value()),
