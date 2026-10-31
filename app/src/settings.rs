@@ -116,6 +116,157 @@ fn open_url(url: &str) {
     let _ = std::process::Command::new("xdg-open").arg(url).spawn();
 }
 
+/// Inoreader sign-in through the local HTTPS listener
+/// (Python's local-server OAuth variant): a self-signed
+/// server on 127.0.0.1:18423 waits for the browser redirect
+/// (the browser warns about the self-signed certificate —
+/// the redirect target registered with Inoreader is this
+/// https URL). The code is exchanged and the tokens saved,
+/// exactly like the paste-the-URL flow.
+fn inoreader_listener_connect(frame: &Dialog, config_path: &Path, app_id: String, app_key: String) {
+    use std::io::{Read, Write};
+    let state = format!("blindrss{}", std::process::id());
+    let url = blindrss_core::oauth::authorization_url(
+        &app_id,
+        blindrss_core::oauth::DEFAULT_REDIRECT,
+        &state,
+    );
+    let (tx, rx) = std::sync::mpsc::channel::<Result<String, String>>();
+    std::thread::spawn(move || {
+        let send = |r: Result<String, String>| {
+            let _ = tx.send(r);
+        };
+        let cert = match rcgen::generate_simple_self_signed(vec![
+            "127.0.0.1".to_string(),
+            "localhost".to_string(),
+        ]) {
+            Ok(c) => c,
+            Err(e) => return send(Err(format!("certificate: {e}"))),
+        };
+        let cert_der = rustls::pki_types::CertificateDer::from(cert.cert.der().to_vec());
+        let key_der = rustls::pki_types::PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into());
+        let server_cfg = match rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der], key_der)
+        {
+            Ok(c) => std::sync::Arc::new(c),
+            Err(e) => return send(Err(format!("tls config: {e}"))),
+        };
+        let listener = match std::net::TcpListener::bind("127.0.0.1:18423") {
+            Ok(l) => l,
+            Err(e) => return send(Err(format!("listener: {e}"))),
+        };
+        let _ = listener.set_nonblocking(true);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+        let mut result: Result<String, String> = Err("sign-in timed out".to_string());
+        while std::time::Instant::now() < deadline {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let _ = stream.set_nonblocking(false);
+                    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(15)));
+                    let mut conn = match rustls::ServerConnection::new(server_cfg.clone()) {
+                        Ok(c) => c,
+                        Err(e) => return send(Err(format!("tls: {e}"))),
+                    };
+                    let mut tls = rustls::Stream::new(&mut conn, &mut stream);
+                    let mut buf = [0u8; 8192];
+                    if let Ok(n) = tls.read(&mut buf) {
+                        let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                        let page = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<html><body><h1>BlindRSS</h1><p>Inoreader sign-in received. You can close this tab.</p></body></html>";
+                        let _ = tls.write_all(page.as_bytes());
+                        let _ = tls.flush();
+                        let (code, _) = blindrss_core::oauth::parse_oauth_redirect(&request);
+                        result = match code {
+                            Some(c) => Ok(c),
+                            None => Err("the redirect carried no code".to_string()),
+                        };
+                    }
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+                Err(e) => {
+                    result = Err(format!("accept: {e}"));
+                    break;
+                }
+            }
+        }
+        send(result);
+    });
+    open_url(&url);
+    // Drain on a dialog timer like the other async flows.
+    let dialog2 = Dialog::builder(frame, "Inoreader Sign-in").build();
+    let sizer2 = BoxSizer::builder(Orientation::Vertical).build();
+    let label = StaticText::builder(&dialog2)
+        .with_label("Waiting for the browser sign-in to complete...")
+        .build();
+    sizer2.add(&label, 0, SizerFlag::All, 8);
+    dialog2.set_sizer(sizer2, true);
+    dialog2.set_size(Size::new(440, 160));
+    let timer = Box::leak(Box::new(Timer::new(&dialog2)));
+    let path = config_path.to_path_buf();
+    let frame_wait = *frame;
+    timer.on_tick(move |_| {
+        if let Ok(result) = rx.try_recv() {
+            let d = dialog2;
+            match result.and_then(|code| {
+                blindrss_core::oauth::exchange_code(
+                    &app_id,
+                    &app_key,
+                    &code,
+                    blindrss_core::oauth::DEFAULT_REDIRECT,
+                )
+            }) {
+                Ok(tokens) => {
+                    let mut cfg2 = Config::load(&path).unwrap_or_default();
+                    if let Some(t) = tokens.get("access_token") {
+                        cfg2.set_path("providers.inoreader.token", t.clone());
+                    }
+                    if let Some(t) = tokens.get("refresh_token") {
+                        cfg2.set_path("providers.inoreader.refresh_token", t.clone());
+                    }
+                    if let Some(exp) = tokens.get("expires_in").and_then(|v| v.as_i64()) {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs() as i64)
+                            .unwrap_or(0);
+                        cfg2.set_path(
+                            "providers.inoreader.token_expires_at",
+                            serde_json::json!(now + exp),
+                        );
+                    }
+                    cfg2.set_path("providers.inoreader.app_id", serde_json::json!(app_id));
+                    cfg2.set_path("providers.inoreader.app_key", serde_json::json!(app_key));
+                    let _ = cfg2.save(&path);
+                    d.end_modal(5100);
+                    let md =
+                        MessageDialog::builder(&frame_wait, "Inoreader connected.", "Inoreader")
+                            .with_style(
+                                MessageDialogStyle::OK | MessageDialogStyle::IconInformation,
+                            )
+                            .build();
+                    md.show_modal();
+                }
+                Err(e) => {
+                    d.end_modal(5101);
+                    let md = MessageDialog::builder(
+                        &frame_wait,
+                        &format!("Inoreader sign-in failed: {e}"),
+                        "Inoreader",
+                    )
+                    .with_style(MessageDialogStyle::OK | MessageDialogStyle::IconWarning)
+                    .build();
+                    md.show_modal();
+                }
+            }
+        }
+    });
+    timer.start(200, false);
+    dialog2.show_modal();
+    dialog2.destroy();
+}
+
 /// Shows the settings dialog. Returns the name of a maintenance
 /// action the user chose inside the dialog ("backup", "restore",
 /// "takeout", "archive", "sync", "prune", "update"), or None. The
@@ -690,6 +841,21 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
     sizer.add_sizer(&maint_row1, 0, SizerFlag::All, 2);
     sizer.add_sizer(&maint_row2, 0, SizerFlag::All, 2);
 
+    let btn_row2 = BoxSizer::builder(Orientation::Horizontal).build();
+    let connect_listener_btn = Button::builder(&dialog)
+        .with_label("Connect Inoreader (browser sign-in)...")
+        .build();
+    let test_miniflux_btn = Button::builder(&dialog)
+        .with_label("Test Miniflux Connection")
+        .build();
+    let youtube_btn = Button::builder(&dialog)
+        .with_label("Connect YouTube Account...")
+        .build();
+    btn_row2.add(&connect_listener_btn, 0, SizerFlag::All, 4);
+    btn_row2.add(&test_miniflux_btn, 0, SizerFlag::All, 4);
+    btn_row2.add(&youtube_btn, 0, SizerFlag::All, 4);
+    sizer.add_sizer(&btn_row2, 0, SizerFlag::All, 2);
+
     let btn_row = BoxSizer::builder(Orientation::Horizontal).build();
     let connect_btn = Button::builder(&dialog)
         .with_label("Connect Inoreader...")
@@ -965,6 +1131,59 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
         let path_ex = config_path.to_path_buf();
         exclude_btn.on_click(move |_| {
             crate::dialogs::show_exclude_feeds(&frame_ex, &path_ex);
+        });
+    }
+    {
+        let frame_mf = dialog;
+        test_miniflux_btn.on_click(move |_| {
+            let (url, key) = (mini_url.get_value(), mini_key.get_value());
+            let result = if url.trim().is_empty() || key.trim().is_empty() {
+                Err("Enter the Miniflux URL and API key first".to_string())
+            } else {
+                blindrss_core::providers::MinifluxClient::new(url.trim(), key.trim())
+                    .test_connection()
+            };
+            let (msg, style) = match &result {
+                Ok(user) => (
+                    format!("Miniflux connected as {user}."),
+                    MessageDialogStyle::OK | MessageDialogStyle::IconInformation,
+                ),
+                Err(e) => (
+                    format!("Miniflux test failed: {e}"),
+                    MessageDialogStyle::OK | MessageDialogStyle::IconWarning,
+                ),
+            };
+            let md = MessageDialog::builder(&frame_mf, &msg, "Miniflux")
+                .with_style(style)
+                .build();
+            md.show_modal();
+        });
+    }
+    {
+        let frame_yt = dialog;
+        let path_yt = config_path.to_path_buf();
+        youtube_btn.on_click(move |_| {
+            crate::dialogs::show_youtube_signin(&frame_yt, &path_yt);
+        });
+    }
+    {
+        let frame_ls = dialog;
+        let path_ls = config_path.to_path_buf();
+        connect_listener_btn.on_click(move |_| {
+            let app_id = ino_id.get_value();
+            let app_key = ino_key.get_value();
+            if app_id.is_empty() || app_key.is_empty() {
+                let md = MessageDialog::builder(
+                    &frame_ls,
+                    "Enter the Inoreader app ID and app key first, then connect.",
+                    "Inoreader",
+                )
+                .with_style(MessageDialogStyle::OK | MessageDialogStyle::IconInformation)
+                .build();
+                md.show_modal();
+                return;
+            }
+            inoreader_listener_connect(&frame_ls, &path_ls, app_id, app_key);
         });
     }
     test_notif_btn.on_click(move |_| test_notify());

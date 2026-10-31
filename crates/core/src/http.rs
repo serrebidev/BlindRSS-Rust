@@ -14,6 +14,7 @@ use std::time::Duration;
 struct HttpState {
     agent: ureq::Agent,
     user_agent: String,
+    timeout_secs: u64,
 }
 
 static STATE: Mutex<Option<HttpState>> = Mutex::new(None);
@@ -26,6 +27,7 @@ fn build(user_agent: String, timeout_secs: u64) -> HttpState {
     HttpState {
         agent: ureq::Agent::new_with_config(config),
         user_agent,
+        timeout_secs,
     }
 }
 
@@ -56,4 +58,45 @@ pub fn agent() -> ureq::Agent {
 /// build their own requests (yt-dlp --user-agent, raw headers).
 pub fn user_agent() -> String {
     state().as_ref().unwrap().user_agent.clone()
+}
+
+/// The configured global timeout in seconds (for call sites
+/// that must build a sibling agent, e.g. status-aware calls).
+pub fn timeout_secs() -> u64 {
+    state().as_ref().unwrap().timeout_secs
+}
+
+/// An agent that does NOT turn HTTP error statuses into
+/// transport errors, for callers that need the status and
+/// headers themselves (rate-limit backoff reads Retry-After).
+pub fn status_agent() -> ureq::Agent {
+    let config = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(timeout_secs().max(1))))
+        .user_agent(user_agent())
+        .http_status_as_error(false)
+        .build();
+    ureq::Agent::new_with_config(config)
+}
+
+/// Run a request with one rate-limit retry: when the response
+/// is 429, wait Retry-After (capped at 30s) and try once more.
+/// The closure performs the request on the status agent and
+/// returns the response for inspection.
+pub fn with_rate_limit_backoff<T>(
+    mut attempt: impl FnMut() -> Result<(u16, Option<String>, T), String>,
+) -> Result<T, String> {
+    let (status, retry_after, value) = attempt()?;
+    if status != 429 {
+        return Ok(value);
+    }
+    let wait = retry_after
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(5)
+        .min(30);
+    std::thread::sleep(Duration::from_secs(wait));
+    let (status2, _, value2) = attempt()?;
+    if status2 == 429 {
+        return Err("rate limited by the provider (429)".to_string());
+    }
+    Ok(value2)
 }

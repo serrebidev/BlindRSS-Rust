@@ -1202,3 +1202,122 @@ pub fn show_exclude_feeds(frame: &impl WxWidget, config_path: &Path) {
     }
     dialog.destroy();
 }
+
+/// YouTube account device sign-in (Python's device-code
+/// flow): shows the user code + verification URL, polls on a
+/// worker until Google approves, then stores the refresh
+/// token in config youtube_account_refresh_token.
+pub fn show_youtube_signin(frame: &impl WxWidget, config_path: &Path) {
+    let cfg = Config::load(config_path).unwrap_or_default();
+    let client_id = {
+        let v = cfg.get_str("youtube_account_client_id", "");
+        if v.is_empty() {
+            blindrss_core::youtube_account::CLIENT_ID.to_string()
+        } else {
+            v.to_string()
+        }
+    };
+    let secret = cfg.get_str("youtube_account_client_secret", "").to_string();
+    let dialog = Dialog::builder(frame, "Connect YouTube Account").build();
+    let sizer = BoxSizer::builder(Orientation::Vertical).build();
+    let status = StaticText::builder(&dialog)
+        .with_label("Contacting Google...")
+        .build();
+    sizer.add(&status, 0, SizerFlag::All, 8);
+    let code_label = StaticText::builder(&dialog).with_label("").build();
+    sizer.add(&code_label, 0, SizerFlag::All, 8);
+    let close_btn = Button::builder(&dialog).with_label("Cancel").build();
+    sizer.add(&close_btn, 0, SizerFlag::All, 4);
+    let (tx, rx) = std::sync::mpsc::channel::<Result<String, String>>();
+    let rx = Rc::new(rx);
+    {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            let signin = match blindrss_core::youtube_account::start_sign_in(&client_id) {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = tx.send(Err(e));
+                    return;
+                }
+            };
+            // Instructions travel through the channel; only
+            // the dialog's timer (UI thread) touches widgets.
+            let _ = tx.send(Ok(format!(
+                "PROGRESS:{}:{}",
+                signin.user_code, signin.verification_url
+            )));
+            let deadline = std::time::Instant::now()
+                + std::time::Duration::from_secs(signin.expires_in.max(60));
+            loop {
+                if std::time::Instant::now() >= deadline {
+                    let _ = tx.send(Err("sign-in code expired".to_string()));
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_secs(signin.interval.max(2)));
+                match blindrss_core::youtube_account::poll_sign_in(
+                    &client_id,
+                    &secret,
+                    &signin.device_code,
+                ) {
+                    Ok(Some(token)) => {
+                        let _ = tx.send(Ok(format!("TOKEN:{token}")));
+                        return;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        let _ = tx.send(Err(e));
+                        return;
+                    }
+                }
+            }
+        });
+    }
+    let done: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
+    let timer = Box::leak(Box::new(Timer::new(&dialog)));
+    {
+        let rx = rx.clone();
+        let status3 = status;
+        let code_label3 = code_label;
+        let done = done.clone();
+        let d = dialog;
+        let path = config_path.to_path_buf();
+        timer.on_tick(move |_| {
+            while let Ok(result) = rx.try_recv() {
+                match result {
+                    Ok(msg) if msg.starts_with("PROGRESS:") => {
+                        let rest = msg.trim_start_matches("PROGRESS:");
+                        let (code, url) = rest
+                            .split_once(':')
+                            .map(|(c, u)| (c.to_string(), u.to_string()))
+                            .unwrap_or_default();
+                        status3.set_label("Open the verification page and enter the code:");
+                        code_label3.set_label(&format!("Code: {code}\n{url}"));
+                        crate::open_in_browser(&url);
+                    }
+                    Ok(msg) if msg.starts_with("TOKEN:") => {
+                        let token = msg.trim_start_matches("TOKEN:").to_string();
+                        let mut cfg = Config::load(&path).unwrap_or_default();
+                        cfg.set_path("youtube_account_refresh_token", serde_json::json!(token));
+                        let _ = cfg.save(&path);
+                        status3.set_label("YouTube account connected.");
+                        *done.borrow_mut() = true;
+                        d.end_modal(5100);
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        status3.set_label(&format!("Sign-in failed: {e}"));
+                        *done.borrow_mut() = true;
+                        d.end_modal(5101);
+                    }
+                }
+            }
+        });
+    }
+    timer.start(200, false);
+    let d = dialog;
+    close_btn.on_click(move |_| d.end_modal(5101));
+    dialog.set_sizer(sizer, true);
+    dialog.set_size(Size::new(520, 260));
+    dialog.show_modal();
+    dialog.destroy();
+}

@@ -1733,6 +1733,68 @@ fn main() {
                 };
                 frame_rf.set_status_text(&format!("Refreshing {}...", feed.title), 0);
                 announce("start_update", "Refresh Feeds");
+                // Hosted feeds refresh through their provider's
+                // per-feed path, not by fetching the site.
+                if feed.id.starts_with("feed/") || feed.id.starts_with("miniflux:") {
+                    let tx = tx_rf.clone();
+                    let feed2 = feed.clone();
+                    std::thread::spawn(move || {
+                        let cfg =
+                            blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+                        let providers = cfg.raw().get("providers").cloned();
+                        let get = |obj: &serde_json::Value, key: &str| -> String {
+                            obj.get(key)
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string()
+                        };
+                        let result = (|| -> Result<usize, String> {
+                            let db = Db::open(&db_path()).map_err(|e| format!("{e}"))?;
+                            let Some(providers) = providers else {
+                                return Err("no providers configured".to_string());
+                            };
+                            if let Some(mf) = feed2.id.strip_prefix("miniflux:") {
+                                let section = providers.get("miniflux");
+                                let (url, key) = (
+                                    section.map(|s| get(s, "url")).unwrap_or_default(),
+                                    section.map(|s| get(s, "api_key")).unwrap_or_default(),
+                                );
+                                let id: i64 = mf.parse().map_err(|_| "bad feed id")?;
+                                return blindrss_core::providers::MinifluxClient::new(&url, &key)
+                                    .refresh_feed(&db, id);
+                            }
+                            use blindrss_core::providers::{GReaderClient, GReaderService};
+                            for (key, service) in [
+                                ("theoldreader", GReaderService::TheOldReader),
+                                ("bazqux", GReaderService::BazQux),
+                            ] {
+                                if let Some(section) = providers.get(key) {
+                                    let (email, password) =
+                                        (get(section, "email"), get(section, "password"));
+                                    if !email.is_empty() && !password.is_empty() {
+                                        return GReaderClient::new(service, &email, &password)
+                                            .refresh_feed(&db, &feed2.id);
+                                    }
+                                }
+                            }
+                            if let Some(section) = providers.get("inoreader") {
+                                let token = get(section, "token");
+                                if !token.is_empty() {
+                                    return GReaderClient::with_oauth(
+                                        GReaderService::Inoreader,
+                                        &token,
+                                    )
+                                    .refresh_feed(&db, &feed2.id);
+                                }
+                            }
+                            Err("hosted provider credentials not set".to_string())
+                        })();
+                        let _ = tx.send(RefreshMsg::ProviderAction(
+                            result.map(|n| format!("{}: {n} new article(s)", feed2.title)),
+                        ));
+                    });
+                    return;
+                }
                 let (cancel, stopped) = {
                     let st = state_rf.borrow();
                     st.cancel_refresh
@@ -1999,6 +2061,25 @@ fn main() {
                         .unwrap_or_else(|| PathBuf::from("config.json"))
                 });
             let cfg = blindrss_core::config::Config::load(&cfg_path).unwrap_or_default();
+            // YouTube account wrapper (factory.py applies it
+            // over every provider): sync its subscriptions as
+            // feeds whenever the account is signed in.
+            if !cfg.get_str("youtube_account_refresh_token", "").is_empty() {
+                let tx = tx_sync.clone();
+                let path = db_path();
+                let cpath = cfg_path.clone();
+                std::thread::spawn(move || {
+                    let result = Db::open(&path)
+                        .map_err(|e| format!("{e}"))
+                        .and_then(|db| {
+                            let mut cfg2 =
+                                blindrss_core::config::Config::load(&cpath).unwrap_or_default();
+                            blindrss_core::youtube_account::sync_account(&mut cfg2, &cpath, &db)
+                        })
+                        .map(|added| format!("YouTube account: {added} new channel feed(s)"));
+                    let _ = tx.send(RefreshMsg::ProviderAction(result));
+                });
+            }
             let providers = cfg.raw().get("providers").cloned();
             let Some(providers) = providers else {
                 frame_sync.set_status_text("No providers configured", 0);

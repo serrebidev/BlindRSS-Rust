@@ -56,6 +56,27 @@ pub struct GReaderClient {
     /// OAuth bearer token (Inoreader). When set, ClientLogin is skipped.
     pub oauth_token: Option<String>,
     token: RefCell<Option<String>>,
+    /// Inoreader quota caches (providers/inoreader.py):
+    /// subscription metadata and per-stream article lists are
+    /// cached process-wide for their TTLs because the app
+    /// quota is small (100 req/day on the free tier).
+    meta_ttl: std::time::Duration,
+    article_ttl: std::time::Duration,
+}
+
+/// Process-wide Inoreader caches (see GReaderClient's TTLs).
+static INOREADER_META_CACHE: std::sync::Mutex<Option<(std::time::Instant, Vec<RemoteFeed>)>> =
+    std::sync::Mutex::new(None);
+type ArticleCacheMap = std::collections::HashMap<String, (std::time::Instant, Vec<Article>)>;
+
+static INOREADER_ARTICLE_CACHE: std::sync::OnceLock<std::sync::Mutex<ArticleCacheMap>> =
+    std::sync::OnceLock::new();
+
+fn article_cache() -> std::sync::MutexGuard<'static, ArticleCacheMap> {
+    INOREADER_ARTICLE_CACHE
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -111,12 +132,16 @@ struct StreamItem {
     #[serde(default)]
     content: Option<ContentBody>,
     origin: Option<Origin>,
+    #[serde(default)]
+    enclosure: Vec<LinkHref>,
 }
 
 #[derive(Deserialize)]
 struct LinkHref {
     #[serde(default)]
     href: String,
+    #[serde(rename = "type", default)]
+    link_type: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -131,6 +156,22 @@ struct Origin {
     stream_id: String,
 }
 
+/// Pick the enclosure to store as an article's media: the
+/// first audio/video one, else the first enclosure at all.
+/// Returns (url, mime type).
+fn pick_enclosure(enclosures: &[LinkHref]) -> Option<(String, Option<String>)> {
+    let chosen = enclosures
+        .iter()
+        .find(|e| {
+            e.link_type
+                .as_deref()
+                .map(|t| t.starts_with("audio/") || t.starts_with("video/"))
+                .unwrap_or(false)
+        })
+        .or_else(|| enclosures.first())?;
+    Some((chosen.href.clone(), chosen.link_type.clone()))
+}
+
 impl GReaderClient {
     pub fn new(service: GReaderService, email: &str, password: &str) -> Self {
         Self {
@@ -141,6 +182,8 @@ impl GReaderClient {
             password: password.to_string(),
             oauth_token: None,
             token: RefCell::new(None),
+            meta_ttl: std::time::Duration::from_secs(3600),
+            article_ttl: std::time::Duration::from_secs(90),
         }
     }
 
@@ -148,6 +191,29 @@ impl GReaderClient {
         let mut c = Self::new(service, "", "");
         c.oauth_token = Some(token.to_string());
         c
+    }
+
+    /// Set the Inoreader cache TTLs from config
+    /// (providers.inoreader.metadata_cache_ttl_seconds,
+    /// default 3600, clamped 60..=86400;
+    /// article_cache_ttl_seconds, default 90, clamped
+    /// 5..=900 — Python's clamps).
+    pub fn with_cache_ttls(mut self, meta_secs: i64, article_secs: i64) -> Self {
+        self.meta_ttl = std::time::Duration::from_secs(meta_secs.clamp(60, 86_400) as u64);
+        self.article_ttl = std::time::Duration::from_secs(article_secs.clamp(5, 900) as u64);
+        self
+    }
+
+    /// Drop the Inoreader caches (a manual refresh bypasses
+    /// them, like Python's cache invalidation).
+    pub fn invalidate_caches(&self) {
+        if self.service != GReaderService::Inoreader {
+            return;
+        }
+        *INOREADER_META_CACHE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = None;
+        article_cache().clear();
     }
 
     fn login(&self) -> Result<String, String> {
@@ -201,21 +267,47 @@ impl GReaderClient {
 
     fn get_json<T: for<'de> Deserialize<'de>>(&self, path: &str) -> Result<T, String> {
         let url = format!("{}{}", self.api_base, path);
-        let mut resp = crate::http::agent()
-            .get(&url)
-            .header("Authorization", &self.auth_header()?)
-            .call()
-            .map_err(|e| format!("GET {path} failed: {e}"))?;
-        let text = resp
-            .body_mut()
-            .read_to_string()
-            .map_err(|e| format!("read failed: {e}"))?;
+        let auth = self.auth_header()?;
+        // Status-aware agent + one Retry-After retry: Inoreader
+        // quotas answer 429 (Python backs off the same way).
+        let (status, text) = crate::http::with_rate_limit_backoff(|| {
+            let mut resp = crate::http::status_agent()
+                .get(&url)
+                .header("Authorization", &auth)
+                .call()
+                .map_err(|e| format!("GET {path} failed: {e}"))?;
+            let status = resp.status().as_u16();
+            let retry = resp
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
+            let text = resp
+                .body_mut()
+                .read_to_string()
+                .map_err(|e| format!("read failed: {e}"))?;
+            Ok((status, retry, (status, text)))
+        })?;
+        if !(200..300).contains(&status) {
+            return Err(format!("GET {path} returned HTTP {status}"));
+        }
         serde_json::from_str(&text).map_err(|e| format!("bad JSON from {path}: {e}"))
     }
 
     pub fn subscriptions(&self) -> Result<Vec<RemoteFeed>, String> {
+        if self.service == GReaderService::Inoreader {
+            let cache = INOREADER_META_CACHE
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if let Some((at, feeds)) = &*cache
+                && at.elapsed() < self.meta_ttl
+            {
+                return Ok(feeds.clone());
+            }
+            drop(cache);
+        }
         let list: SubList = self.get_json("/subscription/list?output=json")?;
-        Ok(list
+        let feeds: Vec<RemoteFeed> = list
             .subscriptions
             .into_iter()
             .map(|s| RemoteFeed {
@@ -229,11 +321,37 @@ impl GReaderClient {
                     .map(|c| c.label)
                     .filter(|l| !l.is_empty()),
             })
-            .collect())
+            .collect();
+        if self.service == GReaderService::Inoreader {
+            *INOREADER_META_CACHE
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) =
+                Some((std::time::Instant::now(), feeds.clone()));
+        }
+        Ok(feeds)
     }
 
     /// Fetch a stream's items as articles (not yet stored).
+    /// Inoreader results ride the short-lived article cache.
     pub fn stream_articles(&self, stream_id: &str, count: usize) -> Result<Vec<Article>, String> {
+        if self.service == GReaderService::Inoreader {
+            let key = format!("{stream_id}|{count}");
+            {
+                let cache = article_cache();
+                if let Some((at, articles)) = cache.get(&key)
+                    && at.elapsed() < self.article_ttl
+                {
+                    return Ok(articles.clone());
+                }
+            }
+            let articles = self.stream_articles_fresh(stream_id, count)?;
+            article_cache().insert(key, (std::time::Instant::now(), articles.clone()));
+            return Ok(articles);
+        }
+        self.stream_articles_fresh(stream_id, count)
+    }
+
+    fn stream_articles_fresh(&self, stream_id: &str, count: usize) -> Result<Vec<Article>, String> {
         let encoded = stream_id
             .replace('%', "%25")
             .replace('/', "%2F")
@@ -283,8 +401,11 @@ impl GReaderClient {
                     },
                     is_read: false,
                     is_favorite: false,
-                    media_url: None,
-                    media_type: None,
+                    // Hosted podcast media (the hosted
+                    // article-media mixin): prefer the first
+                    // audio/video enclosure.
+                    media_url: pick_enclosure(&item.enclosure).map(|e| e.0),
+                    media_type: pick_enclosure(&item.enclosure).and_then(|e| e.1),
                 }
             })
             .collect())
@@ -371,6 +492,80 @@ impl GReaderClient {
             .header("Authorization", &self.auth_header()?)
             .send_form([("s", stream), ("ac", action), ("T", edit_token.trim())])
             .map_err(|e| format!("subscription edit failed: {e}"))?;
+        Ok(())
+    }
+
+    /// Refresh ONE subscription into the database (per-feed
+    /// refresh for hosted feeds): fetch its stream and store
+    /// new articles. Returns how many were new.
+    pub fn refresh_feed(&self, db: &Db, stream_id: &str) -> Result<usize, String> {
+        // Make sure the feed row exists with its remote title.
+        if let Ok(subs) = self.subscriptions()
+            && let Some(sub) = subs.iter().find(|s| s.stream_id == stream_id)
+        {
+            db.insert_feed_if_missing(&Feed {
+                id: sub.stream_id.clone(),
+                url: sub.feed_url.clone(),
+                title: sub.title.clone(),
+                title_is_custom: false,
+                category: sub.category.clone(),
+                icon_url: None,
+            })
+            .map_err(|e| format!("feed store failed: {e}"))?;
+        }
+        let tombstones = db.deleted_article_ids().unwrap_or_default();
+        let mut new = 0;
+        for a in &self.stream_articles(stream_id, 100)? {
+            if tombstones.contains(&a.id) {
+                continue;
+            }
+            if db
+                .insert_article_if_new(a)
+                .map_err(|e| format!("article store failed: {e}"))?
+            {
+                new += 1;
+            }
+        }
+        Ok(new)
+    }
+
+    /// Move a subscription into a category (label) on the
+    /// server: subscription/edit with the label add verb.
+    pub fn set_category_remote(
+        &self,
+        stream_id: &str,
+        category: Option<&str>,
+    ) -> Result<(), String> {
+        let mut token_resp = crate::http::agent()
+            .get(&format!("{}/token", self.api_base))
+            .header("Authorization", &self.auth_header()?)
+            .call()
+            .map_err(|e| format!("token fetch failed: {e}"))?;
+        let edit_token = token_resp
+            .body_mut()
+            .read_to_string()
+            .map_err(|e| format!("token read failed: {e}"))?;
+        let mut form: Vec<(&str, &str)> =
+            vec![("s", stream_id), ("ac", "edit"), ("T", edit_token.trim())];
+        let label;
+        if let Some(cat) = category.filter(|c| !c.is_empty()) {
+            label = format!("user/-/label/{cat}");
+            form.push(("a", &label));
+        }
+        crate::http::agent()
+            .post(&format!("{}/subscription/edit", self.api_base))
+            .header("Authorization", &self.auth_header()?)
+            .send_form(form)
+            .map_err(|e| format!("subscription edit failed: {e}"))?;
+        Ok(())
+    }
+
+    /// Mark many items read with one action token (the
+    /// mark-all-read path for hosted feeds).
+    pub fn mark_read_batch(&self, item_ids: &[String]) -> Result<(), String> {
+        for id in item_ids {
+            self.set_read_remote(id, true)?;
+        }
         Ok(())
     }
 
@@ -481,6 +676,16 @@ pub struct MfEntry {
     published_at: String,
     #[serde(default)]
     status: String,
+    #[serde(default)]
+    enclosures: Vec<MfEnclosure>,
+}
+
+#[derive(Deserialize)]
+pub struct MfEnclosure {
+    #[serde(default)]
+    url: String,
+    #[serde(default)]
+    mime_type: String,
 }
 
 impl MinifluxClient {
@@ -532,6 +737,51 @@ impl MinifluxClient {
             .header("Content-Type", "application/json")
             .send(body.to_string())
             .map_err(|e| format!("mark read failed: {e}"))?;
+        Ok(())
+    }
+
+    /// Test the connection (GET /v1/me): returns the account's
+    /// username. Powers the Settings "Test" button.
+    pub fn test_connection(&self) -> Result<String, String> {
+        #[derive(Deserialize)]
+        struct Me {
+            #[serde(default)]
+            username: String,
+        }
+        let me: Me = self.get_json("/v1/me")?;
+        Ok(me.username)
+    }
+
+    /// Export the account's subscriptions as OPML
+    /// (GET /v1/export).
+    pub fn opml_export(&self) -> Result<String, String> {
+        let mut resp = crate::http::agent()
+            .get(&format!("{}/v1/export", self.base_url))
+            .header("X-Auth-Token", &self.api_key)
+            .call()
+            .map_err(|e| format!("OPML export failed: {e}"))?;
+        resp.body_mut()
+            .read_to_string()
+            .map_err(|e| format!("read failed: {e}"))
+    }
+
+    /// Import OPML into the account (POST /v1/import,
+    /// multipart form with the file part, built by hand —
+    /// ureq's multipart feature is not enabled).
+    pub fn opml_import(&self, opml_xml: &str) -> Result<(), String> {
+        let boundary = "blindrss-opml-boundary-7f3a";
+        let body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"subscriptions.opml\"\r\nContent-Type: text/xml\r\n\r\n{opml_xml}\r\n--{boundary}--\r\n"
+        );
+        crate::http::agent()
+            .post(&format!("{}/v1/import", self.base_url))
+            .header("X-Auth-Token", &self.api_key)
+            .header(
+                "Content-Type",
+                &format!("multipart/form-data; boundary={boundary}"),
+            )
+            .send(body)
+            .map_err(|e| format!("OPML import failed: {e}"))?;
         Ok(())
     }
 
@@ -590,6 +840,67 @@ impl MinifluxClient {
         Ok(())
     }
 
+    /// Refresh ONE feed's entries into the database (per-feed
+    /// refresh for hosted feeds). Returns how many were new.
+    pub fn refresh_feed(&self, db: &Db, mf_id: i64) -> Result<usize, String> {
+        let local_id = format!("miniflux:{mf_id}");
+        let tombstones = db.deleted_article_ids().unwrap_or_default();
+        let mut new = 0;
+        for e in self.entries(mf_id, 100)? {
+            let article = Article {
+                id: format!("miniflux-entry:{}", e.id),
+                feed_id: local_id.clone(),
+                title: if e.title.trim().is_empty() {
+                    "No Title".to_string()
+                } else {
+                    e.title
+                },
+                url: e.url,
+                content: Some(e.content.clone()),
+                description: Some(e.content),
+                date: if e.published_at.is_empty() {
+                    None
+                } else {
+                    Some(e.published_at)
+                },
+                author: if e.author.is_empty() {
+                    None
+                } else {
+                    Some(e.author)
+                },
+                is_read: e.status == "read",
+                is_favorite: false,
+                media_url: e
+                    .enclosures
+                    .iter()
+                    .find(|enc| {
+                        enc.mime_type.starts_with("audio/") || enc.mime_type.starts_with("video/")
+                    })
+                    .or_else(|| e.enclosures.first())
+                    .map(|enc| enc.url.clone()),
+                media_type: e
+                    .enclosures
+                    .iter()
+                    .find(|enc| {
+                        enc.mime_type.starts_with("audio/") || enc.mime_type.starts_with("video/")
+                    })
+                    .or_else(|| e.enclosures.first())
+                    .map(|enc| enc.mime_type.clone())
+                    .filter(|t| !t.is_empty()),
+            };
+            if tombstones.contains(&article.id) {
+                continue;
+            }
+            if db
+                .insert_article_if_new(&article)
+                .map_err(|e| format!("article store failed: {e}"))?
+            {
+                new += 1;
+            }
+        }
+        Ok(new)
+    }
+
     /// Sync feeds + unread entries into the local database.
     pub fn sync(&self, db: &Db, per_feed_items: usize) -> Result<(usize, usize), String> {
         let feeds = self.feeds()?;
@@ -630,8 +941,25 @@ impl MinifluxClient {
                     },
                     is_read: e.status == "read",
                     is_favorite: false,
-                    media_url: None,
-                    media_type: None,
+                    media_url: e
+                        .enclosures
+                        .iter()
+                        .find(|enc| {
+                            enc.mime_type.starts_with("audio/")
+                                || enc.mime_type.starts_with("video/")
+                        })
+                        .or_else(|| e.enclosures.first())
+                        .map(|enc| enc.url.clone()),
+                    media_type: e
+                        .enclosures
+                        .iter()
+                        .find(|enc| {
+                            enc.mime_type.starts_with("audio/")
+                                || enc.mime_type.starts_with("video/")
+                        })
+                        .or_else(|| e.enclosures.first())
+                        .map(|enc| enc.mime_type.clone())
+                        .filter(|t| !t.is_empty()),
                 };
                 if tombstones.contains(&article.id) {
                     continue;

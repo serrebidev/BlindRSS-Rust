@@ -151,7 +151,16 @@ impl HostedProvider {
                     if token.is_empty() {
                         return Err("Inoreader is not connected".to_string());
                     }
-                    Ok(GReaderClient::with_oauth(service, &token))
+                    let meta_ttl = self
+                        .cred("metadata_cache_ttl_seconds")
+                        .parse::<i64>()
+                        .unwrap_or(3600);
+                    let article_ttl = self
+                        .cred("article_cache_ttl_seconds")
+                        .parse::<i64>()
+                        .unwrap_or(90);
+                    Ok(GReaderClient::with_oauth(service, &token)
+                        .with_cache_ttls(meta_ttl, article_ttl))
                 } else {
                     let (email, password) = (self.cred("email"), self.cred("password"));
                     if email.is_empty() || password.is_empty() {
@@ -276,7 +285,13 @@ impl Provider for HostedProvider {
     fn refresh(&self) -> Result<String, String> {
         let db = self.db()?;
         let (feeds, new) = match self.kind {
-            HostedKind::GReader(_) => self.greader()?.sync(&db, 100)?,
+            HostedKind::GReader(_) => {
+                let client = self.greader()?;
+                // A manual refresh bypasses the Inoreader
+                // caches (Python's invalidation rule).
+                client.invalidate_caches();
+                client.sync(&db, 100)?
+            }
             HostedKind::Miniflux => self.miniflux()?.sync(&db, 100)?,
         };
         Ok(format!("{feeds} feeds, {new} new article(s)"))

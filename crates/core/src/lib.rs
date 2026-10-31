@@ -38,6 +38,7 @@ pub mod sponsorblock;
 pub mod takeout;
 pub mod threads;
 pub mod user_agents;
+pub mod youtube_account;
 
 pub use db::{Article, Category, Chapter, Db, Feed, PlaybackState};
 pub use extract::{ExtractOutcome, extract_article};
