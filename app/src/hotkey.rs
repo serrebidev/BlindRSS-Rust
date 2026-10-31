@@ -51,15 +51,7 @@ mod imp {
     static OLD_PROC: AtomicUsize = AtomicUsize::new(0);
     static SENDER: OnceLock<Mutex<Option<std::sync::mpsc::Sender<crate::RefreshMsg>>>> =
         OnceLock::new();
-    static APPLIED: Mutex<Option<(String, (u32, u32))>> = Mutex::new(None);
-
-    /// The accelerator string currently registered, if any.
-    pub fn applied_accel() -> Option<String> {
-        APPLIED
-            .lock()
-            .ok()
-            .and_then(|g| g.as_ref().map(|(a, _)| a.clone()))
-    }
+    static APPLIED: Mutex<Option<(u32, u32)>> = Mutex::new(None);
 
     unsafe extern "system" fn subclass_proc(
         hwnd: isize,
@@ -67,13 +59,13 @@ mod imp {
         wparam: usize,
         lparam: isize,
     ) -> isize {
-        if msg == WM_HOTKEY && wparam as i32 == HOTKEY_ID {
-            if let Some(sender) = SENDER.get()
-                && let Ok(guard) = sender.lock()
-                && let Some(tx) = &*guard
-            {
-                let _ = tx.send(crate::RefreshMsg::ToggleWindow);
-            }
+        if msg == WM_HOTKEY
+            && wparam as i32 == HOTKEY_ID
+            && let Some(sender) = SENDER.get()
+            && let Ok(guard) = sender.lock()
+            && let Some(tx) = &*guard
+        {
+            let _ = tx.send(crate::RefreshMsg::ToggleWindow);
         }
         let old = OLD_PROC.load(Ordering::SeqCst);
         if old == 0 {
@@ -136,16 +128,13 @@ mod imp {
         // Register the new one first; only drop the old on success
         // is impossible (same id), so unregister then register and
         // roll back on failure.
-        let previous = APPLIED
-            .lock()
-            .ok()
-            .and_then(|g| g.as_ref().map(|(_, s)| *s));
+        let previous = APPLIED.lock().ok().and_then(|g| *g);
         unsafe {
             unregister(hwnd, HOTKEY_ID);
         }
         if unsafe { register(hwnd, HOTKEY_ID, spec.0 | MOD_NOREPEAT, spec.1) } != 0 {
             if let Ok(mut guard) = APPLIED.lock() {
-                *guard = Some((trimmed.to_string(), spec));
+                *guard = Some(spec);
             }
             return Ok(Some(spec));
         }
@@ -173,7 +162,7 @@ mod imp {
 }
 
 #[cfg(target_os = "windows")]
-pub use imp::{ApplyError, applied_accel, apply, foreground_is, install, set_foreground};
+pub use imp::{ApplyError, apply, foreground_is, install, set_foreground};
 
 #[cfg(not(target_os = "windows"))]
 #[allow(dead_code)]
@@ -190,12 +179,6 @@ pub fn install(_hwnd: isize, _tx: std::sync::mpsc::Sender<crate::RefreshMsg>) {}
 #[allow(dead_code)]
 pub fn apply(_hwnd: isize, _accel: &str) -> Result<Option<(u32, u32)>, ApplyError> {
     Ok(None)
-}
-
-#[cfg(not(target_os = "windows"))]
-#[allow(dead_code)]
-pub fn applied_accel() -> Option<String> {
-    None
 }
 
 #[cfg(not(target_os = "windows"))]

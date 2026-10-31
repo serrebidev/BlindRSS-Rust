@@ -291,6 +291,7 @@ pub fn load_v10_key(local_state: &Path, browser_key: &str) -> Option<V10Key> {
     }
     #[cfg(target_os = "macos")]
     {
+        let _ = local_state;
         let password = macos_keychain_password(browser_key)?;
         let mut key = [0u8; 16];
         pbkdf2::pbkdf2_hmac::<sha1::Sha1>(&password, b"saltysalt", 1003, &mut key);
