@@ -619,6 +619,69 @@ fn strip_tags(html: &str) -> String {
     out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// One rust-trafilatura pass with an explicit focus.
+fn extract_focus(html: &str, focus: rust_trafilatura::ExtractionFocus) -> (String, String) {
+    let opts = rust_trafilatura::Options {
+        focus,
+        ..Default::default()
+    };
+    rust_trafilatura::extract(html.as_bytes(), &opts)
+        .ok()
+        .map(|r| (r.metadata.title.clone(), r.content_text.trim().to_string()))
+        .unwrap_or_default()
+}
+
+/// Whitespace-collapsed paragraph key for cross-pass matching.
+fn para_key(p: &str) -> String {
+    p.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+/// Python's lead recovery, lean form: when the precision pass
+/// dropped the article's opening paragraphs, the recall pass
+/// usually kept them. Prepend recall paragraphs that come before
+/// the precision text's first paragraph and are absent from it
+/// (at most three, each substantial). Python's full version also
+/// matches the meta description against an allowlist; that depth
+/// stays on the parity list.
+fn recover_lead(precision: &str, recall: &str) -> String {
+    let prec_paras: Vec<&str> = precision
+        .split("\n\n")
+        .map(|p| p.trim())
+        .filter(|p| !p.is_empty())
+        .collect();
+    let rec_paras: Vec<&str> = recall
+        .split("\n\n")
+        .map(|p| p.trim())
+        .filter(|p| !p.is_empty())
+        .collect();
+    let Some(first_prec) = prec_paras.first() else {
+        return precision.to_string();
+    };
+    let first_key = para_key(first_prec);
+    let Some(pos) = rec_paras
+        .iter()
+        .position(|p| para_key(p).starts_with(&first_key[..first_key.len().min(120)]))
+    else {
+        return precision.to_string();
+    };
+    if pos == 0 || pos > 3 {
+        return precision.to_string();
+    }
+    let prec_keys: Vec<String> = prec_paras.iter().map(|p| para_key(p)).collect();
+    let lead: Vec<&str> = rec_paras[..pos]
+        .iter()
+        .copied()
+        .filter(|p| p.chars().count() >= 40 && !prec_keys.contains(&para_key(p)))
+        .collect();
+    if lead.is_empty() {
+        return precision.to_string();
+    }
+    format!("{}\n\n{}", lead.join("\n\n"), precision)
+}
+
 /// Run the cascade over a fetched page.
 ///
 /// `feed_text` is the article body the feed itself supplied, if any; the
@@ -647,11 +710,29 @@ pub fn extract_article(html_in: &str, url: &str, feed_text: Option<&str>) -> Ext
     let feed_owned = feed_text.map(html_to_text);
     let feed_text = feed_owned.as_deref();
 
-    // Base engine: rust-trafilatura.
-    let base = rust_trafilatura::extract(html.as_bytes(), &rust_trafilatura::Options::default())
-        .ok()
-        .map(|r| (r.metadata.title.clone(), r.content_text.trim().to_string()))
-        .unwrap_or_default();
+    // Base engine: rust-trafilatura, precision-first — Python's
+    // recipe (article_extractor._trafilatura_extract_text):
+    // favor_precision is the default pass because balanced/recall
+    // drag in footer and affiliate boilerplate (measured on
+    // Brandon's 9to5Mac example, 2026-10-30: balanced kept the
+    // "Worth checking out on Amazon" list and the FTC disclosure;
+    // precision matched Python's output exactly). Recall runs as
+    // the fallback when precision is too short, and for lead
+    // recovery when precision dropped the intro paragraphs.
+    let prec = extract_focus(html, rust_trafilatura::ExtractionFocus::FavorPrecision);
+    let rec = extract_focus(html, rust_trafilatura::ExtractionFocus::FavorRecall);
+    let base = if char_count(&prec.1) >= 200 {
+        let title = if prec.0.is_empty() {
+            rec.0.clone()
+        } else {
+            prec.0.clone()
+        };
+        (title, recover_lead(&prec.1, &rec.1))
+    } else if char_count(&rec.1) > char_count(&prec.1) {
+        rec
+    } else {
+        prec
+    };
     let base_chars = char_count(&base.1);
 
     // Gate rule: a marker plus a small extracted body is a block page.

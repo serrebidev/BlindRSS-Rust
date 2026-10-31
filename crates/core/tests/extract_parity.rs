@@ -186,3 +186,60 @@ fn feed_fallback_returns_clean_text_not_html() {
     assert!(!text.contains('<'), "feed fallback leaked markup: {text}");
     assert!(text.contains("Feed body here."));
 }
+
+// ---------------------------------------------------------------------
+// Brandon's full-text report, 2026-10-30: the 9to5Mac WhatsApp piece
+// came out with the page's footer boilerplate attached (Amazon
+// picks, FTC disclosure) because the base engine ran balanced and
+// the pick preferred length. Python runs trafilatura
+// precision-first; precision mode on this exact page reproduces
+// Python's output character for character in length and ending.
+// ---------------------------------------------------------------------
+
+#[test]
+fn nine_to_five_mac_has_no_footer_boilerplate() {
+    let html = include_str!("fixtures/9to5mac_whatsapp.html");
+    let url = "https://9to5mac.com/2026/10/30/whatsapp-announces-four-new-features-to-make-group-chats-easier-to-manage/";
+    let ExtractOutcome::Article { text, .. } = extract_article(html, url, None) else {
+        panic!("expected an article outcome");
+    };
+    assert!(text.contains("pin messages indefinitely"), "body missing");
+    assert!(
+        text.trim_end().ends_with("follow this link."),
+        "article should end at the last body paragraph, tail: {}",
+        &text[text.len().saturating_sub(120)..]
+    );
+    for junk in [
+        "Worth checking out",
+        "FTC:",
+        "reading 9to5Mac",
+        "MacBook Neo",
+        "Marcus Mendes is a Brazilian",
+    ] {
+        assert!(!text.contains(junk), "boilerplate leaked: {junk}");
+    }
+}
+
+#[test]
+fn cbc_story_extracts_in_full_not_the_feed_lede() {
+    let html = include_str!("fixtures/cbc_syndicated.html");
+    // The CBC feed supplies only this lede paragraph; Brandon's
+    // reader showed exactly this and nothing more.
+    let lede = "Canada's foreign affairs minister says the decision to let Russia back into the ice hockey world championships came as a \"great disappointment\" on Friday, as the country's ongoing invasion of Ukraine stretches toward its fifth year.";
+    let ExtractOutcome::Article { text, source, .. } =
+        extract_article(html, "https://www.byteseu.com/2486759/", Some(lede))
+    else {
+        panic!("expected an article outcome");
+    };
+    assert_ne!(source, "feed", "must not fall back to the feed lede");
+    assert!(text.contains("Power & Politics"), "middle missing");
+    assert!(
+        text.contains("100-year partnership"),
+        "ending missing — extraction truncated"
+    );
+    assert!(
+        text.chars().count() > 2_500,
+        "suspiciously short: {}",
+        text.chars().count()
+    );
+}

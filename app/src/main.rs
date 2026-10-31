@@ -167,6 +167,17 @@ fn propagate_read_state(article: &blindrss_core::db::Article, read: bool) {
 }
 
 /// Modal text prompt; None when cancelled.
+fn open_in_browser(url: &str) {
+    #[cfg(target_os = "windows")]
+    let _ = std::process::Command::new("rundll32")
+        .args(["url.dll,FileProtocolHandler", url])
+        .spawn();
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").arg(url).spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+}
+
 fn prompt_text(
     parent: &impl WxWidget,
     message: &str,
@@ -313,6 +324,9 @@ const M_KEYS: i32 = 2142;
 const M_PRUNE: i32 = 2143;
 const M_UPDATE: i32 = 2144;
 const M_HELP: i32 = 2151;
+const M_COPY_URL: i32 = 2152;
+const M_COPY_MEDIA: i32 = 2153;
+const M_COPY_FEED_URL: i32 = 2154;
 
 fn feed_label(db: &Db, feed: &Feed) -> String {
     match db.unread_count(Some(&feed.id)) {
@@ -1972,6 +1986,66 @@ fn main() {
         // same Rc action as its button, so menus and buttons can
         // never drift apart. Mnemonics only for now; accelerators
         // arrive with the live shortcut dispatch.
+        let state_cu = state.clone();
+        let frame_cu = frame;
+        let act_copy_url: Rc<dyn Fn()> = Rc::new(move || {
+            let st = state_cu.borrow();
+            let Some(article) = st.selected_article.and_then(|i| st.articles.get(i)) else {
+                frame_cu.set_status_text("No article selected", 0);
+                return;
+            };
+            if article.url.is_empty() {
+                frame_cu.set_status_text("Article has no URL", 0);
+                return;
+            }
+            let ok = Clipboard::get().set_text(&article.url);
+            frame_cu.set_status_text(
+                if ok {
+                    "Article URL copied"
+                } else {
+                    "Copy failed"
+                },
+                0,
+            );
+        });
+        let state_cm = state.clone();
+        let frame_cm = frame;
+        let act_copy_media: Rc<dyn Fn()> = Rc::new(move || {
+            let st = state_cm.borrow();
+            let Some(article) = st.selected_article.and_then(|i| st.articles.get(i)) else {
+                frame_cm.set_status_text("No article selected", 0);
+                return;
+            };
+            let Some(media) = article.media_url.clone().filter(|u| !u.is_empty()) else {
+                frame_cm.set_status_text("Article has no media URL", 0);
+                return;
+            };
+            let ok = Clipboard::get().set_text(&media);
+            frame_cm.set_status_text(
+                if ok {
+                    "Media URL copied"
+                } else {
+                    "Copy failed"
+                },
+                0,
+            );
+        });
+        let state_cf = state.clone();
+        let frame_cf = frame;
+        let act_copy_feed_url: Rc<dyn Fn()> = Rc::new(move || {
+            let st = state_cf.borrow();
+            let Some(feed) = st
+                .selected_feed
+                .as_ref()
+                .and_then(|id| st.feeds.iter().find(|f| &f.id == id))
+            else {
+                frame_cf.set_status_text("No feed selected", 0);
+                return;
+            };
+            let ok = Clipboard::get().set_text(&feed.url);
+            frame_cf.set_status_text(if ok { "Feed URL copied" } else { "Copy failed" }, 0);
+        });
+
         let file_menu = Menu::builder()
             .append_item(M_ADD_FEED, "&Add Feed...", "Subscribe to a feed")
             .append_item(
@@ -1999,6 +2073,11 @@ fn main() {
             .append_item(M_REFRESH, "&Refresh All", "Refresh every feed")
             .append_item(M_REFRESH_FEED, "Refresh &Feed", "Refresh the selected feed")
             .append_item(M_SYNC, "S&ync Providers", "Sync hosted providers")
+            .append_item(
+                M_COPY_FEED_URL,
+                "Copy Feed &URL",
+                "Copy the selected feed's URL",
+            )
             .append_separator()
             .append_item(M_REMOVE_FEED, "Re&move Feed", "Remove the selected feed")
             .append_item(
@@ -2065,6 +2144,13 @@ fn main() {
                 "Download the selected article's media",
             )
             .append_item(M_CAST, "&Cast...", "Cast to a Chromecast")
+            .append_separator()
+            .append_item(M_COPY_URL, "Copy Article &URL", "Copy the article's link")
+            .append_item(
+                M_COPY_MEDIA,
+                "Copy &Media URL",
+                "Copy the article's media link",
+            )
             .append_item(M_SEARCH, "&Search", "Search with the current search text")
             .build();
         let tools_menu = Menu::builder()
@@ -2128,6 +2214,9 @@ fn main() {
             (M_PRUNE, act_prune.clone()),
             (M_UPDATE, act_update.clone()),
             (M_HELP, act_help.clone()),
+            (M_COPY_URL, act_copy_url.clone()),
+            (M_COPY_MEDIA, act_copy_media.clone()),
+            (M_COPY_FEED_URL, act_copy_feed_url.clone()),
         ];
         let frame_menu = frame;
         frame.on_menu(move |ev| {
@@ -2156,6 +2245,7 @@ fn main() {
                 .append_item(M_RENAME_CAT, "Rename &Category...", "")
                 .append_item(M_SET_CAT, "Set Feed Categor&y...", "")
                 .append_item(M_ARCHIVE, "Rescan &Archive", "")
+                .append_item(M_COPY_FEED_URL, "Copy Feed &URL", "")
                 .append_separator()
                 .append_item(M_NEW_SF, "&New Smart Folder...", "")
                 .append_item(M_DEL_SF, "&Delete Smart Folder", "")
@@ -2173,10 +2263,34 @@ fn main() {
                 .append_item(M_DOWNLOAD, "Down&load", "")
                 .append_item(M_CAST, "&Cast...", "")
                 .append_separator()
+                .append_item(M_COPY_URL, "Copy Article &URL", "")
+                .append_item(M_COPY_MEDIA, "Copy &Media URL", "")
+                .append_separator()
                 .append_item(M_DELETE_ARTICLE, "&Delete Article", "")
                 .append_item(M_MARKALL, "Mark All Read", "")
                 .build();
             list.popup_menu(&mut menu, None);
+        });
+
+        // Enter (item activation): play when the article has
+        // media, otherwise open its link in the browser
+        // (Brandon's rule, 2026-10-30).
+        let state_enter = state.clone();
+        let frame_enter = frame;
+        let play_enter = act_play.clone();
+        list.bind_internal(EventType::LIST_ITEM_ACTIVATED, move |ev| {
+            ev.skip(false);
+            let target = {
+                let st = state_enter.borrow();
+                st.selected_article
+                    .and_then(|i| st.articles.get(i))
+                    .map(|a| (a.media_url.clone(), a.url.clone()))
+            };
+            match target {
+                Some((Some(media), _)) if !media.is_empty() => play_enter(),
+                Some((_, url)) if !url.is_empty() => open_in_browser(&url),
+                _ => frame_enter.set_status_text("Article has no media or link", 0),
+            }
         });
 
         let timer = Box::leak(Box::new(Timer::new(&frame)));
