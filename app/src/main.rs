@@ -266,6 +266,14 @@ struct State {
     focus_list: bool,
     /// Config opt-in: persist/reopen the last selected feed.
     remember_last_feed: bool,
+    /// Cooperative refresh cancellation, shared with the refresh
+    /// worker thread (Python's cancel_refresh).
+    cancel_refresh: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Set by the worker when a refresh ended early on cancel;
+    /// the drain reads it on AllDone to announce the stop.
+    refresh_stopped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// When the last refresh finished (scheduled-refresh timer).
+    last_refresh_end: Option<std::time::Instant>,
 }
 
 enum RefreshMsg {
@@ -335,6 +343,59 @@ const M_HELP: i32 = 2151;
 const M_COPY_URL: i32 = 2152;
 const M_COPY_MEDIA: i32 = 2153;
 const M_COPY_FEED_URL: i32 = 2154;
+const M_REFRESH_CAT: i32 = 2155;
+const M_STOP_REFRESH: i32 = 2156;
+const M_ADD_CAT: i32 = 2157;
+const M_DEL_CAT: i32 = 2158;
+const M_IMPORT_HERE: i32 = 2159;
+const M_EXPORT_CAT: i32 = 2160;
+const M_FEED_ERRORS: i32 = 2161;
+
+/// Format a unix timestamp as "YYYY-MM-DD HH:MM" UTC (civil-date
+/// conversion, no date crate needed at this precision).
+fn fmt_ts(ts: Option<f64>) -> String {
+    let Some(ts) = ts.filter(|t| *t > 0.0) else {
+        return "never".to_string();
+    };
+    let secs = ts as i64;
+    let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    let (h, m) = (rem / 3600, (rem % 3600) / 60);
+    // Howard Hinnant's civil-from-days algorithm.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
+    let yr = if mo <= 2 { y + 1 } else { y };
+    format!("{yr:04}-{mo:02}-{d:02} {h:02}:{m:02}")
+}
+
+/// The category path of the current tree selection, if any.
+fn selected_category(st: &State) -> Option<String> {
+    st.selected_feed
+        .as_deref()
+        .and_then(|f| f.strip_prefix("cat:"))
+        .map(str::to_string)
+}
+
+/// Feeds inside a category path, subcategories included.
+fn feeds_in_category(feeds: &[Feed], path: &str) -> Vec<Feed> {
+    let prefix = format!("{path}/");
+    feeds
+        .iter()
+        .filter(|f| {
+            f.category.as_deref() == Some(path)
+                || f.category
+                    .as_deref()
+                    .is_some_and(|c| c.starts_with(&prefix))
+        })
+        .cloned()
+        .collect()
+}
 
 fn feed_label(db: &Db, feed: &Feed) -> String {
     match db.unread_count(Some(&feed.id)) {
@@ -383,9 +444,83 @@ fn rebuild_tree(state: &mut State, tree: &TreeCtrl) {
     tree.set_custom_data_direct(&root, String::new());
     let Some(db) = state.db.as_ref() else { return };
     let feeds = state.feeds.clone();
+    // Category grouping (Python parity): a node per category path
+    // ("News", "News/Tech"), feeds under their category node,
+    // uncategorized feeds at the root. Node data is "cat:<path>".
+    let expand_cats = blindrss_core::config::Config::load(&config_path())
+        .unwrap_or_default()
+        .get_bool("category_tree_default_expanded", true);
+    let mut paths: Vec<String> = db
+        .categories()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|c| c.title)
+        .collect();
+    for f in &feeds {
+        if let Some(cat) = &f.category
+            && !cat.trim().is_empty()
+            && !paths.contains(cat)
+        {
+            paths.push(cat.clone());
+        }
+    }
+    paths.sort();
+    let mut cat_items: std::collections::HashMap<String, TreeItemId> =
+        std::collections::HashMap::new();
+    for path in &paths {
+        let mut cur = String::new();
+        for seg in path.split('/').filter(|s| !s.trim().is_empty()) {
+            let parent = if cur.is_empty() {
+                root.clone()
+            } else {
+                cat_items.get(&cur).cloned().unwrap_or_else(|| root.clone())
+            };
+            if !cur.is_empty() {
+                cur.push('/');
+            }
+            cur.push_str(seg.trim());
+            if !cat_items.contains_key(&cur) {
+                // Node label: leaf name plus the unread total of
+                // every feed in scope, Python-style.
+                let prefix = format!("{cur}/");
+                let unread: i64 = feeds
+                    .iter()
+                    .filter(|f| {
+                        f.category.as_deref() == Some(cur.as_str())
+                            || f.category
+                                .as_deref()
+                                .is_some_and(|c| c.starts_with(&prefix))
+                    })
+                    .map(|f| db.unread_count(Some(&f.id)).unwrap_or(0))
+                    .sum();
+                let label = if unread > 0 {
+                    format!("{} ({unread})", seg.trim())
+                } else {
+                    seg.trim().to_string()
+                };
+                if let Some(item) =
+                    tree.append_item_with_data(&parent, &label, format!("cat:{cur}"), None, None)
+                {
+                    cat_items.insert(cur.clone(), item);
+                }
+            }
+        }
+    }
     for f in &feeds {
         let label = feed_label(db, f);
-        tree.append_item_with_data(&root, &label, f.id.clone(), None, None);
+        let parent = f
+            .category
+            .as_ref()
+            .filter(|c| !c.trim().is_empty())
+            .and_then(|c| cat_items.get(c))
+            .cloned()
+            .unwrap_or_else(|| root.clone());
+        tree.append_item_with_data(&parent, &label, f.id.clone(), None, None);
+    }
+    if expand_cats {
+        for item in cat_items.values() {
+            tree.expand(item);
+        }
     }
     // Smart folders: item data is "smart:<id>".
     if let Ok(folders) = db.smart_folders()
@@ -455,6 +590,23 @@ fn refill_articles(state: &mut State, list: &ListCtrl) {
                 }
                 state.articles = matched;
             }
+        }
+        return;
+    }
+    // Category selection: articles across every feed in the
+    // category, subcategories included.
+    if let Some(path) = filter.and_then(|f| f.strip_prefix("cat:")) {
+        let ids: Vec<String> = feeds_in_category(&state.feeds, path)
+            .iter()
+            .map(|f| f.id.clone())
+            .collect();
+        if let Ok(articles) = db.articles_for_feeds(&ids, 500) {
+            for (i, a) in articles.iter().enumerate() {
+                list.insert_item(i as i64, &a.title, None);
+                list.set_item_text_by_column(i as i64, 1, a.date.as_deref().unwrap_or(""));
+                list.set_item_text_by_column(i as i64, 2, &a.feed_id);
+            }
+            state.articles = articles;
         }
         return;
     }
@@ -642,13 +794,21 @@ fn main() {
             refreshing: false,
             focus_list: false,
             remember_last_feed: false,
+            cancel_refresh: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            refresh_stopped: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            last_refresh_end: None,
         }));
 
-        // Open the existing database and populate.
+        // A staged restore (Python backup.py semantics) applies
+        // before the database opens; the replaced files are kept
+        // as .pre-restore siblings.
+        let _ = blindrss_core::maintenance::apply_pending_restore(&data_dir());
+        // Open the database and populate (creating it on a fresh
+        // install, as Python does).
         let path = db_path();
         {
             let mut st = state.borrow_mut();
-            match Db::open(&path) {
+            match Db::open_or_create(&path) {
                 Ok(db) => {
                     st.feeds = db.feeds().unwrap_or_default();
                     st.db = Some(db);
@@ -740,30 +900,49 @@ fn main() {
         // Refresh: worker threads fetch + parse; results return over a
         // channel; a timer drains them on the main thread, which owns
         // the database connection.
+        fn spawn_refresh(
+            feeds: Vec<Feed>,
+            tx: Sender<RefreshMsg>,
+            cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+            stopped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        ) {
+            std::thread::spawn(move || {
+                for feed in feeds {
+                    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                        stopped.store(true, std::sync::atomic::Ordering::Relaxed);
+                        break;
+                    }
+                    let result = fetch_and_parse(&feed.url);
+                    let _ = tx.send(RefreshMsg::FeedDone(feed, result));
+                }
+                let _ = tx.send(RefreshMsg::AllDone);
+            });
+        }
         let (tx, rx): (Sender<RefreshMsg>, Receiver<RefreshMsg>) = channel();
         let rx = Rc::new(RefCell::new(rx));
         let state_btn = state.clone();
         let frame_btn = frame;
         let tx_refresh = tx.clone();
         let act_refresh: Rc<dyn Fn()> = Rc::new(move || {
-            let feeds = {
+            let (feeds, cancel, stopped) = {
                 let mut st = state_btn.borrow_mut();
                 if st.refreshing {
                     return;
                 }
                 st.refreshing = true;
-                st.feeds.clone()
+                st.cancel_refresh
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                st.refresh_stopped
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                (
+                    st.feeds.clone(),
+                    st.cancel_refresh.clone(),
+                    st.refresh_stopped.clone(),
+                )
             };
             frame_btn.set_status_text(&format!("Refreshing {} feeds...", feeds.len()), 0);
             announce("start_update", "Refresh Feeds");
-            let tx = tx_refresh.clone();
-            std::thread::spawn(move || {
-                for feed in feeds {
-                    let result = fetch_and_parse(&feed.url);
-                    let _ = tx.send(RefreshMsg::FeedDone(feed, result));
-                }
-                let _ = tx.send(RefreshMsg::AllDone);
-            });
+            spawn_refresh(feeds, tx_refresh.clone(), cancel, stopped);
         });
         {
             let a = act_refresh.clone();
@@ -798,12 +977,15 @@ fn main() {
                 };
                 frame_rf.set_status_text(&format!("Refreshing {}...", feed.title), 0);
                 announce("start_update", "Refresh Feeds");
-                let tx = tx_rf.clone();
-                std::thread::spawn(move || {
-                    let result = fetch_and_parse(&feed.url);
-                    let _ = tx.send(RefreshMsg::FeedDone(feed, result));
-                    let _ = tx.send(RefreshMsg::AllDone);
-                });
+                let (cancel, stopped) = {
+                    let st = state_rf.borrow();
+                    st.cancel_refresh
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                    st.refresh_stopped
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                    (st.cancel_refresh.clone(), st.refresh_stopped.clone())
+                };
+                spawn_refresh(vec![feed], tx_rf.clone(), cancel, stopped);
             })
         };
 
@@ -1731,7 +1913,6 @@ fn main() {
         let frame_rs = frame;
         let tree_rs = tree;
         let list_rs = list;
-        let reader_rs = reader;
         let act_restore: Rc<dyn Fn()> = Rc::new(move || {
             let dlg = FileDialog::builder(&frame_rs)
                 .with_message("Restore backup")
@@ -1744,24 +1925,13 @@ fn main() {
                 return;
             }
             if let Some(path) = dlg.get_path() {
-                match blindrss_core::maintenance::restore_backup(
-                    &PathBuf::from(&path),
-                    &db_path(),
-                    &config_path(),
-                ) {
+                // Python stages a restore and applies it at the
+                // next start, before the database opens — swapping
+                // rss.db live under the open connection is unsafe.
+                match blindrss_core::maintenance::stage_restore(&PathBuf::from(&path), &data_dir())
+                {
                     Ok(()) => {
-                        let mut st = state_rs.borrow_mut();
-                        st.db = Db::open(&db_path()).ok();
-                        st.feeds = st
-                            .db
-                            .as_ref()
-                            .and_then(|db| db.feeds().ok())
-                            .unwrap_or_default();
-                        st.articles.clear();
-                        rebuild_tree(&mut st, &tree_rs);
-                        refill_articles(&mut st, &list_rs);
-                        reader_rs.set_value("");
-                        frame_rs.set_status_text("Backup restored", 0);
+                        frame_rs.set_status_text("Restore staged — restart BlindRSS to apply it", 0)
                     }
                     Err(e) => frame_rs.set_status_text(&format!("Restore: {e}"), 0),
                 }
@@ -2065,6 +2235,276 @@ fn main() {
             frame_cf.set_status_text(if ok { "Feed URL copied" } else { "Copy failed" }, 0);
         });
 
+        // Stop Refresh: cooperative cancel the worker checks
+        // between feeds (Python's cancel_refresh).
+        let act_stop_refresh: Rc<dyn Fn()> = {
+            let state_sr = state.clone();
+            let frame_sr = frame;
+            Rc::new(move || {
+                let st = state_sr.borrow();
+                if st.refreshing {
+                    st.cancel_refresh
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    frame_sr.set_status_text("Stopping refresh...", 0);
+                } else {
+                    frame_sr.set_status_text("No refresh is running", 0);
+                }
+            })
+        };
+
+        // Refresh Category: every feed under the selected
+        // category node, through the same worker as Refresh All.
+        let act_refresh_category: Rc<dyn Fn()> = {
+            let state_rc = state.clone();
+            let frame_rc = frame;
+            let tx_rc = tx.clone();
+            Rc::new(move || {
+                let work = {
+                    let mut st = state_rc.borrow_mut();
+                    if st.refreshing {
+                        return;
+                    }
+                    let Some(path) = selected_category(&st) else {
+                        frame_rc.set_status_text("Select a category in the tree first", 0);
+                        return;
+                    };
+                    let feeds = feeds_in_category(&st.feeds, &path);
+                    if feeds.is_empty() {
+                        frame_rc.set_status_text("No feeds in that category", 0);
+                        return;
+                    }
+                    st.refreshing = true;
+                    st.cancel_refresh
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                    st.refresh_stopped
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                    (
+                        feeds,
+                        st.cancel_refresh.clone(),
+                        st.refresh_stopped.clone(),
+                        path,
+                    )
+                };
+                let (feeds, cancel, stopped, path) = work;
+                frame_rc.set_status_text(
+                    &format!("Refreshing {} ({} feeds)...", path, feeds.len()),
+                    0,
+                );
+                announce("start_update", "Refresh Feeds");
+                spawn_refresh(feeds, tx_rc.clone(), cancel, stopped);
+            })
+        };
+
+        // New Category / Delete Category (tree hierarchy ops).
+        let act_add_category: Rc<dyn Fn()> = {
+            let state_ac = state.clone();
+            let frame_ac = frame;
+            Rc::new(move || {
+                let parent = selected_category(&state_ac.borrow());
+                let name = prompt_focus(
+                    &frame_ac,
+                    "Category name:",
+                    "New Category",
+                    "",
+                    &state_ac.borrow(),
+                    &tree,
+                    &list,
+                );
+                let Some(name) = name.filter(|n| !n.trim().is_empty()) else {
+                    return;
+                };
+                let full = match &parent {
+                    Some(p) => format!("{p}/{}", name.trim()),
+                    None => name.trim().to_string(),
+                };
+                let mut st = state_ac.borrow_mut();
+                match st.db.as_ref().map(|db| db.ensure_category_path(&full)) {
+                    Some(Ok(_)) => {
+                        st.selected_feed = Some(format!("cat:{full}"));
+                        rebuild_tree(&mut st, &tree);
+                        refill_articles(&mut st, &list);
+                        frame_ac.set_status_text(&format!("Category {full} created"), 0);
+                    }
+                    Some(Err(e)) => frame_ac.set_status_text(&format!("New category: {e}"), 0),
+                    None => frame_ac.set_status_text("No database", 0),
+                }
+            })
+        };
+        let act_delete_category: Rc<dyn Fn()> = {
+            let state_dc = state.clone();
+            let frame_dc = frame;
+            Rc::new(move || {
+                let Some(path) = selected_category(&state_dc.borrow()) else {
+                    frame_dc.set_status_text("Select a category in the tree first", 0);
+                    return;
+                };
+                let dlg = MessageDialog::builder(
+                    &frame_dc,
+                    &format!(
+                        "Delete category {path}? Its feeds and subcategories move up to the parent category."
+                    ),
+                    "Delete Category",
+                )
+                .with_style(MessageDialogStyle::YesNo)
+                .build();
+                let rc = dlg.show_modal();
+                restore_focus(&state_dc.borrow(), &tree, &list);
+                if rc != ID_YES {
+                    return;
+                }
+                let mut st = state_dc.borrow_mut();
+                match st.db.as_ref().map(|db| db.delete_category_path(&path)) {
+                    Some(Ok(true)) => {
+                        st.selected_feed = None;
+                        st.feeds = st
+                            .db
+                            .as_ref()
+                            .and_then(|db| db.feeds().ok())
+                            .unwrap_or_default();
+                        rebuild_tree(&mut st, &tree);
+                        refill_articles(&mut st, &list);
+                        frame_dc.set_status_text(&format!("Category {path} deleted"), 0);
+                    }
+                    Some(Ok(false)) => frame_dc.set_status_text(
+                        "Category not deleted (missing, or a name collision blocks it)",
+                        0,
+                    ),
+                    Some(Err(e)) => frame_dc.set_status_text(&format!("Delete category: {e}"), 0),
+                    None => frame_dc.set_status_text("No database", 0),
+                }
+            })
+        };
+
+        // Import OPML Here / Export Category OPML.
+        let act_import_here: Rc<dyn Fn()> = {
+            let state_ih = state.clone();
+            let frame_ih = frame;
+            Rc::new(move || {
+                let Some(path) = selected_category(&state_ih.borrow()) else {
+                    frame_ih.set_status_text("Select a category in the tree first", 0);
+                    return;
+                };
+                let dlg = FileDialog::builder(&frame_ih)
+                    .with_message("Import OPML into category")
+                    .with_wildcard("OPML files (*.opml;*.xml)|*.opml;*.xml")
+                    .with_style(FileDialogStyle::Open)
+                    .build();
+                let rc = dlg.show_modal();
+                restore_focus(&state_ih.borrow(), &tree, &list);
+                if rc != ID_OK {
+                    return;
+                }
+                let Some(file) = dlg.get_path() else { return };
+                let text = match std::fs::read_to_string(&file) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        frame_ih.set_status_text(&format!("Could not read file: {e}"), 0);
+                        return;
+                    }
+                };
+                let mut st = state_ih.borrow_mut();
+                let Some(db) = st.db.as_ref() else { return };
+                match blindrss_core::opml::import_opml_under(db, &text, Some(&path)) {
+                    Ok(n) => {
+                        st.feeds = db.feeds().unwrap_or_default();
+                        rebuild_tree(&mut st, &tree);
+                        refill_articles(&mut st, &list);
+                        frame_ih.set_status_text(&format!("Imported {n} feeds into {path}"), 0);
+                    }
+                    Err(e) => frame_ih.set_status_text(&format!("Import failed: {e}"), 0),
+                }
+            })
+        };
+        let act_export_category: Rc<dyn Fn()> = {
+            let state_ec = state.clone();
+            let frame_ec = frame;
+            Rc::new(move || {
+                let work = {
+                    let st = state_ec.borrow();
+                    let Some(path) = selected_category(&st) else {
+                        frame_ec.set_status_text("Select a category in the tree first", 0);
+                        return;
+                    };
+                    (feeds_in_category(&st.feeds, &path), path)
+                };
+                let (feeds, path) = work;
+                if feeds.is_empty() {
+                    frame_ec.set_status_text("No feeds in that category", 0);
+                    return;
+                }
+                let xml = match blindrss_core::opml::export_opml_feeds(&feeds) {
+                    Ok(x) => x,
+                    Err(e) => {
+                        frame_ec.set_status_text(&format!("Export failed: {e}"), 0);
+                        return;
+                    }
+                };
+                let dlg = FileDialog::builder(&frame_ec)
+                    .with_message("Export category OPML")
+                    .with_wildcard("OPML files (*.opml)|*.opml")
+                    .with_style(FileDialogStyle::Save)
+                    .build();
+                let rc = dlg.show_modal();
+                restore_focus(&state_ec.borrow(), &tree, &list);
+                if rc != ID_OK {
+                    return;
+                }
+                let Some(file) = dlg.get_path() else { return };
+                match std::fs::write(&file, xml) {
+                    Ok(()) => frame_ec.set_status_text(&format!("Exported {} to {file}", path), 0),
+                    Err(e) => frame_ec.set_status_text(&format!("Export failed: {e}"), 0),
+                }
+            })
+        };
+
+        // Feed Errors dialog (Python's "Feeds with Errors" view,
+        // fed by the error columns the refresh drain maintains).
+        let act_feed_errors: Rc<dyn Fn()> = {
+            let state_fe = state.clone();
+            let frame_fe = frame;
+            Rc::new(move || {
+                let errors = {
+                    let st = state_fe.borrow();
+                    let Some(db) = st.db.as_ref() else { return };
+                    db.feed_errors().unwrap_or_default()
+                };
+                if errors.is_empty() {
+                    frame_fe.set_status_text("No feed errors", 0);
+                    return;
+                }
+                let dlg = Dialog::builder(&frame_fe, "Feeds with Errors").build();
+                dlg.set_size(Size::new(960, 420));
+                let lc = ListCtrl::builder(&dlg)
+                    .with_style(ListCtrlStyle::Report)
+                    .build();
+                lc.insert_column(0, "Feed", ListColumnFormat::Left, 240);
+                lc.insert_column(1, "Category", ListColumnFormat::Left, 120);
+                lc.insert_column(2, "Failures", ListColumnFormat::Left, 70);
+                lc.insert_column(3, "Last error", ListColumnFormat::Left, 360);
+                lc.insert_column(4, "Last success", ListColumnFormat::Left, 140);
+                for (i, e) in errors.iter().enumerate() {
+                    let i = i as i64;
+                    lc.insert_item(i, &e.title, None);
+                    lc.set_item_text_by_column(i, 1, e.category.as_deref().unwrap_or(""));
+                    lc.set_item_text_by_column(i, 2, &e.consecutive_failures.to_string());
+                    lc.set_item_text_by_column(i, 3, &e.error);
+                    lc.set_item_text_by_column(i, 4, &fmt_ts(e.success_at));
+                }
+                let close_btn = Button::builder(&dlg).with_label("Close").build();
+                let ds = BoxSizer::builder(Orientation::Vertical).build();
+                ds.add(&lc, 1, SizerFlag::Expand | SizerFlag::All, 4);
+                ds.add(&close_btn, 0, SizerFlag::All, 4);
+                dlg.set_sizer(ds, true);
+                let dlg_close = dlg;
+                close_btn.on_click(move |_| {
+                    dlg_close.end_modal(ID_OK);
+                });
+                dlg.show_modal();
+                dlg.destroy();
+                restore_focus(&state_fe.borrow(), &tree, &list);
+            })
+        };
+
         let file_menu = Menu::builder()
             .append_item(M_ADD_FEED, "&Add Feed...", "Subscribe to a feed")
             .append_item(
@@ -2091,6 +2531,12 @@ fn main() {
         let feeds_menu = Menu::builder()
             .append_item(M_REFRESH, "&Refresh All", "Refresh every feed")
             .append_item(M_REFRESH_FEED, "Refresh &Feed", "Refresh the selected feed")
+            .append_item(
+                M_REFRESH_CAT,
+                "Refresh &Category",
+                "Refresh every feed in the selected category",
+            )
+            .append_item(M_STOP_REFRESH, "S&top Refresh", "Stop the running refresh")
             .append_item(M_SYNC, "S&ync Providers", "Sync hosted providers")
             .append_item(
                 M_COPY_FEED_URL,
@@ -2113,6 +2559,23 @@ fn main() {
                 M_SET_CAT,
                 "Set Feed Categor&y...",
                 "Move the selected feed to a category",
+            )
+            .append_separator()
+            .append_item(M_ADD_CAT, "New Category...", "Create a category")
+            .append_item(
+                M_DEL_CAT,
+                "Delete Category",
+                "Delete the selected category (feeds move up)",
+            )
+            .append_item(
+                M_IMPORT_HERE,
+                "Import OPML Here...",
+                "Import OPML into the selected category",
+            )
+            .append_item(
+                M_EXPORT_CAT,
+                "Export Category OPML...",
+                "Export the selected category's feeds",
             )
             .append_separator()
             .append_item(M_NEW_SF, "&New Smart Folder...", "Create a smart folder")
@@ -2189,6 +2652,11 @@ fn main() {
                 "Check for &Updates",
                 "Check GitHub for a newer release",
             )
+            .append_item(
+                M_FEED_ERRORS,
+                "Feed &Errors...",
+                "Feeds whose latest refresh failed",
+            )
             .build();
         let help_menu = Menu::builder()
             .append_item(M_HELP, "&User Guide", "Open the BlindRSS user guide")
@@ -2210,6 +2678,13 @@ fn main() {
             (M_RESTORE, act_restore.clone()),
             (M_REFRESH, act_refresh.clone()),
             (M_REFRESH_FEED, act_refresh_feed.clone()),
+            (M_REFRESH_CAT, act_refresh_category.clone()),
+            (M_STOP_REFRESH, act_stop_refresh.clone()),
+            (M_ADD_CAT, act_add_category.clone()),
+            (M_DEL_CAT, act_delete_category.clone()),
+            (M_IMPORT_HERE, act_import_here.clone()),
+            (M_EXPORT_CAT, act_export_category.clone()),
+            (M_FEED_ERRORS, act_feed_errors.clone()),
             (M_SYNC, act_sync.clone()),
             (M_REMOVE_FEED, act_remove.clone()),
             (M_EDIT_FEED, act_edit_feed.clone()),
@@ -2257,7 +2732,14 @@ fn main() {
             ev.skip(false);
             let mut menu = Menu::builder()
                 .append_item(M_REFRESH_FEED, "Refresh &Feed", "")
+                .append_item(M_REFRESH_CAT, "Refresh &Category", "")
                 .append_item(M_REFRESH, "&Refresh All", "")
+                .append_item(M_STOP_REFRESH, "S&top Refresh", "")
+                .append_separator()
+                .append_item(M_ADD_CAT, "New &Category...", "")
+                .append_item(M_DEL_CAT, "&Delete Category", "")
+                .append_item(M_IMPORT_HERE, "Import OPML &Here...", "")
+                .append_item(M_EXPORT_CAT, "&Export Category OPML...", "")
                 .append_separator()
                 .append_item(M_EDIT_FEED, "&Edit Feed...", "")
                 .append_item(M_REMOVE_FEED, "Re&move Feed", "")
@@ -2326,7 +2808,10 @@ fn main() {
                         let st = state_tick.borrow();
                         if let Some(db) = st.db.as_ref() {
                             match store_parsed(db, &feed, &parsed) {
-                                Ok(n) => new_total += n,
+                                Ok(n) => {
+                                    new_total += n;
+                                    let _ = db.clear_feed_error(&feed.id);
+                                }
                                 Err(e) => frame_tick.set_status_text(
                                     &format!("{}: store failed: {e}", feed.title),
                                     0,
@@ -2335,6 +2820,10 @@ fn main() {
                         }
                     }
                     Ok(RefreshMsg::FeedDone(feed, Err(e))) => {
+                        let st = state_tick.borrow();
+                        if let Some(db) = st.db.as_ref() {
+                            let _ = db.record_feed_error(&feed.id, &e);
+                        }
                         frame_tick.set_status_text(&format!("{}: {e}", feed.title), 0);
                     }
                     Ok(RefreshMsg::Added(_url, Ok((feed_url, parsed)))) => {
@@ -2505,17 +2994,60 @@ fn main() {
             if finished {
                 let mut st = state_tick.borrow_mut();
                 st.refreshing = false;
+                st.last_refresh_end = Some(std::time::Instant::now());
+                let stopped = st
+                    .refresh_stopped
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                st.refresh_stopped
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                st.cancel_refresh
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
                 rebuild_tree(&mut st, &tree);
                 refill_articles(&mut st, &list);
-                frame_tick
-                    .set_status_text(&format!("Refresh complete: {new_total} new articles"), 0);
-                announce(
-                    "general",
-                    &format!("Refresh complete: {new_total} new articles"),
-                );
+                if stopped {
+                    frame_tick.set_status_text("Refresh stopped", 0);
+                    announce("stop_update", "Refresh stopped");
+                } else {
+                    frame_tick
+                        .set_status_text(&format!("Refresh complete: {new_total} new articles"), 0);
+                    announce(
+                        "general",
+                        &format!("Refresh complete: {new_total} new articles"),
+                    );
+                }
             }
         });
         timer.start(150, false);
+
+        let sched_timer = Box::leak(Box::new(Timer::new(&frame)));
+        let state_sched = state.clone();
+        let refresh_sched = act_refresh.clone();
+        sched_timer.on_tick(move |_| {
+            let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+            let interval = cfg.get_i64("refresh_interval", 300);
+            if interval <= 0 {
+                return;
+            }
+            let due = {
+                let mut st = state_sched.borrow_mut();
+                if st.refreshing {
+                    return;
+                }
+                match st.last_refresh_end {
+                    // First tick sets the baseline; the startup
+                    // refresh (below) covers the initial fetch.
+                    None => {
+                        st.last_refresh_end = Some(std::time::Instant::now());
+                        false
+                    }
+                    Some(t) => t.elapsed().as_secs() >= interval as u64,
+                }
+            };
+            if due {
+                refresh_sched();
+            }
+        });
+        sched_timer.start(60_000, false);
 
         // Python parity: start_maximized opens the window
         // maximized (Python skips this only when starting hidden
@@ -2544,5 +3076,19 @@ fn main() {
             }
         });
         focus_timer.start(75, true);
+
+        // Startup refresh: Python's refresh_on_startup defaults
+        // to on. One-shot, shortly after the window is up.
+        {
+            let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+            if cfg.get_bool("refresh_on_startup", true) {
+                let startup_timer = Box::leak(Box::new(Timer::new(&frame)));
+                let refresh_start = act_refresh.clone();
+                startup_timer.on_tick(move |_| {
+                    refresh_start();
+                });
+                startup_timer.start(1200, true);
+            }
+        }
     });
 }

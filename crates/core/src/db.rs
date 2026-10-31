@@ -38,7 +38,65 @@ pub struct PlaybackState {
 pub struct Category {
     pub id: String,
     pub title: String,
+    pub parent_id: Option<String>,
 }
+
+/// One feed's recorded refresh failure (Python issue #32 shape).
+#[derive(Debug, Clone, PartialEq)]
+pub struct FeedError {
+    pub feed_id: String,
+    pub title: String,
+    pub url: String,
+    pub category: Option<String>,
+    pub error: String,
+    pub error_at: Option<f64>,
+    pub success_at: Option<f64>,
+    pub consecutive_failures: i64,
+}
+
+/// The Python schema for every table this crate uses, with the
+/// later Python migration columns inline. A fresh install starts
+/// here; an existing Python database already has all of it.
+const SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS feeds (id TEXT PRIMARY KEY, url TEXT, title TEXT,
+    title_is_custom INTEGER DEFAULT 0, category TEXT, icon_url TEXT,
+    last_error TEXT, last_error_at REAL, last_success_at REAL,
+    consecutive_failures INTEGER DEFAULT 0);
+CREATE TABLE IF NOT EXISTS articles (id TEXT PRIMARY KEY, feed_id TEXT,
+    title TEXT, url TEXT, content TEXT, description TEXT, date TEXT,
+    author TEXT, is_read INTEGER DEFAULT 0, is_favorite INTEGER DEFAULT 0,
+    media_url TEXT, media_type TEXT, chapter_url TEXT, opened_at REAL,
+    category_override TEXT);
+CREATE TABLE IF NOT EXISTS categories (id TEXT PRIMARY KEY,
+    title TEXT UNIQUE, parent_id TEXT);
+CREATE TABLE IF NOT EXISTS deleted_articles (feed_id TEXT,
+    article_id TEXT, url TEXT, deleted_at REAL, title TEXT, content TEXT,
+    description TEXT, date TEXT, author TEXT, media_url TEXT,
+    media_type TEXT, chapter_url TEXT);
+CREATE TABLE IF NOT EXISTS chapters (id TEXT PRIMARY KEY,
+    article_id TEXT, start REAL, title TEXT, href TEXT);
+CREATE TABLE IF NOT EXISTS playback_state (id TEXT PRIMARY KEY,
+    position_ms INTEGER, duration_ms INTEGER, updated_at INTEGER,
+    completed INTEGER, seek_supported INTEGER, title TEXT);
+CREATE TABLE IF NOT EXISTS smart_folders (id TEXT PRIMARY KEY,
+    name TEXT, rule_json TEXT, position INTEGER);
+CREATE TABLE IF NOT EXISTS filter_rules (id TEXT PRIMARY KEY,
+    name TEXT, rule_json TEXT, actions_json TEXT, enabled INTEGER,
+    stop INTEGER, position INTEGER);
+CREATE TABLE IF NOT EXISTS article_labels (article_id TEXT,
+    category TEXT, PRIMARY KEY (article_id, category));
+";
+
+/// Columns Python added to existing tables by migration; older
+/// databases get them on open.
+const MIGRATION_COLUMNS: [(&str, &str, &str); 6] = [
+    ("feeds", "last_error", "TEXT"),
+    ("feeds", "last_error_at", "REAL"),
+    ("feeds", "last_success_at", "REAL"),
+    ("feeds", "consecutive_failures", "INTEGER DEFAULT 0"),
+    ("categories", "parent_id", "TEXT"),
+    ("articles", "category_override", "TEXT"),
+];
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Article {
@@ -73,17 +131,47 @@ impl Db {
         }
         let conn = Connection::open(path)?;
         conn.execute_batch("PRAGMA foreign_keys=ON;")?;
-        Ok(Self { conn })
+        let db = Self { conn };
+        db.init_schema()?;
+        Ok(db)
+    }
+
+    /// Open the database, creating and initialising it when the
+    /// file does not exist yet (Python first-run behaviour — a
+    /// brand-new user starts with an empty, valid library).
+    pub fn open_or_create(path: &Path) -> rusqlite::Result<Self> {
+        let conn = Connection::open(path)?;
+        conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+        let db = Self { conn };
+        db.init_schema()?;
+        Ok(db)
+    }
+
+    fn init_schema(&self) -> rusqlite::Result<()> {
+        self.conn.execute_batch(SCHEMA)?;
+        for (table, column, decl) in MIGRATION_COLUMNS {
+            let mut stmt = self.conn.prepare(&format!("PRAGMA table_info({table})"))?;
+            let cols: Vec<String> = stmt
+                .query_map([], |r| r.get::<_, String>(1))?
+                .collect::<Result<_, _>>()?;
+            drop(stmt);
+            if !cols.iter().any(|c| c == column) {
+                self.conn
+                    .execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"))?;
+            }
+        }
+        Ok(())
     }
 
     pub fn categories(&self) -> rusqlite::Result<Vec<Category>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT id, title FROM categories ORDER BY title")?;
+            .prepare("SELECT id, title, parent_id FROM categories ORDER BY title")?;
         let rows = stmt.query_map([], |r| {
             Ok(Category {
                 id: r.get(0)?,
                 title: r.get(1)?,
+                parent_id: r.get(2)?,
             })
         })?;
         rows.collect()
@@ -482,13 +570,33 @@ impl Db {
     /// Rename a category: the categories row and every feed's
     /// category title string move together (Python semantics).
     pub fn rename_category(&self, old_title: &str, new_title: &str) -> rusqlite::Result<()> {
+        // Renaming a category renames its whole subtree: descendant
+        // category paths and feed assignments keep their tails.
         self.conn.execute(
             "UPDATE categories SET title = ?2 WHERE title = ?1",
             params![old_title, new_title],
         )?;
         self.conn.execute(
+            "UPDATE categories SET title = ?2 || substr(title, ?3) \
+             WHERE title LIKE ?1",
+            params![
+                format!("{old_title}/%"),
+                format!("{new_title}/"),
+                (old_title.len() + 2) as i64
+            ],
+        )?;
+        self.conn.execute(
             "UPDATE feeds SET category = ?2 WHERE category = ?1",
             params![old_title, new_title],
+        )?;
+        self.conn.execute(
+            "UPDATE feeds SET category = ?2 || substr(category, ?3) \
+             WHERE category LIKE ?1",
+            params![
+                format!("{old_title}/%"),
+                format!("{new_title}/"),
+                (old_title.len() + 2) as i64
+            ],
         )?;
         Ok(())
     }
@@ -540,12 +648,225 @@ impl Db {
         let cat = Category {
             id: uuid::Uuid::new_v4().to_string(),
             title: title.to_string(),
+            parent_id: None,
         };
         self.conn.execute(
             "INSERT INTO categories (id, title) VALUES (?1, ?2)",
             params![cat.id, cat.title],
         )?;
         Ok(cat)
+    }
+
+    /// Ensure a category path exists ("News/Tech"), creating any
+    /// missing rows with parent links (Python's local provider
+    /// stores hierarchy natively in categories.parent_id while the
+    /// title carries the full path). Returns the leaf's id.
+    pub fn ensure_category_path(&self, path: &str) -> rusqlite::Result<String> {
+        let mut parent_id: Option<String> = None;
+        let mut current = String::new();
+        for segment in path.split('/').filter(|s| !s.trim().is_empty()) {
+            if !current.is_empty() {
+                current.push('/');
+            }
+            current.push_str(segment.trim());
+            let existing: Option<String> = self
+                .conn
+                .query_row(
+                    "SELECT id FROM categories WHERE title = ?1",
+                    params![current],
+                    |r| r.get(0),
+                )
+                .ok();
+            let id = match existing {
+                Some(id) => id,
+                None => {
+                    let id = uuid::Uuid::new_v4().to_string();
+                    self.conn.execute(
+                        "INSERT INTO categories (id, title, parent_id) VALUES (?1, ?2, ?3)",
+                        params![id, current, parent_id],
+                    )?;
+                    id
+                }
+            };
+            parent_id = Some(id);
+        }
+        Ok(parent_id.unwrap_or_default())
+    }
+
+    /// Delete a category by full path (Python delete_category):
+    /// direct children and their feeds are reparented to the
+    /// deleted node's parent, shortening their paths; the node
+    /// itself is removed. Refuses when a reparented child would
+    /// collide with an existing category of the same name.
+    pub fn delete_category_path(&self, path: &str) -> rusqlite::Result<bool> {
+        let row: Option<(String, Option<String>)> = self
+            .conn
+            .query_row(
+                "SELECT id, parent_id FROM categories WHERE title = ?1",
+                params![path],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .ok();
+        let Some((cat_id, parent_id)) = row else {
+            return Ok(false);
+        };
+        let parent_path: Option<String> = match &parent_id {
+            Some(pid) => self
+                .conn
+                .query_row(
+                    "SELECT title FROM categories WHERE id = ?1",
+                    params![pid],
+                    |r| r.get(0),
+                )
+                .ok(),
+            None => None,
+        };
+        let old_prefix = format!("{path}/");
+        let new_prefix = parent_path
+            .as_ref()
+            .map(|p| format!("{p}/"))
+            .unwrap_or_default();
+        let cats = self.categories()?;
+        // Collision check: a shortened descendant path must not
+        // land on an existing category outside the subtree.
+        for c in &cats {
+            if let Some(rest) = c.title.strip_prefix(&old_prefix) {
+                let target = format!("{new_prefix}{rest}");
+                if cats
+                    .iter()
+                    .any(|o| o.title == target && o.id != c.id && !o.title.starts_with(&old_prefix))
+                {
+                    return Ok(false);
+                }
+            }
+        }
+        // Rewrite descendant category paths, then feeds, then the
+        // node itself.
+        for c in &cats {
+            if let Some(rest) = c.title.strip_prefix(&old_prefix) {
+                let target = format!("{new_prefix}{rest}");
+                self.conn.execute(
+                    "UPDATE categories SET title = ?2 WHERE id = ?1",
+                    params![c.id, target],
+                )?;
+            }
+        }
+        self.conn.execute(
+            "UPDATE feeds SET category = ?2 WHERE category = ?1",
+            params![path, parent_path],
+        )?;
+        self.conn.execute(
+            "UPDATE feeds SET category = ?2 || substr(category, ?3) \
+             WHERE category LIKE ?1",
+            params![
+                format!("{old_prefix}%"),
+                new_prefix,
+                (old_prefix.len() + 1) as i64
+            ],
+        )?;
+        // Children of the deleted node now belong to its parent.
+        self.conn.execute(
+            "UPDATE categories SET parent_id = ?2 WHERE parent_id = ?1",
+            params![cat_id, parent_id],
+        )?;
+        self.conn
+            .execute("DELETE FROM categories WHERE id = ?1", params![cat_id])?;
+        Ok(true)
+    }
+
+    /// Record a feed refresh failure (Python record_feed_error).
+    pub fn record_feed_error(&self, feed_id: &str, error: &str) -> rusqlite::Result<()> {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        self.conn.execute(
+            "UPDATE feeds SET last_error = ?2, last_error_at = ?3, \
+             consecutive_failures = COALESCE(consecutive_failures, 0) + 1 \
+             WHERE id = ?1",
+            params![feed_id, error, ts],
+        )?;
+        Ok(())
+    }
+
+    /// Clear a feed's error after a successful refresh.
+    pub fn clear_feed_error(&self, feed_id: &str) -> rusqlite::Result<()> {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        self.conn.execute(
+            "UPDATE feeds SET last_error = NULL, last_error_at = NULL, \
+             last_success_at = ?2, consecutive_failures = 0 WHERE id = ?1",
+            params![feed_id, ts],
+        )?;
+        Ok(())
+    }
+
+    /// Feeds whose latest refresh failed, most recent first
+    /// (Python get_feed_errors).
+    pub fn feed_errors(&self) -> rusqlite::Result<Vec<FeedError>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, title, url, category, last_error, last_error_at, \
+             last_success_at, COALESCE(consecutive_failures, 0) FROM feeds \
+             WHERE last_error IS NOT NULL AND TRIM(last_error) != '' \
+             ORDER BY COALESCE(last_error_at, 0) DESC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(FeedError {
+                feed_id: r.get(0)?,
+                title: r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                url: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                category: r.get(3)?,
+                error: r.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                error_at: r.get(5)?,
+                success_at: r.get(6)?,
+                consecutive_failures: r.get(7)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// Articles across several feeds, newest first (category
+    /// scopes in the tree read through this).
+    pub fn articles_for_feeds(
+        &self,
+        feed_ids: &[String],
+        limit: usize,
+    ) -> rusqlite::Result<Vec<Article>> {
+        if feed_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let marks = feed_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT id, feed_id, title, url, content, description, date, author, \
+             is_read, is_favorite, media_url, media_type FROM articles \
+             WHERE feed_id IN ({marks}) ORDER BY COALESCE(date, '') DESC LIMIT ?"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut params: Vec<&dyn rusqlite::ToSql> = feed_ids
+            .iter()
+            .map(|id| id as &dyn rusqlite::ToSql)
+            .collect();
+        let limit_i = limit as i64;
+        params.push(&limit_i);
+        let rows = stmt.query_map(params.as_slice(), |r| {
+            Ok(Article {
+                id: r.get(0)?,
+                feed_id: r.get(1)?,
+                title: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                url: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                content: r.get(4)?,
+                description: r.get(5)?,
+                date: r.get(6)?,
+                author: r.get(7)?,
+                is_read: r.get::<_, i64>(8)? != 0,
+                is_favorite: r.get::<_, i64>(9)? != 0,
+                media_url: r.get(10)?,
+                media_type: r.get(11)?,
+            })
+        })?;
+        rows.collect()
     }
 
     pub fn remove_category(&self, category_id: &str) -> rusqlite::Result<()> {

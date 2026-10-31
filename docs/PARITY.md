@@ -14,7 +14,7 @@ Implementations found in Python (7):
 
 | Provider | Python size | Interface coverage in Python | Rust status |
 |---|---|---|---|
-| Local (`providers/local.py`) | 6,063 lines, 55 public methods | Full interface + smart folders, filter rules, feed errors, retention, podcast archive | **partial** — refresh/store, feed CRUD, OPML, categories, search, favorites, delete/restore, smart folders + filter rules (evaluate on store), retention prune done; feed errors view, scheduled/startup refresh, refresh cancel missing |
+| Local (`providers/local.py`) | 6,063 lines, 55 public methods | Full interface + smart folders, filter rules, feed errors, retention, podcast archive | **partial** — refresh/store, feed CRUD, OPML, categories, search, favorites, delete/restore, smart folders + filter rules (evaluate on store), retention prune done; category hierarchy + tree grouping, feed-errors view + recording, refresh cancel, scheduled + startup refresh done (v0.1.13) |
 | Miniflux (`providers/miniflux.py`) | 2,945 lines, 33 public | + test_connection, podcast archive, article delete, fetch_full_content, browser fallbacks for some endpoints | **partial** — feeds/entries sync + remote mark-read done (slice 5); connection test, categories sync, OPML import, full-content fetch, delete missing |
 | Inoreader (`providers/inoreader.py`) | 1,110 lines, 24 public | GReader protocol + OAuth2 (`core/inoreader_oauth.py`), rate-limit handling, metadata/article caches | **partial** — OAuth-token GReader sync done (slice 5); OAuth flow, rate-limit backoff, caches missing |
 | BazQux (`providers/bazqux.py`) | 765 lines, 24 public | GReader protocol | **partial** — ClientLogin sync done via shared GReader client (slice 5); per-feed refresh, remote feed add/remove/category ops missing |
@@ -26,8 +26,10 @@ Base-interface method groups (54) and where they stand in Rust core:
 
 - Lifecycle: get_name, refresh, cancel_refresh, refresh_feed,
   refresh_feeds_by_ids, scheduled_refresh_tick,
-  should_force_startup_refresh — **partial** (manual refresh only;
-  cancel + scheduled + startup-force missing)
+  should_force_startup_refresh — **done** locally (v0.1.13:
+  Refresh Category covers by-ids, the refresh worker honours a
+  cancel flag between feeds, a 60s tick fires refreshes on
+  refresh_interval, refresh_on_startup fires shortly after launch)
 - Feeds: get_feeds, add_feed, remove_feed, supports/update feed edit
   and URL update, supports/reset feed title — **partial**
   (add/remove done; edit dialog, URL update, title reset missing)
@@ -41,8 +43,11 @@ Base-interface method groups (54) and where they stand in Rust core:
 - OPML: import_opml, export_opml — **done** (local)
 - Categories: get_categories, add/rename/delete, move_category,
   supports_subcategories, get_category_hierarchy,
-  uncategorized_is_real_category — **partial** (flat add/remove done;
-  rename + move done (provider depth pass); hierarchy/subcategories missing)
+  uncategorized_is_real_category — **done** locally (v0.1.13:
+  categories carry parent_id + full-path titles,
+  ensure_category_path/delete_category_path with Python's
+  reparenting, rename moves the subtree, the tree groups feeds
+  under nested category nodes)
 - Full text: fetch_full_content — **partial** (cascade wired into
   the app via Read Full Text, slice 6; fetch fallback chain missing)
 - Media/chapters: get_article_chapters, HostedArticleMediaMixin
@@ -59,7 +64,7 @@ Base-interface method groups (54) and where they stand in Rust core:
 | Area | Python module(s), size | Rust status |
 |---|---|---|
 | Database (schema, counts, chapters, playback state, smart folders, filter rules) | db.py 2,656 | **partial** — feeds/articles/categories/deleted/chapters/playback_state/smart_folders/filter_rules all read+written; podcast archive state tables + article counts unread |
-| Config (defaults incl. providers, shortcuts, columns) | config.py 886 | **partial** — reader + writer (dotted set_path, pretty save) + settings dialog done; Python's default surface is 189 keys (Audit 2, §5B) and Rust touches 13 — the settings-depth gap lives there |
+| Config (defaults incl. providers, shortcuts, columns) | config.py 886 | **partial** — reader + writer (dotted set_path, pretty save) + settings dialog done; Python's default surface is 189 keys (Audit 2, §5B) and Rust touches 13 — the settings-depth gap lives there. Wired so far beyond the 13: remember_last_feed/start_maximized (v0.1.9), announcements map (v0.1.12), refresh_interval/refresh_on_startup/category_tree_default_expanded (v0.1.13) |
 | Feed discovery + site search | discovery.py 5,530 | **partial** — social transforms (Reddit/Bluesky/Mastodon/Lemmy/PieFed/Kbin/YouTube channel+playlist) + HTML alternate discovery + Add Feed resolution chain done; directory search (Feedsearch/Podcast Index/Apple/Fyyd), yt-dlp site search, synthetic forum subscriptions missing |
 | Article extraction (layered cascade) | article_extractor.py 5,098 | **partial** — cascade + full gate-marker list, paywall/link-list rejection, JSON-LD, Register + Axios dedicated extractors, metered notice, zero-width strip (slices 1, 6); engine-disagreement vetting hardened v0.1.4 (error-page title/body markers + prose shape, with BBC article + BBC 404 fixture regression tests — a blanket disagreement rejection discarded good extractions); precision-first base + lean lead recovery v0.1.11 (Python's favor_precision recipe: balanced mode dragged footer/affiliate boilerplate into Brandon's 9to5Mac full text; precision reproduced Python's output exactly; regression fixtures 9to5mac_whatsapp.html + cbc_syndicated.html); remaining: BBC/Sky/Bloomberg/GSMArena fixes, thread rebuilds (Reddit/Lemmy/forums), fetch fallback chain, Python's meta-description lead recovery depth |
 | HTML rendering of articles | article_html.py 1,190 | **missing** (native TextCtrl reader instead; rich view is a Phase-6 manual gate) |
@@ -83,7 +88,7 @@ Base-interface method groups (54) and where they stand in Rust core:
 | Playback state persistence | playback_state.py | **done** (slice 7: get/upsert/delete against the Python table) |
 | Equalizer (libVLC 10-band presets) | equalizer.py | **missing** |
 | User agents / fetch identity | user_agents.py 540; http_headers.py | **partial** — UA set on full-text fetch; presets + per-feed identity missing |
-| Backup/restore | backup.py | **done** — ZIP backup (VACUUM INTO + config) + restore + app buttons |
+| Backup/restore | backup.py | **done** — ZIP backup (VACUUM INTO + config) + restore + app buttons; restore is staged to restore_pending/ and applied at startup before the DB opens, replaced files kept as .pre-restore (Python semantics; the earlier live swap was a correctness bug, fixed v0.1.13) |
 | Retention/purge | retention.py | **partial** — prune read non-favorites + old tombstones (30d button) done; policy options missing |
 | Smart folders / filters logic | smart_folders.py; filters.py | **partial** — rule tree evaluator + action pipeline ported and tested (tag field awaits articles.tags) |
 | Metadata enrichment | metadata_enrich.py | **missing** |
@@ -106,9 +111,11 @@ Base-interface method groups (54) and where they stand in Rust core:
   delete + deleted restore, mark all read, search, read full text,
   play media + player window, download, Takeout import, archive
   rescan, cast, backup/restore, prune, settings dialog, shortcuts
-  dialog, help viewer, check updates, smart folder new/delete.
-  **Missing:** menu bar + context menus, feed properties, feed
-  errors view, per-feed/category refresh, stop refresh, sort
+  dialog, help viewer, check updates, smart folder new/delete,
+  category tree grouping, refresh category, stop refresh, feed
+  errors dialog, new/delete category, import OPML here, export
+  category OPML (v0.1.13).
+  **Missing:** menu bar + context menus, feed properties, sort
   controls, article/media filters, persistent searches,
   smart-folder edit + filter-rules UI, copy link/text variants,
   open in browser, download-as, podcast archive dialog, find in
@@ -233,10 +240,9 @@ Refresh All, Edit/Remove Feed, category ops, archive rescan, smart
 folders; list: read/full-text/favorite, play/download/cast,
 delete/mark-all). Still missing: the Python-only menus
 (Edit/View/Player). Menu-only actions still
-missing in Rust include: per-feed Refresh Feed, Refresh
-Category, Add Subcategory, Edit/Remove Category, Delete Category
-and Feeds, Import OPML Here, Export Category to OPML, Copy Feed
-URL, Open Article, Open in Default Browser, multi-select
+missing in Rust include: Edit/Remove Category as dedicated
+  dialogs (delete + rename exist), Delete Category and Feeds
+  (combined), Open Article, Open in Default Browser, multi-select
 Mark {count} as Read/Unread, Copy Links / Copy Media Link /
 Copy Image Link, Download As..., Detect Audio, play-queue
 Add/Remove/Open, View History, View Feed Description,
@@ -315,8 +321,8 @@ workspace; raw extraction audit3-features.json. Newly inventoried:
   from the article page) — the source of article tags — **missing**.
 - backup.py semantics: restore is STAGED to restore_pending/ and
   applied at next start before the DB opens; auto-backup rotates.
-  Rust restore currently swaps rss.db live under the open
-  connection — **correctness fix owed**; auto-backup **missing**.
+  Rust restore staged + applied at startup since v0.1.13
+  (correctness fix landed); auto-backup **missing**.
 - download_formats.py / retention.py: named preset systems (yt-dlp
   format selectors, retention id -> days) replace Rust's hardcoded
   download presets and fixed 30-day prune — **partial, generalize**.
@@ -356,8 +362,8 @@ surface audits missed, in port order:
    checkboxes write the Python config keys; selection changes
    persist last_selected_feed, startup reopens on it, and
    start_maximized maximizes before show). Tree expansion
-   default waits on category grouping (the Rust tree is flat
-   today); start_in_system_tray waits on a tray restore path.
+   default DONE v0.1.13 with category grouping in the tree;
+   start_in_system_tray waits on a tray restore path.
 3. AccessibleBrowserFrame + accessible view entries (flattened
    speech-first view model with special views and category
    hierarchy) — **missing entirely**.

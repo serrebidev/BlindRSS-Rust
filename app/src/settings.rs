@@ -141,6 +141,28 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
         .build();
     maximized_cb.set_value(cfg.get_bool("start_maximized", false));
     sizer.add(&maximized_cb, 0, SizerFlag::All, 4);
+    let expand_cb = CheckBox::builder(&dialog)
+        .with_label("Expand categories by default")
+        .build();
+    expand_cb.set_value(cfg.get_bool("category_tree_default_expanded", true));
+    sizer.add(&expand_cb, 0, SizerFlag::All, 4);
+
+    // Refresh scheduling (Python keys: refresh_on_startup defaults
+    // on, refresh_interval is in seconds, 300 default, 0 = off).
+    let refresh_label = StaticText::builder(&dialog).with_label("Refresh").build();
+    sizer.add(&refresh_label, 0, SizerFlag::All, 4);
+    let refresh_startup_cb = CheckBox::builder(&dialog)
+        .with_label("Refresh feeds on startup")
+        .build();
+    refresh_startup_cb.set_value(cfg.get_bool("refresh_on_startup", true));
+    sizer.add(&refresh_startup_cb, 0, SizerFlag::All, 4);
+    let interval_field = add_field(
+        &dialog,
+        &sizer,
+        "Refresh interval (seconds, 0 = off)",
+        &cfg.get_i64("refresh_interval", 300).to_string(),
+        false,
+    );
 
     // Announcements (PARITY 7.4): per-event speech/Braille mode,
     // mirroring Python's Settings > Announcements page.
@@ -219,7 +241,7 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
     btn_row.add(&cancel_btn, 0, SizerFlag::All, 4);
     sizer.add_sizer(&btn_row, 0, SizerFlag::All, 4);
     dialog.set_sizer(sizer, true);
-    dialog.set_size(Size::new(560, 860));
+    dialog.set_size(Size::new(560, 990));
 
     let cfg_path_buf = config_path.to_path_buf();
     let cfg_path_connect = config_path.to_path_buf();
@@ -271,6 +293,17 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
                 "start_maximized",
                 serde_json::json!(maximized_cb.is_checked()),
             );
+            cfg.set_path(
+                "category_tree_default_expanded",
+                serde_json::json!(expand_cb.is_checked()),
+            );
+            cfg.set_path(
+                "refresh_on_startup",
+                serde_json::json!(refresh_startup_cb.is_checked()),
+            );
+            if let Ok(secs) = interval_field.get_value().trim().parse::<i64>() {
+                cfg.set_path("refresh_interval", serde_json::json!(secs.max(0)));
+            }
             let mut modes = blindrss_core::announce::Announcements::from_config(&cfg);
             for (ev, choice) in blindrss_core::announce::EVENTS
                 .iter()

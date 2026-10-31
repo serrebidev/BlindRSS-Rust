@@ -5,7 +5,7 @@
 //! belong to that category. feeds.category stores the category title,
 //! matching the Python schema.
 
-use crate::db::Db;
+use crate::db::{Db, Feed};
 use opml::{OPML, Outline};
 
 fn collect(
@@ -22,7 +22,13 @@ fn collect(
             };
             out.push((url.clone(), title, category.map(str::to_string)));
         } else if !o.outlines.is_empty() {
-            collect(&o.outlines, Some(o.text.as_str()), out);
+            // Nested category outlines build the full path
+            // ("News/Tech"), matching Python's category identity.
+            let child = match category {
+                Some(parent) => format!("{parent}/{}", o.text.trim()),
+                None => o.text.trim().to_string(),
+            };
+            collect(&o.outlines, Some(&child), out);
         }
     }
 }
@@ -30,6 +36,13 @@ fn collect(
 /// Import subscriptions from OPML text. Feeds whose URL is already
 /// subscribed are skipped. Returns how many feeds were added.
 pub fn import_opml(db: &Db, xml: &str) -> Result<usize, String> {
+    import_opml_under(db, xml, None)
+}
+
+/// Import OPML under a target category ("Import OPML Here"):
+/// every imported feed's category is prefixed with the target
+/// path, and the category rows are created to match.
+pub fn import_opml_under(db: &Db, xml: &str, target: Option<&str>) -> Result<usize, String> {
     let doc = OPML::from_str(xml).map_err(|e| format!("OPML parse failed: {e}"))?;
     let mut found = Vec::new();
     collect(&doc.body.outlines, None, &mut found);
@@ -37,6 +50,14 @@ pub fn import_opml(db: &Db, xml: &str) -> Result<usize, String> {
     for (url, title, category) in found {
         if db.feed_url_exists(&url).map_err(|e| format!("{e}"))? {
             continue;
+        }
+        let category = match (target, category) {
+            (Some(t), Some(c)) => Some(format!("{t}/{c}")),
+            (Some(t), None) => Some(t.to_string()),
+            (None, c) => c,
+        };
+        if let Some(cat) = &category {
+            let _ = db.ensure_category_path(cat);
         }
         db.add_feed(&url, &title, category.as_deref())
             .map_err(|e| format!("add failed: {e}"))?;
@@ -48,6 +69,12 @@ pub fn import_opml(db: &Db, xml: &str) -> Result<usize, String> {
 /// Export all subscriptions as OPML 2.0, feeds grouped by category.
 pub fn export_opml(db: &Db) -> Result<String, String> {
     let feeds = db.feeds().map_err(|e| format!("{e}"))?;
+    export_opml_feeds(&feeds)
+}
+
+/// Export a chosen set of feeds as OPML 2.0 with category paths
+/// nested as outline hierarchies (the shape import reads back).
+pub fn export_opml_feeds(feeds: &[Feed]) -> Result<String, String> {
     let mut doc = OPML {
         head: Some(opml::Head {
             title: Some("BlindRSS Subscriptions".to_string()),
@@ -55,31 +82,44 @@ pub fn export_opml(db: &Db) -> Result<String, String> {
         }),
         ..Default::default()
     };
-    let mut uncategorized: Vec<Outline> = Vec::new();
-    let mut by_category: std::collections::BTreeMap<String, Vec<Outline>> =
-        std::collections::BTreeMap::new();
-    for f in &feeds {
+    #[derive(Default)]
+    struct CatNode {
+        feeds: Vec<Outline>,
+        children: std::collections::BTreeMap<String, CatNode>,
+    }
+    fn node_outline(name: &str, node: &CatNode) -> Outline {
+        let mut outlines: Vec<Outline> = node
+            .children
+            .iter()
+            .map(|(child, n)| node_outline(child, n))
+            .collect();
+        outlines.extend(node.feeds.iter().cloned());
+        Outline {
+            text: name.to_string(),
+            outlines,
+            ..Default::default()
+        }
+    }
+    let mut root = CatNode::default();
+    for f in feeds {
         let outline = Outline {
             text: f.title.clone(),
             xml_url: Some(f.url.clone()),
             r#type: Some("rss".to_string()),
             ..Default::default()
         };
-        match &f.category {
-            Some(cat) if !cat.trim().is_empty() => {
-                by_category.entry(cat.clone()).or_default().push(outline);
+        let mut node = &mut root;
+        if let Some(cat) = &f.category {
+            for segment in cat.split('/').filter(|s| !s.trim().is_empty()) {
+                node = node.children.entry(segment.trim().to_string()).or_default();
             }
-            _ => uncategorized.push(outline),
         }
+        node.feeds.push(outline);
     }
-    for (cat, outlines) in by_category {
-        doc.body.outlines.push(Outline {
-            text: cat,
-            outlines,
-            ..Default::default()
-        });
+    for (name, node) in &root.children {
+        doc.body.outlines.push(node_outline(name, node));
     }
-    doc.body.outlines.extend(uncategorized);
+    doc.body.outlines.extend(root.feeds);
     doc.to_string()
         .map_err(|e| format!("OPML write failed: {e}"))
 }

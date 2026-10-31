@@ -109,3 +109,43 @@ pub fn check_update() -> Result<(String, Option<String>), String> {
         .map_err(|e| format!("update check: {e}"))?;
     parse_latest_release(&text).ok_or_else(|| "unexpected release response".to_string())
 }
+
+/// Stage a restore the way Python's backup.py does: the backup's
+/// rss.db + config.json land in `<data_dir>/restore_pending/` and
+/// are applied at the next start, before the database opens —
+/// swapping the DB live under an open connection corrupts state.
+pub fn stage_restore(zip_path: &std::path::Path, data_dir: &std::path::Path) -> Result<(), String> {
+    let pending = data_dir.join("restore_pending");
+    std::fs::create_dir_all(&pending).map_err(|e| format!("stage dir: {e}"))?;
+    restore_backup(
+        zip_path,
+        &pending.join("rss.db"),
+        &pending.join("config.json"),
+    )
+}
+
+/// Apply a staged restore, if one is pending. Call before opening
+/// the database. Returns true when a restore was applied; the
+/// replaced files are kept as `.pre-restore` siblings.
+pub fn apply_pending_restore(data_dir: &std::path::Path) -> bool {
+    let pending = data_dir.join("restore_pending");
+    let staged_db = pending.join("rss.db");
+    if !staged_db.exists() {
+        return false;
+    }
+    let db_path = data_dir.join("rss.db");
+    if db_path.exists() {
+        let _ = std::fs::rename(&db_path, data_dir.join("rss.db.pre-restore"));
+    }
+    let applied = std::fs::rename(&staged_db, &db_path).is_ok();
+    let staged_cfg = pending.join("config.json");
+    if staged_cfg.exists() {
+        let cfg_path = data_dir.join("config.json");
+        if cfg_path.exists() {
+            let _ = std::fs::rename(&cfg_path, data_dir.join("config.json.pre-restore"));
+        }
+        let _ = std::fs::rename(&staged_cfg, &cfg_path);
+    }
+    let _ = std::fs::remove_dir_all(&pending);
+    applied
+}
