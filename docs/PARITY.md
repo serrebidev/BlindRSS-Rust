@@ -14,7 +14,7 @@ Implementations found in Python (7):
 
 | Provider | Python size | Interface coverage in Python | Rust status |
 |---|---|---|---|
-| Local (`providers/local.py`) | 6,063 lines, 55 public methods | Full interface + smart folders, filter rules, feed errors, retention, podcast archive | **partial** — refresh/store, feed CRUD, OPML, categories, search, favorites, delete/restore done (slices 1–4); smart folders, filter rules, feed errors, retention, scheduled refresh missing |
+| Local (`providers/local.py`) | 6,063 lines, 55 public methods | Full interface + smart folders, filter rules, feed errors, retention, podcast archive | **partial** — refresh/store, feed CRUD, OPML, categories, search, favorites, delete/restore, smart folders + filter rules (evaluate on store), retention prune done; feed errors view, scheduled/startup refresh, refresh cancel missing |
 | Miniflux (`providers/miniflux.py`) | 2,945 lines, 33 public | + test_connection, podcast archive, article delete, fetch_full_content, browser fallbacks for some endpoints | **partial** — feeds/entries sync + remote mark-read done (slice 5); connection test, categories sync, OPML import, full-content fetch, delete missing |
 | Inoreader (`providers/inoreader.py`) | 1,110 lines, 24 public | GReader protocol + OAuth2 (`core/inoreader_oauth.py`), rate-limit handling, metadata/article caches | **partial** — OAuth-token GReader sync done (slice 5); OAuth flow, rate-limit backoff, caches missing |
 | BazQux (`providers/bazqux.py`) | 765 lines, 24 public | GReader protocol | **partial** — ClientLogin sync done via shared GReader client (slice 5); per-feed refresh, remote feed add/remove/category ops missing |
@@ -58,8 +58,8 @@ Base-interface method groups (54) and where they stand in Rust core:
 
 | Area | Python module(s), size | Rust status |
 |---|---|---|
-| Database (schema, counts, chapters, playback state, smart folders, filter rules) | db.py 2,656 | **partial** — feeds/articles/categories/deleted done; chapters, playback_state, smart_folders, filter_rules tables unread |
-| Config (defaults incl. providers, shortcuts, columns) | config.py 886 | **partial** — reader with defaults; no writer/settings model yet |
+| Database (schema, counts, chapters, playback state, smart folders, filter rules) | db.py 2,656 | **partial** — feeds/articles/categories/deleted/chapters/playback_state/smart_folders/filter_rules all read+written; podcast archive state tables + article counts unread |
+| Config (defaults incl. providers, shortcuts, columns) | config.py 886 | **partial** — reader + writer (dotted set_path, pretty save) + settings dialog done; Python's default surface is 189 keys (Audit 2, §5B) and Rust touches 13 — the settings-depth gap lives there |
 | Feed discovery + site search | discovery.py 5,530 | **partial** — social transforms (Reddit/Bluesky/Mastodon/Lemmy/PieFed/Kbin/YouTube channel+playlist) + HTML alternate discovery + Add Feed resolution chain done; directory search (Feedsearch/Podcast Index/Apple/Fyyd), yt-dlp site search, synthetic forum subscriptions missing |
 | Article extraction (layered cascade) | article_extractor.py 5,098 | **partial** — cascade + full gate-marker list, paywall/link-list rejection, JSON-LD, Register + Axios dedicated extractors, metered notice, zero-width strip (slices 1, 6); remaining: BBC/Sky/Bloomberg/GSMArena fixes, thread rebuilds (Reddit/Lemmy/forums), fetch fallback chain, lead recovery |
 | HTML rendering of articles | article_html.py 1,190 | **missing** (native TextCtrl reader instead; rich view is a Phase-6 manual gate) |
@@ -94,24 +94,27 @@ Base-interface method groups (54) and where they stand in Rust core:
 | Platform integration (Windows/macOS) | windows_integration.py; macos_integration.py | **missing** |
 | Screen-reader announcements | screen_reader_announce.py | **partial** — status-bar text; no dedicated announce channel yet |
 | i18n (17 locales) + po compile | i18n.py; po_compile.py | **partial** — PO parser + catalog load + language resolution done, main-window labels wired (Refresh); full string sweep + .mo compile step missing |
-| Help system (92 topics; guide in 17 locales) | help_topics.py; docs/help/*.md | **done** — guide loader with locale fallback, topic split, plain-text viewer dialog |
+| Help system (80 top-level topics; guide in 17 locales) | help_topics.py; docs/help/*.md | **partial** — guide loader with locale fallback, topic split, plain-text viewer dialog done; context-sensitive help mapping (help_topics.py: topic per dialog/command) not wired; release zips do not bundle the guide/locale assets yet |
 | Shortcuts registry (70 actions, remappable) | shortcuts.py 439; gui/shortcut_keys.py; gui/hotkeys.py | **partial** — full registry extracted from Python, normalisation/conflicts, overrides dialog; live key dispatch for wired actions missing |
 
 ## 3. GUI surface (Python `gui/`)
 
-- MainFrame: 127 user-action handlers. Rust app today covers:
-  refresh all, add/remove feed, import/export OPML, sync providers,
-  article open (mark read), delete, favorite, mark all read, deleted
-  restore, search. **Missing:** feed properties/edit, feed errors
-  view, per-feed/category refresh, stop refresh, sort controls,
-  article/media filters, persistent searches, smart-folder UI,
-  filter-rules UI, copy link/text variants, open in browser,
-  downloads (article/media, download-as), podcast archive dialog,
-  find in article (next/prev), article history, play queue UI,
-  rich-view toggle, accessible browser, feed notifications toggles,
-  feed images setting, backup/restore UI, site-cookies import UI,
-  equalizer UI, YouTube account UI, settings dialog, check updates,
-  user guide/about, keyboard shortcuts dialog, tray, global hotkeys.
+- MainFrame: 127 user-action handlers. Rust app today covers (as
+  buttons; there is no menu bar yet — Audit 2 §5C): refresh all,
+  add/remove/edit feed, rename category, set feed category,
+  import/export OPML, sync providers, toggle read/favorite,
+  delete + deleted restore, mark all read, search, read full text,
+  play media + player window, download, Takeout import, archive
+  rescan, cast, backup/restore, prune, settings dialog, shortcuts
+  dialog, help viewer, check updates, smart folder new/delete.
+  **Missing:** menu bar + context menus, feed properties, feed
+  errors view, per-feed/category refresh, stop refresh, sort
+  controls, article/media filters, persistent searches,
+  smart-folder edit + filter-rules UI, copy link/text variants,
+  open in browser, download-as, podcast archive dialog, find in
+  article, article history, play queue UI, rich-view toggle,
+  accessible browser, per-feed notifications, equalizer UI,
+  YouTube account UI, about dialog, global hotkeys.
 - PlayerFrame: 20 handlers (play/pause/stop, seek slider, rewind/
   forward, volume, speed, chapters menu + prev/next/jump, cast) +
   CastDialog — **partial** (slice 7 player window: play/pause/stop,
@@ -154,5 +157,130 @@ Base-interface method groups (54) and where they stand in Rust core:
     tray.
 11. CI + release (slice 9).
 12. Manual NVDA/JAWS acceptance — Brandon's hands, release-blocking.
+
+## 5. Audit 2 — feature-surface sweep (2026-10-30)
+
+Second mechanical pass (audit/feature_audit.py in the migration
+workspace; report: reports/feature-audit-2026-10-30.md). Extracted:
+189 Python config default keys, 65 MainFrame menu labels, 31
+dialog/frame classes, every core/providers/root module surface, 80
+help topics, the 2 bundled sounds; Rust side: core pub fns per
+module, 42 app UI labels, 13 config paths. Findings beyond §1–§4:
+
+### 5A. Provider architecture gap (biggest single finding)
+Python runs against ONE active provider (`active_provider` config +
+`core/factory.py::get_provider`): Local, Miniflux, Inoreader,
+BazQux or The Old Reader can each be the live backend the whole UI
+reads/writes through the 54-method interface. Rust today is
+local-DB-only with a manual Sync Providers button. Porting the
+switchable-backend model is a design slice of its own; until then
+every "partial" provider row above understates the gap.
+
+### 5B. Settings surface: 189 default keys + dynamic keys
+Rust's settings dialog covers provider credentials + download
+folder (13 paths). Missing families, by config key group:
+- Reading: article_columns layout, article_sort_by/ascending,
+  article_structure_{headings,links,lists,quotes,tables},
+  show_image_alt (+ per-feed tri-state in menus), article_open_method,
+  article_open_command, cache_full_text, full_text_rich_view,
+  max_cached_views, remember_last_feed + last_selected_feed
+  (dynamic keys, verified in mainframe.py).
+- Refresh: refresh_interval, refresh_on_startup,
+  max_concurrent_refreshes, feed_timeout_seconds, feed_retry_attempts,
+  refresh_stop_pause_seconds, automatic_feed_refresh_workload,
+  ignore_feed_cache.
+- Player: seek_forward_ms/seek_back_ms (Rust hardcodes 30s),
+  volume + volume_step, playback_speed default, resume_* family
+  (resume_playback/min/complete threshold/save interval/back),
+  preferred_soundcard, show_player_on_play, vlc caching knobs,
+  custom_ffmpeg/ffprobe/ytdlp paths, prompt_missing_dependencies.
+- Downloads: downloads_enabled, download_format (download_formats.py
+  presets + mp3 bitrate), max_downloads, download_retention,
+  auto_download_podcasts + auto_download_period, downloaded_media.
+- Streaming caches: range_cache_* (11 keys; range_cache_proxy.py +
+  stream_proxy.py + play_cache.py incl. youtube_play_cache_*).
+- Silence/SponsorBlock: skip_silence + silence_* (11 keys,
+  audio_silence.py + webrtcvad), sponsorblock_{enabled,categories}.
+- Translation: translation_enabled/provider/target + SIX provider
+  key+model pairs (grok, openai, groq, gemini, openrouter, qwen) —
+  translation.py is 1,020 lines, not a single-client stub.
+- Notifications: windows_notifications_* (6 keys), sounds_enabled +
+  refresh_complete/refresh_error sounds (sounds/*.wav, not bundled
+  in Rust), announcements modes (announcements.py).
+- Window/tray/startup: close_to_tray, minimize_to_tray,
+  start_in_system_tray, start_maximized, start_on_windows_login,
+  category_tree_default_expanded, show_search_field, search_mode,
+  delete_behavior, confirm_article_delete, start menu/desktop
+  shortcut integration (windows_integration.py, macos_integration.py).
+- Accounts/search extras: github_token, groups_io_api_key,
+  newsapi_api_key, thenewsapi_api_key, enable_adult_search,
+  discovery_{city,country,language,region}, captcha_solver_*
+  (captcha_solver.py — Turnstile solving service), data_location,
+  debug_mode, global_show_hide_hotkey.
+- Updates: auto_check_updates, install_updates_automatically,
+  auto_backup_{enabled,dir,last} (scheduled auto-backup — Rust has
+  manual backup only).
+- Inoreader depth keys: article/metadata cache TTLs, page size.
+
+### 5C. Menu bar and context menus (structural)
+Python: full menu bar (File/Feeds/Edit/View/Player/Tools/Help) +
+tree/list context menus. Rust: none — buttons only. Menu-only
+actions missing in Rust include: per-feed Refresh Feed, Refresh
+Category, Add Subcategory, Edit/Remove Category, Delete Category
+and Feeds, Import OPML Here, Export Category to OPML, Copy Feed
+URL, Open Article, Open in Default Browser, multi-select
+Mark {count} as Read/Unread, Copy Links / Copy Media Link /
+Copy Image Link, Download As..., Detect Audio, play-queue
+Add/Remove/Open, View History, View Feed Description,
+Notifications for This Feed, playback speed selector,
+Show Chapters + Previous/Next Chapter (main window), in-player
+Cast to Device..., Open Chapter Link, Cut/Copy/Paste/Select All.
+
+### 5D. Dialogs: 31 Python classes vs Rust
+No Rust equivalent yet: AboutDialog, AccessibleBrowserFrame,
+AddShortcutsDialog, CategoryPropertiesDialog, FeedPropertiesDialog,
+FeedSearchDialog (discovery UI), FilterRulesDialog +
+FilterRuleEditorDialog, OpenArticleDialog (open-by-URL,
+core/open_article.py), OpenMediaUrlDialog (core/media_url.py),
+PersistentSearchDialog, PodcastArchiveDialog, QueueDialog,
+SmartFolderDialog (Rust has a name prompt only),
+TakeoutImportSelectionDialog (Rust imports the whole ZIP),
+YtdlpGlobalSearchDialog (18 handlers), ExcludeNotificationFeedsDialog,
+ShortcutCaptureDialog, ArticleWindow (separate reading window with
+HTML View menu; Rust reads in the main window only).
+
+### 5E. Module-level gaps not itemised in §2
+- article_columns.py — configurable article-list columns: **missing**.
+- captcha_solver.py — **missing** (see 5B).
+- Caster engine protocols: caster_devices.py + caster_extras.py add
+  Sonos, Roku, Kodi and generic UPnP/DLNA beside Chromecast —
+  Rust caster-core is Chromecast-only: **partial** widened.
+- Single-instance activation (single_instance.py): **missing**.
+- Runtime self-test (runtime_self_test.py) + startup dependency
+  prompt (dependency_check.py): **missing**.
+- Screen-reader announce channel (screen_reader_announce.py:
+  speech + braille): **partial** — status bar only.
+- Context help mapping (help_topics.py): **missing** (see §2 help row).
+- text_encoding.py — charset detection for feeds/pages: **missing**
+  as an explicit layer (feed-rs/ureq defaults only).
+- Translation updates channel (translation_updates.py): **missing**.
+- Player engine note: Python plays through a shared libVLC instance
+  (vlc_instance.py/vlc_options.py, hence the EQ + caching keys);
+  Rust uses wx MediaCtrl. Parity for EQ/silence/SponsorBlock/speed
+  must be re-proven against MediaCtrl backends per OS.
+
+### 5F. Port queue additions (after §4 items, rough order)
+1. Menu bar + context menus on the existing actions (discoverability
+   is an accessibility feature for screen-reader users).
+2. Active-provider architecture decision + factory (5A).
+3. Settings depth in SettingsDialog pages mirroring the help
+   topics' 10 settings pages, family by family (5B).
+4. Per-feed/category refresh + refresh cancel + scheduled refresh.
+5. Play queue UI + history + persistent searches + smart-folder
+   editor + filter-rules dialogs.
+6. Article columns, sort controls, open-by-URL/media dialogs.
+7. Caster protocols (DLNA/Sonos/Roku/Kodi), play/range caches.
+8. Translation (6 providers), announcements + sounds, single
+   instance, startup dependency check, context help.
 
 </content>
