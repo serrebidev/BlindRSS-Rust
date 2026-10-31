@@ -1317,7 +1317,20 @@ fn main() {
                 frame_pm.set_status_text("No article selected", 0);
                 return;
             };
-            if let Some(media_url) = article.media_url.clone().filter(|u| !u.is_empty()) {
+            // Direct media (a playable enclosure) plays at once.
+            // Anything else goes through the resolution chain on a
+            // worker: Python never feeds an arbitrary article page
+            // straight to yt-dlp (podcast pages without enclosures
+            // failed with a raw "Unsupported URL" error).
+            if let Some(media_url) =
+                article
+                    .media_url
+                    .clone()
+                    .filter(|u| !u.is_empty())
+                    .filter(|u| {
+                        blindrss_core::media::is_playable_media(u, article.media_type.as_deref())
+                    })
+            {
                 let chapters = st
                     .db
                     .as_ref()
@@ -1331,14 +1344,29 @@ fn main() {
                 frame_pm.set_status_text("Article has no media or link", 0);
                 return;
             }
-            frame_pm.set_status_text("Resolving media with yt-dlp...", 0);
+            frame_pm.set_status_text("Finding playable media...", 0);
             let tx = tx_pm.clone();
             let id = article.id.clone();
-            let url = article.url.clone();
             std::thread::spawn(move || {
-                let result = blindrss_core::media::stream_url(&url).map(|stream| {
-                    let info = blindrss_core::media::info(&url).ok();
-                    (stream, info)
+                let result = blindrss_core::media::resolve_for_play(
+                    article.media_url.as_deref(),
+                    article.media_type.as_deref(),
+                    &article.url,
+                    article.content.as_deref(),
+                )
+                .map(|r| {
+                    if r.detected
+                        && let Ok(db) = Db::open(&db_path())
+                    {
+                        let _ =
+                            db.update_article_media(&article.id, &r.url, r.media_type.as_deref());
+                    }
+                    let info = if r.via_ytdlp {
+                        blindrss_core::media::info(&article.url).ok()
+                    } else {
+                        None
+                    };
+                    (r.url, info)
                 });
                 let _ = tx.send(RefreshMsg::MediaReady(id, result));
             });
@@ -1461,20 +1489,40 @@ fn main() {
             frame_dl.set_status_text("Downloading...", 0);
             let tx = tx_dl.clone();
             std::thread::spawn(move || {
-                let result =
-                    if let Some(media) = article.media_url.clone().filter(|u| !u.is_empty()) {
-                        blindrss_core::download::download_direct(&media, &dir, &article.title)
-                            .map(|p| format!("Downloaded {}", p.display()))
-                    } else if !article.url.is_empty() {
-                        blindrss_core::download::download_with_ytdlp(
+                let result = if let Some(media) = article
+                    .media_url
+                    .clone()
+                    .filter(|u| !u.is_empty())
+                    .filter(|u| {
+                        blindrss_core::media::is_playable_media(u, article.media_type.as_deref())
+                    }) {
+                    blindrss_core::download::download_direct(&media, &dir, &article.title)
+                        .map(|p| format!("Downloaded {}", p.display()))
+                } else if !article.url.is_empty() {
+                    // Same resolution as Play: yt-dlp only for
+                    // supported sites or as the last resort; other
+                    // pages are scanned for media first.
+                    match blindrss_core::media::resolve_for_play(
+                        article.media_url.as_deref(),
+                        article.media_type.as_deref(),
+                        &article.url,
+                        article.content.as_deref(),
+                    ) {
+                        Ok(r) if r.via_ytdlp => blindrss_core::download::download_with_ytdlp(
                             &article.url,
                             &dir,
                             blindrss_core::download::DownloadPreset::Best,
                         )
-                        .map(|d| format!("Downloaded to {}", d.display()))
-                    } else {
-                        Err("Article has nothing to download".to_string())
-                    };
+                        .map(|d| format!("Downloaded to {}", d.display())),
+                        Ok(r) => {
+                            blindrss_core::download::download_direct(&r.url, &dir, &article.title)
+                                .map(|p| format!("Downloaded {}", p.display()))
+                        }
+                        Err(e) => Err(e),
+                    }
+                } else {
+                    Err("Article has nothing to download".to_string())
+                };
                 let _ = tx.send(RefreshMsg::DownloadDone(result));
             });
         });

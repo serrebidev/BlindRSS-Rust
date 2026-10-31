@@ -59,6 +59,7 @@ fn delete_tombstone_restore_cycle() {
             date: None,
             author: None,
             media_url: None,
+            media_type: None,
         }],
     };
     assert_eq!(store_parsed(&db, &feed, &parsed).unwrap(), 0);

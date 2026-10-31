@@ -32,7 +32,7 @@ fn entry_to_article(feed_id: &str, e: &ParsedEntry) -> Article {
         is_read: false,
         is_favorite: false,
         media_url: e.media_url.clone(),
-        media_type: None,
+        media_type: e.media_type.clone(),
     }
 }
 

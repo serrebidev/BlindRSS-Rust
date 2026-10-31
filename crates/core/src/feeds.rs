@@ -15,6 +15,7 @@ pub struct ParsedEntry {
     pub date: Option<String>,
     pub author: Option<String>,
     pub media_url: Option<String>,
+    pub media_type: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -44,11 +45,35 @@ fn entry_from(e: &Entry) -> ParsedEntry {
         .first()
         .map(|l| l.href.clone())
         .unwrap_or_else(|| e.id.clone());
-    let media_url = e
-        .media
-        .iter()
-        .flat_map(|m| m.content.iter())
-        .find_map(|c| c.url.as_ref().map(|u| u.to_string()));
+    // Enclosures and media:content alike land in e.media. Podcast
+    // posts can carry an image enclosure ahead of the episode audio
+    // (Python's Sky lesson), so prefer the first audio/video item;
+    // fall back to the first media item of any kind.
+    let mut fallback: Option<(String, Option<String>)> = None;
+    let mut chosen: Option<(String, Option<String>)> = None;
+    'scan: for m in &e.media {
+        for c in &m.content {
+            let Some(u) = &c.url else { continue };
+            let url = u.to_string();
+            let ctype = c.content_type.as_ref().map(|t| t.to_string());
+            if fallback.is_none() {
+                fallback = Some((url.clone(), ctype.clone()));
+            }
+            let playable = ctype
+                .as_deref()
+                .map(|t| t.starts_with("audio/") || t.starts_with("video/"))
+                .unwrap_or(false)
+                || crate::media::is_media_file_url(&url);
+            if playable {
+                chosen = Some((url, ctype));
+                break 'scan;
+            }
+        }
+    }
+    let (media_url, media_type) = match chosen.or(fallback) {
+        Some((u, t)) => (Some(u), t),
+        None => (None, None),
+    };
     ParsedEntry {
         id: e.id.clone(),
         title: e
@@ -62,6 +87,7 @@ fn entry_from(e: &Entry) -> ParsedEntry {
         date: e.published.or(e.updated).map(|d| d.to_rfc3339()),
         author: e.authors.first().and_then(|p| p.name.clone()),
         media_url,
+        media_type,
     }
 }
 

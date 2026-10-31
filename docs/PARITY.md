@@ -87,7 +87,7 @@ Base-interface method groups (54) and where they stand in Rust core:
 | Retention/purge | retention.py | **partial** — prune read non-favorites + old tombstones (30d button) done; policy options missing |
 | Smart folders / filters logic | smart_folders.py; filters.py | **partial** — rule tree evaluator + action pipeline ported and tested (tag field awaits articles.tags) |
 | Metadata enrichment | metadata_enrich.py | **missing** |
-| Media URL resolution | media_url.py; download_formats.py | **partial** — yt-dlp info/stream resolution + download presets done; media_url.py rules missing |
+| Media URL resolution | media_url.py; download_formats.py | **partial** — yt-dlp info/stream resolution + download presets done; playback resolution chain ported v0.1.10 (enclosures keep their MIME type, audio/video enclosure preferred over images, yt-dlp gated to Python's supported-site allowlist, page media detection scans stored content then the fetched page, detected media persisted via update_article_media, yt-dlp generic only as last resort — fixes Brandon's Double Tap "Unsupported URL" failure); media_url.py normalize rules + download_formats.py presets still missing |
 | Article language detect | article_lang.py | **missing** |
 | Announcements | announcements.py | **missing** |
 | Single instance, runtime env, self-test | single_instance.py; runtime_env.py; runtime_self_test.py | **missing** |

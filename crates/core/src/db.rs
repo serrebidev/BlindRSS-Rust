@@ -173,6 +173,21 @@ impl Db {
         }
     }
 
+    /// Attach media found after the fact (page detection at play
+    /// time), mirroring Python's provider.update_article_media.
+    pub fn update_article_media(
+        &self,
+        article_id: &str,
+        url: &str,
+        media_type: Option<&str>,
+    ) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE articles SET media_url = ?1, media_type = ?2 WHERE id = ?3",
+            params![url, media_type, article_id],
+        )?;
+        Ok(())
+    }
+
     pub fn mark_read(&self, article_id: &str, read: bool) -> rusqlite::Result<()> {
         self.conn.execute(
             "UPDATE articles SET is_read = ?1 WHERE id = ?2",
