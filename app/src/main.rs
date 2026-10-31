@@ -173,16 +173,101 @@ fn arbitrate_full_text(
 /// its protocol. Non-Cast devices receive the stream through
 /// the local proxy (they cannot take resolver URLs or local
 /// paths); Chromecast takes the URL directly.
+/// The running AirPlay cast's stop flag (RAOP streams FROM
+/// this app, unlike the other protocols, so it needs an
+/// explicit stop).
+static RAOP_STOP: std::sync::OnceLock<
+    std::sync::Mutex<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>>,
+> = std::sync::OnceLock::new();
+
+fn raop_stop_registry()
+-> &'static std::sync::Mutex<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>> {
+    RAOP_STOP.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// Start (or replace) the AirPlay cast of `url` (an http(s)
+/// URL or local file) to the RAOP device. ffmpeg decodes to
+/// PCM; the RAOP sender streams it with the configured EQ.
+fn start_raop_cast(
+    device: &blindrss_core::cast::CastDevice,
+    title: &str,
+    url: &str,
+    tx: &Sender<RefreshMsg>,
+) -> Result<String, String> {
+    // Stop any cast already running.
+    if let Some(old) = raop_stop_registry().lock().unwrap().take() {
+        old.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    *raop_stop_registry().lock().unwrap() = Some(stop.clone());
+    let ffmpeg =
+        blindrss_core::silence::find_ffmpeg().ok_or("AirPlay casting needs ffmpeg (not found)")?;
+    let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+    let eq = blindrss_core::equalizer::EqConfig::from_config(&cfg);
+    let (host, port) = (device.host.clone(), device.port);
+    let url = url.to_string();
+    let tx = tx.clone();
+    let name = device.name.clone();
+    let title_thread = title.to_string();
+    let title = title.to_string();
+    std::thread::spawn(move || {
+        let title = title_thread;
+        let mut child = match std::process::Command::new(&ffmpeg)
+            .args([
+                "-v", "error", "-i", &url, "-f", "s16le", "-ar", "44100", "-ac", "2", "-",
+            ])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = tx.send(RefreshMsg::StatusNote(format!(
+                    "AirPlay cast failed to start ffmpeg: {e}"
+                )));
+                return;
+            }
+        };
+        let mut pcm = child.stdout.take();
+        let result = match pcm.as_mut() {
+            Some(p) => blindrss_core::raop::stream_pcm(&host, port, p, Some(&eq), 80, stop.clone()),
+            None => Err("ffmpeg gave no output".to_string()),
+        };
+        let _ = child.kill();
+        let note = match result {
+            Ok(_) => format!("AirPlay cast to {name} finished: {title}"),
+            Err(e) => format!("AirPlay cast to {name} ended: {e}"),
+        };
+        if raop_stop_registry()
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|s| std::sync::Arc::ptr_eq(s, &stop))
+            .unwrap_or(false)
+        {
+            *raop_stop_registry().lock().unwrap() = None;
+        }
+        let _ = tx.send(RefreshMsg::StatusNote(note));
+    });
+    Ok(format!("Casting {title} to {} (AirPlay)", device.name))
+}
+
 fn cast_to_device(
     device: &blindrss_core::cast::CastDevice,
     article: &Article,
     url: &str,
+    tx: &Sender<RefreshMsg>,
 ) -> Result<String, String> {
     let mime = article
         .media_type
         .clone()
         .filter(|t| t.contains('/'))
         .unwrap_or_else(|| "audio/mpeg".to_string());
+    if device.kind == "airplay" {
+        // RAOP streams from us: no URL handoff. Audio only —
+        // a video article casts its soundtrack.
+        return start_raop_cast(device, &article.title, url, tx);
+    }
     if device.kind == "chromecast" {
         let mut session =
             blindrss_core::castsession::CastSession::connect(&device.host, device.port)?;
@@ -948,6 +1033,7 @@ const M_DELETED: i32 = 2126;
 const M_PLAY: i32 = 2127;
 const M_DOWNLOAD: i32 = 2128;
 const M_CAST: i32 = 2129;
+const M_STOP_CAST: i32 = 2207;
 const M_SEARCH: i32 = 2130;
 const M_HISTORY: i32 = 2131;
 const M_SETTINGS: i32 = 2141;
@@ -3899,6 +3985,18 @@ fn main() {
             cast_btn.on_click(move |_| a());
         }
 
+        // Stop AirPlay Cast: ends the RAOP stream (the other
+        // protocols play autonomously on the device).
+        let frame_sac = frame;
+        let act_stop_cast: Rc<dyn Fn()> =
+            Rc::new(move || match raop_stop_registry().lock().unwrap().take() {
+                Some(flag) => {
+                    flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                    frame_sac.set_status_text("AirPlay cast stopping", 0);
+                }
+                None => frame_sac.set_status_text("No AirPlay cast is running", 0),
+            });
+
         // Backup / Restore / Prune / Updates.
         let frame_bk = frame;
         let state_bk = state.clone();
@@ -4010,6 +4108,10 @@ fn main() {
         let state_set = state.clone();
         let tree_set = tree;
         let list_set = list;
+        let frame_eqd = frame;
+        let act_equalizer: Rc<dyn Fn()> = Rc::new(move || {
+            dialogs::show_equalizer(&frame_eqd, &config_path());
+        });
         type Action = Rc<dyn Fn()>;
         let dispatch: Vec<(&'static str, Action)> = vec![
             ("backup", act_backup.clone()),
@@ -4020,6 +4122,7 @@ fn main() {
             ("prune", act_prune.clone()),
             ("update", act_update.clone()),
             ("columns", act_columns.clone()),
+            ("equalizer", act_equalizer.clone()),
         ];
         let act_settings: Rc<dyn Fn()> = Rc::new(move || {
             #[cfg(target_os = "windows")]
@@ -4942,6 +5045,11 @@ fn main() {
                 "Download the selected article's media",
             )
             .append_item(M_CAST, "&Cast...", "Cast to a Chromecast")
+            .append_item(
+                M_STOP_CAST,
+                "Stop &AirPlay Cast",
+                "Stop the running AirPlay cast",
+            )
             .append_separator()
             .append_item(M_COPY_URL, "Copy Article &URL", "Copy the article's link")
             .append_item(
@@ -5091,6 +5199,7 @@ fn main() {
             (M_PLAY, act_play.clone()),
             (M_DOWNLOAD, act_download.clone()),
             (M_CAST, act_cast.clone()),
+            (M_STOP_CAST, act_stop_cast.clone()),
             (M_SEARCH, act_search.clone()),
             (M_SETTINGS, act_settings.clone()),
             (M_KEYS, act_keys.clone()),
@@ -5817,7 +5926,7 @@ fn main() {
                         if let Some(device) = device {
                             let tx2 = tx.clone();
                             std::thread::spawn(move || {
-                                let result = cast_to_device(&device, &article, &url);
+                                let result = cast_to_device(&device, &article, &url, &tx2);
                                 let _ = tx2.send(RefreshMsg::CastDone(result));
                             });
                         }

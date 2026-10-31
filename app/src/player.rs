@@ -219,6 +219,22 @@ pub fn open_player_queue(
     );
 }
 
+/// When the equalizer is enabled with a non-flat shape, route
+/// playback through the local EQ stream (MediaCtrl exposes no
+/// EQ; the stream is an ffmpeg transcode with the filter
+/// chain applied — seeking inside it is limited). Otherwise
+/// the URL passes through untouched.
+fn eq_wrap(url: &str, cfg: &blindrss_core::config::Config) -> String {
+    let eq = blindrss_core::equalizer::EqConfig::from_config(cfg);
+    if eq.enabled && (eq.bands.iter().any(|g| *g != 0.0) || eq.effective_preamp_db() != 0.0) {
+        let chain = blindrss_core::equalizer::ffmpeg_filter_chain(&eq);
+        if !chain.is_empty() {
+            return blindrss_core::proxy::eq_url(url, &chain);
+        }
+    }
+    url.to_string()
+}
+
 fn open_player_impl(
     _parent: &Frame,
     article: Article,
@@ -351,6 +367,7 @@ fn open_player_impl(
         }),
     }));
 
+    let stream_url = eq_wrap(&stream_url, &cfg);
     let loaded = media.load_uri(&stream_url);
     if loaded {
         media.play();
@@ -577,7 +594,7 @@ fn open_player_impl(
                             *chapters_tick.borrow_mut() = (Vec::new(), Vec::new());
                             chapter_list.clear();
                             set_queue_index(idx as i64);
-                            queue_load = Some((stream, entry.title.clone()));
+                            queue_load = Some((eq_wrap(&stream, &cfg2), entry.title.clone()));
                         }
                         Err(e) => queue_error = Some(e),
                     }

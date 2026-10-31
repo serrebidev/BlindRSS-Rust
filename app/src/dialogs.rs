@@ -2017,3 +2017,258 @@ pub fn show_import_cookies(frame: &Frame, config_path: &Path) {
     dialog.show_modal();
     dialog.destroy();
 }
+
+/// The Equalizer dialog (Python's EqualizerDialog): enable
+/// checkbox, preset choice (libVLC's built-ins plus the user's
+/// own), preamp + ten band fields in stored dB units, and
+/// save/delete for user presets. Writes the "equalizer" and
+/// "equalizer_user_presets" config keys on OK.
+pub fn show_equalizer(frame: &Frame, config_path: &Path) {
+    use blindrss_core::equalizer::*;
+    let mut cfg = Config::load(config_path).unwrap_or_default();
+    let current = EqConfig::from_config(&cfg);
+    let user_presets: Rc<RefCell<Vec<UserPreset>>> = Rc::new(RefCell::new(normalize_user_presets(
+        cfg.raw().get("equalizer_user_presets"),
+    )));
+    let dialog = Dialog::builder(frame, "Equalizer").build();
+    bind_f1(frame, &dialog, "EqualizerDialog");
+    let sizer = BoxSizer::builder(Orientation::Vertical).build();
+    let enabled_cb = CheckBox::builder(&dialog)
+        .with_label(&crate::tr("Enable equalizer"))
+        .build();
+    enabled_cb.set_value(current.enabled);
+    sizer.add(&enabled_cb, 0, SizerFlag::All, 4);
+
+    let preset_row = BoxSizer::builder(Orientation::Horizontal).build();
+    let preset_label = StaticText::builder(&dialog)
+        .with_label(&crate::tr("Preset:"))
+        .build();
+    let preset_choice = Choice::builder(&dialog).build();
+    preset_row.add(&preset_label, 0, SizerFlag::All, 4);
+    preset_row.add(&preset_choice, 1, SizerFlag::Expand | SizerFlag::All, 4);
+    sizer.add_sizer(&preset_row, 0, SizerFlag::Expand | SizerFlag::All, 2);
+
+    // Spin fields: preamp + one per band, labelled by frequency.
+    let make_spin = |parent: &Dialog| -> SpinCtrlDouble {
+        let s = SpinCtrlDouble::builder(parent)
+            .with_range(AMP_MIN, AMP_MAX)
+            .build();
+        s.set_digits(1);
+        s.set_increment(0.5);
+        s
+    };
+    let preamp_row = BoxSizer::builder(Orientation::Horizontal).build();
+    let preamp_label = StaticText::builder(&dialog)
+        .with_label(&crate::tr("Preamp (dB):"))
+        .build();
+    let preamp_spin = make_spin(&dialog);
+    preamp_spin.set_value(current.preamp);
+    preamp_row.add(&preamp_label, 0, SizerFlag::All, 4);
+    preamp_row.add(&preamp_spin, 1, SizerFlag::Expand | SizerFlag::All, 4);
+    sizer.add_sizer(&preamp_row, 0, SizerFlag::Expand | SizerFlag::All, 2);
+    let mut band_spins: Vec<SpinCtrlDouble> = Vec::new();
+    for (i, freq) in BAND_FREQUENCIES.iter().enumerate() {
+        let row = BoxSizer::builder(Orientation::Horizontal).build();
+        let label = StaticText::builder(&dialog)
+            .with_label(&format!("{} (dB):", format_band_label(*freq)))
+            .build();
+        let spin = make_spin(&dialog);
+        spin.set_value(current.bands[i]);
+        row.add(&label, 0, SizerFlag::All, 4);
+        row.add(&spin, 1, SizerFlag::Expand | SizerFlag::All, 4);
+        sizer.add_sizer(&row, 0, SizerFlag::Expand | SizerFlag::All, 1);
+        band_spins.push(spin);
+    }
+
+    // Preset list: index 0 = Custom, then built-ins, then the
+    // user's presets. Refilled after save/delete.
+    let fill_presets: Rc<dyn Fn(Option<u32>)> = {
+        let user_presets = user_presets.clone();
+        Rc::new(move |select: Option<u32>| {
+            preset_choice.clear();
+            preset_choice.append("Custom");
+            for (name, _, _) in PRESETS.iter() {
+                preset_choice.append(name);
+            }
+            for p in user_presets.borrow().iter() {
+                preset_choice.append(&p.name);
+            }
+            preset_choice.set_selection(select.unwrap_or(0));
+        })
+    };
+    // Initial selection: the stored preset name if it matches.
+    let initial_sel = current
+        .preset
+        .as_ref()
+        .and_then(|name| {
+            if let Some(i) = PRESETS.iter().position(|p| p.0 == name) {
+                Some((i + 1) as u32)
+            } else {
+                user_presets
+                    .borrow()
+                    .iter()
+                    .position(|p| &p.name == name)
+                    .map(|i| (i + 1 + PRESETS.len()) as u32)
+            }
+        })
+        .unwrap_or(0);
+    fill_presets(Some(initial_sel));
+
+    // Choosing a preset loads its values into the fields.
+    {
+        let user_presets = user_presets.clone();
+        let band_spins = band_spins.clone();
+        preset_choice.on_selection_changed(move |_| {
+            let Some(sel) = preset_choice.get_selection().map(|s| s as usize) else {
+                return;
+            };
+            if sel == 0 {
+                return;
+            }
+            let (preamp, bands) = if sel <= PRESETS.len() {
+                let (_, pre, bands) = &PRESETS[sel - 1];
+                // Built-ins are stored as effective dB; the
+                // config units carry the +12 convention.
+                (pre + 12.0, *bands)
+            } else {
+                let users = user_presets.borrow();
+                let Some(p) = users.get(sel - 1 - PRESETS.len()) else {
+                    return;
+                };
+                (p.preamp, p.bands)
+            };
+            preamp_spin.set_value(preamp);
+            for (i, spin) in band_spins.iter().enumerate() {
+                spin.set_value(bands[i]);
+            }
+            enabled_cb.set_value(true);
+        });
+    }
+
+    let name_row = BoxSizer::builder(Orientation::Horizontal).build();
+    let name_label = StaticText::builder(&dialog)
+        .with_label(&crate::tr("Preset name:"))
+        .build();
+    let name_field = TextCtrl::builder(&dialog).build();
+    let save_btn = Button::builder(&dialog)
+        .with_label(&crate::tr("Save Preset"))
+        .build();
+    let delete_btn = Button::builder(&dialog)
+        .with_label(&crate::tr("Delete Preset"))
+        .build();
+    name_row.add(&name_label, 0, SizerFlag::All, 4);
+    name_row.add(&name_field, 1, SizerFlag::Expand | SizerFlag::All, 4);
+    name_row.add(&save_btn, 0, SizerFlag::All, 4);
+    name_row.add(&delete_btn, 0, SizerFlag::All, 4);
+    sizer.add_sizer(&name_row, 0, SizerFlag::Expand | SizerFlag::All, 2);
+    {
+        let user_presets = user_presets.clone();
+        let fill = fill_presets.clone();
+        let band_spins = band_spins.clone();
+        save_btn.on_click(move |_| {
+            let name = name_field.get_value();
+            if name.trim().is_empty() {
+                return;
+            }
+            let bands: [f64; BAND_COUNT] = std::array::from_fn(|i| band_spins[i].get_value());
+            let mut list = user_presets.borrow_mut();
+            list.retain(|p| !p.name.eq_ignore_ascii_case(name.trim()));
+            list.push(UserPreset {
+                name: name.trim().to_string(),
+                preamp: clamp_amp(preamp_spin.get_value()),
+                bands: bands.map(clamp_amp),
+            });
+            let sel = (list.len() + PRESETS.len()) as u32;
+            drop(list);
+            fill(Some(sel));
+        });
+    }
+    {
+        let user_presets = user_presets.clone();
+        let fill = fill_presets.clone();
+        delete_btn.on_click(move |_| {
+            let Some(sel) = preset_choice.get_selection().map(|s| s as usize) else {
+                return;
+            };
+            if sel <= PRESETS.len() {
+                return;
+            }
+            let idx = sel - 1 - PRESETS.len();
+            let mut list = user_presets.borrow_mut();
+            if idx < list.len() {
+                list.remove(idx);
+            }
+            drop(list);
+            fill(Some(0));
+        });
+    }
+
+    let btn_row = BoxSizer::builder(Orientation::Horizontal).build();
+    let ok_btn = Button::builder(&dialog)
+        .with_label(&crate::tr("OK"))
+        .build();
+    let cancel_btn = Button::builder(&dialog)
+        .with_label(&crate::tr("Cancel"))
+        .build();
+    btn_row.add(&ok_btn, 0, SizerFlag::All, 4);
+    btn_row.add(&cancel_btn, 0, SizerFlag::All, 4);
+    sizer.add_sizer(&btn_row, 0, SizerFlag::All, 2);
+    let saved: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
+    {
+        let saved = saved.clone();
+        let d = dialog;
+        ok_btn.on_click(move |_| {
+            *saved.borrow_mut() = true;
+            d.end_modal(5100);
+        });
+    }
+    let d = dialog;
+    cancel_btn.on_click(move |_| d.end_modal(5101));
+    dialog.set_sizer(sizer, true);
+    dialog.set_size(Size::new(430, 560));
+    enabled_cb.set_focus();
+    let rc = dialog.show_modal();
+    if rc == 5100 && *saved.borrow() {
+        let bands: [f64; BAND_COUNT] = std::array::from_fn(|i| band_spins[i].get_value());
+        let sel = preset_choice.get_selection().unwrap_or(0) as usize;
+        // The preset name is recorded only when the fields
+        // still match the chosen preset exactly.
+        let preset_name = if sel == 0 {
+            None
+        } else if sel <= PRESETS.len() {
+            let (name, pre, pbands) = &PRESETS[sel - 1];
+            if (preamp_spin.get_value() - (pre + 12.0)).abs() < 0.001 && bands == *pbands {
+                Some(name.to_string())
+            } else {
+                None
+            }
+        } else {
+            user_presets
+                .borrow()
+                .get(sel - 1 - PRESETS.len())
+                .filter(|p| (preamp_spin.get_value() - p.preamp).abs() < 0.001 && bands == p.bands)
+                .map(|p| p.name.clone())
+        };
+        let eq = EqConfig {
+            enabled: enabled_cb.get_value(),
+            preamp: clamp_amp(preamp_spin.get_value()),
+            bands: bands.map(clamp_amp),
+            preset: preset_name,
+        };
+        cfg.set_path("equalizer", eq.to_value());
+        let users: Vec<Value> = user_presets
+            .borrow()
+            .iter()
+            .map(|p| {
+                json!({
+                    "name": p.name,
+                    "preamp": p.preamp,
+                    "bands": p.bands.to_vec(),
+                })
+            })
+            .collect();
+        cfg.set_path("equalizer_user_presets", Value::Array(users));
+        let _ = cfg.save(config_path);
+    }
+    dialog.destroy();
+}

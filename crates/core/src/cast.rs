@@ -16,7 +16,8 @@ pub struct CastDevice {
     pub name: String,
     pub host: String,
     pub port: u16,
-    /// "chromecast" | "dlna" | "sonos" | "roku" | "kodi".
+    /// "chromecast" | "dlna" | "sonos" | "roku" | "kodi" |
+    /// "airplay" (RAOP; host+port are the RTSP endpoint).
     pub kind: String,
     pub model: String,
     /// Protocol endpoint when discovery resolved one (UPnP
@@ -289,6 +290,53 @@ pub fn discover_all(timeout: Duration) -> Vec<CastDevice> {
         }
     }
     out.extend(discover_kodi(timeout));
+    out.extend(discover_airplay(timeout));
+    out
+}
+
+/// AirPlay (RAOP) discovery: mDNS for `_raop._tcp`. Instance
+/// names are "{device-id}@{display name}". The port is the
+/// RAOP RTSP port (5000 on classic AirPort, dynamic on newer
+/// receivers).
+pub fn discover_airplay(timeout: Duration) -> Vec<CastDevice> {
+    let mut out = Vec::new();
+    let Ok(socket) = UdpSocket::bind("0.0.0.0:0") else {
+        return out;
+    };
+    let _ = socket.set_read_timeout(Some(Duration::from_millis(400)));
+    let query = mdns_ptr_query("_raop._tcp.local");
+    let _ = socket.send_to(&query, "224.0.0.251:5353");
+    let deadline = std::time::Instant::now() + timeout;
+    let mut buf = [0u8; 8192];
+    let mut names: Vec<(String, String, u16)> = Vec::new();
+    while std::time::Instant::now() < deadline {
+        match socket.recv_from(&mut buf) {
+            Ok((n, _)) => {
+                for (instance, host, port) in parse_mdns_response(&buf[..n]) {
+                    if !names.iter().any(|(i, _, _)| *i == instance) {
+                        names.push((instance, host, port));
+                    }
+                }
+            }
+            Err(_) => continue,
+        }
+    }
+    for (instance, host, port) in names {
+        let label = instance.split("._").next().unwrap_or("AirPlay");
+        let name = label
+            .split_once('@')
+            .map(|(_, n)| n.trim().to_string())
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| label.to_string());
+        out.push(CastDevice {
+            name,
+            host,
+            port: if port == 0 { 5000 } else { port },
+            kind: "airplay".to_string(),
+            model: String::new(),
+            endpoint: String::new(),
+        });
+    }
     out
 }
 

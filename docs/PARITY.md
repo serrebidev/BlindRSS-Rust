@@ -606,3 +606,43 @@ queue needs cast-session end-of-media events driving the
 next load. The source-feed family (github_source, forum,
 rumble, odysee, npr, sky) is portable API/transform work
 needing per-type refresh-pipeline integration.
+
+Batch 24 resolution (v0.1.24, Brandon's finds): AirPlay and
+the equalizer, both previously recorded as blocked, landed
+after Brandon supplied the references the audit should have
+found itself (his standing research protocol — web search,
+GitHub most-recent 20, most-stars 20 — is now the required
+method before any residual is declared blocked here).
+AirPlay: shairplay-rust is a RECEIVER (server) library and
+LGPL, so it cannot serve; the sender design is RAOP v2 as
+implemented by LinusU/rust-raop-player (itself a port of
+philippe44's RAOP-Player) and by pyatv, which Python uses.
+core/raop.rs implements that protocol directly (no code
+copied; the repo carries no license): mDNS _raop discovery
+in cast::discover_airplay, the RTSP handshake with the SDP
+AES key RSA-OAEP-encrypted to the public AirPort key, ALAC
+(alac-encoder crate) over RTP with real-time pacing, the
+timing responder, per-second sync packets, retransmit from
+a 512-packet backlog, SET_PARAMETER volume, FLUSH/TEARDOWN,
+and a Stop AirPlay Cast menu action (RAOP streams from this
+app, unlike the URL-handoff protocols). The app decodes the
+article media through ffmpeg to PCM, so AirPlay casts audio
+(a video article casts its soundtrack). AirPlay 2 pairing
+devices stay out of scope, exactly as in Python.
+Equalizer: LunaDesktop/eq is a PipeWire LADSPA plugin,
+GPL-3.0 and Linux-only, so the plugin itself is not
+adoptable into this MIT cross-platform app; its shape (a
+10-band graphic EQ) is what landed, implemented
+independently in core/equalizer.rs: Python's exact config
+model ("equalizer" + "equalizer_user_presets", [-20, +20]
+clamping, the libVLC preset table read the way Python
+reads it, with the preamp's +12 dB libVLC convention
+converted for the DSP), RBJ peaking biquads applied to the
+PCM in the AirPlay path, and an ffmpeg filter chain
+(core/proxy.rs /eq endpoint) that the built-in player
+routes through when the EQ is enabled — a live transcode,
+so seeking inside EQ playback is limited; with the EQ off
+playback is untouched. Settings gains an Equalizer section
+opening the full dialog (presets, user presets, per-band
+fields). Remaining from this pair: nothing structural;
+live proof needs Brandon's receiver and ears.

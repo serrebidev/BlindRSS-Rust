@@ -1,6 +1,6 @@
 [package]
 name = "blindrss-core"
-version = "0.1.23"
+version = "0.1.24"
 edition.workspace = true
 license.workspace = true
 
@@ -20,10 +20,12 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 base64 = "0.22"
 aes = "0.8"
-cbc = "0.1"
+cbc = { version = "0.1", features = ["block-padding", "alloc"] }
 pbkdf2 = "0.12"
 sha1 = "0.10"
 ring = "0.17"
+alac-encoder = "0.3"
+rsa = { version = "0.9", default-features = false, features = ["std", "getrandom"] }
 
 [dev-dependencies]
 rusqlite = { version = "0.40", features = ["bundled"] }

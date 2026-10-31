@@ -77,6 +77,58 @@ pub fn hls_url(target: &str) -> String {
     format!("{}/hls?url={}", ensure_started(), url_encode(target))
 }
 
+/// A proxy URL that plays `target` through the ffmpeg audio
+/// filter chain `af` (the equalizer path for the built-in
+/// player: MediaCtrl has no EQ, so when the EQ is enabled the
+/// player loads this stream instead — a live transcode, which
+/// means seeking inside it is limited).
+pub fn eq_url(target: &str, af: &str) -> String {
+    format!(
+        "{}/eq?url={}&af={}",
+        ensure_started(),
+        url_encode(target),
+        url_encode(af)
+    )
+}
+
+/// Serve `url` transcoded through the ffmpeg `-af` chain as a
+/// live MP3 stream.
+fn serve_eq(stream: &mut std::net::TcpStream, url: &str, af: &str) {
+    use std::io::Read as _;
+    let Some(ffmpeg) = crate::silence::find_ffmpeg() else {
+        return respond(stream, "503 Unavailable", &[], b"ffmpeg not found");
+    };
+    let mut cmd = std::process::Command::new(&ffmpeg);
+    cmd.args(["-v", "error", "-i", url, "-af", af, "-f", "mp3", "-"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    let Ok(mut child) = cmd.spawn() else {
+        return respond(stream, "502 Bad Gateway", &[], b"ffmpeg failed to start");
+    };
+    let Some(mut out) = child.stdout.take() else {
+        let _ = child.kill();
+        return respond(stream, "502 Bad Gateway", &[], b"ffmpeg failed");
+    };
+    let head = "HTTP/1.1 200 OK\r\nContent-Type: audio/mpeg\r\nConnection: close\r\n\r\n";
+    if stream.write_all(head.as_bytes()).is_err() {
+        let _ = child.kill();
+        return;
+    }
+    let mut buf = [0u8; 16384];
+    loop {
+        match out.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                if stream.write_all(&buf[..n]).is_err() {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    let _ = child.kill();
+}
+
 fn url_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len() * 2);
     for b in s.bytes() {
@@ -177,6 +229,12 @@ fn handle(mut stream: std::net::TcpStream) {
                 return respond(&mut stream, "400 Bad Request", &[], b"missing url");
             };
             serve_hls(&mut stream, &u);
+        }
+        "/eq" => {
+            let (Some(u), Some(af)) = (query_param(query, "url"), query_param(query, "af")) else {
+                return respond(&mut stream, "400 Bad Request", &[], b"missing url/af");
+            };
+            serve_eq(&mut stream, &u, &af);
         }
         _ => {
             if let Some(rest) = path.strip_prefix("/hlsseg/") {

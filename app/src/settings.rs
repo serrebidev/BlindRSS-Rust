@@ -661,6 +661,14 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
         false,
     );
 
+    // Equalizer (its own dialog, opened via the intent
+    // mechanism like Article Columns).
+    add_heading(&dialog, &sizer, "Equalizer");
+    let eq_btn = Button::builder(&dialog)
+        .with_label(&crate::tr("Equalizer..."))
+        .build();
+    sizer.add(&eq_btn, 0, SizerFlag::All, 2);
+
     // Notifications + sounds.
     add_heading(&dialog, &sizer, "Notifications and Sounds");
     let notif_cb = add_check(
@@ -1423,6 +1431,7 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
         (prune_btn, "prune"),
         (update_btn, "update"),
         (columns_btn, "columns"),
+        (eq_btn, "equalizer"),
     ] {
         let save_m = save_all.clone();
         let intent_m = intent.clone();
