@@ -289,7 +289,39 @@ fn feed_label(db: &Db, feed: &Feed) -> String {
     }
 }
 
+/// Find a tree item by its filter data, depth-first from `item`.
+fn find_item_by_data(tree: &TreeCtrl, item: &TreeItemId, data: &str) -> Option<TreeItemId> {
+    let mine = tree
+        .get_custom_data_direct(item)
+        .and_then(|d| d.downcast_ref::<String>().cloned());
+    if mine.as_deref() == Some(data) {
+        return Some(item.clone());
+    }
+    let (mut child, mut cookie) = tree.get_first_child(item)?;
+    loop {
+        if let Some(found) = find_item_by_data(tree, &child, data) {
+            return Some(found);
+        }
+        match tree.get_next_child(item, &mut cookie) {
+            Some(next) => child = next,
+            None => return None,
+        }
+    }
+}
+
 fn rebuild_tree(state: &mut State, tree: &TreeCtrl) {
+    // Python's tree rebuild always ends with a selection (the saved
+    // feed, else All Feeds): a focused tree with no selected item
+    // gives NVDA nothing to announce. Preserve the current selection
+    // by its filter data; fall back to state, then to the root.
+    let previous = tree
+        .get_selection()
+        .and_then(|sel| {
+            tree.get_custom_data_direct(&sel)
+                .and_then(|d| d.downcast_ref::<String>().cloned())
+        })
+        .or_else(|| state.selected_feed.clone())
+        .unwrap_or_default();
     tree.delete_all_items();
     let Some(root) = tree.add_root("Feeds", None, None) else {
         return;
@@ -318,6 +350,15 @@ fn rebuild_tree(state: &mut State, tree: &TreeCtrl) {
         }
     }
     tree.expand(&root);
+    // Restore (or default) the selection, mirroring Python's
+    // SelectItem(selection_target) at the end of every tree build.
+    let found = find_item_by_data(tree, &root, &previous);
+    let keep = found.is_some() && !previous.is_empty();
+    let target = found.unwrap_or(root);
+    tree.select_item(&target);
+    tree.set_focused_item(&target);
+    tree.ensure_visible(&target);
+    state.selected_feed = if keep { Some(previous) } else { None };
 }
 
 fn refill_articles(state: &mut State, list: &ListCtrl) {
@@ -2171,11 +2212,23 @@ fn main() {
         });
         timer.start(150, false);
 
-        frame.show(true);
-        // Python `_focus_default_control`: focus lands in the tree
-        // when the app opens, so keyboard and screen reader start
-        // in the feed list.
-        tree.set_focus();
         frame.centre();
+        frame.show(true);
+        // Python `_focus_default_control`, ported faithfully: Python
+        // schedules it with wx.CallAfter from __init__ (the frame is
+        // shown later by main.py) and the handler checks IsShown
+        // before tree.SetFocus(). A synchronous set_focus during
+        // window creation loses to the activation that follows, so
+        // defer it past the show/activation. wxdragon::call_after
+        // requires Send closures and widget handles are not Send, so
+        // a one-shot timer is the deferral mechanism here — it fires
+        // on the main thread after activation, like CallAfter.
+        let focus_timer = Box::leak(Box::new(Timer::new(&frame)));
+        focus_timer.on_tick(move |_| {
+            if frame.is_shown() {
+                tree.set_focus();
+            }
+        });
+        focus_timer.start(75, true);
     });
 }

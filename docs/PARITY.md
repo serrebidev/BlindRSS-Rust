@@ -337,7 +337,15 @@ Full report: reports/deep-audit-2026-10-30.md in the migration
 workspace; raw extraction deep-audit.json. Behaviour systems the
 surface audits missed, in port order:
 
-1. Focus choreography: startup focus in tree (FIXED v0.1.6),
+1. Focus choreography: startup focus in tree (FIXED v0.1.6 —
+   re-audited against Python after Brandon's v0.1.5 report: Python
+   defers via wx.CallAfter with an IsShown guard AND every tree
+   build ends with SelectItem, defaulting to All Feeds. The first
+   v0.1.6 cut only did a synchronous set_focus and the tree never
+   selected an item, so NVDA had nothing to announce. Port now:
+   one-shot 75 ms timer (call_after needs Send; handles are not)
+   with is_shown check + set_focus, and rebuild_tree preserves the
+   selection by item data, defaulting to the root),
    focus restore after dialogs, reader-surface focus, large-reader
    mode — **mostly missing**.
 2. Startup state restore: remember_last_feed/last_selected_feed,
