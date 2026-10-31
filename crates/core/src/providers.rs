@@ -535,6 +535,19 @@ impl MinifluxClient {
         Ok(())
     }
 
+    /// Fetch an entry's full content from the server
+    /// (GET /v1/entries/{id}/fetch-content): Miniflux's own
+    /// scraper result, the provider side of full-text
+    /// arbitration.
+    pub fn fetch_content_remote(&self, entry_id: i64) -> Result<String, String> {
+        #[derive(serde::Deserialize)]
+        struct FetchContent {
+            content: String,
+        }
+        let resp: FetchContent = self.get_json(&format!("/v1/entries/{entry_id}/fetch-content"))?;
+        Ok(resp.content)
+    }
+
     /// Create a feed on the server (POST /v1/feeds); returns
     /// the new feed's id.
     pub fn create_feed_remote(&self, feed_url: &str) -> Result<i64, String> {

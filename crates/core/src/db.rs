@@ -89,7 +89,7 @@ CREATE TABLE IF NOT EXISTS article_labels (article_id TEXT,
 
 /// Columns Python added to existing tables by migration; older
 /// databases get them on open.
-const MIGRATION_COLUMNS: [(&str, &str, &str); 8] = [
+const MIGRATION_COLUMNS: [(&str, &str, &str); 10] = [
     ("feeds", "last_error", "TEXT"),
     ("feeds", "last_error_at", "REAL"),
     ("feeds", "last_success_at", "REAL"),
@@ -98,6 +98,8 @@ const MIGRATION_COLUMNS: [(&str, &str, &str); 8] = [
     ("articles", "category_override", "TEXT"),
     ("feeds", "delete_behavior", "TEXT"),
     ("deleted_articles", "purged", "INTEGER DEFAULT 0"),
+    ("articles", "tags", "TEXT"),
+    ("feeds", "feed_settings", "TEXT"),
 ];
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1032,6 +1034,106 @@ impl Db {
             "UPDATE feeds SET delete_behavior = ?2 WHERE id = ?1",
             params![feed_id, behavior],
         )?;
+        Ok(())
+    }
+
+    /// A feed's per-feed settings object (feeds.feed_settings
+    /// JSON: encoding, refresh_interval_seconds, timeout...).
+    pub fn feed_settings(&self, feed_id: &str) -> rusqlite::Result<serde_json::Value> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT feed_settings FROM feeds WHERE id = ?1")?;
+        let mut rows = stmt.query(params![feed_id])?;
+        match rows.next()? {
+            Some(row) => {
+                let raw: Option<String> = row.get(0)?;
+                Ok(raw
+                    .and_then(|t| serde_json::from_str(&t).ok())
+                    .unwrap_or_else(|| serde_json::json!({})))
+            }
+            None => Ok(serde_json::json!({})),
+        }
+    }
+
+    /// Merge keys into a feed's settings object.
+    pub fn set_feed_settings(
+        &self,
+        feed_id: &str,
+        patch: &serde_json::Value,
+    ) -> rusqlite::Result<()> {
+        let mut current = self.feed_settings(feed_id)?;
+        if let (Some(dst), Some(src)) = (current.as_object_mut(), patch.as_object()) {
+            for (k, v) in src {
+                dst.insert(k.clone(), v.clone());
+            }
+        }
+        self.conn.execute(
+            "UPDATE feeds SET feed_settings = ?2 WHERE id = ?1",
+            params![feed_id, current.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// An article's enrichment tags (articles.tags JSON list).
+    pub fn article_tags(&self, article_id: &str) -> rusqlite::Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT tags FROM articles WHERE id = ?1")?;
+        let mut rows = stmt.query(params![article_id])?;
+        match rows.next()? {
+            Some(row) => {
+                let raw: Option<String> = row.get(0)?;
+                Ok(raw
+                    .and_then(|t| serde_json::from_str::<Vec<String>>(&t).ok())
+                    .unwrap_or_default())
+            }
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// All stored article tags at once (smart-folder rule
+    /// evaluation reads the Tag field from here).
+    pub fn all_article_tags(
+        &self,
+    ) -> rusqlite::Result<std::collections::HashMap<String, Vec<String>>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, tags FROM articles WHERE tags IS NOT NULL AND tags != ''")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+        })?;
+        let mut out = std::collections::HashMap::new();
+        for row in rows {
+            let (id, raw) = row?;
+            if let Some(tags) = raw.and_then(|t| serde_json::from_str::<Vec<String>>(&t).ok()) {
+                out.insert(id, tags);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Apply fetched-page metadata to a stored article
+    /// (metadata_enrich.py): fill a missing author, merge tags.
+    pub fn apply_enrichment(
+        &self,
+        article_id: &str,
+        meta: &crate::enrich::EnrichMeta,
+    ) -> rusqlite::Result<()> {
+        if !meta.author.is_empty() {
+            self.conn.execute(
+                "UPDATE articles SET author = ?2 WHERE id = ?1 \
+                 AND (author IS NULL OR author = '')",
+                params![article_id, meta.author],
+            )?;
+        }
+        if !meta.tags.is_empty() {
+            let existing = self.article_tags(article_id)?;
+            let merged = crate::enrich::merge_tags(existing, &meta.tags);
+            self.conn.execute(
+                "UPDATE articles SET tags = ?2 WHERE id = ?1",
+                params![article_id, serde_json::json!(merged).to_string()],
+            )?;
+        }
         Ok(())
     }
 

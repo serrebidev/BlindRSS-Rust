@@ -417,18 +417,12 @@ pub fn fetch_html(url: &str) -> Result<String, String> {
 }
 
 /// Like `fetch_html`, sending a site-cookies header when one is
-/// provided (from the Netscape jar beside the config).
+/// provided (from the Netscape jar beside the config). The body
+/// is decoded from raw bytes (header/meta charset chain), not
+/// ureq's UTF-8 assumption.
 pub fn fetch_html_with_cookies(url: &str, cookie_header: &str) -> Result<String, String> {
-    let req = crate::http::agent().get(url);
-    let req = if cookie_header.is_empty() {
-        req
-    } else {
-        req.header("Cookie", cookie_header)
-    };
-    let mut resp = req.call().map_err(|e| format!("fetch failed: {e}"))?;
-    resp.body_mut()
-        .read_to_string()
-        .map_err(|e| format!("read failed: {e}"))
+    let (bytes, content_type) = fetch_page_bytes(url, cookie_header)?;
+    Ok(decode_bytes(&bytes, &content_type, ""))
 }
 
 /// Convert an HTML fragment (feed content, articleBody payloads,
@@ -684,6 +678,30 @@ fn recover_lead(precision: &str, recall: &str) -> String {
 /// `feed_text` is the article body the feed itself supplied, if any; the
 /// prefer-feed-content rule can keep it when the scrape is worse.
 pub fn extract_article(html_in: &str, url: &str, feed_text: Option<&str>) -> ExtractOutcome {
+    // Bloomberg video pages carry their text in the JSON-LD
+    // description; the generic cascade sees a video shell.
+    if let Some(text) = bloomberg_video_text(html_in, url) {
+        return ExtractOutcome::Article {
+            title: String::new(),
+            text,
+            source: "bloomberg",
+        };
+    }
+    match extract_article_impl(html_in, url, feed_text) {
+        ExtractOutcome::Article {
+            title,
+            text,
+            source,
+        } => ExtractOutcome::Article {
+            title,
+            text: apply_site_cleaners(&text, url),
+            source,
+        },
+        other => other,
+    }
+}
+
+fn extract_article_impl(html_in: &str, url: &str, feed_text: Option<&str>) -> ExtractOutcome {
     // Pre-clean zero-width characters from the page itself: engines
     // can mangle them into mojibake before the output strip can run.
     let cleaned;
@@ -874,4 +892,595 @@ pub fn extract_article(html_in: &str, url: &str, feed_text: Option<&str>) -> Ext
         text,
         source,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Fetch layer: byte-accurate decoding + the fallback chain
+// (Python `_fetch_page` / `_try_fallbacks`).
+//
+// Order (Python's, minus the two stages a desktop app without
+// a browser engine or a TLS-impersonation library cannot run —
+// curl_cffi impersonation and the warm-browser fetch are
+// documented non-ports in PARITY §7):
+//   direct (with stored site cookies)
+//   -> Sky News via Google Translate (news.sky.com only)
+//   -> Jina reader as text (only when a gate was seen)
+//   -> Smry (always)
+//   -> Wayback Machine (always, last resort)
+// Every fallback body is re-checked against the gate markers
+// before it is trusted, exactly like Python.
+// ---------------------------------------------------------------------------
+
+/// Decode an HTTP body the Python way (issue #75): a per-feed
+/// override wins, then BOM, then the Content-Type charset,
+/// then a <meta charset> declaration, then UTF-8 — always with
+/// replacement so a wrong guess shows text instead of failing.
+pub fn decode_bytes(bytes: &[u8], content_type: &str, override_enc: &str) -> String {
+    let label = if !override_enc.trim().is_empty() {
+        override_enc.trim().to_string()
+    } else if let Some(enc) = encoding_rs::Encoding::for_bom(bytes) {
+        return enc
+            .0
+            .decode_without_bom_handling_and_without_replacement(&bytes[enc.1..])
+            .map(|c| c.into_owned())
+            .unwrap_or_else(|| enc.0.decode(&bytes[enc.1..]).0.into_owned());
+    } else if let Some(cs) = charset_from_content_type(content_type) {
+        cs
+    } else if let Some(cs) = charset_from_meta(bytes) {
+        cs
+    } else {
+        "utf-8".to_string()
+    };
+    match encoding_rs::Encoding::for_label(label.as_bytes()) {
+        Some(enc) => enc.decode(bytes).0.into_owned(),
+        None => String::from_utf8_lossy(bytes).into_owned(),
+    }
+}
+
+fn charset_from_content_type(content_type: &str) -> Option<String> {
+    for part in content_type.split(';') {
+        let part = part.trim();
+        if let Some(v) = part.strip_prefix("charset=") {
+            let v = v.trim().trim_matches('"').trim_matches('\'');
+            if !v.is_empty() {
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn charset_from_meta(bytes: &[u8]) -> Option<String> {
+    let head = &bytes[..bytes.len().min(2048)];
+    let head = String::from_utf8_lossy(head).to_lowercase();
+    if let Some(pos) = head.find("charset") {
+        let rest = &head[pos + "charset".len()..];
+        let rest = rest.trim_start_matches([' ', '=', '"', '\'']);
+        let label: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+            .collect();
+        if !label.is_empty() {
+            return Some(label);
+        }
+    }
+    None
+}
+
+/// Fetch a URL's body bytes + Content-Type through the shared
+/// agent, sending the site's stored cookie header when given.
+pub fn fetch_page_bytes(url: &str, cookie_header: &str) -> Result<(Vec<u8>, String), String> {
+    let req = crate::http::agent().get(url);
+    let req = if cookie_header.is_empty() {
+        req
+    } else {
+        req.header("Cookie", cookie_header)
+    };
+    let mut resp = req.call().map_err(|e| format!("fetch failed: {e}"))?;
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let bytes = resp
+        .body_mut()
+        .read_to_vec()
+        .map_err(|e| format!("read failed: {e}"))?;
+    Ok((bytes, content_type))
+}
+
+/// Percent-encode a URL for use as a query parameter value.
+fn url_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 2);
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// True when the body looks like a bot gate (Python's
+/// `_looks_like_bot_interstitial` approximation over the
+/// ported marker set).
+fn looks_gated(body: &str) -> bool {
+    let lower = body.to_lowercase();
+    gate_marker(&lower).is_some() && body.len() < 60_000
+}
+
+/// Jina reader proxy as plain text (Python `_download_via_
+/// jina` + `_download_via_jina_as_text`): the proxy answers in
+/// Markdown; the "Markdown Content:" section is converted to
+/// plain text so no **labels**, * bullets or [text](url)
+/// debris reaches the reader.
+pub fn fetch_via_jina_text(url: &str) -> Option<String> {
+    let target = url
+        .trim()
+        .strip_prefix("https://")
+        .or_else(|| url.trim().strip_prefix("http://"))
+        .unwrap_or(url.trim());
+    if target.is_empty() {
+        return None;
+    }
+    let mut resp = crate::http::agent()
+        .get(&format!("https://r.jina.ai/http://{target}"))
+        .header("Accept", "text/plain, text/markdown, */*;q=0.8")
+        .call()
+        .ok()?;
+    let text = resp.body_mut().read_to_string().ok()?;
+    let text = match text.split_once("Markdown Content:") {
+        Some((_, rest)) => rest.trim().to_string(),
+        None => text,
+    };
+    if text.trim().is_empty() || looks_gated(&text) {
+        return None;
+    }
+    Some(markdown_to_text(&text))
+}
+
+/// Convert proxy Markdown to plain text: links keep their
+/// label, images drop, emphasis markers and heading hashes go.
+pub fn markdown_to_text(md: &str) -> String {
+    let mut out_lines: Vec<String> = Vec::new();
+    for line in md.lines() {
+        let mut l = line.trim().to_string();
+        // Images: ![alt](url) -> drop entirely.
+        while let Some(start) = l.find("![") {
+            if let Some(end) = l[start..].find(')') {
+                l.replace_range(start..start + end + 1, "");
+            } else {
+                break;
+            }
+        }
+        // Links: [label](url) -> label.
+        let mut guard = 0;
+        while let Some(open) = l.find('[') {
+            guard += 1;
+            if guard > 50 {
+                break;
+            }
+            let Some(close) = l[open..].find("](") else {
+                break;
+            };
+            let label = l[open + 1..open + close].to_string();
+            let Some(end) = l[open + close..].find(')') else {
+                break;
+            };
+            l.replace_range(open..open + close + end + 1, &label);
+        }
+        let l = l.trim_start_matches(['#', '>', ' ']);
+        let l = l.trim_start_matches("* ").trim_start_matches("- ");
+        let l = l.replace("**", "").replace("__", "");
+        let l = l.trim().to_string();
+        if !l.is_empty()
+            || out_lines
+                .last()
+                .map(|p: &String| !p.is_empty())
+                .unwrap_or(false)
+        {
+            out_lines.push(l);
+        }
+    }
+    out_lines.join("\n").trim().to_string()
+}
+
+/// Parse a Smry SSE stream into (title, plain text): find the
+/// `data:` line whose JSON carries an "article" object
+/// (Python `_download_via_smry`). Minimum 300 chars of text.
+pub fn parse_smry_stream(sse: &str) -> Option<(String, String)> {
+    for line in sse.lines() {
+        let Some(data) = line.trim().strip_prefix("data:") else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(data.trim()) else {
+            continue;
+        };
+        let Some(article) = value.get("article").filter(|a| a.is_object()) else {
+            continue;
+        };
+        let plain = article
+            .get("textContent")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .or_else(|| {
+                article
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .map(html_to_text)
+            })?;
+        if plain.trim().chars().count() < 300 {
+            return None;
+        }
+        let title = article
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        return Some((title, plain.trim().to_string()));
+    }
+    None
+}
+
+/// Smry reader endpoint (SSE).
+pub fn fetch_via_smry(url: &str) -> Option<(String, String)> {
+    let api = format!(
+        "https://smry.ai/api/article/auto/stream?url={}&uiLocale=en",
+        url_encode(url)
+    );
+    let mut resp = crate::http::agent()
+        .get(&api)
+        .header(
+            "Accept",
+            "text/event-stream, application/json;q=0.9, */*;q=0.8",
+        )
+        .call()
+        .ok()?;
+    let sse = resp.body_mut().read_to_string().ok()?;
+    parse_smry_stream(&sse)
+}
+
+/// Rewrite a Wayback snapshot URL to its raw `id_` form
+/// (Python `_wayback_raw_url`).
+pub fn wayback_raw_url(snapshot: &str) -> String {
+    let Some(pos) = snapshot.find("/web/") else {
+        return snapshot.to_string();
+    };
+    let after = &snapshot[pos + 5..];
+    let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.len() < 4 || digits.len() > 14 {
+        return snapshot.to_string();
+    }
+    let rest = &after[digits.len()..];
+    if rest.starts_with("id_/") {
+        return snapshot.to_string();
+    }
+    if let Some(stripped) = rest.strip_prefix('/') {
+        return format!("{}id_/{}", &snapshot[..pos + 5 + digits.len()], stripped);
+    }
+    snapshot.to_string()
+}
+
+/// Wayback Machine: closest snapshot, raw form first
+/// (Python `_download_via_wayback`).
+pub fn fetch_via_wayback(url: &str, cookie_header: &str) -> Option<String> {
+    let api = format!(
+        "https://archive.org/wayback/available?url={}",
+        url_encode(url)
+    );
+    let mut resp = crate::http::agent().get(&api).call().ok()?;
+    let text = resp.body_mut().read_to_string().ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let closest = value.get("archived_snapshots")?.get("closest")?;
+    if closest.get("available").and_then(|v| v.as_bool()) != Some(true) {
+        return None;
+    }
+    let snap = closest.get("url")?.as_str()?.trim().to_string();
+    let snap = snap
+        .strip_prefix("http://")
+        .map(|rest| format!("https://{rest}"))
+        .unwrap_or(snap);
+    for candidate in [wayback_raw_url(&snap), snap] {
+        if let Ok((bytes, ct)) = fetch_page_bytes(&candidate, cookie_header) {
+            let body = decode_bytes(&bytes, &ct, "");
+            if !body.trim().is_empty() && !looks_gated(&body) {
+                return Some(body);
+            }
+        }
+    }
+    None
+}
+
+/// Sky News via the Google Translate web proxy (Python
+/// `_download_sky_via_google_translate`): Sky's Akamai edge
+/// 403s plain clients; the translate route serves the live
+/// page with its markup intact.
+pub fn fetch_via_sky_translate(url: &str) -> Option<String> {
+    let host = url.split('/').nth(2).unwrap_or("").to_lowercase();
+    if host != "news.sky.com" {
+        return None;
+    }
+    let after_host = &url[url.find("news.sky.com")? + "news.sky.com".len()..];
+    let (path, query) = match after_host.split_once('?') {
+        Some((p, q)) => (p, q.to_string()),
+        None => (after_host, String::new()),
+    };
+    let path = if path.is_empty() { "/" } else { path };
+    let query = if query.is_empty() {
+        "_x_tr_sl=auto&_x_tr_tl=en&_x_tr_hl=en".to_string()
+    } else {
+        format!("{query}&_x_tr_sl=auto&_x_tr_tl=en&_x_tr_hl=en")
+    };
+    let proxy = format!("https://news-sky-com.translate.goog{path}?{query}");
+    let (bytes, ct) = fetch_page_bytes(&proxy, "").ok()?;
+    let body = decode_bytes(&bytes, &ct, "");
+    if body.trim().is_empty() || looks_gated(&body) {
+        None
+    } else {
+        Some(body)
+    }
+}
+
+/// Fetch a page and extract its full text, running Python's
+/// fallback chain when the direct fetch is gated or empty.
+/// Returns the outcome plus the direct-fetch HTML when there
+/// was one (metadata enrichment reads it).
+///
+/// `source` on an Article outcome names the winning stage:
+/// the cascade's own label for a direct win, or "sky",
+/// "jina", "smry", "wayback".
+pub fn fetch_full_text(
+    url: &str,
+    cookie_header: &str,
+    feed_text: Option<&str>,
+    encoding_override: &str,
+) -> (ExtractOutcome, Option<String>) {
+    // Thread reconstructions (Lemmy/GitHub/Reddit/Discourse
+    // APIs) beat HTML scraping for thread URLs.
+    if let Some((title, text)) = crate::threads::thread_text(url) {
+        return (
+            ExtractOutcome::Article {
+                title,
+                text,
+                source: "thread",
+            },
+            None,
+        );
+    }
+    let mut first_html: Option<String> = None;
+    let direct = fetch_page_bytes(url, cookie_header)
+        .map(|(bytes, ct)| decode_bytes(&bytes, &ct, encoding_override));
+    let mut direct_outcome: Option<ExtractOutcome> = None;
+    let mut gate_seen = false;
+    if let Ok(html) = &direct {
+        first_html = Some(html.clone());
+        let outcome = extract_article(html, url, feed_text);
+        gate_seen = matches!(outcome, ExtractOutcome::Gate { .. });
+        if matches!(outcome, ExtractOutcome::Article { .. }) {
+            return (outcome, first_html);
+        }
+        direct_outcome = Some(outcome);
+    }
+    let relabel = |outcome: ExtractOutcome, label: &'static str| match outcome {
+        ExtractOutcome::Article { title, text, .. } => ExtractOutcome::Article {
+            title,
+            text,
+            source: label,
+        },
+        other => other,
+    };
+    // Sky via Google Translate (host-gated inside the fn).
+    if let Some(html) = fetch_via_sky_translate(url) {
+        let outcome = extract_article(&html, url, feed_text);
+        if matches!(outcome, ExtractOutcome::Article { .. }) {
+            return (relabel(outcome, "sky"), first_html);
+        }
+    }
+    // Jina as text, only when a gate was seen.
+    if gate_seen
+        && let Some(text) = fetch_via_jina_text(url)
+        && text.chars().count() >= 200
+    {
+        return (
+            ExtractOutcome::Article {
+                title: String::new(),
+                text,
+                source: "jina",
+            },
+            first_html,
+        );
+    }
+    // Smry (always tried).
+    if let Some((title, text)) = fetch_via_smry(url) {
+        return (
+            ExtractOutcome::Article {
+                title,
+                text,
+                source: "smry",
+            },
+            first_html,
+        );
+    }
+    // Wayback (last resort).
+    if let Some(html) = fetch_via_wayback(url, cookie_header) {
+        let outcome = extract_article(&html, url, feed_text);
+        if matches!(outcome, ExtractOutcome::Article { .. }) {
+            return (relabel(outcome, "wayback"), first_html);
+        }
+    }
+    // Nothing worked: report the direct outcome (Gate/Empty)
+    // or the fetch failure as a Gate with its reason.
+    match direct_outcome {
+        Some(outcome) => (outcome, first_html),
+        None => (
+            ExtractOutcome::Gate {
+                reason: direct.err().unwrap_or_else(|| "fetch failed".to_string()),
+            },
+            first_html,
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Site-specific text cleaners (Python's boilerplate strips),
+// applied to every cascade Article result.
+// ---------------------------------------------------------------------------
+
+fn host_matches(url: &str, domain: &str) -> bool {
+    let host = host_of(url);
+    host == domain || host.ends_with(&format!(".{domain}"))
+}
+
+/// BBC: drop the fused "ShareSave" chrome and complete (or
+/// drop) the dangling "- Published" byline lead.
+pub fn strip_bbc_boilerplate(text: &str) -> String {
+    let mut t = text.replace("ShareSave", "");
+    let trimmed = t.trim_start().to_string();
+    if let Some(rest) = trimmed.strip_prefix("- Published\n") {
+        t = rest.to_string();
+    }
+    t
+}
+
+/// WSJ / Dow Jones: strip the trailing copyright line + the
+/// opaque tracking hash after "All Rights Reserved.".
+pub fn strip_wsj_boilerplate(text: &str) -> String {
+    let lower = text.to_lowercase();
+    if let Some(pos) = lower.rfind("copyright") {
+        let tail = &text[pos..];
+        if tail.to_lowercase().contains("dow jones")
+            && tail.to_lowercase().contains("all rights reserved.")
+        {
+            return text[..pos].trim_end().to_string();
+        }
+    }
+    text.to_string()
+}
+
+/// TechRadar (Future sites): cut the trailing comment-gate
+/// block (gate line + author bio + optional promo line above).
+pub fn strip_techradar_boilerplate(text: &str) -> String {
+    let paras: Vec<&str> = text.split("\n\n").collect();
+    let gate = paras.iter().position(|p| {
+        p.to_lowercase()
+            .starts_with("you must confirm your public display name before commenting")
+    });
+    let Some(mut cut) = gate else {
+        return text.to_string();
+    };
+    if cut >= 1 {
+        cut -= 1; // author bio above the gate
+    }
+    if cut >= 1 {
+        let above = paras[cut - 1].to_lowercase();
+        if above.starts_with("follow techradar") || above.starts_with("sign up for breaking news") {
+            cut -= 1;
+        }
+    }
+    paras[..cut].join("\n\n").trim().to_string()
+}
+
+/// Apply the site cleaners for a URL to extracted text.
+pub fn apply_site_cleaners(text: &str, url: &str) -> String {
+    let mut t = text.to_string();
+    if host_matches(url, "bbc.com") || host_matches(url, "bbc.co.uk") {
+        t = strip_bbc_boilerplate(&t);
+    }
+    if host_matches(url, "wsj.com") {
+        t = strip_wsj_boilerplate(&t);
+    }
+    if host_matches(url, "techradar.com") {
+        t = strip_techradar_boilerplate(&t);
+    }
+    t
+}
+
+/// Bloomberg video pages: the article text lives in the
+/// JSON-LD description (Python `_extract_bloomberg_video_
+/// text`). Returns the longest clean description >= 80 chars.
+pub fn bloomberg_video_text(html: &str, url: &str) -> Option<String> {
+    if !host_matches(url, "bloomberg.com") {
+        return None;
+    }
+    let path = url.to_lowercase();
+    if !path.contains("/videos/") && !path.contains("/news/videos/") {
+        return None;
+    }
+    let mut candidates: Vec<String> = Vec::new();
+    let mut rest = html;
+    while let Some(pos) = rest.find("application/ld+json") {
+        let after = &rest[pos..];
+        let Some(start) = after.find('>') else { break };
+        let Some(end) = after.find("</script>") else {
+            break;
+        };
+        let raw = &after[start + 1..end];
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) {
+            collect_descriptions(&value, &mut candidates);
+        }
+        rest = &after[end..];
+    }
+    if let Some(desc) = meta_content(html, "description") {
+        candidates.push(desc);
+    }
+    candidates
+        .into_iter()
+        .map(|c| c.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|c| c.chars().count() >= 80 && !looks_gated(c))
+        .max_by_key(|c| c.chars().count())
+}
+
+fn collect_descriptions(value: &serde_json::Value, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (k, v) in map {
+                if k == "description"
+                    && let Some(s) = v.as_str()
+                {
+                    out.push(s.to_string());
+                }
+                collect_descriptions(v, out);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_descriptions(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Read a <meta name/property="..." content="..."> value with
+/// a tolerant hand scan (attribute order varies).
+pub fn meta_content(html: &str, name: &str) -> Option<String> {
+    let lower = html.to_lowercase();
+    let mut search = 0usize;
+    while let Some(pos) = lower[search..].find("<meta") {
+        let start = search + pos;
+        let end = lower[start..].find('>').map(|e| start + e)?;
+        let tag = &html[start..end];
+        let tag_lower = &lower[start..end];
+        if (tag_lower.contains(&format!("\"{}\"", name.to_lowercase()))
+            || tag_lower.contains(&format!("'{}\'", name.to_lowercase())))
+            && let Some(cpos) = tag_lower.find("content=")
+        {
+            let rest = &tag[cpos + "content=".len()..];
+            let rest = rest.trim_start();
+            if let Some(stripped) = rest.strip_prefix('"') {
+                if let Some(close) = stripped.find('"') {
+                    return Some(stripped[..close].to_string());
+                }
+            } else if let Some(stripped) = rest.strip_prefix('\'')
+                && let Some(close) = stripped.find('\'')
+            {
+                return Some(stripped[..close].to_string());
+            }
+        }
+        search = end;
+    }
+    None
 }

@@ -108,6 +108,66 @@ fn log_line(msg: &str) {
 /// articles (Python providers push mark_read/mark_unread to the
 /// server the same way). Runs on a worker thread; failures are
 /// silent because the local state is already correct.
+/// Full-text arbitration (PARITY 7.6): when the active
+/// provider is Miniflux and the article is one of its entries,
+/// the server's fetch-content result competes with the local
+/// cascade outcome; the more complete text wins. Runs on the
+/// full-text worker thread.
+fn arbitrate_full_text(
+    outcome: blindrss_core::extract::ExtractOutcome,
+    article_id: &str,
+) -> blindrss_core::extract::ExtractOutcome {
+    use blindrss_core::extract::ExtractOutcome as EO;
+    let Some(entry) = article_id
+        .strip_prefix("miniflux-entry:")
+        .and_then(|s| s.parse::<i64>().ok())
+    else {
+        return outcome;
+    };
+    let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+    if blindrss_core::provider::active_name(&cfg) != "miniflux" {
+        return outcome;
+    }
+    let (url, key) = (
+        cfg.raw()
+            .get("providers")
+            .and_then(|p| p.get("miniflux"))
+            .and_then(|s| s.get("url"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        cfg.raw()
+            .get("providers")
+            .and_then(|p| p.get("miniflux"))
+            .and_then(|s| s.get("api_key"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+    );
+    if url.is_empty() || key.is_empty() {
+        return outcome;
+    }
+    let Ok(html) =
+        blindrss_core::providers::MinifluxClient::new(&url, &key).fetch_content_remote(entry)
+    else {
+        return outcome;
+    };
+    let remote_text = blindrss_core::extract::html_to_text(&html);
+    let local_len = match &outcome {
+        EO::Article { text, .. } => text.chars().count(),
+        _ => 0,
+    };
+    if remote_text.chars().count() > local_len {
+        EO::Article {
+            title: String::new(),
+            text: remote_text,
+            source: "miniflux",
+        }
+    } else {
+        outcome
+    }
+}
+
 fn propagate_read_state(article: &blindrss_core::db::Article, read: bool) {
     let article = article.clone();
     std::thread::spawn(move || {
@@ -656,7 +716,11 @@ enum RefreshMsg {
     /// Result of a hosted-provider sync: (provider name, (feeds, new)).
     ProviderDone(String, Result<(usize, usize), String>),
     /// Fetched article page HTML for full-text extraction.
-    FullText(String, Result<String, String>),
+    FullText(
+        String,
+        blindrss_core::extract::ExtractOutcome,
+        Option<String>,
+    ),
     /// yt-dlp resolution for playback: (stream URL, info if fetched).
     MediaReady(
         String,
@@ -1034,6 +1098,8 @@ fn refill_articles(state: &mut State, list: &ListCtrl) {
                 .map(|f| (f.id.as_str(), f.title.as_str()))
                 .collect();
             if let Ok(all) = db.articles(None, 500) {
+                let tags_map = db.all_article_tags().unwrap_or_default();
+                let empty_tags: Vec<String> = Vec::new();
                 let matched: Vec<Article> = all
                     .into_iter()
                     .filter(|a| {
@@ -1042,7 +1108,7 @@ fn refill_articles(state: &mut State, list: &ListCtrl) {
                             feed_title: feed_titles.get(a.feed_id.as_str()).copied().unwrap_or(""),
                             opened: false,
                             updated: false,
-                            tags: &[],
+                            tags: tags_map.get(&a.id).unwrap_or(&empty_tags),
                         };
                         blindrss_core::rules::rule_matches(&rule, &view)
                     })
@@ -2034,6 +2100,9 @@ fn main() {
             let tx = tx_ft.clone();
             let id = article.id.clone();
             let url = article.url.clone();
+            let article_feed = article.feed_id.clone();
+            let article_content = article.content.clone();
+            let article_id = article.id.clone();
             std::thread::spawn(move || {
                 // YouTube articles use the dedicated full-text path
                 // (description + chapters + transcript), like Python.
@@ -2043,8 +2112,29 @@ fn main() {
                 } else {
                     let jar = blindrss_core::cookies::load_jar_beside(&config_path());
                     let header = blindrss_core::cookies::cookie_header_for(&jar, &url);
-                    let result = blindrss_core::extract::fetch_html_with_cookies(&url, &header);
-                    let _ = tx.send(RefreshMsg::FullText(id, result));
+                    // Per-feed encoding override (feeds.feed_settings).
+                    let encoding = Db::open(&db_path())
+                        .ok()
+                        .and_then(|db| db.feed_settings(&article_feed).ok())
+                        .and_then(|s| {
+                            s.get("encoding")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string())
+                        })
+                        .unwrap_or_default();
+                    let (outcome, first_html) = blindrss_core::extract::fetch_full_text(
+                        &url,
+                        &header,
+                        article_content.as_deref(),
+                        &encoding,
+                    );
+                    // Full-text arbitration (PARITY 7.6): when
+                    // the active provider is Miniflux, its
+                    // server-side fetch-content competes with
+                    // the local cascade; the more complete
+                    // result wins.
+                    let outcome = arbitrate_full_text(outcome, &article_id);
+                    let _ = tx.send(RefreshMsg::FullText(id, outcome, first_html));
                 }
             });
         });
@@ -2510,19 +2600,20 @@ fn main() {
             frame_oa.set_status_text("Fetching article...", 0);
             let tx = tx_oa.clone();
             std::thread::spawn(move || {
-                let result = blindrss_core::extract::fetch_html(&url).and_then(|html| {
-                    match blindrss_core::extract::extract_article(&html, &url, None) {
-                        blindrss_core::extract::ExtractOutcome::Article { title, text, .. } => {
-                            Ok((title, text))
-                        }
-                        blindrss_core::extract::ExtractOutcome::Gate { reason } => {
-                            Err(format!("page blocked: {reason}"))
-                        }
-                        blindrss_core::extract::ExtractOutcome::Empty => {
-                            Err("nothing extractable on that page".to_string())
-                        }
+                let jar = blindrss_core::cookies::load_jar_beside(&config_path());
+                let header = blindrss_core::cookies::cookie_header_for(&jar, &url);
+                let (outcome, _) = blindrss_core::extract::fetch_full_text(&url, &header, None, "");
+                let result = match outcome {
+                    blindrss_core::extract::ExtractOutcome::Article { title, text, .. } => {
+                        Ok((title, text))
                     }
-                });
+                    blindrss_core::extract::ExtractOutcome::Gate { reason } => {
+                        Err(format!("page blocked: {reason}"))
+                    }
+                    blindrss_core::extract::ExtractOutcome::Empty => {
+                        Err("nothing extractable on that page".to_string())
+                    }
+                };
                 let _ = tx.send(RefreshMsg::OpenedArticle(result));
             });
         });
@@ -4555,39 +4646,40 @@ fn main() {
                             Err(e) => frame_tick.set_status_text(&format!("{name}: {e}"), 0),
                         }
                     }
-                    Ok(RefreshMsg::FullText(id, result)) => {
+                    Ok(RefreshMsg::FullText(id, outcome, first_html)) => {
                         let st = state_tick.borrow();
                         let article = st.articles.iter().find(|a| a.id == id).cloned();
-                        match (article, result) {
-                            (Some(article), Ok(html)) => {
-                                let outcome = blindrss_core::extract::extract_article(
-                                    &html,
-                                    &article.url,
-                                    article.content.as_deref(),
-                                );
-                                use blindrss_core::extract::ExtractOutcome as EO;
-                                match outcome {
-                                    EO::Article { text, source, .. } => {
-                                        reader.set_value(&format!("{}\n\n{}", article.title, text));
-                                        frame_tick
-                                            .set_status_text(&format!("Full text ({source})"), 0);
-                                    }
-                                    EO::Gate { reason } => {
-                                        frame_tick.set_status_text(
-                                            &format!("Full text unavailable: {reason}"),
-                                            0,
-                                        );
-                                    }
-                                    EO::Empty => {
-                                        frame_tick.set_status_text(
-                                            "Full text unavailable: nothing extracted",
-                                            0,
-                                        );
-                                    }
-                                }
+                        // Metadata enrichment: the fetched page
+                        // declares author/tags the feed omitted.
+                        if let (Some(article), Some(html)) = (&article, &first_html)
+                            && let Some(db) = st.db.as_ref()
+                        {
+                            let meta = blindrss_core::enrich::extract_metadata(html);
+                            if !meta.author.is_empty() || !meta.tags.is_empty() {
+                                let _ = db.apply_enrichment(&article.id, &meta);
                             }
-                            (_, Err(e)) => {
-                                frame_tick.set_status_text(&format!("Full text: {e}"), 0)
+                        }
+                        match (article, outcome) {
+                            (
+                                Some(article),
+                                blindrss_core::extract::ExtractOutcome::Article {
+                                    text,
+                                    source,
+                                    ..
+                                },
+                            ) => {
+                                reader.set_value(&format!("{}\n\n{}", article.title, text));
+                                frame_tick.set_status_text(&format!("Full text ({source})"), 0);
+                            }
+                            (_, blindrss_core::extract::ExtractOutcome::Gate { reason }) => {
+                                frame_tick.set_status_text(
+                                    &format!("Full text unavailable: {reason}"),
+                                    0,
+                                );
+                            }
+                            (_, blindrss_core::extract::ExtractOutcome::Empty) => {
+                                frame_tick
+                                    .set_status_text("Full text unavailable: nothing extracted", 0);
                             }
                             _ => {}
                         }

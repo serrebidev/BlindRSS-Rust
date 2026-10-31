@@ -548,13 +548,31 @@ pub fn show_feed_properties(frame: &Frame, db: &Db, feed: &blindrss_core::Feed) 
     let url_ctrl = name_row(&dialog, &sizer, "Feed URL:", &feed.url);
     let cat0 = feed.category.clone().unwrap_or_default();
     let cat_ctrl = name_row(&dialog, &sizer, "Category (blank = none):", &cat0);
+    // Per-feed encoding override (feeds.feed_settings.encoding,
+    // issue #75): wins over header/meta charset detection when
+    // decoding this feed's article pages.
+    let encoding0 = Db::open(&crate::db_path())
+        .ok()
+        .and_then(|db| db.feed_settings(&feed.id).ok())
+        .and_then(|s| {
+            s.get("encoding")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_default();
+    let enc_ctrl = name_row(
+        &dialog,
+        &sizer,
+        "Encoding override (blank = auto-detect):",
+        &encoding0,
+    );
     let reset_btn = Button::builder(&dialog)
         .with_label("Reset Title to Feed's Own")
         .build();
     sizer.add(&reset_btn, 0, SizerFlag::All, 4);
     ok_cancel(&dialog, &sizer);
     dialog.set_sizer(sizer, true);
-    dialog.set_size(Size::new(560, 320));
+    dialog.set_size(Size::new(560, 380));
     let feed_id = feed.id.clone();
     let reset = Rc::new(RefCell::new(false));
     {
@@ -603,6 +621,8 @@ pub fn show_feed_properties(frame: &Frame, db: &Db, feed: &blindrss_core::Feed) 
                 Some(cat.trim())
             },
         );
+        let enc = enc_ctrl.get_value();
+        let _ = db.set_feed_settings(&feed_id, &serde_json::json!({"encoding": enc.trim()}));
         changed = true;
     }
     dialog.destroy();

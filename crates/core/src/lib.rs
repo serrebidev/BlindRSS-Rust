@@ -7,6 +7,7 @@
 
 pub mod announce;
 pub mod archive;
+pub mod captcha;
 pub mod cast;
 pub mod castsession;
 pub mod castwire;
@@ -15,6 +16,7 @@ pub mod cookies;
 pub mod db;
 pub mod discovery;
 pub mod download;
+pub mod enrich;
 pub mod extract;
 pub mod feeds;
 pub mod help;
@@ -34,6 +36,7 @@ pub mod shortcuts_data;
 pub mod silence;
 pub mod sponsorblock;
 pub mod takeout;
+pub mod threads;
 pub mod user_agents;
 
 pub use db::{Article, Category, Chapter, Db, Feed, PlaybackState};
