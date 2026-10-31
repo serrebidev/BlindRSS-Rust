@@ -167,6 +167,14 @@ fn propagate_read_state(article: &blindrss_core::db::Article, read: bool) {
 }
 
 /// Modal text prompt; None when cancelled.
+/// Speak/braille a configured announcement for an event
+/// (PARITY 7.4). Config is re-read per event so Settings changes
+/// apply live, as in Python.
+fn announce(event: &str, message: &str) {
+    let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+    let _ = blindrss_core::announce::Announcements::from_config(&cfg).announce(event, message);
+}
+
 fn open_in_browser(url: &str) {
     #[cfg(target_os = "windows")]
     let _ = std::process::Command::new("rundll32")
@@ -747,6 +755,7 @@ fn main() {
                 st.feeds.clone()
             };
             frame_btn.set_status_text(&format!("Refreshing {} feeds...", feeds.len()), 0);
+            announce("start_update", "Refresh Feeds");
             let tx = tx_refresh.clone();
             std::thread::spawn(move || {
                 for feed in feeds {
@@ -788,6 +797,7 @@ fn main() {
                     return;
                 };
                 frame_rf.set_status_text(&format!("Refreshing {}...", feed.title), 0);
+                announce("start_update", "Refresh Feeds");
                 let tx = tx_rf.clone();
                 std::thread::spawn(move || {
                     let result = fetch_and_parse(&feed.url);
@@ -851,6 +861,14 @@ fn main() {
                     a.title
                 ),
                 0,
+            );
+            announce(
+                "favorite_toggle",
+                if new_value {
+                    "Added to favorites"
+                } else {
+                    "Removed from favorites"
+                },
             );
         });
         {
@@ -1129,6 +1147,7 @@ fn main() {
                 &format!("Marked {}", if new_state { "read" } else { "unread" }),
                 0,
             );
+            announce("status_toggle", if new_state { "Read" } else { "Unread" });
             drop(st);
             propagate_read_state(&article, new_state);
         });
@@ -2490,6 +2509,10 @@ fn main() {
                 refill_articles(&mut st, &list);
                 frame_tick
                     .set_status_text(&format!("Refresh complete: {new_total} new articles"), 0);
+                announce(
+                    "general",
+                    &format!("Refresh complete: {new_total} new articles"),
+                );
             }
         });
         timer.start(150, false);

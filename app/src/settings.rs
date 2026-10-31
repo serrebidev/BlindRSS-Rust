@@ -142,6 +142,32 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
     maximized_cb.set_value(cfg.get_bool("start_maximized", false));
     sizer.add(&maximized_cb, 0, SizerFlag::All, 4);
 
+    // Announcements (PARITY 7.4): per-event speech/Braille mode,
+    // mirroring Python's Settings > Announcements page.
+    let announce_label = StaticText::builder(&dialog)
+        .with_label("Announcements")
+        .build();
+    sizer.add(&announce_label, 0, SizerFlag::All, 4);
+    let current_modes = blindrss_core::announce::Announcements::from_config(&cfg);
+    let mut announce_choices: Vec<Choice> = Vec::new();
+    for ev in blindrss_core::announce::EVENTS.iter() {
+        let row = BoxSizer::builder(Orientation::Horizontal).build();
+        let lbl = StaticText::builder(&dialog).with_label(ev.label).build();
+        row.add(&lbl, 1, SizerFlag::All, 4);
+        let choice = Choice::builder(&dialog).build();
+        for label in blindrss_core::announce::MODE_LABELS {
+            choice.append(label);
+        }
+        choice.set_selection(current_modes.mode_index(ev.id) as u32);
+        row.add(&choice, 0, SizerFlag::All, 4);
+        sizer.add_sizer(&row, 0, SizerFlag::Expand | SizerFlag::All, 2);
+        announce_choices.push(choice);
+    }
+    let announce_test_btn = Button::builder(&dialog)
+        .with_label("Test Announcement")
+        .build();
+    sizer.add(&announce_test_btn, 0, SizerFlag::All, 4);
+
     // Maintenance actions (moved off the main window, Brandon
     // 2026-10-30): each saves the fields, closes the dialog, and
     // reports its name back so the caller runs it on the main frame.
@@ -193,7 +219,7 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
     btn_row.add(&cancel_btn, 0, SizerFlag::All, 4);
     sizer.add_sizer(&btn_row, 0, SizerFlag::All, 4);
     dialog.set_sizer(sizer, true);
-    dialog.set_size(Size::new(560, 700));
+    dialog.set_size(Size::new(560, 860));
 
     let cfg_path_buf = config_path.to_path_buf();
     let cfg_path_connect = config_path.to_path_buf();
@@ -245,9 +271,34 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
                 "start_maximized",
                 serde_json::json!(maximized_cb.is_checked()),
             );
+            let mut modes = blindrss_core::announce::Announcements::from_config(&cfg);
+            for (ev, choice) in blindrss_core::announce::EVENTS
+                .iter()
+                .zip(announce_choices.iter())
+            {
+                let idx = choice.get_selection().unwrap_or(3) as usize;
+                modes.set_mode(ev.id, blindrss_core::announce::MODE_ORDER[idx.min(3)]);
+            }
+            cfg.set_path("announcements", modes.to_json());
             let _ = cfg.save(&path_s);
         })
     };
+    let frame_test = dialog;
+    announce_test_btn.on_click(move |_| {
+        let ok = blindrss_core::announce::announce_test("BlindRSS test announcement");
+        let md = MessageDialog::builder(
+            &frame_test,
+            if ok {
+                "Test announcement sent to your screen reader."
+            } else {
+                "No speech or Braille output path is available on this system."
+            },
+            "Announcements",
+        )
+        .with_style(MessageDialogStyle::OK | MessageDialogStyle::IconInformation)
+        .build();
+        md.show_modal();
+    });
     let dialog_save = dialog;
     let save_for_btn = save_all.clone();
     save_btn.on_click(move |_| {

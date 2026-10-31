@@ -65,6 +65,10 @@ jobs:
           else
             cp target/release/blindrss dist/BlindRSS/
           fi
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            cp app/assets/nvdaControllerClient.dll dist/BlindRSS/
+            cp app/assets/nvdaControllerClient-LICENSE.txt dist/BlindRSS/
+          fi
           cp README.md dist/BlindRSS/
           cp docs/PARITY.md dist/BlindRSS/
           cp -r locale dist/BlindRSS/
