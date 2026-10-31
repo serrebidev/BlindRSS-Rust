@@ -630,6 +630,7 @@ fn notify_desktop(tray: &TaskBarIcon, title: &str, body: &str) {
     }
     #[cfg(target_os = "macos")]
     {
+        let _ = tray;
         let script = format!(
             "display notification \"{}\" with title \"{}\"",
             body.replace('\"', "'"),

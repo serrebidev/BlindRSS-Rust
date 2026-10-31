@@ -13,7 +13,7 @@ use std::io::{Read, Write};
 fn state_path() -> std::path::PathBuf {
     #[cfg(target_os = "windows")]
     {
-        return std::env::temp_dir().join(".blindrss-instance.json");
+        std::env::temp_dir().join(".blindrss-instance.json")
     }
     #[cfg(not(target_os = "windows"))]
     {
