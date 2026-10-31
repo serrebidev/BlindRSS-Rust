@@ -183,6 +183,33 @@ fn prompt_text(
     }
 }
 
+/// Put keyboard focus back on the surface the user was working in
+/// after a modal dialog closes. Python returns focus to the tree
+/// or the article list by context whenever a panel/dialog closes;
+/// without this the screen reader lands nowhere useful.
+fn restore_focus(state: &State, tree: &TreeCtrl, list: &ListCtrl) {
+    if state.focus_list {
+        list.set_focus();
+    } else {
+        tree.set_focus();
+    }
+}
+
+/// prompt_text + focus restore to the working surface.
+fn prompt_focus(
+    parent: &impl WxWidget,
+    message: &str,
+    caption: &str,
+    default: &str,
+    state: &State,
+    tree: &TreeCtrl,
+    list: &ListCtrl,
+) -> Option<String> {
+    let value = prompt_text(parent, message, caption, default);
+    restore_focus(state, tree, list);
+    value
+}
+
 fn db_path() -> PathBuf {
     if let Ok(p) = std::env::var("BLINDRSS_DB") {
         return PathBuf::from(p);
@@ -215,6 +242,9 @@ struct State {
     selected_feed: Option<String>,
     selected_article: Option<usize>,
     refreshing: bool,
+    /// Surface the user is working in: false = feed tree,
+    /// true = article list. Modal dialogs restore focus to it.
+    focus_list: bool,
 }
 
 enum RefreshMsg {
@@ -586,6 +616,7 @@ fn main() {
             selected_feed: None,
             selected_article: None,
             refreshing: false,
+            focus_list: false,
         }));
 
         // Open the existing database and populate.
@@ -619,6 +650,7 @@ fn main() {
                 .filter(|s| !s.is_empty());
             let mut st = state_tree.borrow_mut();
             st.selected_feed = filter;
+            st.focus_list = false;
             refill_articles(&mut st, &list);
         });
 
@@ -633,6 +665,7 @@ fn main() {
             }
             let mut st = state_list.borrow_mut();
             st.selected_article = Some(idx as usize);
+            st.focus_list = true;
             let Some(a) = st.articles.get(idx as usize).cloned() else {
                 return;
             };
@@ -886,6 +919,7 @@ fn main() {
                 dlg.end_modal(ID_OK);
             });
             dlg.show_modal();
+            restore_focus(&state_deleted.borrow(), &tree, &list);
         });
         {
             let a = act_deleted.clone();
@@ -1085,11 +1119,26 @@ fn main() {
             if !db_ok {
                 return;
             }
-            let Some(title) = prompt_text(&frame_ef, "Feed title:", "Edit Feed", &feed.title)
-            else {
+            let Some(title) = prompt_focus(
+                &frame_ef,
+                "Feed title:",
+                "Edit Feed",
+                &feed.title,
+                &state_ef.borrow(),
+                &tree_ef,
+                &list_ef,
+            ) else {
                 return;
             };
-            let Some(url) = prompt_text(&frame_ef, "Feed URL:", "Edit Feed", &feed.url) else {
+            let Some(url) = prompt_focus(
+                &frame_ef,
+                "Feed URL:",
+                "Edit Feed",
+                &feed.url,
+                &state_ef.borrow(),
+                &tree_ef,
+                &list_ef,
+            ) else {
                 return;
             };
             let mut st = state_ef.borrow_mut();
@@ -1144,11 +1193,14 @@ fn main() {
             if !db_ok {
                 return;
             }
-            let Some(new_name) = prompt_text(
+            let Some(new_name) = prompt_focus(
                 &frame_rc,
                 "New category name:",
                 "Rename Category",
                 &category,
+                &state_rc.borrow(),
+                &tree_rc,
+                &list_rc,
             ) else {
                 return;
             };
@@ -1192,11 +1244,14 @@ fn main() {
             if !db_ok {
                 return;
             }
-            let Some(name) = prompt_text(
+            let Some(name) = prompt_focus(
                 &frame_sc,
                 "Category (blank for none):",
                 "Set Feed Category",
                 feed.category.as_deref().unwrap_or(""),
+                &state_sc.borrow(),
+                &tree_sc,
+                &list_sc,
             ) else {
                 return;
             };
@@ -1275,18 +1330,28 @@ fn main() {
         let tree_nsf = tree;
         let list_nsf = list;
         let act_new_sf: Rc<dyn Fn()> = Rc::new(move || {
-            let Some(name) = prompt_text(&frame_nsf, "Smart folder name:", "New Smart Folder", "")
-            else {
+            let Some(name) = prompt_focus(
+                &frame_nsf,
+                "Smart folder name:",
+                "New Smart Folder",
+                "",
+                &state_nsf.borrow(),
+                &tree_nsf,
+                &list_nsf,
+            ) else {
                 return;
             };
             if name.trim().is_empty() {
                 return;
             }
-            let needle = prompt_text(
+            let needle = prompt_focus(
                 &frame_nsf,
                 "Show articles whose title contains (blank = all):",
                 "New Smart Folder",
                 "",
+                &state_nsf.borrow(),
+                &tree_nsf,
+                &list_nsf,
             )
             .unwrap_or_default();
             let rule = if needle.trim().is_empty() {
@@ -1404,7 +1469,9 @@ fn main() {
                 .with_wildcard("ZIP files (*.zip)|*.zip")
                 .with_style(FileDialogStyle::Open)
                 .build();
-            if dlg.show_modal() != 5100 {
+            let rc = dlg.show_modal();
+            restore_focus(&state_to.borrow(), &tree_to, &list_to);
+            if rc != 5100 {
                 return;
             }
             let Some(path) = dlg.get_path() else { return };
@@ -1528,13 +1595,18 @@ fn main() {
 
         // Backup / Restore / Prune / Updates.
         let frame_bk = frame;
+        let state_bk = state.clone();
+        let tree_bk = tree;
+        let list_bk = list;
         let act_backup: Rc<dyn Fn()> = Rc::new(move || {
             let dlg = FileDialog::builder(&frame_bk)
                 .with_message("Save backup")
                 .with_wildcard("ZIP files (*.zip)|*.zip")
                 .with_style(FileDialogStyle::Save)
                 .build();
-            if dlg.show_modal() != 5100 {
+            let rc = dlg.show_modal();
+            restore_focus(&state_bk.borrow(), &tree_bk, &list_bk);
+            if rc != 5100 {
                 return;
             }
             if let Some(path) = dlg.get_path() {
@@ -1559,7 +1631,9 @@ fn main() {
                 .with_wildcard("ZIP files (*.zip)|*.zip")
                 .with_style(FileDialogStyle::Open)
                 .build();
-            if dlg.show_modal() != 5100 {
+            let rc = dlg.show_modal();
+            restore_focus(&state_rs.borrow(), &tree_rs, &list_rs);
+            if rc != 5100 {
                 return;
             }
             if let Some(path) = dlg.get_path() {
@@ -1618,6 +1692,9 @@ fn main() {
         // crowded with them); the dialog reports which one was
         // chosen and it runs here, after the dialog closes.
         let frame_set = frame;
+        let state_set = state.clone();
+        let tree_set = tree;
+        let list_set = list;
         type Action = Rc<dyn Fn()>;
         let dispatch: Vec<(&'static str, Action)> = vec![
             ("backup", act_backup.clone()),
@@ -1629,7 +1706,9 @@ fn main() {
             ("update", act_update.clone()),
         ];
         let act_settings: Rc<dyn Fn()> = Rc::new(move || {
-            if let Some(intent) = settings::show_settings(&frame_set, &config_path())
+            let intent = settings::show_settings(&frame_set, &config_path());
+            restore_focus(&state_set.borrow(), &tree_set, &list_set);
+            if let Some(intent) = intent
                 && let Some((_, action)) = dispatch.iter().find(|(name, _)| *name == intent)
             {
                 action();
@@ -1642,17 +1721,25 @@ fn main() {
 
         // Help viewer + shortcuts registry dialogs.
         let frame_help = frame;
+        let state_help = state.clone();
+        let tree_help = tree;
+        let list_help = list;
         let language_help = language.clone();
         let act_help: Rc<dyn Fn()> = Rc::new(move || {
             help::show_help(&frame_help, &language_help);
+            restore_focus(&state_help.borrow(), &tree_help, &list_help);
         });
         {
             let a = act_help.clone();
             help_btn.on_click(move |_| a());
         }
         let frame_keys = frame;
+        let state_keys = state.clone();
+        let tree_keys = tree;
+        let list_keys = list;
         let act_keys: Rc<dyn Fn()> = Rc::new(move || {
             keys::show_shortcuts(&frame_keys, &config_path());
+            restore_focus(&state_keys.borrow(), &tree_keys, &list_keys);
         });
         {
             let a = act_keys.clone();
@@ -1663,10 +1750,14 @@ fn main() {
         // learn its title, then subscribe + store its current articles.
         let state_add = state.clone();
         let frame_add = frame;
+        let tree_add = tree;
+        let list_add = list;
         let tx_add = tx.clone();
         let act_add: Rc<dyn Fn()> = Rc::new(move || {
             let dlg = TextEntryDialog::builder(&frame_add, "Feed URL:", "Add Feed").build();
-            if dlg.show_modal() != ID_OK {
+            let rc = dlg.show_modal();
+            restore_focus(&state_add.borrow(), &tree_add, &list_add);
+            if rc != ID_OK {
                 return;
             }
             let Some(url) = dlg.get_value().filter(|v| !v.trim().is_empty()) else {
@@ -1715,7 +1806,9 @@ fn main() {
             )
             .with_style(MessageDialogStyle::YesNo)
             .build();
-            if dlg.show_modal() != ID_YES {
+            let rc = dlg.show_modal();
+            restore_focus(&state_rm.borrow(), &tree, &list);
+            if rc != ID_YES {
                 return;
             }
             let mut st = state_rm.borrow_mut();
@@ -1742,7 +1835,9 @@ fn main() {
                 .with_wildcard("OPML files (*.opml;*.xml)|*.opml;*.xml")
                 .with_style(FileDialogStyle::Open)
                 .build();
-            if dlg.show_modal() != ID_OK {
+            let rc = dlg.show_modal();
+            restore_focus(&state_imp.borrow(), &tree, &list);
+            if rc != ID_OK {
                 return;
             }
             let Some(path) = dlg.get_path() else { return };
@@ -1778,7 +1873,9 @@ fn main() {
                 .with_wildcard("OPML files (*.opml)|*.opml")
                 .with_style(FileDialogStyle::Save)
                 .build();
-            if dlg.show_modal() != ID_OK {
+            let rc = dlg.show_modal();
+            restore_focus(&state_exp.borrow(), &tree, &list);
+            if rc != ID_OK {
                 return;
             }
             let Some(path) = dlg.get_path() else { return };

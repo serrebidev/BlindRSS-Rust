@@ -346,8 +346,11 @@ surface audits missed, in port order:
    one-shot 75 ms timer (call_after needs Send; handles are not)
    with is_shown check + set_focus, and rebuild_tree preserves the
    selection by item data, defaulting to the root),
-   focus restore after dialogs, reader-surface focus, large-reader
-   mode — **mostly missing**.
+   focus restore after dialogs (DONE v0.1.8 — State tracks the
+   working surface from the selection handlers; every modal
+   dialog site restores focus to the tree or article list right
+   after it closes, via restore_focus/prompt_focus),
+   reader-surface focus, large-reader mode — **partly missing**.
 2. Startup state restore: remember_last_feed/last_selected_feed,
    tree expansion default, start maximized — **missing**.
 3. AccessibleBrowserFrame + accessible view entries (flattened
