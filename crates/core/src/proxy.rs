@@ -91,15 +91,36 @@ pub fn eq_url(target: &str, af: &str) -> String {
     )
 }
 
+/// A proxy URL that plays any media URL by transcoding it to
+/// a live MP3 stream with ffmpeg. The player's last-resort
+/// path for sources the native media backend cannot open
+/// (podcast CDNs with redirect chains and modern TLS are the
+/// common case: libVLC in Python opens them, wx MediaCtrl's
+/// DirectShow backend often does not).
+pub fn play_url(target: &str) -> String {
+    format!("{}/play?url={}", ensure_started(), url_encode(target))
+}
+
 /// Serve `url` transcoded through the ffmpeg `-af` chain as a
 /// live MP3 stream.
 fn serve_eq(stream: &mut std::net::TcpStream, url: &str, af: &str) {
+    serve_ffmpeg_mp3(stream, url, Some(af));
+}
+
+/// Serve `url` as a live MP3 stream transcoded by ffmpeg,
+/// with an optional `-af` filter chain (None = plain decode,
+/// the /play route).
+fn serve_ffmpeg_mp3(stream: &mut std::net::TcpStream, url: &str, af: Option<&str>) {
     use std::io::Read as _;
     let Some(ffmpeg) = crate::silence::find_ffmpeg() else {
         return respond(stream, "503 Unavailable", &[], b"ffmpeg not found");
     };
     let mut cmd = std::process::Command::new(&ffmpeg);
-    cmd.args(["-v", "error", "-i", url, "-af", af, "-f", "mp3", "-"])
+    cmd.args(["-v", "error", "-i", url]);
+    if let Some(af) = af {
+        cmd.args(["-af", af]);
+    }
+    cmd.args(["-vn", "-f", "mp3", "-"])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null());
     let Ok(mut child) = cmd.spawn() else {
@@ -236,6 +257,12 @@ fn handle(mut stream: std::net::TcpStream) {
             };
             serve_eq(&mut stream, &u, &af);
         }
+        "/play" => {
+            let Some(u) = query_param(query, "url") else {
+                return respond(&mut stream, "400 Bad Request", &[], b"missing url");
+            };
+            serve_ffmpeg_mp3(&mut stream, &u, None);
+        }
         _ => {
             if let Some(rest) = path.strip_prefix("/hlsseg/") {
                 serve_hls_segment(&mut stream, rest);
@@ -327,39 +354,55 @@ fn serve_stream(stream: &mut std::net::TcpStream, url: &str, range: &str) {
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("application/octet-stream")
                 .to_string();
+            // Stream the body through as it arrives instead of
+            // buffering the whole file first: a podcast episode
+            // can be 100 MB, and playback through this proxy
+            // must start on the first bytes, not the last.
+            use std::io::Read as _;
             let content_range = resp
                 .headers()
                 .get("content-range")
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("")
                 .to_string();
-            match resp.body_mut().read_to_vec() {
-                Ok(data) => {
-                    let mut headers = vec![
-                        ("Content-Type", mime),
-                        ("Accept-Ranges", "bytes".to_string()),
-                    ];
-                    if !content_range.is_empty() {
-                        headers.push(("Content-Range", content_range));
-                    }
-                    respond(
-                        stream,
-                        if status == 206 {
-                            "206 Partial Content"
-                        } else {
-                            "200 OK"
-                        },
-                        &headers,
-                        &data,
-                    );
+            let content_length = resp
+                .headers()
+                .get("content-length")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            let mut head = format!(
+                "HTTP/1.1 {}\r\nContent-Type: {mime}\r\nAccept-Ranges: bytes\r\n",
+                if status == 206 {
+                    "206 Partial Content"
+                } else {
+                    "200 OK"
                 }
-                Err(e) => respond(
-                    stream,
-                    "502 Bad Gateway",
-                    &[],
-                    format!("upstream read: {e}").as_bytes(),
-                ),
+            );
+            if !content_range.is_empty() {
+                head.push_str(&format!("Content-Range: {content_range}\r\n"));
             }
+            if !content_length.is_empty() {
+                head.push_str(&format!("Content-Length: {content_length}\r\n"));
+            }
+            head.push_str("Connection: close\r\n\r\n");
+            if stream.write_all(head.as_bytes()).is_err() {
+                return;
+            }
+            let mut reader = resp.body_mut().as_reader();
+            let mut buf = [0u8; 16384];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if stream.write_all(&buf[..n]).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            let _ = stream.flush();
         }
         Err(e) => respond(
             stream,

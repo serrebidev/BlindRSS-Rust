@@ -791,3 +791,48 @@ flow — a failed install reports its reason in the status
 bar, and the Settings custom-path fields stay as the manual
 override. Tests: batch28_slice (managed layout detection,
 zip extraction).
+
+Batch 28 resolution (v0.1.28, Brandon's hands-on report:
+podcasts do not play, the player is not NVDA-accessible,
+categories must collapse by default, and category navigation
+lags ~1s per step): (1) Podcasts — the audit found an
+engine mismatch, not a resolution bug: enclosures resolve
+correctly, but Python plays through libVLC (gui/player.py)
+while the Rust player uses wx MediaCtrl, whose Windows
+DirectShow backend routinely refuses podcast CDN URLs
+(redirect chains, modern TLS). The player now falls back in
+order: direct load, the local proxy /stream route (the
+app's own HTTP stack fetches the bytes), then the new
+proxy /play route (a live ffmpeg transcode). serve_stream
+was rewritten to stream progressively — it previously
+buffered the entire file before responding, which alone
+would have stalled episode starts. A libVLC engine port
+(vlc-rs is maintained) remains the playback-parity endgame
+and is recorded as an open residual below. (2) Player
+accessibility: the seek slider, chapter list and position
+readout now carry accessible names (NVDA announced a bare
+"slider"/"list" before), visible Seek/Chapters captions
+were added, and keyboard focus lands on Play/Pause at open
+instead of the unreadable native media pane. (3) Categories
+collapse by default: category_tree_default_expanded now
+defaults to false in both the tree build and the existing
+Settings checkbox ("Expand categories by default") — a
+stored true from earlier Settings saves still wins, as a
+saved preference should. (4) Category lag: refill_articles
+now wraps the fill in Freeze/Thaw (Python's
+reader_performance.py pattern), rebuilds list columns only
+when the article_columns config actually changed (every
+refill previously ran clear_all and recreated them), and
+tree selection changes coalesce through the 150 ms drain
+timer so arrowing past a category no longer fills it — only
+the landed-on node fills. Tests: batch29_slice (proxy
+routes + live /stream pass-through).
+
+Open residual (playback engine): Python's player is libVLC
+end to end (7,276-line gui/player.py: VLC caching knobs,
+preferred soundcard, resume_* family, HTTP header control).
+The Rust player substitutes wx MediaCtrl plus the batch-28
+fallback chain; a libVLC engine port (garkimasera/vlc-rs,
+maintained as of 2026-10) behind the same player window is
+the parity endgame and its own batch — it also decides the
+vlc-knob and preferred_soundcard residuals above.

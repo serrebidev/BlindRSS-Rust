@@ -1148,6 +1148,15 @@ struct State {
     /// rebuilds; category_tree_default_expanded covers the rest.
     expanded_cats: std::collections::HashSet<String>,
     collapsed_cats: std::collections::HashSet<String>,
+    /// Signature of the article-column layout currently built
+    /// in the list; a refill rebuilds columns only when this
+    /// changes (clear_all + re-insert per refill was a freeze
+    /// source — Python only rebuilds on layout changes too).
+    cols_sig: String,
+    /// A tree selection asked for a refill; the drain timer
+    /// runs it once for the node the user lands on instead of
+    /// refilling for every node arrowed past.
+    refill_pending: bool,
     /// Per-feed new-article counts for the running refresh
     /// (sounds/notifications at AllDone consume them).
     refresh_new: Vec<(String, String, usize)>,
@@ -1476,7 +1485,7 @@ fn rebuild_tree(state: &mut State, tree: &TreeCtrl) {
     // uncategorized feeds at the root. Node data is "cat:<path>".
     let expand_cats = blindrss_core::config::Config::load(&config_path())
         .unwrap_or_default()
-        .get_bool("category_tree_default_expanded", true);
+        .get_bool("category_tree_default_expanded", false);
     let mut paths: Vec<String> = db
         .categories()
         .unwrap_or_default()
@@ -1686,7 +1695,33 @@ fn article_cell(
 }
 
 fn refill_articles(state: &mut State, list: &ListCtrl) {
-    setup_article_columns(list);
+    // Freeze/Thaw around the whole fill: without it every
+    // inserted row repaints the control — arrowing between
+    // categories froze for ~1s at a time on big categories.
+    // Python wraps its fills the same way
+    // (gui/reader_performance.py).
+    list.freeze();
+    refill_inner(state, list);
+    list.thaw();
+}
+
+fn refill_inner(state: &mut State, list: &ListCtrl) {
+    // Columns are rebuilt only when the layout config changed;
+    // the common refill just clears the rows (clear_all also
+    // tears down and recreates every column).
+    let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+    let sig = serde_json::to_string(
+        cfg.raw()
+            .get("article_columns")
+            .unwrap_or(&serde_json::Value::Null),
+    )
+    .unwrap_or_default();
+    if sig != state.cols_sig {
+        setup_article_columns(list);
+        state.cols_sig = sig;
+    } else {
+        list.delete_all_items();
+    }
     state.articles.clear();
     let Some(db) = state.db.as_ref() else { return };
     let filter = state.selected_feed.as_deref();
@@ -2250,6 +2285,8 @@ fn main() {
             search_focused: false,
             expanded_cats: std::collections::HashSet::new(),
             collapsed_cats: std::collections::HashSet::new(),
+            cols_sig: String::new(),
+            refill_pending: false,
         }));
 
         // A staged restore (Python backup.py semantics) applies
@@ -2327,7 +2364,10 @@ fn main() {
                     let _ = cfg.save(&path);
                 }
             }
-            refill_articles(&mut st, &list);
+            // Defer the fill to the drain timer: arrowing
+            // through the tree marks it pending repeatedly and
+            // only the node he lands on gets filled.
+            st.refill_pending = true;
         });
 
         // Category expansion memory (Python issue #33): record the
@@ -6350,6 +6390,15 @@ fn main() {
         let rx_tick = rx.clone();
         let tx_tick = tx.clone();
         timer.on_tick(move |_| {
+            // Coalesced tree refill (see the tree selection
+            // handler): fill once for the landed-on node.
+            {
+                let mut st = state_tick.borrow_mut();
+                if st.refill_pending {
+                    st.refill_pending = false;
+                    refill_articles(&mut st, &list);
+                }
+            }
             let mut new_total = 0usize;
             let mut finished = false;
             loop {

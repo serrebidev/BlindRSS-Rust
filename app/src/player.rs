@@ -243,6 +243,32 @@ fn eq_wrap(url: &str, cfg: &blindrss_core::config::Config) -> String {
     url.to_string()
 }
 
+/// Load `url` into the media control, falling back when the
+/// native backend cannot open it. wx MediaCtrl's Windows
+/// backend (DirectShow) routinely refuses podcast CDN URLs —
+/// redirect chains, modern TLS, odd content types — that
+/// libVLC (Python's engine) opens without trouble. Fallback
+/// order: the raw URL, then the same bytes fetched by the
+/// app's own HTTP stack and streamed over the local proxy,
+/// then a live ffmpeg transcode of the URL. Returns which
+/// path loaded: "" direct, "proxy", "ffmpeg", or "failed".
+fn load_with_fallbacks(media: &MediaCtrl, url: &str) -> &'static str {
+    if media.load_uri(url) {
+        return "";
+    }
+    if url.starts_with("http://") || url.starts_with("https://") {
+        if media.load_uri(&blindrss_core::proxy::stream_url(url)) {
+            return "proxy";
+        }
+        if blindrss_core::silence::find_ffmpeg().is_some()
+            && media.load_uri(&blindrss_core::proxy::play_url(url))
+        {
+            return "ffmpeg";
+        }
+    }
+    "failed"
+}
+
 fn open_player_impl(
     _parent: &Frame,
     article: Article,
@@ -321,6 +347,19 @@ fn open_player_impl(
     let seek_slider = Slider::builder(&frame).build();
     seek_slider.set_range(0, 1000);
     let chapter_list = ListBox::builder(&frame).build();
+    // Accessible names: NVDA reads a bare slider as just
+    // "slider" and a bare list box as just "list" — the names
+    // are what a screen reader announces for them (Python's
+    // player labels every control the same way).
+    seek_slider.set_name(&crate::tr("Seek"));
+    chapter_list.set_name(&crate::tr("Chapters"));
+    pos_label.set_name(&crate::tr("Position"));
+    let seek_caption = StaticText::builder(&frame)
+        .with_label(&crate::tr("Seek"))
+        .build();
+    let chapters_caption = StaticText::builder(&frame)
+        .with_label(&crate::tr("Chapters"))
+        .build();
     for ch in &chapters {
         let t = ch.title.as_deref().unwrap_or("Chapter");
         chapter_list.append(&format!("{} - {}", fmt_ms((ch.start * 1000.0) as i64), t));
@@ -343,7 +382,9 @@ fn open_player_impl(
     col.add_sizer(&row, 0, SizerFlag::Expand, 0);
     col.add_sizer(&row2, 0, SizerFlag::Expand, 0);
     col.add(&pos_label, 0, SizerFlag::All, 4);
+    col.add(&seek_caption, 0, SizerFlag::All, 4);
     col.add(&seek_slider, 0, SizerFlag::Expand | SizerFlag::All, 4);
+    col.add(&chapters_caption, 0, SizerFlag::All, 4);
     col.add(&chapter_list, 1, SizerFlag::Expand | SizerFlag::All, 4);
     frame.set_sizer(col, true);
     frame.create_status_bar(1, 0, -1, "player status");
@@ -377,15 +418,33 @@ fn open_player_impl(
         }),
     }));
 
-    let stream_url = eq_wrap(&stream_url, &cfg);
-    let loaded = media.load_uri(&stream_url);
-    if loaded {
+    let wrapped = eq_wrap(&stream_url, &cfg);
+    // An EQ-wrapped URL is already a local ffmpeg stream (its
+    // own network path is ffmpeg's), so it loads directly;
+    // anything else goes through the fallback chain.
+    let via = if wrapped != stream_url {
+        if media.load_uri(&wrapped) {
+            ""
+        } else {
+            "failed"
+        }
+    } else {
+        load_with_fallbacks(&media, &stream_url)
+    };
+    if via != "failed" {
         media.set_volume(start_volume);
         media.play();
         if (start_speed - 1.0).abs() > 0.001 {
             media.set_playback_rate(start_speed);
         }
-        frame.set_status_text("Playing", 0);
+        frame.set_status_text(
+            match via {
+                "proxy" => "Playing (via local proxy)",
+                "ffmpeg" => "Playing (via ffmpeg)",
+                _ => "Playing",
+            },
+            0,
+        );
     } else {
         frame.set_status_text("Could not load media", 0);
     }
@@ -567,7 +626,7 @@ fn open_player_impl(
         let len = m.length();
         let pos = m.tell();
         let mut seek_to: Option<(i64, String)> = None;
-        let mut queue_load: Option<(String, String)> = None;
+        let mut queue_load: Option<(String, String, String)> = None;
         let mut queue_error: Option<String> = None;
         {
             let mut s = st.borrow_mut();
@@ -607,7 +666,8 @@ fn open_player_impl(
                             *chapters_tick.borrow_mut() = (Vec::new(), Vec::new());
                             chapter_list.clear();
                             set_queue_index(idx as i64);
-                            queue_load = Some((eq_wrap(&stream, &cfg2), entry.title.clone()));
+                            queue_load =
+                                Some((eq_wrap(&stream, &cfg2), stream, entry.title.clone()));
                         }
                         Err(e) => queue_error = Some(e),
                     }
@@ -649,18 +709,23 @@ fn open_player_impl(
             frame_tick.set_status_text(&label, 0);
             crate::announce("sponsor_skip", &label);
         }
-        if let Some((stream, title)) = queue_load
-            && m.load_uri(&stream)
-        {
-            m.play();
-            // A fresh load can reset the backend volume; the
-            // persisted level is the one in the config.
-            let cfg_q =
-                blindrss_core::config::Config::load(&crate::config_path()).unwrap_or_default();
-            m.set_volume((cfg_q.get_i64("volume", 100) as f64 / 100.0).clamp(0.0, 1.0));
-            frame_tick.set_title(&format!("Playing: {title}"));
-            frame_tick.set_status_text(&format!("Queue: {title}"), 0);
-            crate::announce("general", &format!("Now playing: {title}"));
+        if let Some((wrapped, raw, title)) = queue_load {
+            let via = if wrapped != raw {
+                if m.load_uri(&wrapped) { "" } else { "failed" }
+            } else {
+                load_with_fallbacks(&m, &raw)
+            };
+            if via != "failed" {
+                m.play();
+                // A fresh load can reset the backend volume; the
+                // persisted level is the one in the config.
+                let cfg_q =
+                    blindrss_core::config::Config::load(&crate::config_path()).unwrap_or_default();
+                m.set_volume((cfg_q.get_i64("volume", 100) as f64 / 100.0).clamp(0.0, 1.0));
+                frame_tick.set_title(&format!("Playing: {title}"));
+                frame_tick.set_status_text(&format!("Queue: {title}"), 0);
+                crate::announce("general", &format!("Now playing: {title}"));
+            }
         }
         if let Some(e) = queue_error {
             frame_tick.set_status_text(&format!("Queue: {e}"), 0);
@@ -677,6 +742,10 @@ fn open_player_impl(
     timer.start(1000, false);
 
     frame.show(true);
+    // Land keyboard focus on Play/Pause, not the media pane:
+    // the pane is a native video surface NVDA cannot read, and
+    // it is created first so it would otherwise take focus.
+    play_btn.set_focus();
     // show_player_on_play: raise the player over the main window
     // when playback starts (Python default in its settings UI).
     if show_player {

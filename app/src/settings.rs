@@ -375,7 +375,7 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
     let expand_cb = CheckBox::builder(&dialog)
         .with_label(&crate::tr("Expand categories by default"))
         .build();
-    expand_cb.set_value(cfg.get_bool("category_tree_default_expanded", true));
+    expand_cb.set_value(cfg.get_bool("category_tree_default_expanded", false));
     sizer.add(&expand_cb, 0, SizerFlag::All, 4);
     let hotkey_field = add_field(
         &dialog,
