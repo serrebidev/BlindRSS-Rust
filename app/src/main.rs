@@ -257,6 +257,7 @@ const M_BACKUP: i32 = 2105;
 const M_RESTORE: i32 = 2106;
 const M_EXIT: i32 = 2107;
 const M_REFRESH: i32 = 2111;
+const M_REFRESH_FEED: i32 = 2120;
 const M_SYNC: i32 = 2112;
 const M_REMOVE_FEED: i32 = 2113;
 const M_EDIT_FEED: i32 = 2114;
@@ -666,6 +667,42 @@ fn main() {
             let a = act_refresh.clone();
             refresh_btn.on_click(move |_| a());
         }
+
+        // Refresh Feed (menu/context only): fetch just the feed
+        // selected in the tree, reusing the same worker + channel +
+        // AllDone completion path as Refresh All.
+        let act_refresh_feed: Rc<dyn Fn()> = {
+            let state_rf = state.clone();
+            let frame_rf = frame;
+            let tx_rf = tx.clone();
+            Rc::new(move || {
+                let feed = {
+                    let mut st = state_rf.borrow_mut();
+                    if st.refreshing {
+                        return;
+                    }
+                    let found = st
+                        .selected_feed
+                        .as_ref()
+                        .and_then(|id| st.feeds.iter().find(|f| &f.id == id).cloned());
+                    if found.is_some() {
+                        st.refreshing = true;
+                    }
+                    found
+                };
+                let Some(feed) = feed else {
+                    frame_rf.set_status_text("Select a feed in the tree first", 0);
+                    return;
+                };
+                frame_rf.set_status_text(&format!("Refreshing {}...", feed.title), 0);
+                let tx = tx_rf.clone();
+                std::thread::spawn(move || {
+                    let result = fetch_and_parse(&feed.url);
+                    let _ = tx.send(RefreshMsg::FeedDone(feed, result));
+                    let _ = tx.send(RefreshMsg::AllDone);
+                });
+            })
+        };
 
         // Article actions: delete (tombstoned), favorite, mark all
         // read, restore-deleted dialog, and search.
@@ -1780,6 +1817,7 @@ fn main() {
             .build();
         let feeds_menu = Menu::builder()
             .append_item(M_REFRESH, "&Refresh All", "Refresh every feed")
+            .append_item(M_REFRESH_FEED, "Refresh &Feed", "Refresh the selected feed")
             .append_item(M_SYNC, "S&ync Providers", "Sync hosted providers")
             .append_separator()
             .append_item(M_REMOVE_FEED, "Re&move Feed", "Remove the selected feed")
@@ -1886,6 +1924,7 @@ fn main() {
             (M_BACKUP, act_backup.clone()),
             (M_RESTORE, act_restore.clone()),
             (M_REFRESH, act_refresh.clone()),
+            (M_REFRESH_FEED, act_refresh_feed.clone()),
             (M_SYNC, act_sync.clone()),
             (M_REMOVE_FEED, act_remove.clone()),
             (M_EDIT_FEED, act_edit_feed.clone()),
@@ -1920,6 +1959,44 @@ fn main() {
             if let Some((_, action)) = menu_actions.iter().find(|(mid, _)| *mid == id) {
                 action();
             }
+        });
+
+        // Context menus (PARITY 5C): right-click / Menu key on the
+        // feed tree and the article list. Selections dispatch through
+        // the frame's menu handler above (wx command events from a
+        // popup propagate to the frame), so the same actions run.
+        tree.bind_internal(EventType::CONTEXT_MENU, move |ev| {
+            ev.skip(false);
+            let mut menu = Menu::builder()
+                .append_item(M_REFRESH_FEED, "Refresh &Feed", "")
+                .append_item(M_REFRESH, "&Refresh All", "")
+                .append_separator()
+                .append_item(M_EDIT_FEED, "&Edit Feed...", "")
+                .append_item(M_REMOVE_FEED, "Re&move Feed", "")
+                .append_item(M_RENAME_CAT, "Rename &Category...", "")
+                .append_item(M_SET_CAT, "Set Feed Categor&y...", "")
+                .append_item(M_ARCHIVE, "Rescan &Archive", "")
+                .append_separator()
+                .append_item(M_NEW_SF, "&New Smart Folder...", "")
+                .append_item(M_DEL_SF, "&Delete Smart Folder", "")
+                .build();
+            tree.popup_menu(&mut menu, None);
+        });
+        list.bind_internal(EventType::CONTEXT_MENU, move |ev| {
+            ev.skip(false);
+            let mut menu = Menu::builder()
+                .append_item(M_TOGGLE_READ, "Toggle &Read", "")
+                .append_item(M_FULLTEXT, "Read &Full Text", "")
+                .append_item(M_FAVORITE, "Toggle &Favorite", "")
+                .append_separator()
+                .append_item(M_PLAY, "&Play Media", "")
+                .append_item(M_DOWNLOAD, "Down&load", "")
+                .append_item(M_CAST, "&Cast...", "")
+                .append_separator()
+                .append_item(M_DELETE_ARTICLE, "&Delete Article", "")
+                .append_item(M_MARKALL, "Mark All Read", "")
+                .build();
+            list.popup_menu(&mut menu, None);
         });
 
         let timer = Box::leak(Box::new(Timer::new(&frame)));

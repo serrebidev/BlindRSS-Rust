@@ -227,8 +227,12 @@ Python: full menu bar (File/Feeds/Edit/View/Player/Tools/Help) +
 tree/list context menus. Rust: menu bar SHIPPED in v0.1.2
 (File/Feeds/Article/Tools/Help; every item invokes the same Rc
 action as its button, so the two can never drift; mnemonics only,
-no accelerators yet). Still missing: tree/list context menus, and
-the Python-only menus (Edit/View/Player). Menu-only actions still
+no accelerators yet). Context menus SHIPPED in v0.1.3 (tree:
+Refresh Feed — a new per-feed action also added to the Feeds menu —
+Refresh All, Edit/Remove Feed, category ops, archive rescan, smart
+folders; list: read/full-text/favorite, play/download/cast,
+delete/mark-all). Still missing: the Python-only menus
+(Edit/View/Player). Menu-only actions still
 missing in Rust include: per-feed Refresh Feed, Refresh
 Category, Add Subcategory, Edit/Remove Category, Delete Category
 and Feeds, Import OPML Here, Export Category to OPML, Copy Feed
