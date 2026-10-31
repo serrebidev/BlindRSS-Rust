@@ -374,7 +374,7 @@ fn open_player_impl(
                     &entry.url,
                     entry.content.as_deref(),
                 )
-                .map(|r| r.url);
+                .map(|r| crate::maybe_cache_youtube(&entry, &r.url, r.via_ytdlp));
                 let _ = tx.send((next, result));
             });
         });

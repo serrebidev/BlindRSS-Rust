@@ -671,6 +671,498 @@ pub fn show_article_window(title: &str, body: &str) {
     reader.set_focus();
 }
 
+/// Article change history (Python's on_view_article_history):
+/// every recorded version of the article, newest first, with
+/// the selected version's text beside the list.
+pub fn show_article_history(frame: &Frame, db: &Db, article: &blindrss_core::Article) {
+    let versions = db.article_versions(&article.id).unwrap_or_default();
+    if versions.is_empty() {
+        let md = MessageDialog::builder(
+            frame,
+            "No change history for this article.",
+            "Article History",
+        )
+        .with_style(MessageDialogStyle::OK | MessageDialogStyle::IconInformation)
+        .build();
+        md.show_modal();
+        md.destroy();
+        return;
+    }
+    let total = versions.len();
+    let dialog = Dialog::builder(frame, "Article History").build();
+    let sizer = BoxSizer::builder(Orientation::Vertical).build();
+    let heading = StaticText::builder(&dialog)
+        .with_label(&format!("{total} versions of: {}", article.title))
+        .build();
+    sizer.add(&heading, 0, SizerFlag::All, 4);
+    let row = BoxSizer::builder(Orientation::Horizontal).build();
+    let list = ListBox::builder(&dialog).build();
+    for (i, v) in versions.iter().enumerate() {
+        let num = total - i;
+        let suffix = if i == 0 {
+            " (current)"
+        } else if num == 1 {
+            " (original)"
+        } else {
+            ""
+        };
+        list.append(&format!(
+            "Version {num} - {}{suffix}",
+            crate::fmt_ts(Some(v.captured_at))
+        ));
+    }
+    row.add(&list, 1, SizerFlag::Expand | SizerFlag::All, 4);
+    let text = TextCtrl::builder(&dialog)
+        .with_style(TextCtrlStyle::MultiLine | TextCtrlStyle::ReadOnly)
+        .build();
+    row.add(&text, 2, SizerFlag::Expand | SizerFlag::All, 4);
+    sizer.add_sizer(&row, 1, SizerFlag::Expand | SizerFlag::All, 2);
+    let close_btn = Button::builder(&dialog).with_label("Close").build();
+    sizer.add(&close_btn, 0, SizerFlag::All, 4);
+    let versions = Rc::new(versions);
+    let show_version: Rc<dyn Fn(usize)> = {
+        let versions = versions.clone();
+        Rc::new(move |idx: usize| {
+            if let Some(v) = versions.get(idx) {
+                let body = blindrss_core::extract::html_to_text(&v.content);
+                text.set_value(&format!("{}\n\n{}", v.title, body));
+            }
+        })
+    };
+    show_version(0);
+    list.set_selection(0, true);
+    {
+        let show_version = show_version.clone();
+        list.on_selection_changed(move |_| {
+            if let Some(sel) = list.get_selection() {
+                show_version(sel as usize);
+            }
+        });
+    }
+    let d = dialog;
+    close_btn.on_click(move |_| d.end_modal(5100));
+    dialog.set_sizer(sizer, true);
+    dialog.set_size(Size::new(720, 520));
+    list.set_focus();
+    dialog.show_modal();
+    dialog.destroy();
+}
+
+/// Article column layout editor (Python's ArticleColumnsPanel
+/// in Settings): list order is column order, checked is shown,
+/// Move Up / Move Down reorder, Title stays first and visible.
+/// Writes config "article_columns" on OK.
+pub fn show_article_columns(frame: &Frame, config_path: &Path) {
+    use blindrss_core::article_columns::{ColumnLayout, layout_from_config, resolve_layout};
+    let cfg = Config::load(config_path).unwrap_or_default();
+    let state: Rc<RefCell<Vec<ColumnLayout>>> = Rc::new(RefCell::new(layout_from_config(&cfg)));
+    let dialog = Dialog::builder(frame, "Article Columns").build();
+    let sizer = BoxSizer::builder(Orientation::Vertical).build();
+    let help = StaticText::builder(&dialog)
+        .with_label("Columns (checked = shown). Use Move Up / Move Down to reorder:")
+        .build();
+    sizer.add(&help, 0, SizerFlag::All, 4);
+    let list = CheckListBox::builder(&dialog).build();
+    sizer.add(&list, 1, SizerFlag::Expand | SizerFlag::All, 4);
+    let note = StaticText::builder(&dialog)
+        .with_label("Title is always the first column and cannot be hidden.")
+        .build();
+    sizer.add(&note, 0, SizerFlag::All, 4);
+    let row = BoxSizer::builder(Orientation::Horizontal).build();
+    let up_btn = Button::builder(&dialog).with_label("Move Up").build();
+    let down_btn = Button::builder(&dialog).with_label("Move Down").build();
+    let reset_btn = Button::builder(&dialog)
+        .with_label("Reset All to Defaults")
+        .build();
+    let ok_btn = Button::builder(&dialog).with_label("OK").build();
+    let cancel_btn = Button::builder(&dialog).with_label("Cancel").build();
+    row.add(&up_btn, 0, SizerFlag::All, 4);
+    row.add(&down_btn, 0, SizerFlag::All, 4);
+    row.add(&reset_btn, 0, SizerFlag::All, 4);
+    row.add(&ok_btn, 0, SizerFlag::All, 4);
+    row.add(&cancel_btn, 0, SizerFlag::All, 4);
+    sizer.add_sizer(&row, 0, SizerFlag::All, 2);
+
+    let rebuild: Rc<dyn Fn(Option<usize>)> = {
+        let state = state.clone();
+        Rc::new(move |select: Option<usize>| {
+            let st = state.borrow();
+            list.clear();
+            for (i, c) in st.iter().enumerate() {
+                if c.key == blindrss_core::article_columns::PINNED_KEY {
+                    list.append(&format!("{} (always first)", c.label));
+                } else {
+                    list.append(&c.label);
+                }
+                list.check(i as u32, c.visible);
+            }
+            if let Some(sel) = select.or(Some(0))
+                && sel < st.len()
+            {
+                list.set_selection(sel as u32, true);
+            }
+        })
+    };
+    // Pull the widget's check states back into the layout
+    // (Title's check is forced on, like Python).
+    let sync_checks: Rc<dyn Fn()> = {
+        let state = state.clone();
+        Rc::new(move || {
+            let mut st = state.borrow_mut();
+            for (i, c) in st.iter_mut().enumerate() {
+                c.visible = if c.key == blindrss_core::article_columns::PINNED_KEY {
+                    true
+                } else {
+                    list.is_checked(i as u32)
+                };
+            }
+        })
+    };
+    rebuild(Some(0));
+    {
+        let state = state.clone();
+        let rebuild = rebuild.clone();
+        let sync_checks = sync_checks.clone();
+        up_btn.on_click(move |_| {
+            sync_checks();
+            let Some(sel) = list.get_selection().map(|s| s as usize) else {
+                return;
+            };
+            // Title (row 0) never moves; nothing moves above it.
+            if sel < 2 {
+                return;
+            }
+            state.borrow_mut().swap(sel, sel - 1);
+            rebuild(Some(sel - 1));
+            list.set_focus();
+        });
+    }
+    {
+        let state = state.clone();
+        let rebuild = rebuild.clone();
+        let sync_checks = sync_checks.clone();
+        down_btn.on_click(move |_| {
+            sync_checks();
+            let Some(sel) = list.get_selection().map(|s| s as usize) else {
+                return;
+            };
+            let len = state.borrow().len();
+            if sel == 0 || sel + 1 >= len {
+                return;
+            }
+            state.borrow_mut().swap(sel, sel + 1);
+            rebuild(Some(sel + 1));
+            list.set_focus();
+        });
+    }
+    {
+        let state = state.clone();
+        let rebuild = rebuild.clone();
+        reset_btn.on_click(move |_| {
+            *state.borrow_mut() = resolve_layout(None);
+            rebuild(Some(0));
+            list.set_focus();
+        });
+    }
+    let saved: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
+    {
+        let saved = saved.clone();
+        let sync_checks = sync_checks.clone();
+        let d = dialog;
+        ok_btn.on_click(move |_| {
+            sync_checks();
+            *saved.borrow_mut() = true;
+            d.end_modal(5100);
+        });
+    }
+    let d = dialog;
+    cancel_btn.on_click(move |_| d.end_modal(5101));
+    dialog.set_sizer(sizer, true);
+    dialog.set_size(Size::new(480, 460));
+    list.set_focus();
+    if dialog.show_modal() == 5100 && *saved.borrow() {
+        let items: Vec<Value> = state
+            .borrow()
+            .iter()
+            .map(|c| json!({"key": c.key, "visible": c.visible, "width": c.width}))
+            .collect();
+        let mut cfg = Config::load(config_path).unwrap_or_default();
+        cfg.set_path("article_columns", Value::Array(items));
+        let _ = cfg.save(config_path);
+    }
+    dialog.destroy();
+}
+
+/// Video Search (Python's YtdlpGlobalSearchDialog): search
+/// videos across yt-dlp sites, then Play / Subscribe / Copy
+/// URL a result. Returns ("play" | "subscribe", result) for
+/// the caller to act on; Copy URL is handled in place.
+/// Per-site searches run on their own threads (Python caps
+/// concurrency at 8; the site list itself is the cap here)
+/// and stream into the list through a timer drain, deduped
+/// by canonical key. Load More widens the per-site limit by
+/// 80 and re-runs, matching Python's step.
+pub fn show_video_search(
+    frame: &Frame,
+    config_path: &Path,
+) -> Option<(&'static str, blindrss_core::videosearch::VideoResult)> {
+    use blindrss_core::videosearch::{VideoResult, canonical_key, search_site, searchable_sites};
+    let cfg = Config::load(config_path).unwrap_or_default();
+    let sites = searchable_sites(cfg.get_bool("enable_adult_search", false));
+    let dialog = Dialog::builder(frame, "Video Search").build();
+    let sizer = BoxSizer::builder(Orientation::Vertical).build();
+    let query_ctrl = name_row(&dialog, &sizer, "Search:", "");
+    let opt_row = BoxSizer::builder(Orientation::Horizontal).build();
+    let scope_label = StaticText::builder(&dialog)
+        .with_label("Search Sites:")
+        .build();
+    opt_row.add(&scope_label, 0, SizerFlag::All, 4);
+    let mut scope_items: Vec<&str> = vec!["All sites"];
+    scope_items.extend(sites.iter().map(|s| s.label));
+    let scope_choice = Choice::builder(&dialog).build();
+    for item in &scope_items {
+        scope_choice.append(item);
+    }
+    scope_choice.set_selection(0);
+    opt_row.add(&scope_choice, 1, SizerFlag::All, 4);
+    let sort_label = StaticText::builder(&dialog).with_label("Sort by:").build();
+    opt_row.add(&sort_label, 0, SizerFlag::All, 4);
+    let sort_choice = Choice::builder(&dialog).build();
+    for item in ["Relevance", "Title", "Site", "Plays"] {
+        sort_choice.append(item);
+    }
+    sort_choice.set_selection(0);
+    opt_row.add(&sort_choice, 0, SizerFlag::All, 4);
+    sizer.add_sizer(&opt_row, 0, SizerFlag::Expand | SizerFlag::All, 2);
+    let list = ListCtrl::builder(&dialog)
+        .with_style(ListCtrlStyle::Report | ListCtrlStyle::SingleSel)
+        .build();
+    list.insert_column(0, "Title", ListColumnFormat::Left, 340);
+    list.insert_column(1, "Site", ListColumnFormat::Left, 120);
+    list.insert_column(2, "Plays", ListColumnFormat::Left, 90);
+    list.insert_column(3, "Duration", ListColumnFormat::Left, 80);
+    list.insert_column(4, "Uploader", ListColumnFormat::Left, 160);
+    sizer.add(&list, 1, SizerFlag::Expand | SizerFlag::All, 4);
+    let status = StaticText::builder(&dialog).with_label("Ready.").build();
+    sizer.add(&status, 0, SizerFlag::All, 4);
+    let row = BoxSizer::builder(Orientation::Horizontal).build();
+    let mk = |label: &str| {
+        let b = Button::builder(&dialog).with_label(label).build();
+        row.add(&b, 0, SizerFlag::All, 4);
+        b
+    };
+    let search_btn = mk("Search");
+    let more_btn = mk("Load More Results (+80/site)");
+    let play_btn = mk("Play");
+    let sub_btn = mk("Subscribe");
+    let copy_btn = mk("Copy URL");
+    let close_btn = mk("Close");
+    sizer.add_sizer(&row, 0, SizerFlag::Expand | SizerFlag::All, 2);
+
+    let results: Rc<RefCell<Vec<VideoResult>>> = Rc::new(RefCell::new(Vec::new()));
+    let per_site_limit = Rc::new(std::cell::Cell::new(80usize));
+    let expected = Rc::new(std::cell::Cell::new(0usize));
+    let completed = Rc::new(std::cell::Cell::new(0usize));
+    let last_search: Rc<RefCell<(String, Vec<usize>)>> =
+        Rc::new(RefCell::new((String::new(), Vec::new())));
+    let (tx, rx) = std::sync::mpsc::channel::<(usize, Result<Vec<VideoResult>, String>)>();
+    let rx = Rc::new(rx);
+    let sites = Rc::new(sites);
+
+    // Refill the list from results, honouring the sort choice.
+    let refill: Rc<dyn Fn()> = {
+        let results = results.clone();
+        Rc::new(move || {
+            let mut items = results.borrow().clone();
+            match sort_choice.get_selection() {
+                Some(1) => items.sort_by_key(|a| a.title.to_lowercase()),
+                Some(2) => items.sort_by(|a, b| a.site.cmp(&b.site)),
+                Some(3) => items.sort_by_key(|b| std::cmp::Reverse(b.play_count.unwrap_or(-1))),
+                _ => {}
+            }
+            list.delete_all_items();
+            for (i, r) in items.iter().enumerate() {
+                list.insert_item(i as i64, &r.title, None);
+                list.set_item_text_by_column(i as i64, 1, &r.site);
+                list.set_item_text_by_column(
+                    i as i64,
+                    2,
+                    &r.play_count.map(|n| n.to_string()).unwrap_or_default(),
+                );
+                list.set_item_text_by_column(
+                    i as i64,
+                    3,
+                    &r.duration
+                        .map(|d| {
+                            let s = d as i64;
+                            format!("{}:{:02}", s / 60, s % 60)
+                        })
+                        .unwrap_or_default(),
+                );
+                list.set_item_text_by_column(i as i64, 4, r.uploader.as_deref().unwrap_or(""));
+            }
+            // Keep the visible order as the selection order.
+            *results.borrow_mut() = items;
+        })
+    };
+
+    let run_search: Rc<dyn Fn(bool)> = {
+        let results = results.clone();
+        let sites = sites.clone();
+        let per_site_limit = per_site_limit.clone();
+        let last_search = last_search.clone();
+        let expected = expected.clone();
+        let completed = completed.clone();
+        Rc::new(move |more: bool| {
+            let term = query_ctrl.get_value().trim().to_string();
+            if term.is_empty() {
+                return;
+            }
+            let scope = scope_choice.get_selection().unwrap_or(0) as usize;
+            let chosen: Vec<usize> = if scope == 0 {
+                (0..sites.len()).collect()
+            } else {
+                vec![scope - 1]
+            };
+            expected.set(chosen.len());
+            completed.set(0);
+            if more {
+                per_site_limit.set(per_site_limit.get() + 80);
+            } else {
+                per_site_limit.set(80);
+                results.borrow_mut().clear();
+            }
+            *last_search.borrow_mut() = (term.clone(), chosen.clone());
+            status.set_label(&format!("Searching {} site(s)...", chosen.len()));
+            for idx in chosen {
+                let site = sites[idx].clone();
+                let tx = tx.clone();
+                let term = term.clone();
+                let limit = per_site_limit.get();
+                std::thread::spawn(move || {
+                    let _ = tx.send((idx, search_site(&term, &site, limit)));
+                });
+            }
+        })
+    };
+    {
+        let run_search = run_search.clone();
+        search_btn.on_click(move |_| run_search(false));
+    }
+    {
+        let run_search = run_search.clone();
+        let last_search = last_search.clone();
+        more_btn.on_click(move |_| {
+            if !last_search.borrow().0.is_empty() {
+                run_search(true);
+            }
+        });
+    }
+    {
+        let refill = refill.clone();
+        sort_choice.on_selection_changed(move |_| refill());
+    }
+
+    let chosen: Rc<RefCell<Option<(&'static str, VideoResult)>>> = Rc::new(RefCell::new(None));
+    let pick = {
+        let chosen = chosen.clone();
+        let results = results.clone();
+        let d = dialog;
+        move |action: &'static str| {
+            let sel = list.get_first_selected_item();
+            if sel >= 0
+                && let Some(r) = results.borrow().get(sel as usize).cloned()
+            {
+                *chosen.borrow_mut() = Some((action, r));
+                d.end_modal(5100);
+            }
+        }
+    };
+    {
+        let pick = pick.clone();
+        play_btn.on_click(move |_| pick("play"));
+    }
+    {
+        let pick = pick.clone();
+        sub_btn.on_click(move |_| pick("subscribe"));
+    }
+    {
+        let pick = pick.clone();
+        list.on_item_activated(move |_| pick("play"));
+    }
+    {
+        let results = results.clone();
+        copy_btn.on_click(move |_| {
+            let sel = list.get_first_selected_item();
+            if sel >= 0
+                && let Some(r) = results.borrow().get(sel as usize)
+            {
+                let _ = Clipboard::get().set_text(&r.url);
+                status.set_label("URL copied");
+            }
+        });
+    }
+    let d = dialog;
+    close_btn.on_click(move |_| d.end_modal(5101));
+
+    // Drain per-site results while the dialog is open.
+    let timer = Box::leak(Box::new(Timer::new(&dialog)));
+    {
+        let rx = rx.clone();
+        let results = results.clone();
+        let refill = refill.clone();
+        let expected = expected.clone();
+        let completed = completed.clone();
+        let last_search = last_search.clone();
+        timer.on_tick(move |_| {
+            let mut changed = false;
+            while let Ok((_idx, result)) = rx.try_recv() {
+                changed = true;
+                completed.set(completed.get() + 1);
+                if let Ok(found) = result {
+                    let mut have: std::collections::HashSet<String> = results
+                        .borrow()
+                        .iter()
+                        .map(|r| canonical_key(&r.url))
+                        .collect();
+                    let mut all = results.borrow_mut();
+                    for r in found {
+                        let key = canonical_key(&r.url);
+                        if !key.is_empty() && have.insert(key) {
+                            all.push(r);
+                        }
+                    }
+                }
+            }
+            if changed {
+                refill();
+                let (term, chosen_sites) = last_search.borrow().clone();
+                let total = results.borrow().len();
+                if completed.get() >= expected.get() && !term.is_empty() {
+                    status.set_label(&format!(
+                        "{} result(s) from {} site(s)",
+                        total,
+                        chosen_sites.len()
+                    ));
+                } else {
+                    status.set_label(&format!("{total} result(s) so far..."));
+                }
+            }
+        });
+    }
+    timer.start(200, false);
+    dialog.set_sizer(sizer, true);
+    dialog.set_size(Size::new(900, 620));
+    query_ctrl.set_focus();
+    let picked = if dialog.show_modal() == 5100 {
+        chosen.borrow().clone()
+    } else {
+        None
+    };
+    dialog.destroy();
+    picked
+}
+
 /// Manage persistent searches (Python's
 /// PersistentSearchDialog): the saved query list lives in
 /// config "persistent_searches". Returns a query to run when
@@ -1320,4 +1812,33 @@ pub fn show_youtube_signin(frame: &impl WxWidget, config_path: &Path) {
     dialog.set_size(Size::new(520, 260));
     dialog.show_modal();
     dialog.destroy();
+}
+
+/// Cast device picker: every discovered device (all
+/// protocols) with its kind. Returns the chosen device.
+pub fn show_cast_picker(
+    frame: &Frame,
+    devices: &[blindrss_core::cast::CastDevice],
+) -> Option<blindrss_core::cast::CastDevice> {
+    let dialog = Dialog::builder(frame, "Cast to Device").build();
+    let sizer = BoxSizer::builder(Orientation::Vertical).build();
+    let list = ListBox::builder(&dialog).build();
+    for d in devices {
+        list.append(&format!("{} ({})", d.name, d.kind));
+    }
+    if !devices.is_empty() {
+        list.set_selection(0, true);
+    }
+    sizer.add(&list, 1, SizerFlag::Expand | SizerFlag::All, 4);
+    ok_cancel(&dialog, &sizer);
+    dialog.set_sizer(sizer, true);
+    dialog.set_size(Size::new(480, 360));
+    let picked = if dialog.show_modal() == 5100 {
+        list.get_selection()
+            .and_then(|i| devices.get(i as usize).cloned())
+    } else {
+        None
+    };
+    dialog.destroy();
+    picked
 }

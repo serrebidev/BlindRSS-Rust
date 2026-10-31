@@ -41,6 +41,15 @@ pub struct Category {
     pub parent_id: Option<String>,
 }
 
+/// One recorded change-history version of an article
+/// (Python `article_versions` row, newest first when listed).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ArticleVersion {
+    pub captured_at: f64,
+    pub title: String,
+    pub content: String,
+}
+
 /// One feed's recorded refresh failure (Python issue #32 shape).
 #[derive(Debug, Clone, PartialEq)]
 pub struct FeedError {
@@ -85,6 +94,11 @@ CREATE TABLE IF NOT EXISTS filter_rules (id TEXT PRIMARY KEY,
     stop INTEGER, position INTEGER);
 CREATE TABLE IF NOT EXISTS article_labels (article_id TEXT,
     category TEXT, PRIMARY KEY (article_id, category));
+CREATE TABLE IF NOT EXISTS article_versions (id INTEGER PRIMARY KEY
+    AUTOINCREMENT, article_id TEXT NOT NULL, captured_at REAL NOT NULL,
+    content_hash TEXT NOT NULL, title TEXT, content TEXT);
+CREATE INDEX IF NOT EXISTS idx_article_versions_article
+    ON article_versions (article_id, captured_at);
 ";
 
 /// Columns Python added to existing tables by migration; older
@@ -1074,6 +1088,51 @@ impl Db {
         Ok(())
     }
 
+    /// Stamp an article's opened_at (the History view's
+    /// source) at selection time.
+    pub fn mark_opened(&self, article_id: &str) -> rusqlite::Result<()> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        self.conn.execute(
+            "UPDATE articles SET opened_at = ?2 WHERE id = ?1",
+            params![article_id, now],
+        )?;
+        Ok(())
+    }
+
+    /// Recently opened articles, newest first:
+    /// (article, opened_at epoch seconds).
+    pub fn opened_articles(&self, limit: usize) -> rusqlite::Result<Vec<(Article, f64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, feed_id, title, url, content, description, date, \
+             author, is_read, is_favorite, media_url, media_type, opened_at \
+             FROM articles WHERE opened_at IS NOT NULL AND opened_at > 0 \
+             ORDER BY opened_at DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |r| {
+            Ok((
+                Article {
+                    id: r.get(0)?,
+                    feed_id: r.get(1)?,
+                    title: r.get(2)?,
+                    url: r.get(3)?,
+                    content: r.get(4)?,
+                    description: r.get(5)?,
+                    date: r.get(6)?,
+                    author: r.get(7)?,
+                    is_read: r.get(8)?,
+                    is_favorite: r.get(9)?,
+                    media_url: r.get(10)?,
+                    media_type: r.get(11)?,
+                },
+                r.get::<_, f64>(12)?,
+            ))
+        })?;
+        rows.collect()
+    }
+
     /// An article's enrichment tags (articles.tags JSON list).
     pub fn article_tags(&self, article_id: &str) -> rusqlite::Result<Vec<String>> {
         let mut stmt = self
@@ -1302,6 +1361,9 @@ impl Db {
 
     /// Insert an article if its id is new; returns true when inserted.
     /// Refresh dedupes on the article id, mirroring the Python store.
+    /// Both outcomes record a change-history version (Python
+    /// providers/local.py): a first fetch seeds the original, a
+    /// later fetch appends only when (title, content) changed.
     pub fn insert_article_if_new(&self, a: &Article) -> rusqlite::Result<bool> {
         let n = self.conn.execute(
             "INSERT OR IGNORE INTO articles \
@@ -1323,6 +1385,101 @@ impl Db {
                 a.media_type
             ],
         )?;
+        let _ = self.record_article_version(&a.id, &a.title, a.content.as_deref());
         Ok(n > 0)
+    }
+
+    /// Append a change-history version for an article, deduped
+    /// by the SHA-256 of title + NUL + content (Python
+    /// `record_article_version`). Returns true when a row was
+    /// written.
+    pub fn record_article_version(
+        &self,
+        article_id: &str,
+        title: &str,
+        content: Option<&str>,
+    ) -> rusqlite::Result<bool> {
+        use sha2::Digest;
+        if article_id.trim().is_empty() {
+            return Ok(false);
+        }
+        let mut h = sha2::Sha256::new();
+        h.update(title.as_bytes());
+        h.update([0u8]);
+        h.update(content.unwrap_or("").as_bytes());
+        let hash = h
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        let latest: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT content_hash FROM article_versions \
+                 WHERE article_id = ?1 \
+                 ORDER BY captured_at DESC, id DESC LIMIT 1",
+                params![article_id],
+                |r| r.get(0),
+            )
+            .ok();
+        if latest.as_deref() == Some(hash.as_str()) {
+            return Ok(false);
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        self.conn.execute(
+            "INSERT INTO article_versions \
+             (article_id, captured_at, content_hash, title, content) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![article_id, now, hash, title, content],
+        )?;
+        Ok(true)
+    }
+
+    /// An article's change history, newest first.
+    pub fn article_versions(&self, article_id: &str) -> rusqlite::Result<Vec<ArticleVersion>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT captured_at, title, content FROM article_versions \
+             WHERE article_id = ?1 ORDER BY captured_at DESC, id DESC",
+        )?;
+        let rows = stmt.query_map(params![article_id], |r| {
+            Ok(ArticleVersion {
+                captured_at: r.get(0)?,
+                title: r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                content: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+            })
+        })?;
+        rows.collect()
+    }
+
+    pub fn count_article_versions(&self, article_id: &str) -> rusqlite::Result<i64> {
+        self.conn.query_row(
+            "SELECT COUNT(*) FROM article_versions WHERE article_id = ?1",
+            params![article_id],
+            |r| r.get(0),
+        )
+    }
+
+    /// Ids of articles with more than one recorded version
+    /// (the smart-folder `updated` fact).
+    pub fn updated_article_ids(&self) -> rusqlite::Result<std::collections::HashSet<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT article_id FROM article_versions \
+             GROUP BY article_id HAVING COUNT(*) > 1",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        rows.collect()
+    }
+
+    /// Ids of articles the user has opened (the smart-folder
+    /// `opened` fact).
+    pub fn opened_article_ids(&self) -> rusqlite::Result<std::collections::HashSet<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id FROM articles WHERE opened_at IS NOT NULL AND opened_at > 0")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        rows.collect()
     }
 }

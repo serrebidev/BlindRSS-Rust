@@ -269,7 +269,7 @@ fn inoreader_listener_connect(frame: &Dialog, config_path: &Path, app_id: String
 
 /// Shows the settings dialog. Returns the name of a maintenance
 /// action the user chose inside the dialog ("backup", "restore",
-/// "takeout", "archive", "sync", "prune", "update"), or None. The
+/// "takeout", "archive", "sync", "prune", "update", "columns"), or None. The
 /// caller runs the action after the dialog has closed, so the
 /// action's own dialogs parent cleanly on the main frame.
 pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> {
@@ -735,6 +735,54 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
         "Install updates automatically",
         cfg.get_bool("install_updates_automatically", false),
     );
+    // Translation (six LLM providers).
+    add_heading(&dialog, &sizer, "Translation");
+    let translation_cb = add_check(
+        &dialog,
+        &sizer,
+        "Translation enabled",
+        cfg.get_bool("translation_enabled", false),
+    );
+    let tr_sel = blindrss_core::translate::PROVIDERS
+        .iter()
+        .position(|p| *p == cfg.get_str("translation_provider", "grok"))
+        .unwrap_or(0);
+    let tr_provider_choice = add_choice(
+        &dialog,
+        &sizer,
+        "Translation provider",
+        &blindrss_core::translate::PROVIDER_LABELS,
+        tr_sel,
+    );
+    let tr_target_field = add_field(
+        &dialog,
+        &sizer,
+        "Target language (code or name)",
+        cfg.get_str("translation_target_language", "en"),
+        false,
+    );
+    let mut tr_fields: Vec<(TextCtrl, TextCtrl)> = Vec::new();
+    for (key, label) in blindrss_core::translate::PROVIDERS
+        .iter()
+        .zip(blindrss_core::translate::PROVIDER_LABELS.iter())
+    {
+        let key_field = add_field(
+            &dialog,
+            &sizer,
+            &format!("{label} API key"),
+            cfg.get_str(&format!("translation_{key}_api_key"), ""),
+            true,
+        );
+        let model_field = add_field(
+            &dialog,
+            &sizer,
+            &format!("{label} model (blank = defaults)"),
+            cfg.get_str(&format!("translation_{key}_model"), ""),
+            false,
+        );
+        tr_fields.push((key_field, model_field));
+    }
+
     add_heading(&dialog, &sizer, "Advanced");
     let mut ua_items: Vec<&str> = vec!["Automatic (matches this computer)"];
     ua_items.extend(
@@ -775,6 +823,12 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
         "yt-dlp cookies file (optional)",
         cfg.get_str("ytdlp_cookies_file", ""),
         false,
+    );
+    let dep_prompt_cb = add_check(
+        &dialog,
+        &sizer,
+        "Prompt about missing tools (yt-dlp, ffmpeg) on startup",
+        cfg.get_bool("prompt_missing_dependencies_on_startup", true),
     );
     let captcha_cb = add_check(
         &dialog,
@@ -831,6 +885,9 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
     let update_btn = Button::builder(&dialog)
         .with_label("Check for Updates")
         .build();
+    let columns_btn = Button::builder(&dialog)
+        .with_label("Article Columns...")
+        .build();
     maint_row1.add(&backup_btn, 0, SizerFlag::All, 4);
     maint_row1.add(&restore_btn, 0, SizerFlag::All, 4);
     maint_row1.add(&takeout_btn, 0, SizerFlag::All, 4);
@@ -838,6 +895,7 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
     maint_row2.add(&sync_btn, 0, SizerFlag::All, 4);
     maint_row2.add(&prune_btn, 0, SizerFlag::All, 4);
     maint_row2.add(&update_btn, 0, SizerFlag::All, 4);
+    maint_row2.add(&columns_btn, 0, SizerFlag::All, 4);
     sizer.add_sizer(&maint_row1, 0, SizerFlag::All, 2);
     sizer.add_sizer(&maint_row2, 0, SizerFlag::All, 2);
 
@@ -1096,6 +1154,36 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
                 serde_json::json!(cookies_file_field.get_value()),
             );
             cfg.set_path(
+                "prompt_missing_dependencies_on_startup",
+                serde_json::json!(dep_prompt_cb.is_checked()),
+            );
+            cfg.set_path(
+                "translation_enabled",
+                serde_json::json!(translation_cb.is_checked()),
+            );
+            if let Some(sel) = tr_provider_choice.get_selection()
+                && let Some(p) = blindrss_core::translate::PROVIDERS.get(sel as usize)
+            {
+                cfg.set_path("translation_provider", serde_json::json!(p));
+            }
+            cfg.set_path(
+                "translation_target_language",
+                serde_json::json!(tr_target_field.get_value()),
+            );
+            for (key, (key_field, model_field)) in blindrss_core::translate::PROVIDERS
+                .iter()
+                .zip(tr_fields.iter())
+            {
+                cfg.set_path(
+                    &format!("translation_{key}_api_key"),
+                    serde_json::json!(key_field.get_value()),
+                );
+                cfg.set_path(
+                    &format!("translation_{key}_model"),
+                    serde_json::json!(model_field.get_value()),
+                );
+            }
+            cfg.set_path(
                 "captcha_solver_enabled",
                 serde_json::json!(captcha_cb.is_checked()),
             );
@@ -1202,6 +1290,7 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
         (sync_btn, "sync"),
         (prune_btn, "prune"),
         (update_btn, "update"),
+        (columns_btn, "columns"),
     ] {
         let save_m = save_all.clone();
         let intent_m = intent.clone();

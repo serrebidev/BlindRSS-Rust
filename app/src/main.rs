@@ -168,6 +168,71 @@ fn arbitrate_full_text(
     }
 }
 
+/// Cast one resolved stream to one device, dispatching on
+/// its protocol. Non-Cast devices receive the stream through
+/// the local proxy (they cannot take resolver URLs or local
+/// paths); Chromecast takes the URL directly.
+fn cast_to_device(
+    device: &blindrss_core::cast::CastDevice,
+    article: &Article,
+    url: &str,
+) -> Result<String, String> {
+    let mime = article
+        .media_type
+        .clone()
+        .filter(|t| t.contains('/'))
+        .unwrap_or_else(|| "audio/mpeg".to_string());
+    if device.kind == "chromecast" {
+        let mut session =
+            blindrss_core::castsession::CastSession::connect(&device.host, device.port)?;
+        session.launch_default_receiver()?;
+        session.load_media(url, &mime, &article.title)?;
+        return Ok(format!("Casting {} to {}", article.title, device.name));
+    }
+    let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+    let reachable = if url.starts_with("http://") || url.starts_with("https://") {
+        blindrss_core::proxy::stream_url(url)
+    } else {
+        blindrss_core::proxy::file_url(std::path::Path::new(url))
+    };
+    blindrss_core::castupnp::play(
+        device,
+        &reachable,
+        &article.title,
+        &mime,
+        cfg.get_str("cast_kodi_user", ""),
+        cfg.get_str("cast_kodi_password", ""),
+    )?;
+    Ok(format!("Casting {} to {}", article.title, device.name))
+}
+
+/// The play-cache step (youtube_play_via_download): when a
+/// YouTube stream was resolved through yt-dlp and the cache
+/// is enabled, download the audio once and play the file.
+/// Any failure keeps the streamed URL.
+fn maybe_cache_youtube(article: &Article, stream_url: &str, via_ytdlp: bool) -> String {
+    if !via_ytdlp {
+        return stream_url.to_string();
+    }
+    let is_youtube = article.url.contains("youtube.com") || article.url.contains("youtu.be");
+    if !is_youtube {
+        return stream_url.to_string();
+    }
+    let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+    if !cfg.get_bool("youtube_play_via_download", false) {
+        return stream_url.to_string();
+    }
+    let dir = blindrss_core::play_cache::cache_dir(
+        cfg.get_str("youtube_play_cache_dir", ""),
+        &data_dir(),
+    );
+    let max_mb = cfg.get_i64("youtube_play_cache_max_mb", 500);
+    match blindrss_core::play_cache::fetch_youtube_audio(&article.url, &dir, max_mb) {
+        Ok(path) => path.to_string_lossy().to_string(),
+        Err(_) => stream_url.to_string(),
+    }
+}
+
 fn propagate_read_state(article: &blindrss_core::db::Article, read: bool) {
     let article = article.clone();
     std::thread::spawn(move || {
@@ -334,6 +399,15 @@ fn apply_http_config() {
             cfg.get_str("ytdlp_cookies_file", ""),
         );
         std::env::set_var("BLINDRSS_USER_AGENT", blindrss_core::http::user_agent());
+        // Managed yt-dlp (dependency self-update installs into
+        // <data_dir>/bin) wins over PATH when present and the
+        // user has not pinned their own binary.
+        if std::env::var_os("BLINDRSS_YTDLP").is_none() {
+            let managed = blindrss_core::dependency::managed_ytdlp(&data_dir());
+            if managed.exists() {
+                std::env::set_var("BLINDRSS_YTDLP", &managed);
+            }
+        }
     }
 }
 
@@ -557,7 +631,7 @@ fn notify_desktop(tray: &TaskBarIcon, title: &str, body: &str) {
     #[cfg(target_os = "macos")]
     {
         let script = format!(
-            "display notification "{}" with title "{}"",
+            "display notification \"{}\" with title \"{}\"",
             body.replace('\"', "'"),
             title.replace('\"', "'")
         );
@@ -734,6 +808,9 @@ enum RefreshMsg {
     ArchiveDone(String, Result<usize, String>),
     /// A finished cast attempt.
     CastDone(Result<String, String>),
+    /// Cast discovery finished: the devices found plus the
+    /// article and its resolved stream URL, for the picker.
+    CastDevices(Vec<blindrss_core::cast::CastDevice>, Article, String),
     /// Update check: latest release tag.
     UpdateChecked(Result<(String, Option<String>), String>),
     /// Open-article-by-URL result: (page title, plain text).
@@ -743,6 +820,14 @@ enum RefreshMsg {
     /// A finished active-provider action (hosted refresh,
     /// subscribe, unsubscribe): a human summary or an error.
     ProviderAction(Result<String, String>),
+    /// A finished article translation: (article id, result).
+    Translated(String, Result<String, String>),
+    /// A second copy asked this one to come to the front.
+    ActivateWindow,
+    /// Startup dependency check found missing tools (names).
+    DepsMissing(Vec<String>),
+    /// Managed yt-dlp download finished.
+    YtdlpUpdated(Result<std::path::PathBuf, String>),
 }
 
 const ID_OK: i32 = 5100;
@@ -778,6 +863,7 @@ const M_PLAY: i32 = 2127;
 const M_DOWNLOAD: i32 = 2128;
 const M_CAST: i32 = 2129;
 const M_SEARCH: i32 = 2130;
+const M_HISTORY: i32 = 2131;
 const M_SETTINGS: i32 = 2141;
 const M_KEYS: i32 = 2142;
 const M_PRUNE: i32 = 2143;
@@ -798,6 +884,7 @@ const M_FILTER_RULES: i32 = 2191;
 const M_FEED_PROPS: i32 = 2192;
 const M_OPEN_ARTICLE: i32 = 2193;
 const M_OPEN_MEDIA: i32 = 2194;
+const M_VIDEO_SEARCH: i32 = 2195;
 const M_PERSISTENT: i32 = 2195;
 const M_ABOUT: i32 = 2196;
 const M_ARTICLE_WINDOW: i32 = 2197;
@@ -807,6 +894,7 @@ const M_QUEUE_OPEN: i32 = 2200;
 const M_QUEUE_NEXT: i32 = 2201;
 const M_QUEUE_PREV: i32 = 2202;
 const M_FEED_SEARCH: i32 = 2203;
+const M_TRANSLATE: i32 = 2204;
 const M_FILTER_ALL: i32 = 2170;
 const M_FILTER_UNREAD: i32 = 2171;
 const M_FILTER_READ: i32 = 2172;
@@ -1074,11 +1162,65 @@ fn rebuild_tree(state: &mut State, tree: &TreeCtrl) {
     state.selected_feed = if keep { Some(previous) } else { None };
 }
 
-fn refill_articles(state: &mut State, list: &ListCtrl) {
+/// (Re)build the article list's columns from the configured
+/// layout (core/article_columns.rs). Title is pinned first.
+fn setup_article_columns(list: &ListCtrl) {
+    let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+    let layout = blindrss_core::article_columns::layout_from_config(&cfg);
     list.clear_all();
-    list.insert_column(0, "Title", ListColumnFormat::Left, 420);
-    list.insert_column(1, "Date", ListColumnFormat::Left, 160);
-    list.insert_column(2, "Feed", ListColumnFormat::Left, 160);
+    for (i, col) in blindrss_core::article_columns::visible_columns(&layout)
+        .iter()
+        .enumerate()
+    {
+        list.insert_column(i as i64, &col.label, ListColumnFormat::Left, col.width);
+    }
+}
+
+/// One article cell for a column key.
+fn article_cell(
+    a: &Article,
+    key: &str,
+    feed_titles: &std::collections::HashMap<&str, &str>,
+) -> String {
+    match key {
+        "author" => a.author.clone().unwrap_or_default(),
+        "media" => a
+            .media_type
+            .clone()
+            .filter(|t| !t.is_empty())
+            .or_else(|| {
+                if a.media_url.as_deref().is_some_and(|m| !m.is_empty()) {
+                    Some("Media".to_string())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_default(),
+        "date" => a.date.clone().unwrap_or_default(),
+        "feed" => feed_titles
+            .get(a.feed_id.as_str())
+            .copied()
+            .unwrap_or(&a.feed_id)
+            .to_string(),
+        "description" => a
+            .description
+            .as_deref()
+            .map(blindrss_core::extract::html_to_text)
+            .map(|d| d.split_whitespace().collect::<Vec<_>>().join(" "))
+            .unwrap_or_default(),
+        "status" => {
+            let mut parts = vec![if a.is_read { "Read" } else { "Unread" }];
+            if a.is_favorite {
+                parts.push("Favorite");
+            }
+            parts.join(", ")
+        }
+        _ => a.title.clone(),
+    }
+}
+
+fn refill_articles(state: &mut State, list: &ListCtrl) {
+    setup_article_columns(list);
     state.articles.clear();
     let Some(db) = state.db.as_ref() else { return };
     let filter = state.selected_feed.as_deref();
@@ -1099,6 +1241,8 @@ fn refill_articles(state: &mut State, list: &ListCtrl) {
                 .collect();
             if let Ok(all) = db.articles(None, 500) {
                 let tags_map = db.all_article_tags().unwrap_or_default();
+                let opened_ids = db.opened_article_ids().unwrap_or_default();
+                let updated_ids = db.updated_article_ids().unwrap_or_default();
                 let empty_tags: Vec<String> = Vec::new();
                 let matched: Vec<Article> = all
                     .into_iter()
@@ -1106,8 +1250,8 @@ fn refill_articles(state: &mut State, list: &ListCtrl) {
                         let view = blindrss_core::rules::RuleArticle {
                             article: a,
                             feed_title: feed_titles.get(a.feed_id.as_str()).copied().unwrap_or(""),
-                            opened: false,
-                            updated: false,
+                            opened: opened_ids.contains(&a.id),
+                            updated: updated_ids.contains(&a.id),
                             tags: tags_map.get(&a.id).unwrap_or(&empty_tags),
                         };
                         blindrss_core::rules::rule_matches(&rule, &view)
@@ -1173,10 +1317,16 @@ fn finish_refill(state: &mut State, list: &ListCtrl, mut loaded: Vec<Article>) {
     } else if !state.sort_ascending {
         loaded.reverse();
     }
+    let layout = blindrss_core::article_columns::layout_from_config(
+        &blindrss_core::config::Config::load(&config_path()).unwrap_or_default(),
+    );
+    let visible = blindrss_core::article_columns::visible_columns(&layout);
     for (i, a) in loaded.iter().enumerate() {
         list.insert_item(i as i64, &a.title, None);
-        list.set_item_text_by_column(i as i64, 1, a.date.as_deref().unwrap_or(""));
-        list.set_item_text_by_column(i as i64, 2, &a.feed_id);
+        for (col_idx, col) in visible.iter().enumerate().skip(1) {
+            let cell = article_cell(a, &col.key, &feed_titles);
+            list.set_item_text_by_column(i as i64, col_idx as i32, &cell);
+        }
     }
     state.articles = loaded;
 }
@@ -1239,6 +1389,12 @@ fn main() {
         db_path().display(),
         config_path().display()
     ));
+    // Single instance: hand activation to the running copy
+    // and exit when one answers.
+    if blindrss_core::single_instance::signal_existing() {
+        log_line("BlindRSS already running; activation sent, exiting");
+        return;
+    }
     let _ = wxdragon::main(|_| {
         apply_pending_update();
         apply_http_config();
@@ -1285,11 +1441,16 @@ fn main() {
         let tray_refresh_slot: ActionSlot = Rc::new(RefCell::new(None));
         let quit_flag = Rc::new(std::cell::Cell::new(false));
         {
-            let frame_tray = frame;
-            tray.on_left_double_click(move |_| {
-                frame_tray.show(true);
-                frame_tray.raise();
-            });
+            // wx has no taskbar mouse events on macOS; the tray
+            // menu's Show item is the restore path there.
+            #[cfg(any(target_os = "windows", target_os = "linux"))]
+            {
+                let frame_tray = frame;
+                tray.on_left_double_click(move |_| {
+                    frame_tray.show(true);
+                    frame_tray.raise();
+                });
+            }
         }
         {
             let frame_tray = frame;
@@ -1528,6 +1689,9 @@ fn main() {
             let Some(a) = st.articles.get(idx as usize).cloned() else {
                 return;
             };
+            if let Some(db) = st.db.as_ref() {
+                let _ = db.mark_opened(&a.id);
+            }
             let body = a
                 .content
                 .clone()
@@ -1647,6 +1811,34 @@ fn main() {
             }
         }
         let (tx, rx): (Sender<RefreshMsg>, Receiver<RefreshMsg>) = channel();
+        // Single-instance listener: a second copy's activation
+        // request raises this window (via the drain).
+        {
+            let tx_act = tx.clone();
+            blindrss_core::single_instance::serve(move || {
+                let _ = tx_act.send(RefreshMsg::ActivateWindow);
+            });
+        }
+        // Startup dependency check (Python mainframe parity):
+        // off the UI thread because detection shells out to
+        // --version probes; the drain shows the prompt.
+        {
+            let tx_dep = tx.clone();
+            std::thread::spawn(move || {
+                let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+                if !cfg.get_bool("prompt_missing_dependencies_on_startup", true) {
+                    return;
+                }
+                let missing: Vec<String> = blindrss_core::dependency::check_tools()
+                    .into_iter()
+                    .filter(|t| t.path.is_none())
+                    .map(|t| t.name)
+                    .collect();
+                if !missing.is_empty() {
+                    let _ = tx_dep.send(RefreshMsg::DepsMissing(missing));
+                }
+            });
+        }
         let rx = Rc::new(RefCell::new(rx));
         let state_btn = state.clone();
         let frame_btn = frame;
@@ -1968,14 +2160,22 @@ fn main() {
                 .unwrap_or(false);
             match db.search_articles_mode(query.trim(), 300, title_only) {
                 Ok(results) => {
-                    list.clear_all();
-                    list.insert_column(0, "Title", ListColumnFormat::Left, 420);
-                    list.insert_column(1, "Date", ListColumnFormat::Left, 160);
-                    list.insert_column(2, "Feed", ListColumnFormat::Left, 160);
+                    setup_article_columns(&list);
+                    let feed_titles: std::collections::HashMap<&str, &str> = st
+                        .feeds
+                        .iter()
+                        .map(|f| (f.id.as_str(), f.title.as_str()))
+                        .collect();
+                    let layout = blindrss_core::article_columns::layout_from_config(
+                        &blindrss_core::config::Config::load(&config_path()).unwrap_or_default(),
+                    );
+                    let visible = blindrss_core::article_columns::visible_columns(&layout);
                     for (i, a) in results.iter().enumerate() {
                         list.insert_item(i as i64, &a.title, None);
-                        list.set_item_text_by_column(i as i64, 1, a.date.as_deref().unwrap_or(""));
-                        list.set_item_text_by_column(i as i64, 2, &a.feed_id);
+                        for (col_idx, col) in visible.iter().enumerate().skip(1) {
+                            let cell = article_cell(a, &col.key, &feed_titles);
+                            list.set_item_text_by_column(i as i64, col_idx as i32, &cell);
+                        }
                     }
                     let n = results.len();
                     st.articles = results;
@@ -2157,6 +2357,32 @@ fn main() {
             }
         });
 
+        // View History: the selected article's recorded versions.
+        let state_hist = state.clone();
+        let frame_hist = frame;
+        let tree_hist = tree;
+        let list_hist = list;
+        let act_history: Rc<dyn Fn()> = Rc::new(move || {
+            {
+                let st = state_hist.borrow();
+                let Some(article) = st
+                    .selected_article
+                    .and_then(|i| st.articles.get(i))
+                    .cloned()
+                else {
+                    frame_hist.set_status_text("No article selected", 0);
+                    return;
+                };
+                let Some(db) = st.db.as_ref() else { return };
+                if db.count_article_versions(&article.id).unwrap_or(0) == 0 {
+                    frame_hist.set_status_text("No change history for this article", 0);
+                    return;
+                }
+                dialogs::show_article_history(&frame_hist, db, &article);
+            }
+            restore_focus(&state_hist.borrow(), &tree_hist, &list_hist);
+        });
+
         // Read Full Text: fetch the selected article's page on a
         // worker thread; extraction runs on the main thread when the
         // HTML lands (feed body is the fallback, per the cascade).
@@ -2223,6 +2449,63 @@ fn main() {
             let a = act_fulltext.clone();
             fulltext_btn.on_click(move |_| a());
         }
+
+        // Translate Article: send the reader's text (or the
+        // article body) to the configured LLM provider on a
+        // worker; the translation replaces the reader content.
+        let state_tl = state.clone();
+        let frame_tl = frame;
+        let tx_tl = tx.clone();
+        let act_translate: Rc<dyn Fn()> = Rc::new(move || {
+            let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+            if !cfg.get_bool("translation_enabled", false) {
+                frame_tl.set_status_text("Translation is disabled — enable it in Settings", 0);
+                return;
+            }
+            let (article, text) = {
+                let st = state_tl.borrow();
+                let Some(article) = st
+                    .selected_article
+                    .and_then(|i| st.articles.get(i))
+                    .cloned()
+                else {
+                    frame_tl.set_status_text("No article selected", 0);
+                    return;
+                };
+                let shown = reader.get_value();
+                let text = if shown.trim().is_empty() {
+                    article
+                        .content
+                        .clone()
+                        .or(article.description.clone())
+                        .unwrap_or_default()
+                } else {
+                    shown
+                };
+                (article, text)
+            };
+            if text.trim().is_empty() {
+                frame_tl.set_status_text("Nothing to translate", 0);
+                return;
+            }
+            let target = cfg.get_str("translation_target_language", "en").to_string();
+            // Skip work when the text already reads as the
+            // target language (article_lang priority: declared
+            // language wins — here the heuristic over the text).
+            let detected = blindrss_core::translate::detect_language(&text);
+            if !detected.is_empty() && detected == target {
+                frame_tl.set_status_text("Article is already in the target language", 0);
+                return;
+            }
+            frame_tl.set_status_text("Translating...", 0);
+            let tx = tx_tl.clone();
+            let id = article.id.clone();
+            std::thread::spawn(move || {
+                let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+                let result = blindrss_core::translate::translate_text(&cfg, &text, &target);
+                let _ = tx.send(RefreshMsg::Translated(id, result));
+            });
+        });
 
         // Toggle Read: flips the selected article locally and
         // propagates to the hosted provider when it came from one.
@@ -2503,7 +2786,8 @@ fn main() {
                     } else {
                         None
                     };
-                    (r.url, info)
+                    let url = maybe_cache_youtube(&article, &r.url, r.via_ytdlp);
+                    (url, info)
                 });
                 let _ = tx.send(RefreshMsg::MediaReady(id, result));
             });
@@ -2737,6 +3021,68 @@ fn main() {
             };
             player::open_player(&frame_om, article, url, Vec::new());
         });
+
+        // Video Search (Tools): cross-site yt-dlp search dialog;
+        // Play resolves through the normal playback path,
+        // Subscribe runs the result URL through feed discovery.
+        let frame_vs = frame;
+        let state_vs = state.clone();
+        let tx_vs = tx.clone();
+        let act_video_search: Rc<dyn Fn()> =
+            Rc::new(
+                move || match dialogs::show_video_search(&frame_vs, &config_path()) {
+                    Some(("play", result)) => {
+                        let article = blindrss_core::Article {
+                            id: result.url.clone(),
+                            feed_id: String::new(),
+                            title: result.title.clone(),
+                            url: result.url.clone(),
+                            content: None,
+                            description: None,
+                            date: None,
+                            author: result.uploader.clone(),
+                            is_read: true,
+                            is_favorite: false,
+                            media_url: Some(result.url.clone()),
+                            media_type: None,
+                        };
+                        {
+                            let mut st = state_vs.borrow_mut();
+                            st.pending_play = Some(article.clone());
+                        }
+                        frame_vs.set_status_text("Loading...", 0);
+                        let tx = tx_vs.clone();
+                        std::thread::spawn(move || {
+                            let id = article.id.clone();
+                            let resolved = blindrss_core::media::resolve_for_play(
+                                article.media_url.as_deref(),
+                                article.media_type.as_deref(),
+                                &article.url,
+                                article.content.as_deref(),
+                            )
+                            .map(|r| {
+                                let info = if r.via_ytdlp {
+                                    blindrss_core::media::info(&article.url).ok()
+                                } else {
+                                    None
+                                };
+                                (r.url, info)
+                            });
+                            let _ = tx.send(RefreshMsg::MediaReady(id, resolved));
+                        });
+                    }
+                    Some(("subscribe", result)) => {
+                        let url = result.url.clone();
+                        frame_vs.set_status_text(&format!("Adding {url}..."), 0);
+                        let tx = tx_vs.clone();
+                        std::thread::spawn(move || {
+                            let resolved = blindrss_core::discovery::resolve_subscribe_url(&url);
+                            let _ = tx.send(RefreshMsg::Added(url, resolved));
+                        });
+                    }
+                    _ => {}
+                },
+            );
 
         // Persistent Search (Tools): manage saved searches and
         // run one into the article list via the existing search.
@@ -3176,34 +3522,55 @@ fn main() {
             frame_cast.set_status_text("Looking for cast devices...", 0);
             let tx = tx_cast.clone();
             std::thread::spawn(move || {
-                let result = (|| -> Result<String, String> {
-                    let url = if let Some(m) = article.media_url.clone().filter(|u| !u.is_empty()) {
-                        m
-                    } else if !article.url.is_empty() {
-                        blindrss_core::media::stream_url(&article.url)?
-                    } else {
-                        return Err("Article has no playable media".to_string());
-                    };
-                    let devices = blindrss_core::cast::discover_chromecasts(
-                        std::time::Duration::from_secs(3),
-                    );
-                    let device = devices
-                        .first()
-                        .ok_or("No Chromecast found on this network")?;
-                    let mut session = blindrss_core::castsession::CastSession::connect(
-                        &device.host,
-                        device.port,
-                    )?;
-                    session.launch_default_receiver()?;
-                    let ctype = article
-                        .media_type
-                        .clone()
-                        .filter(|t| t.contains('/'))
-                        .unwrap_or_else(|| "audio/mpeg".to_string());
-                    session.load_media(&url, &ctype, &article.title)?;
-                    Ok(format!("Casting {} to {}", article.title, device.name))
-                })();
-                let _ = tx.send(RefreshMsg::CastDone(result));
+                let result =
+                    (|| -> Result<(Vec<blindrss_core::cast::CastDevice>, String), String> {
+                        let resolved = blindrss_core::media::resolve_for_play(
+                            article.media_url.as_deref(),
+                            article.media_type.as_deref(),
+                            &article.url,
+                            article.content.as_deref(),
+                        )?;
+                        let mut devices =
+                            blindrss_core::cast::discover_all(std::time::Duration::from_secs(3));
+                        // Configured Kodi hosts join discovery
+                        // (mDNS does not reach every network).
+                        let cfg =
+                            blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+                        if let Some(hosts) =
+                            cfg.raw().get("cast_kodi_hosts").and_then(|v| v.as_array())
+                        {
+                            for h in hosts.iter().filter_map(|v| v.as_str()) {
+                                let (host, port) = match h.rsplit_once(':') {
+                                    Some((host, p)) => {
+                                        (host.to_string(), p.parse().unwrap_or(8080))
+                                    }
+                                    None => (h.to_string(), 8080),
+                                };
+                                if !devices.iter().any(|d| d.host == host) {
+                                    devices.push(blindrss_core::cast::CastDevice {
+                                        name: format!("Kodi {host}"),
+                                        host,
+                                        port,
+                                        kind: "kodi".to_string(),
+                                        model: String::new(),
+                                        endpoint: String::new(),
+                                    });
+                                }
+                            }
+                        }
+                        if devices.is_empty() {
+                            return Err("No cast devices found on this network".to_string());
+                        }
+                        Ok((devices, resolved.url))
+                    })();
+                match result {
+                    Ok((devices, url)) => {
+                        let _ = tx.send(RefreshMsg::CastDevices(devices, article, url));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(RefreshMsg::CastDone(Err(e)));
+                    }
+                }
             });
         });
         {
@@ -3304,6 +3671,20 @@ fn main() {
         // in the dialog now (Brandon, 2026-10-30: the main page was
         // crowded with them); the dialog reports which one was
         // chosen and it runs here, after the dialog closes.
+        // Article Columns editor (from Settings): modal layout
+        // dialog, then re-apply the layout to the article list.
+        let frame_col = frame;
+        let state_col = state.clone();
+        let tree_col = tree;
+        let list_col = list;
+        let act_columns: Rc<dyn Fn()> = Rc::new(move || {
+            dialogs::show_article_columns(&frame_col, &config_path());
+            let mut st = state_col.borrow_mut();
+            setup_article_columns(&list_col);
+            refill_articles(&mut st, &list_col);
+            restore_focus(&st, &tree_col, &list_col);
+        });
+
         let frame_set = frame;
         let state_set = state.clone();
         let tree_set = tree;
@@ -3317,6 +3698,7 @@ fn main() {
             ("sync", act_sync.clone()),
             ("prune", act_prune.clone()),
             ("update", act_update.clone()),
+            ("columns", act_columns.clone()),
         ];
         let act_settings: Rc<dyn Fn()> = Rc::new(move || {
             let intent = settings::show_settings(&frame_set, &config_path());
@@ -4137,6 +4519,16 @@ fn main() {
                 "Show the selected article in its own window",
             )
             .append_item(
+                M_HISTORY,
+                "View &History...",
+                "Show the article's recorded change history",
+            )
+            .append_item(
+                M_TRANSLATE,
+                "&Translate Article",
+                "Translate the article with the configured provider",
+            )
+            .append_item(
                 M_QUEUE_TOGGLE,
                 "Add to Play &Queue",
                 "Add or remove the selected article from the play queue",
@@ -4254,6 +4646,11 @@ fn main() {
                 "Play a media URL in the player",
             )
             .append_item(
+                M_VIDEO_SEARCH,
+                "&Video Search...",
+                "Search videos across sites with yt-dlp",
+            )
+            .append_item(
                 M_PODCAST_ARCHIVE,
                 "Podcast &Archive...",
                 "Recover old podcast episodes from the Wayback Machine",
@@ -4303,6 +4700,7 @@ fn main() {
             (M_ARCHIVE, act_archive.clone()),
             (M_TOGGLE_READ, act_toggle_read.clone()),
             (M_FULLTEXT, act_fulltext.clone()),
+            (M_HISTORY, act_history.clone()),
             (M_FAVORITE, act_fav.clone()),
             (M_MARKALL, act_markall.clone()),
             (M_DELETE_ARTICLE, act_delete.clone()),
@@ -4334,6 +4732,7 @@ fn main() {
             (M_FEED_PROPS, act_feed_props.clone()),
             (M_OPEN_ARTICLE, act_open_article.clone()),
             (M_OPEN_MEDIA, act_open_media.clone()),
+            (M_VIDEO_SEARCH, act_video_search.clone()),
             (M_PERSISTENT, act_persistent.clone()),
             (M_ABOUT, act_about.clone()),
             (M_ARTICLE_WINDOW, act_article_window.clone()),
@@ -4343,6 +4742,7 @@ fn main() {
             (M_QUEUE_NEXT, act_queue_next.clone()),
             (M_QUEUE_PREV, act_queue_prev.clone()),
             (M_FEED_SEARCH, act_feed_search.clone()),
+            (M_TRANSLATE, act_translate.clone()),
             (M_COPY_URL, act_copy_url.clone()),
             (M_COPY_MEDIA, act_copy_media.clone()),
             (M_COPY_FEED_URL, act_copy_feed_url.clone()),
@@ -4397,6 +4797,7 @@ fn main() {
             let mut menu = Menu::builder()
                 .append_item(M_TOGGLE_READ, "Toggle &Read", "")
                 .append_item(M_FULLTEXT, "Read &Full Text", "")
+                .append_item(M_HISTORY, "View &History...", "")
                 .append_item(M_FAVORITE, "Toggle &Favorite", "")
                 .append_separator()
                 .append_item(M_PLAY, "&Play Media", "")
@@ -4444,6 +4845,7 @@ fn main() {
             let h_stop = act_stop_refresh.clone();
             let h_refresh_feed = act_refresh_feed.clone();
             let h_add = act_add.clone();
+            let h_video_search = act_video_search.clone();
             let h_errors = act_feed_errors.clone();
             let h_toggle_read = act_toggle_read.clone();
             let h_fav = act_fav.clone();
@@ -4545,6 +4947,10 @@ fn main() {
                         h_errors();
                         true
                     }
+                    Some("feeds.video_search") => {
+                        h_video_search();
+                        true
+                    }
                     Some("article.toggle_favorite") => {
                         h_fav();
                         true
@@ -4627,6 +5033,7 @@ fn main() {
         let state_tick = state.clone();
         let frame_tick = frame;
         let rx_tick = rx.clone();
+        let tx_tick = tx.clone();
         timer.on_tick(move |_| {
             let mut new_total = 0usize;
             let mut finished = false;
@@ -4686,6 +5093,85 @@ fn main() {
                     }
                     Ok(RefreshMsg::Added(url, Err(e))) => {
                         frame_tick.set_status_text(&format!("Could not add {url}: {e}"), 0);
+                    }
+                    Ok(RefreshMsg::ActivateWindow) => {
+                        frame_tick.show(true);
+                        frame_tick.raise();
+                    }
+                    Ok(RefreshMsg::DepsMissing(missing)) => {
+                        let mut msg = "Missing recommended tools:\n".to_string();
+                        for name in &missing {
+                            let why = if name == "yt-dlp" {
+                                "required for YouTube and many media sources"
+                            } else {
+                                "required for some downloads and silence detection"
+                            };
+                            msg.push_str(&format!("- {name} ({why})\n"));
+                        }
+                        // yt-dlp is the one tool BlindRSS can
+                        // fetch itself (managed copy in the data
+                        // dir); ffmpeg needs a manual install.
+                        if missing.iter().any(|n| n == "yt-dlp") {
+                            msg.push_str("\nDownload yt-dlp now?");
+                            let md =
+                                MessageDialog::builder(&frame_tick, &msg, "Missing Dependencies")
+                                    .with_style(
+                                        MessageDialogStyle::YesNo
+                                            | MessageDialogStyle::IconQuestion,
+                                    )
+                                    .build();
+                            let answer = md.show_modal();
+                            md.destroy();
+                            if answer == ID_YES {
+                                frame_tick.set_status_text("Downloading yt-dlp...", 0);
+                                let tx = tx_tick.clone();
+                                std::thread::spawn(move || {
+                                    let _ = tx.send(RefreshMsg::YtdlpUpdated(
+                                        blindrss_core::dependency::update_ytdlp(&data_dir()),
+                                    ));
+                                });
+                            }
+                        } else {
+                            let md =
+                                MessageDialog::builder(&frame_tick, &msg, "Missing Dependencies")
+                                    .with_style(
+                                        MessageDialogStyle::OK | MessageDialogStyle::IconWarning,
+                                    )
+                                    .build();
+                            md.show_modal();
+                            md.destroy();
+                        }
+                    }
+                    Ok(RefreshMsg::YtdlpUpdated(result)) => match result {
+                        Ok(path) => {
+                            // SAFETY: UI thread, same trade-off
+                            // as apply_http_config's env writes.
+                            unsafe {
+                                std::env::set_var("BLINDRSS_YTDLP", &path);
+                            }
+                            frame_tick.set_status_text(
+                                &format!("yt-dlp installed: {}", path.display()),
+                                0,
+                            );
+                            announce("general", "yt-dlp installed");
+                        }
+                        Err(e) => frame_tick.set_status_text(&format!("yt-dlp download: {e}"), 0),
+                    },
+                    Ok(RefreshMsg::Translated(id, result)) => {
+                        let st = state_tick.borrow();
+                        let title = st
+                            .articles
+                            .iter()
+                            .find(|a| a.id == id)
+                            .map(|a| a.title.clone())
+                            .unwrap_or_default();
+                        match result {
+                            Ok(text) => {
+                                reader.set_value(&format!("{title}\n\n{text}"));
+                                frame_tick.set_status_text("Article translated", 0);
+                            }
+                            Err(e) => frame_tick.set_status_text(&format!("Translate: {e}"), 0),
+                        }
                     }
                     Ok(RefreshMsg::ProviderAction(result)) => {
                         let mut st = state_tick.borrow_mut();
@@ -4846,6 +5332,21 @@ fn main() {
                                 );
                             }
                             Err(e) => frame_tick.set_status_text(&format!("{title}: {e}"), 0),
+                        }
+                    }
+                    Ok(RefreshMsg::CastDevices(devices, article, url)) => {
+                        let device = if devices.len() == 1 {
+                            devices.into_iter().next()
+                        } else {
+                            dialogs::show_cast_picker(&frame_tick, &devices)
+                        };
+                        restore_focus(&state_tick.borrow(), &tree, &list);
+                        if let Some(device) = device {
+                            let tx2 = tx.clone();
+                            std::thread::spawn(move || {
+                                let result = cast_to_device(&device, &article, &url);
+                                let _ = tx2.send(RefreshMsg::CastDone(result));
+                            });
                         }
                     }
                     Ok(RefreshMsg::CastDone(result)) => match result {

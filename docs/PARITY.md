@@ -377,6 +377,45 @@ ExcludeNotificationFeedsDialog (batch 5, with notifications).
 8. Translation (6 providers), announcements + sounds, single
    instance, startup dependency check, context help.
 
+**Batch 9 resolution (v0.1.20):** item 7 landed — core/cast.rs
+discovery now covers Chromecast + DLNA/AVTransport + Sonos +
+Roku ECP + Kodi (hand-rolled mDNS), core/castupnp.rs plays to
+DLNA/Sonos/Roku/Kodi, core/proxy.rs serves the LAN stream/file/
+HLS proxy (HLS transcodes synchronously via ffmpeg), and
+core/play_cache.rs caches YouTube audio downloads under
+youtube_play_cache_max_mb. Item 8 landed except context help:
+article translation for all 6 providers (core/translate.rs,
+Tools > Translate + Settings section), single instance
+(core/single_instance.rs, activation raises the running copy),
+startup dependency check (core/dependency.rs: yt-dlp/ffmpeg
+detection, managed yt-dlp self-update into <data_dir>/bin,
+prompt gated by prompt_missing_dependencies_on_startup with a
+Settings checkbox; ffmpeg offers no in-app install, matching
+Python's Linux behaviour). Also landed in this batch: article
+change history (article_versions table — seeded on first
+fetch, appended on changed re-fetch, SHA-256 title+NUL+content
+dedupe, Python providers/local.py semantics; View History in
+the Article menu and list context menu), which also fixed the
+smart-folder `opened`/`updated` facts (previously hardcoded
+false in the refill), the Article Columns editor (Settings >
+Article Columns...), and Video Search (core/videosearch.rs +
+Tools > Video Search...: the mainstream yt-dlp site set +
+Mixcloud API + adult site behind enable_adult_search,
+per-site threads, canonical-key dedupe, Play through the
+normal resolve path, Subscribe through feed discovery; the
+runtime-derived extractor site list, the separate Filter
+choice, and title-enrichment pools are not ported). Two macOS
+build breaks from batch 5 were fixed in this batch: an
+unescaped-quote osascript format string that only parses
+under cfg(macos), and the tray double-click binding, which
+wx does not provide on macOS (the tray menu Show item is the
+restore path there). Release note: v0.1.16's macOS package
+failed on those breaks and v0.1.17-v0.1.19 were not released
+standalone; batches 6-9 ship cumulatively in v0.1.20.
+Remaining from item 8: F1 context help (help_topics.py),
+Chromium cookie import, global hotkeys, JAWS announcements,
+full i18n sweep — batch 9c.
+
 ## 6. Audit 3 additions (2026-10-30, depth pass)
 
 Full report: reports/feature-audit-3-2026-10-30.md in the migration
