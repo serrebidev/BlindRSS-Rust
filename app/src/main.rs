@@ -246,6 +246,41 @@ enum RefreshMsg {
 const ID_OK: i32 = 5100;
 const ID_YES: i32 = 5103;
 
+// Menu bar command ids (2100s; wx stock ids live below 6000 but the
+// app dialog ids 5100+ are modal results, so keep menus clear of the
+// button range and of each other).
+const M_ADD_FEED: i32 = 2101;
+const M_IMPORT_OPML: i32 = 2102;
+const M_EXPORT_OPML: i32 = 2103;
+const M_TAKEOUT: i32 = 2104;
+const M_BACKUP: i32 = 2105;
+const M_RESTORE: i32 = 2106;
+const M_EXIT: i32 = 2107;
+const M_REFRESH: i32 = 2111;
+const M_SYNC: i32 = 2112;
+const M_REMOVE_FEED: i32 = 2113;
+const M_EDIT_FEED: i32 = 2114;
+const M_RENAME_CAT: i32 = 2115;
+const M_SET_CAT: i32 = 2116;
+const M_NEW_SF: i32 = 2117;
+const M_DEL_SF: i32 = 2118;
+const M_ARCHIVE: i32 = 2119;
+const M_TOGGLE_READ: i32 = 2121;
+const M_FULLTEXT: i32 = 2122;
+const M_FAVORITE: i32 = 2123;
+const M_MARKALL: i32 = 2124;
+const M_DELETE_ARTICLE: i32 = 2125;
+const M_DELETED: i32 = 2126;
+const M_PLAY: i32 = 2127;
+const M_DOWNLOAD: i32 = 2128;
+const M_CAST: i32 = 2129;
+const M_SEARCH: i32 = 2130;
+const M_SETTINGS: i32 = 2141;
+const M_KEYS: i32 = 2142;
+const M_PRUNE: i32 = 2143;
+const M_UPDATE: i32 = 2144;
+const M_HELP: i32 = 2151;
+
 fn feed_label(db: &Db, feed: &Feed) -> String {
     match db.unread_count(Some(&feed.id)) {
         Ok(n) if n > 0 => format!("{} ({n})", feed.title),
@@ -608,7 +643,7 @@ fn main() {
         let state_btn = state.clone();
         let frame_btn = frame;
         let tx_refresh = tx.clone();
-        refresh_btn.on_click(move |_| {
+        let act_refresh: Rc<dyn Fn()> = Rc::new(move || {
             let feeds = {
                 let mut st = state_btn.borrow_mut();
                 if st.refreshing {
@@ -627,12 +662,16 @@ fn main() {
                 let _ = tx.send(RefreshMsg::AllDone);
             });
         });
+        {
+            let a = act_refresh.clone();
+            refresh_btn.on_click(move |_| a());
+        }
 
         // Article actions: delete (tombstoned), favorite, mark all
         // read, restore-deleted dialog, and search.
         let state_del = state.clone();
         let frame_del = frame;
-        delete_btn.on_click(move |_| {
+        let act_delete: Rc<dyn Fn()> = Rc::new(move || {
             let mut st = state_del.borrow_mut();
             let Some(idx) = st.selected_article else {
                 frame_del.set_status_text("Select an article first", 0);
@@ -648,10 +687,14 @@ fn main() {
             refill_articles(&mut st, &list);
             frame_del.set_status_text(&format!("Deleted {}", a.title), 0);
         });
+        {
+            let a = act_delete.clone();
+            delete_btn.on_click(move |_| a());
+        }
 
         let state_fav = state.clone();
         let frame_fav = frame;
-        fav_btn.on_click(move |_| {
+        let act_fav: Rc<dyn Fn()> = Rc::new(move || {
             let mut st = state_fav.borrow_mut();
             let Some(idx) = st.selected_article else {
                 frame_fav.set_status_text("Select an article first", 0);
@@ -680,10 +723,14 @@ fn main() {
                 0,
             );
         });
+        {
+            let a = act_fav.clone();
+            fav_btn.on_click(move |_| a());
+        }
 
         let state_ma = state.clone();
         let frame_ma = frame;
-        markall_btn.on_click(move |_| {
+        let act_markall: Rc<dyn Fn()> = Rc::new(move || {
             let mut st = state_ma.borrow_mut();
             let filter = st.selected_feed.clone();
             let mut count = 0;
@@ -695,10 +742,14 @@ fn main() {
             }
             frame_ma.set_status_text(&format!("Marked {count} articles read"), 0);
         });
+        {
+            let a = act_markall.clone();
+            markall_btn.on_click(move |_| a());
+        }
 
         let state_s = state.clone();
         let frame_s = frame;
-        search_btn.on_click(move |_| {
+        let act_search: Rc<dyn Fn()> = Rc::new(move || {
             let query = search_box.get_value();
             let mut st = state_s.borrow_mut();
             if query.trim().is_empty() {
@@ -725,10 +776,14 @@ fn main() {
                 Err(e) => frame_s.set_status_text(&format!("Search failed: {e}"), 0),
             }
         });
+        {
+            let a = act_search.clone();
+            search_btn.on_click(move |_| a());
+        }
 
         let state_deleted = state.clone();
         let frame_deleted = frame;
-        deleted_btn.on_click(move |_| {
+        let act_deleted: Rc<dyn Fn()> = Rc::new(move || {
             let deleted = {
                 let st = state_deleted.borrow();
                 let Some(db) = st.db.as_ref() else { return };
@@ -775,6 +830,10 @@ fn main() {
             });
             dlg.show_modal();
         });
+        {
+            let a = act_deleted.clone();
+            deleted_btn.on_click(move |_| a());
+        }
 
         // Sync Providers: for each hosted provider configured in
         // config.json, run its sync on a worker thread with its own
@@ -782,7 +841,7 @@ fn main() {
         // the main thread reloads when the result lands).
         let frame_sync = frame;
         let tx_sync = tx.clone();
-        sync_btn.on_click(move |_| {
+        let act_sync: Rc<dyn Fn()> = Rc::new(move || {
             let cfg_path = std::env::var("BLINDRSS_CONFIG")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| {
@@ -868,6 +927,10 @@ fn main() {
                 frame_sync.set_status_text(&format!("Syncing {started} provider(s)..."), 0);
             }
         });
+        {
+            let a = act_sync.clone();
+            sync_btn.on_click(move |_| a());
+        }
 
         // Read Full Text: fetch the selected article's page on a
         // worker thread; extraction runs on the main thread when the
@@ -875,7 +938,7 @@ fn main() {
         let state_ft = state.clone();
         let frame_ft = frame;
         let tx_ft = tx.clone();
-        fulltext_btn.on_click(move |_| {
+        let act_fulltext: Rc<dyn Fn()> = Rc::new(move || {
             let st = state_ft.borrow();
             let Some(article) = st
                 .selected_article
@@ -907,13 +970,17 @@ fn main() {
                 }
             });
         });
+        {
+            let a = act_fulltext.clone();
+            fulltext_btn.on_click(move |_| a());
+        }
 
         // Toggle Read: flips the selected article locally and
         // propagates to the hosted provider when it came from one.
         let state_tr = state.clone();
         let frame_tr = frame;
         let list_tr = list;
-        toggle_read_btn.on_click(move |_| {
+        let act_toggle_read: Rc<dyn Fn()> = Rc::new(move || {
             let mut st = state_tr.borrow_mut();
             let Some(article) = st
                 .selected_article
@@ -938,13 +1005,17 @@ fn main() {
             drop(st);
             propagate_read_state(&article, new_state);
         });
+        {
+            let a = act_toggle_read.clone();
+            toggle_read_btn.on_click(move |_| a());
+        }
 
         // Edit Feed: title + URL prompts for the tree-selected feed.
         let state_ef = state.clone();
         let frame_ef = frame;
         let tree_ef = tree;
         let list_ef = list;
-        edit_feed_btn.on_click(move |_| {
+        let act_edit_feed: Rc<dyn Fn()> = Rc::new(move || {
             let (feed, db_ok) = {
                 let st = state_ef.borrow();
                 (
@@ -989,6 +1060,10 @@ fn main() {
             refill_articles(&mut st, &list_ef);
             frame_ef.set_status_text("Feed updated", 0);
         });
+        {
+            let a = act_edit_feed.clone();
+            edit_feed_btn.on_click(move |_| a());
+        }
 
         // Rename Category: renames the selected feed's category
         // everywhere (category row + all feeds in it).
@@ -996,7 +1071,7 @@ fn main() {
         let frame_rc = frame;
         let tree_rc = tree;
         let list_rc = list;
-        rename_cat_btn.on_click(move |_| {
+        let act_rename_cat: Rc<dyn Fn()> = Rc::new(move || {
             let (category, db_ok) = {
                 let st = state_rc.borrow();
                 (
@@ -1036,6 +1111,10 @@ fn main() {
             refill_articles(&mut st, &list_rc);
             frame_rc.set_status_text("Category renamed", 0);
         });
+        {
+            let a = act_rename_cat.clone();
+            rename_cat_btn.on_click(move |_| a());
+        }
 
         // Set Feed Category: prompt (blank = uncategorized); a new
         // name creates the category.
@@ -1043,7 +1122,7 @@ fn main() {
         let frame_sc = frame;
         let tree_sc = tree;
         let list_sc = list;
-        set_cat_btn.on_click(move |_| {
+        let act_set_cat: Rc<dyn Fn()> = Rc::new(move || {
             let (feed, db_ok) = {
                 let st = state_sc.borrow();
                 (
@@ -1083,6 +1162,10 @@ fn main() {
             refill_articles(&mut st, &list_sc);
             frame_sc.set_status_text("Feed category set", 0);
         });
+        {
+            let a = act_set_cat.clone();
+            set_cat_btn.on_click(move |_| a());
+        }
 
         // Play Media: direct media URL plays immediately; a page
         // URL (YouTube etc.) resolves through yt-dlp on a worker
@@ -1090,7 +1173,7 @@ fn main() {
         let state_pm = state.clone();
         let frame_pm = frame;
         let tx_pm = tx.clone();
-        play_btn.on_click(move |_| {
+        let act_play: Rc<dyn Fn()> = Rc::new(move || {
             let st = state_pm.borrow();
             let Some(article) = st
                 .selected_article
@@ -1126,6 +1209,10 @@ fn main() {
                 let _ = tx.send(RefreshMsg::MediaReady(id, result));
             });
         });
+        {
+            let a = act_play.clone();
+            play_btn.on_click(move |_| a());
+        }
 
         // New Smart Folder: name + a simple title-contains rule
         // (blank matches everything). Full rule editing is a later
@@ -1134,7 +1221,7 @@ fn main() {
         let frame_nsf = frame;
         let tree_nsf = tree;
         let list_nsf = list;
-        new_sf_btn.on_click(move |_| {
+        let act_new_sf: Rc<dyn Fn()> = Rc::new(move || {
             let Some(name) = prompt_text(&frame_nsf, "Smart folder name:", "New Smart Folder", "")
             else {
                 return;
@@ -1164,6 +1251,10 @@ fn main() {
             refill_articles(&mut st, &list_nsf);
             frame_nsf.set_status_text("Smart folder created", 0);
         });
+        {
+            let a = act_new_sf.clone();
+            new_sf_btn.on_click(move |_| a());
+        }
 
         // Delete Smart Folder: deletes the smart folder selected in
         // the tree.
@@ -1171,7 +1262,7 @@ fn main() {
         let frame_dsf = frame;
         let tree_dsf = tree;
         let list_dsf = list;
-        del_sf_btn.on_click(move |_| {
+        let act_del_sf: Rc<dyn Fn()> = Rc::new(move || {
             let mut st = state_dsf.borrow_mut();
             let Some(id) = st
                 .selected_feed
@@ -1191,13 +1282,17 @@ fn main() {
             refill_articles(&mut st, &list_dsf);
             frame_dsf.set_status_text("Smart folder deleted", 0);
         });
+        {
+            let a = act_del_sf.clone();
+            del_sf_btn.on_click(move |_| a());
+        }
 
         // Download: the selected article's media (direct) or page
         // (yt-dlp) into the configured download directory.
         let state_dl = state.clone();
         let frame_dl = frame;
         let tx_dl = tx.clone();
-        download_btn.on_click(move |_| {
+        let act_download: Rc<dyn Fn()> = Rc::new(move || {
             let st = state_dl.borrow();
             let Some(article) = st
                 .selected_article
@@ -1239,6 +1334,10 @@ fn main() {
                 let _ = tx.send(RefreshMsg::DownloadDone(result));
             });
         });
+        {
+            let a = act_download.clone();
+            download_btn.on_click(move |_| a());
+        }
 
         // Import YouTube Takeout: pick the ZIP, subscribe every
         // channel/playlist feed not already present.
@@ -1246,7 +1345,7 @@ fn main() {
         let frame_to = frame;
         let tree_to = tree;
         let list_to = list;
-        takeout_btn.on_click(move |_| {
+        let act_takeout: Rc<dyn Fn()> = Rc::new(move || {
             let dlg = FileDialog::builder(&frame_to)
                 .with_message("Select YouTube Takeout ZIP")
                 .with_wildcard("ZIP files (*.zip)|*.zip")
@@ -1292,13 +1391,17 @@ fn main() {
                 Err(e) => frame_to.set_status_text(&format!("Takeout: {e}"), 0),
             }
         });
+        {
+            let a = act_takeout.clone();
+            takeout_btn.on_click(move |_| a());
+        }
 
         // Rescan Archive: live document + newest Wayback snapshot
         // for the selected feed, on a worker thread/connection.
         let state_ar = state.clone();
         let frame_ar = frame;
         let tx_ar = tx.clone();
-        archive_btn.on_click(move |_| {
+        let act_archive: Rc<dyn Fn()> = Rc::new(move || {
             let feed = {
                 let st = state_ar.borrow();
                 st.selected_feed
@@ -1318,6 +1421,10 @@ fn main() {
                 let _ = tx.send(RefreshMsg::ArchiveDone(feed.title.clone(), result));
             });
         });
+        {
+            let a = act_archive.clone();
+            archive_btn.on_click(move |_| a());
+        }
 
         // Cast: resolve the article's stream, discover Chromecasts,
         // launch the default receiver and load the media — all on a
@@ -1325,7 +1432,7 @@ fn main() {
         let state_cast = state.clone();
         let frame_cast = frame;
         let tx_cast = tx.clone();
-        cast_btn.on_click(move |_| {
+        let act_cast: Rc<dyn Fn()> = Rc::new(move || {
             let article = {
                 let st = state_cast.borrow();
                 st.selected_article
@@ -1369,10 +1476,14 @@ fn main() {
                 let _ = tx.send(RefreshMsg::CastDone(result));
             });
         });
+        {
+            let a = act_cast.clone();
+            cast_btn.on_click(move |_| a());
+        }
 
         // Backup / Restore / Prune / Updates.
         let frame_bk = frame;
-        backup_btn.on_click(move |_| {
+        let act_backup: Rc<dyn Fn()> = Rc::new(move || {
             let dlg = FileDialog::builder(&frame_bk)
                 .with_message("Save backup")
                 .with_wildcard("ZIP files (*.zip)|*.zip")
@@ -1392,12 +1503,16 @@ fn main() {
                 }
             }
         });
+        {
+            let a = act_backup.clone();
+            backup_btn.on_click(move |_| a());
+        }
         let state_rs = state.clone();
         let frame_rs = frame;
         let tree_rs = tree;
         let list_rs = list;
         let reader_rs = reader;
-        restore_btn.on_click(move |_| {
+        let act_restore: Rc<dyn Fn()> = Rc::new(move || {
             let dlg = FileDialog::builder(&frame_rs)
                 .with_message("Restore backup")
                 .with_wildcard("ZIP files (*.zip)|*.zip")
@@ -1430,10 +1545,14 @@ fn main() {
                 }
             }
         });
+        {
+            let a = act_restore.clone();
+            restore_btn.on_click(move |_| a());
+        }
         let state_pr = state.clone();
         let frame_pr = frame;
         let list_pr = list;
-        prune_btn.on_click(move |_| {
+        let act_prune: Rc<dyn Fn()> = Rc::new(move || {
             let mut st = state_pr.borrow_mut();
             match st.db.as_ref().map(|db| db.prune_old_articles(30)) {
                 Some(Ok(n)) => {
@@ -1444,9 +1563,13 @@ fn main() {
                 None => frame_pr.set_status_text("No database", 0),
             }
         });
+        {
+            let a = act_prune.clone();
+            prune_btn.on_click(move |_| a());
+        }
         let frame_up = frame;
         let tx_up = tx.clone();
-        update_btn.on_click(move |_| {
+        let act_update: Rc<dyn Fn()> = Rc::new(move || {
             frame_up.set_status_text("Checking for updates...", 0);
             let tx = tx_up.clone();
             std::thread::spawn(move || {
@@ -1455,31 +1578,47 @@ fn main() {
                 ));
             });
         });
+        {
+            let a = act_update.clone();
+            update_btn.on_click(move |_| a());
+        }
 
         // Settings: provider accounts + download folder + Inoreader
         // OAuth connect, in a modal dialog.
         let frame_set = frame;
-        settings_btn.on_click(move |_| {
+        let act_settings: Rc<dyn Fn()> = Rc::new(move || {
             settings::show_settings(&frame_set, &config_path());
         });
+        {
+            let a = act_settings.clone();
+            settings_btn.on_click(move |_| a());
+        }
 
         // Help viewer + shortcuts registry dialogs.
         let frame_help = frame;
         let language_help = language.clone();
-        help_btn.on_click(move |_| {
+        let act_help: Rc<dyn Fn()> = Rc::new(move || {
             help::show_help(&frame_help, &language_help);
         });
+        {
+            let a = act_help.clone();
+            help_btn.on_click(move |_| a());
+        }
         let frame_keys = frame;
-        keys_btn.on_click(move |_| {
+        let act_keys: Rc<dyn Fn()> = Rc::new(move || {
             keys::show_shortcuts(&frame_keys, &config_path());
         });
+        {
+            let a = act_keys.clone();
+            keys_btn.on_click(move |_| a());
+        }
 
         // Add Feed: prompt for a URL, fetch it on a worker thread to
         // learn its title, then subscribe + store its current articles.
         let state_add = state.clone();
         let frame_add = frame;
         let tx_add = tx.clone();
-        add_btn.on_click(move |_| {
+        let act_add: Rc<dyn Fn()> = Rc::new(move || {
             let dlg = TextEntryDialog::builder(&frame_add, "Feed URL:", "Add Feed").build();
             if dlg.show_modal() != ID_OK {
                 return;
@@ -1504,12 +1643,16 @@ fn main() {
                 let _ = tx.send(RefreshMsg::Added(url, result));
             });
         });
+        {
+            let a = act_add.clone();
+            add_btn.on_click(move |_| a());
+        }
 
         // Remove Feed: removes the feed selected in the tree, after a
         // confirmation (it also deletes that feed's stored articles).
         let state_rm = state.clone();
         let frame_rm = frame;
-        remove_btn.on_click(move |_| {
+        let act_remove: Rc<dyn Fn()> = Rc::new(move || {
             let feed = {
                 let st = state_rm.borrow();
                 let Some(id) = st.selected_feed.clone() else {
@@ -1539,11 +1682,15 @@ fn main() {
             refill_articles(&mut st, &list);
             frame_rm.set_status_text(&format!("Removed {}", feed.title), 0);
         });
+        {
+            let a = act_remove.clone();
+            remove_btn.on_click(move |_| a());
+        }
 
         // OPML import/export.
         let state_imp = state.clone();
         let frame_imp = frame;
-        import_btn.on_click(move |_| {
+        let act_import: Rc<dyn Fn()> = Rc::new(move || {
             let dlg = FileDialog::builder(&frame_imp)
                 .with_message("Import OPML")
                 .with_wildcard("OPML files (*.opml;*.xml)|*.opml;*.xml")
@@ -1572,10 +1719,14 @@ fn main() {
                 Err(e) => frame_imp.set_status_text(&format!("Import failed: {e}"), 0),
             }
         });
+        {
+            let a = act_import.clone();
+            import_btn.on_click(move |_| a());
+        }
 
         let state_exp = state.clone();
         let frame_exp = frame;
-        export_btn.on_click(move |_| {
+        let act_export: Rc<dyn Fn()> = Rc::new(move || {
             let dlg = FileDialog::builder(&frame_exp)
                 .with_message("Export OPML")
                 .with_wildcard("OPML files (*.opml)|*.opml")
@@ -1593,6 +1744,181 @@ fn main() {
                     Err(e) => frame_exp.set_status_text(&format!("Could not write file: {e}"), 0),
                 },
                 Err(e) => frame_exp.set_status_text(&format!("Export failed: {e}"), 0),
+            }
+        });
+        {
+            let a = act_export.clone();
+            export_btn.on_click(move |_| a());
+        }
+
+        // Menu bar (PARITY Audit 2, 5C/5F.1): every item invokes the
+        // same Rc action as its button, so menus and buttons can
+        // never drift apart. Mnemonics only for now; accelerators
+        // arrive with the live shortcut dispatch.
+        let file_menu = Menu::builder()
+            .append_item(M_ADD_FEED, "&Add Feed...", "Subscribe to a feed")
+            .append_item(
+                M_IMPORT_OPML,
+                "&Import OPML...",
+                "Import feeds from an OPML file",
+            )
+            .append_item(
+                M_EXPORT_OPML,
+                "&Export OPML...",
+                "Export feeds to an OPML file",
+            )
+            .append_item(
+                M_TAKEOUT,
+                "Import &YouTube Takeout...",
+                "Import subscriptions from a Takeout ZIP",
+            )
+            .append_separator()
+            .append_item(M_BACKUP, "&Backup...", "Save a backup ZIP")
+            .append_item(M_RESTORE, "&Restore...", "Restore from a backup ZIP")
+            .append_separator()
+            .append_item(M_EXIT, "E&xit", "Close BlindRSS")
+            .build();
+        let feeds_menu = Menu::builder()
+            .append_item(M_REFRESH, "&Refresh All", "Refresh every feed")
+            .append_item(M_SYNC, "S&ync Providers", "Sync hosted providers")
+            .append_separator()
+            .append_item(M_REMOVE_FEED, "Re&move Feed", "Remove the selected feed")
+            .append_item(
+                M_EDIT_FEED,
+                "&Edit Feed...",
+                "Edit the selected feed's title and URL",
+            )
+            .append_item(
+                M_RENAME_CAT,
+                "Rename &Category...",
+                "Rename the selected feed's category",
+            )
+            .append_item(
+                M_SET_CAT,
+                "Set Feed Categor&y...",
+                "Move the selected feed to a category",
+            )
+            .append_separator()
+            .append_item(M_NEW_SF, "&New Smart Folder...", "Create a smart folder")
+            .append_item(
+                M_DEL_SF,
+                "&Delete Smart Folder",
+                "Delete the selected smart folder",
+            )
+            .append_item(
+                M_ARCHIVE,
+                "Rescan &Archive",
+                "Rescan the selected feed's podcast archive",
+            )
+            .build();
+        let article_menu = Menu::builder()
+            .append_item(
+                M_TOGGLE_READ,
+                "Toggle &Read",
+                "Mark the selected article read or unread",
+            )
+            .append_item(
+                M_FULLTEXT,
+                "Read &Full Text",
+                "Fetch and extract the full article",
+            )
+            .append_item(
+                M_FAVORITE,
+                "Toggle &Favorite",
+                "Favorite or unfavorite the selected article",
+            )
+            .append_separator()
+            .append_item(M_MARKALL, "Mark All Read", "Mark every shown article read")
+            .append_item(
+                M_DELETE_ARTICLE,
+                "&Delete Article",
+                "Delete the selected article",
+            )
+            .append_item(
+                M_DELETED,
+                "De&leted Articles...",
+                "View and restore deleted articles",
+            )
+            .append_separator()
+            .append_item(M_PLAY, "&Play Media", "Play the selected article's media")
+            .append_item(
+                M_DOWNLOAD,
+                "Down&load",
+                "Download the selected article's media",
+            )
+            .append_item(M_CAST, "&Cast...", "Cast to a Chromecast")
+            .append_item(M_SEARCH, "&Search", "Search with the current search text")
+            .build();
+        let tools_menu = Menu::builder()
+            .append_item(M_SETTINGS, "&Settings...", "Provider accounts and options")
+            .append_item(
+                M_KEYS,
+                "&Keyboard Shortcuts...",
+                "View and edit keyboard shortcuts",
+            )
+            .append_item(
+                M_PRUNE,
+                "Pr&une Old Articles",
+                "Delete read articles older than 30 days",
+            )
+            .append_item(
+                M_UPDATE,
+                "Check for &Updates",
+                "Check GitHub for a newer release",
+            )
+            .build();
+        let help_menu = Menu::builder()
+            .append_item(M_HELP, "&User Guide", "Open the BlindRSS user guide")
+            .build();
+        let menu_bar = MenuBar::builder()
+            .append(file_menu, "&File")
+            .append(feeds_menu, "&Feeds")
+            .append(article_menu, "&Article")
+            .append(tools_menu, "&Tools")
+            .append(help_menu, "&Help")
+            .build();
+        frame.set_menu_bar(menu_bar);
+        let menu_actions: Vec<(i32, Rc<dyn Fn()>)> = vec![
+            (M_ADD_FEED, act_add.clone()),
+            (M_IMPORT_OPML, act_import.clone()),
+            (M_EXPORT_OPML, act_export.clone()),
+            (M_TAKEOUT, act_takeout.clone()),
+            (M_BACKUP, act_backup.clone()),
+            (M_RESTORE, act_restore.clone()),
+            (M_REFRESH, act_refresh.clone()),
+            (M_SYNC, act_sync.clone()),
+            (M_REMOVE_FEED, act_remove.clone()),
+            (M_EDIT_FEED, act_edit_feed.clone()),
+            (M_RENAME_CAT, act_rename_cat.clone()),
+            (M_SET_CAT, act_set_cat.clone()),
+            (M_NEW_SF, act_new_sf.clone()),
+            (M_DEL_SF, act_del_sf.clone()),
+            (M_ARCHIVE, act_archive.clone()),
+            (M_TOGGLE_READ, act_toggle_read.clone()),
+            (M_FULLTEXT, act_fulltext.clone()),
+            (M_FAVORITE, act_fav.clone()),
+            (M_MARKALL, act_markall.clone()),
+            (M_DELETE_ARTICLE, act_delete.clone()),
+            (M_DELETED, act_deleted.clone()),
+            (M_PLAY, act_play.clone()),
+            (M_DOWNLOAD, act_download.clone()),
+            (M_CAST, act_cast.clone()),
+            (M_SEARCH, act_search.clone()),
+            (M_SETTINGS, act_settings.clone()),
+            (M_KEYS, act_keys.clone()),
+            (M_PRUNE, act_prune.clone()),
+            (M_UPDATE, act_update.clone()),
+            (M_HELP, act_help.clone()),
+        ];
+        let frame_menu = frame;
+        frame.on_menu(move |ev| {
+            let id = ev.get_id();
+            if id == M_EXIT {
+                frame_menu.close(true);
+                return;
+            }
+            if let Some((_, action)) = menu_actions.iter().find(|(mid, _)| *mid == id) {
+                action();
             }
         });
 

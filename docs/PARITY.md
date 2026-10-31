@@ -224,8 +224,12 @@ folder (13 paths). Missing families, by config key group:
 
 ### 5C. Menu bar and context menus (structural)
 Python: full menu bar (File/Feeds/Edit/View/Player/Tools/Help) +
-tree/list context menus. Rust: none — buttons only. Menu-only
-actions missing in Rust include: per-feed Refresh Feed, Refresh
+tree/list context menus. Rust: menu bar SHIPPED in v0.1.2
+(File/Feeds/Article/Tools/Help; every item invokes the same Rc
+action as its button, so the two can never drift; mnemonics only,
+no accelerators yet). Still missing: tree/list context menus, and
+the Python-only menus (Edit/View/Player). Menu-only actions still
+missing in Rust include: per-feed Refresh Feed, Refresh
 Category, Add Subcategory, Edit/Remove Category, Delete Category
 and Feeds, Import OPML Here, Export Category to OPML, Copy Feed
 URL, Open Article, Open in Default Browser, multi-select
@@ -270,8 +274,9 @@ HTML View menu; Rust reads in the main window only).
   must be re-proven against MediaCtrl backends per OS.
 
 ### 5F. Port queue additions (after §4 items, rough order)
-1. Menu bar + context menus on the existing actions (discoverability
-   is an accessibility feature for screen-reader users).
+1. Menu bar (done, v0.1.2) + context menus on the existing actions
+   (discoverability is an accessibility feature for screen-reader
+   users); menu accelerators with the shortcut dispatch slice.
 2. Active-provider architecture decision + factory (5A).
 3. Settings depth in SettingsDialog pages mirroring the help
    topics' 10 settings pages, family by family (5B).
