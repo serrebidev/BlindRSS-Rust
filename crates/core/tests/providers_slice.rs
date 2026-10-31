@@ -58,6 +58,18 @@ fn route(method: &str, path: &str) -> (u16, &'static str) {
     if path.starts_with("/v1/entries") && method == "PUT" {
         return (201, "");
     }
+    if path.starts_with("/v1/categories") && method == "GET" {
+        return (200, r#"[{"id":1,"title":"News"},{"id":2,"title":"Tech"}]"#);
+    }
+    if path.starts_with("/v1/categories/1") && method == "PUT" {
+        return (200, r#"{"id":1,"title":"Renamed"}"#);
+    }
+    if path.starts_with("/v1/categories/2") && method == "DELETE" {
+        return (204, "");
+    }
+    if path.starts_with("/v1/categories/9") && method == "DELETE" {
+        return (400, "category has feeds");
+    }
     (404, "not found")
 }
 
@@ -190,4 +202,16 @@ fn miniflux_sync_and_mark_read() {
     assert_eq!(articles[0].title, "MF One");
     client.mark_read_remote(&[7]).unwrap();
     std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn miniflux_category_rename_delete() {
+    let base = serve();
+    let client = MinifluxClient::new(&base, "secret-key");
+    let cats = client.categories_remote().unwrap();
+    assert_eq!(cats, vec![(1, "News".to_string()), (2, "Tech".to_string())]);
+    assert!(client.rename_category_remote("News", "Renamed").unwrap());
+    assert!(!client.rename_category_remote("Missing", "X").unwrap());
+    assert!(client.delete_category_remote("Tech").unwrap());
+    assert!(!client.delete_category_remote("Missing").unwrap());
 }

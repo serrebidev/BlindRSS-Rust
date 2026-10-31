@@ -565,3 +565,44 @@ ordinary playback; the full i18n string sweep (menus, field
 labels, status strings unwrapped); Chromium v20 cookies;
 the warm-browser and curl_cffi extraction stages; GSMArena
 table sort; WebRTC VAD (ffmpeg detector stands in).
+
+Residual audit (v0.1.23, at Brandon's order — "audit the
+residuals, a lot of it is in the sourcecode"): every remaining
+item was re-checked against the Python source and the
+SmartTube precedent. Three were simply unported source and
+landed in v0.1.23: (1) the YouTube TV client secret — Python's
+core/youtube_account.py carries CLIENT_ID and CLIENT_SECRET as
+constants (the SmartTube device flow; Google documents an
+installed app's secret as non-confidential), while the Rust
+port had made the secret config-only, which silently broke
+sign-in for every fresh install; the constant and an
+effective_secret fallback (config still wins) are now in
+core/youtube_account.rs, so sign-in and Recommendations work
+out of the box. (2) The GSMArena battery-table sort — an HTML
+pre-transform in Python's extractor; ported as a string-level
+normalize_gsmarena_battery_table_html in core/extract.rs with
+its URL gate (gsmarena.com/battery-test-v2.php3 only).
+(3) Miniflux remote category rename/delete —
+providers/miniflux.py methods ported to the client and
+mirrored from the tree's category actions when Miniflux is
+the active provider, refusals reported as status notes.
+The rest are not unported code but different shapes, recorded
+exactly: AirPlay in Python is pyatv (an asyncio library) doing
+RAOP — no Rust equivalent exists, a RAOP client is a new
+protocol project. Chromium v20 in Python is a short-lived
+ELEVATED helper process plus a scheduled task for silent
+re-elevation and a cached master key — a privileged install
+component, not app code. WebRTC VAD is Python wrapping the
+native _webrtcvad extension, optional there too (its RMS
+fallback is the ported detector). curl_cffi and the
+warm-browser stages (including browser_feed page fetching)
+are Python libraries with no Rust counterpart short of
+bundling Python. The WebView reader is blocked on the
+WebView2 loader build failure that removed the feature in
+v0.1.1 plus the Phase-6 manual gate. The equalizer drives
+libVLC because Python's player is libVLC-based; the Rust
+player is MediaCtrl, which exposes no EQ. Casting the play
+queue needs cast-session end-of-media events driving the
+next load. The source-feed family (github_source, forum,
+rumble, odysee, npr, sky) is portable API/transform work
+needing per-type refresh-pipeline integration.

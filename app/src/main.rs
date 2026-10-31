@@ -256,6 +256,58 @@ fn mark_article_favorite(
     }
 }
 
+/// Mirror a category rename/delete to the Miniflux server when
+/// Miniflux is the active provider (Python's provider methods);
+/// a refusal surfaces as a status note rather than a phantom
+/// local-only success.
+fn mirror_miniflux_category(
+    tx: &std::sync::mpsc::Sender<RefreshMsg>,
+    rename: Option<(String, String)>,
+    delete: Option<String>,
+) {
+    let tx = tx.clone();
+    std::thread::spawn(move || {
+        let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+        if blindrss_core::provider::active_name(&cfg) != "miniflux" {
+            return;
+        }
+        let get = |key: &str| -> String {
+            cfg.raw()
+                .get("providers")
+                .and_then(|p| p.get("miniflux"))
+                .and_then(|s| s.get(key))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        };
+        let (url, key) = (get("url"), get("api_key"));
+        if url.is_empty() || key.is_empty() {
+            return;
+        }
+        let client = blindrss_core::providers::MinifluxClient::new(&url, &key);
+        let (label, result) = if let Some((old, new)) = &rename {
+            (old.clone(), client.rename_category_remote(old, new))
+        } else if let Some(title) = &delete {
+            (title.clone(), client.delete_category_remote(title))
+        } else {
+            return;
+        };
+        match result {
+            Ok(true) => {}
+            Ok(false) => {
+                let _ = tx.send(RefreshMsg::StatusNote(format!(
+                    "Miniflux: category {label} was not changed on the server"
+                )));
+            }
+            Err(e) => {
+                let _ = tx.send(RefreshMsg::StatusNote(format!(
+                    "Miniflux category sync failed: {e}"
+                )));
+            }
+        }
+    });
+}
+
 fn propagate_read_state(article: &blindrss_core::db::Article, read: bool) {
     // Recommendations are local-only state.
     if article.feed_id == blindrss_core::youtube_account::RECOMMENDATIONS_FEED_ID {
@@ -2865,6 +2917,7 @@ fn main() {
         let frame_rc = frame;
         let tree_rc = tree;
         let list_rc = list;
+        let tx_rc = tx.clone();
         let act_rename_cat: Rc<dyn Fn()> = Rc::new(move || {
             let (category, db_ok) = {
                 let st = state_rc.borrow();
@@ -2904,6 +2957,13 @@ fn main() {
                 let _ = db.rename_category(&category, new_name.trim());
                 st.feeds = db.feeds().unwrap_or_default();
             }
+            drop(st);
+            mirror_miniflux_category(
+                &tx_rc,
+                Some((category.clone(), new_name.trim().to_string())),
+                None,
+            );
+            let mut st = state_rc.borrow_mut();
             rebuild_tree(&mut st, &tree_rc);
             refill_articles(&mut st, &list_rc);
             frame_rc.set_status_text("Category renamed", 0);
@@ -4405,6 +4465,7 @@ fn main() {
         let act_delete_category: Rc<dyn Fn()> = {
             let state_dc = state.clone();
             let frame_dc = frame;
+            let tx_dc = tx.clone();
             Rc::new(move || {
                 let Some(path) = selected_category(&state_dc.borrow()) else {
                     frame_dc.set_status_text("Select a category in the tree first", 0);
@@ -4425,7 +4486,11 @@ fn main() {
                     return;
                 }
                 let mut st = state_dc.borrow_mut();
-                match st.db.as_ref().map(|db| db.delete_category_path(&path)) {
+                let deleted = st.db.as_ref().map(|db| db.delete_category_path(&path));
+                if matches!(deleted, Some(Ok(true))) {
+                    mirror_miniflux_category(&tx_dc, None, Some(path.clone()));
+                }
+                match deleted {
                     Some(Ok(true)) => {
                         st.selected_feed = None;
                         st.feeds = st

@@ -677,7 +677,162 @@ fn recover_lead(precision: &str, recall: &str) -> String {
 ///
 /// `feed_text` is the article body the feed itself supplied, if any; the
 /// prefer-feed-content rule can keep it when the scrape is worse.
+/// GSMArena battery-test pages: the server sends newest phones
+/// first and the page's own script sorts the "Your score" column
+/// descending. Python reproduces that one DOM operation on the
+/// source HTML; this is the string-level equivalent (the table
+/// is flat — a nested table inside it bails out unchanged).
+fn is_gsmarena_battery_test_url(url: &str) -> bool {
+    if !host_matches(url, "gsmarena.com") {
+        return false;
+    }
+    let path = url
+        .split(['?', '#'])
+        .next()
+        .unwrap_or("")
+        .trim_end_matches('/');
+    path.ends_with("/battery-test-v2.php3")
+}
+
+/// Parse GSMArena's `25:35h` duration values to minutes.
+fn gsmarena_duration_minutes(text: &str) -> Option<i64> {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_digit() {
+            let start = i;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            let hours = &text[start..i];
+            if i < bytes.len() && bytes[i] == b':' {
+                let mstart = i + 1;
+                let mut mend = mstart;
+                while mend < bytes.len() && bytes[mend].is_ascii_digit() {
+                    mend += 1;
+                }
+                if mend - mstart == 2 && bytes.get(mend) == Some(&b'h') && hours.len() <= 3 {
+                    return Some(
+                        hours.parse::<i64>().ok()? * 60 + text[mstart..mend].parse::<i64>().ok()?,
+                    );
+                }
+            }
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
+/// Visible text of an HTML fragment (tags stripped, the common
+/// entities decoded, whitespace collapsed).
+fn fragment_text(fragment: &str) -> String {
+    let mut out = String::new();
+    let mut in_tag = false;
+    for c in fragment.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    out.replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Apply the battery table's default browser order to the page
+/// HTML (Python's _normalize_gsmarena_battery_table_html).
+pub fn normalize_gsmarena_battery_table_html(html: &str, url: &str) -> String {
+    if html.is_empty() || !is_gsmarena_battery_test_url(url) {
+        return html.to_string();
+    }
+    let lower = html.to_lowercase();
+    let Some(marker) = lower.find("battery-table") else {
+        return html.to_string();
+    };
+    let Some(tbody_open_rel) = lower[marker..].find("<tbody") else {
+        return html.to_string();
+    };
+    let tbody_tag_start = marker + tbody_open_rel;
+    let Some(tbody_content_start) = lower[tbody_tag_start..]
+        .find('>')
+        .map(|i| tbody_tag_start + i + 1)
+    else {
+        return html.to_string();
+    };
+    let Some(tbody_end_rel) = lower[tbody_content_start..].find("</tbody>") else {
+        return html.to_string();
+    };
+    let tbody_end = tbody_content_start + tbody_end_rel;
+    let inner = &html[tbody_content_start..tbody_end];
+    let inner_lower = inner.to_lowercase();
+    if inner_lower.contains("<table") {
+        return html.to_string();
+    }
+    // Split the top-level rows.
+    let mut rows: Vec<String> = Vec::new();
+    let mut scan = 0;
+    while let Some(rel) = inner_lower[scan..].find("<tr") {
+        let row_start = scan + rel;
+        let Some(end_rel) = inner_lower[row_start..].find("</tr>") else {
+            return html.to_string();
+        };
+        let row_end = row_start + end_rel + "</tr>".len();
+        rows.push(inner[row_start..row_end].to_string());
+        scan = row_end;
+    }
+    if rows.is_empty() {
+        return html.to_string();
+    }
+    let score_of = |row: &str| -> Option<i64> {
+        // Last cell's text (Python reads cells[-1]).
+        let row_lower = row.to_lowercase();
+        let mut last_cell_start = None;
+        for pat in ["<td", "<th"] {
+            let mut s = 0;
+            while let Some(rel) = row_lower[s..].find(pat) {
+                last_cell_start = Some(s + rel);
+                s += rel + pat.len();
+            }
+        }
+        let cell = last_cell_start.map(|i| &row[i..]).unwrap_or(row);
+        gsmarena_duration_minutes(&fragment_text(cell))
+    };
+    let mut scored: Vec<(Option<i64>, String)> =
+        rows.into_iter().map(|r| (score_of(&r), r)).collect();
+    if scored.iter().all(|(s, _)| s.is_none()) {
+        return html.to_string();
+    }
+    // (has score, score) descending, stable — Python's sort.
+    scored.sort_by(|a, b| {
+        let ka = (a.0.is_some(), a.0.unwrap_or(-1));
+        let kb = (b.0.is_some(), b.0.unwrap_or(-1));
+        kb.cmp(&ka)
+    });
+    let mut out = String::with_capacity(html.len());
+    out.push_str(&html[..tbody_content_start]);
+    for (_, row) in &scored {
+        out.push_str(row);
+        out.push('\n');
+    }
+    out.push_str(&html[tbody_end..]);
+    out
+}
+
 pub fn extract_article(html_in: &str, url: &str, feed_text: Option<&str>) -> ExtractOutcome {
+    // GSMArena's battery table arrives in the wrong order
+    // (its sorter is a script we do not run); normalize first.
+    let gsm_normalized;
+    let html_in = if is_gsmarena_battery_test_url(url) {
+        gsm_normalized = normalize_gsmarena_battery_table_html(html_in, url);
+        &gsm_normalized
+    } else {
+        html_in
+    };
     // Bloomberg video pages carry their text in the JSON-LD
     // description; the generic cascade sees a video shell.
     if let Some(text) = bloomberg_video_text(html_in, url) {

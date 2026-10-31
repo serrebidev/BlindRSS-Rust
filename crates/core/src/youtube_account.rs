@@ -7,7 +7,10 @@
 //! no password passes through the app. Python ships the TV
 //! client's public client id; the client secret for that
 //! public installed-app client is read from config
-//! (`youtube_account_client_secret`) rather than embedded.
+//! (`youtube_account_client_secret`) when set; otherwise the
+//! YouTube TV app's installed-app client constants are used, as
+//! in Python (Google documents that an installed app's client
+//! secret is not confidential).
 //!
 //! When signed in, the account's subscriptions auto-add as
 //! ordinary YouTube feeds under the configured category
@@ -19,6 +22,10 @@
 /// Python; also used by yt-dlp's TV client).
 pub const CLIENT_ID: &str =
     "861556708454-d6dlm3lh05idd8npek18k6be8ba3oc68.apps.googleusercontent.com";
+
+/// The YouTube TV installed-app client secret (Python's
+/// CLIENT_SECRET; not a confidential credential).
+pub const CLIENT_SECRET: &str = "SboVhoG9s0rNafixCSGGKXAT";
 
 const DEVICE_CODE_URL: &str = "https://www.youtube.com/o/oauth2/device/code";
 const TOKEN_URL: &str = "https://www.youtube.com/o/oauth2/token";
@@ -83,6 +90,17 @@ pub fn start_sign_in(client_id: &str) -> Result<DeviceSignIn, String> {
     })
 }
 
+/// The effective client secret: a config-provided value wins;
+/// empty resolves to the built-in TV client secret (Python's
+/// flow always uses the constant).
+pub fn effective_secret(configured: &str) -> &str {
+    if configured.trim().is_empty() {
+        CLIENT_SECRET
+    } else {
+        configured
+    }
+}
+
 /// One poll of the token endpoint: Ok(Some(refresh_token))
 /// when approved, Ok(None) while still pending, Err on a
 /// terminal failure (expired/denied).
@@ -95,7 +113,7 @@ pub fn poll_sign_in(
         TOKEN_URL,
         &[
             ("client_id", client_id),
-            ("client_secret", client_secret),
+            ("client_secret", effective_secret(client_secret)),
             ("code", device_code),
             ("grant_type", GRANT_TYPE),
         ],
@@ -125,7 +143,7 @@ pub fn access_token(
         TOKEN_URL,
         &[
             ("client_id", client_id),
-            ("client_secret", client_secret),
+            ("client_secret", effective_secret(client_secret)),
             ("refresh_token", refresh_token),
             ("grant_type", "refresh_token"),
         ],

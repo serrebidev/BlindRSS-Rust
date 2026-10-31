@@ -328,3 +328,48 @@ fn cookies_import_downloads_merge() {
     // Marker persisted: nothing new on the second pass.
     assert!(ci::auto_import_downloads(&mut config, &jar, Some(vec![downloads]), 200.0).is_none());
 }
+
+#[test]
+fn youtube_secret_falls_back_to_tv_client() {
+    // Python embeds the TV installed-app client secret; an empty
+    // config value resolves to it, a set value wins. (The value
+    // itself is a public constant in both repos.)
+    assert_eq!(
+        blindrss_core::youtube_account::effective_secret(""),
+        blindrss_core::youtube_account::CLIENT_SECRET
+    );
+    assert_eq!(
+        blindrss_core::youtube_account::effective_secret("mine"),
+        "mine"
+    );
+    assert!(!blindrss_core::youtube_account::CLIENT_SECRET.is_empty());
+}
+
+#[test]
+fn gsmarena_battery_table_sorts_by_score() {
+    let html = r#"<html><body><table id="battery-table"><thead><tr><th>Phone</th><th>Score</th></tr></thead>
+<tbody>
+<tr><td>Phone A</td><td>10:00h</td></tr>
+<tr><td>Phone B</td><td>25:35h</td></tr>
+<tr><td>Phone C</td><td></td></tr>
+<tr><td>Phone D</td><td>12:30h</td></tr>
+</tbody></table></body></html>"#;
+    let url = "https://www.gsmarena.com/battery-test-v2.php3";
+    let out = blindrss_core::extract::normalize_gsmarena_battery_table_html(html, url);
+    let pos = |name: &str| out.find(name).unwrap();
+    assert!(pos("Phone B") < pos("Phone D"));
+    assert!(pos("Phone D") < pos("Phone A"));
+    assert!(pos("Phone A") < pos("Phone C"));
+    // Other URLs and other pages are untouched.
+    assert_eq!(
+        blindrss_core::extract::normalize_gsmarena_battery_table_html(
+            html,
+            "https://example.com/battery-test-v2.php3"
+        ),
+        html
+    );
+    assert_eq!(
+        blindrss_core::extract::normalize_gsmarena_battery_table_html("<p>no table</p>", url),
+        "<p>no table</p>"
+    );
+}

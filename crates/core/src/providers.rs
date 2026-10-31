@@ -868,6 +868,64 @@ impl MinifluxClient {
         Ok(())
     }
 
+    /// Server categories as (id, title).
+    pub fn categories_remote(&self) -> Result<Vec<(i64, String)>, String> {
+        let cats: Vec<serde_json::Value> = self.get_json("/v1/categories")?;
+        Ok(cats
+            .into_iter()
+            .filter_map(|c| {
+                Some((
+                    c.get("id")?.as_i64()?,
+                    c.get("title")?.as_str()?.to_string(),
+                ))
+            })
+            .collect())
+    }
+
+    fn category_id(&self, title: &str) -> Result<Option<i64>, String> {
+        Ok(self
+            .categories_remote()?
+            .into_iter()
+            .find(|(_, t)| t == title)
+            .map(|(id, _)| id))
+    }
+
+    /// Rename a category on the server (Python's
+    /// MinifluxProvider.rename_category). False when the title
+    /// is not a server category.
+    pub fn rename_category_remote(&self, old_title: &str, new_title: &str) -> Result<bool, String> {
+        let Some(id) = self.category_id(old_title)? else {
+            return Ok(false);
+        };
+        let body = serde_json::json!({"title": new_title});
+        crate::http::agent()
+            .put(&format!("{}/v1/categories/{id}", self.base_url))
+            .header("X-Auth-Token", &self.api_key)
+            .header("Content-Type", "application/json")
+            .send(body.to_string())
+            .map_err(|e| format!("rename category failed: {e}"))?;
+        Ok(true)
+    }
+
+    /// Delete a category on the server (Python's
+    /// MinifluxProvider.delete_category). False when the title
+    /// is unknown or the server refuses (Miniflux refuses a
+    /// category that still has feeds with a 400).
+    pub fn delete_category_remote(&self, title: &str) -> Result<bool, String> {
+        let Some(id) = self.category_id(title)? else {
+            return Ok(false);
+        };
+        match crate::http::agent()
+            .delete(&format!("{}/v1/categories/{id}", self.base_url))
+            .header("X-Auth-Token", &self.api_key)
+            .call()
+        {
+            Ok(_) => Ok(true),
+            Err(ureq::Error::StatusCode(_)) => Ok(false),
+            Err(e) => Err(format!("delete category failed: {e}")),
+        }
+    }
+
     /// Toggle an entry's bookmark (Miniflux's favorite).
     pub fn toggle_bookmark_remote(&self, entry_id: i64) -> Result<(), String> {
         crate::http::agent()
