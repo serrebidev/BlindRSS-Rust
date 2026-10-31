@@ -144,7 +144,12 @@ fn opml_import_builds_full_category_paths() {
     let feeds = db.feeds().unwrap();
     let nested = feeds.iter().find(|f| f.title == "Example").unwrap();
     assert_eq!(nested.category.as_deref(), Some("News/Tech"));
-    let titles: Vec<String> = db.categories().unwrap().iter().map(|c| c.title.clone()).collect();
+    let titles: Vec<String> = db
+        .categories()
+        .unwrap()
+        .iter()
+        .map(|c| c.title.clone())
+        .collect();
     assert_eq!(titles, vec!["News", "News/Tech"]);
     let _ = std::fs::remove_file(&path);
 }

@@ -94,13 +94,13 @@ Base-interface method groups (54) and where they stand in Rust core:
 | Metadata enrichment | metadata_enrich.py | **missing** |
 | Media URL resolution | media_url.py; download_formats.py | **partial** — yt-dlp info/stream resolution + download presets done; playback resolution chain ported v0.1.10 (enclosures keep their MIME type, audio/video enclosure preferred over images, yt-dlp gated to Python's supported-site allowlist, page media detection scans stored content then the fetched page, detected media persisted via update_article_media, yt-dlp generic only as last resort — fixes Brandon's Double Tap "Unsupported URL" failure); media_url.py normalize rules + download_formats.py presets still missing |
 | Article language detect | article_lang.py | **missing** |
-| Announcements | announcements.py | **partial** — event table + mode resolution ported (v0.1.12, core/announce.rs, Python's normalize_modes semantics); NVDA controller-client speech + Braille backend on Windows (vendored nvdaControllerClient.dll ships in the Windows zip), macOS `say` speech; Settings > Announcements page with per-event mode choices + Test button; wired events so far: start_update, refresh-complete (general), favorite_toggle, status_toggle. Remaining: JAWS COM backend (Python falls back to it after NVDA), accessible-output2 layer, and wiring for filter_change / playback_speed / media_navigation / sponsor_skip as those features land |
+| Announcements | announcements.py | **partial** — event table + mode resolution ported (v0.1.12, core/announce.rs, Python's normalize_modes semantics); NVDA controller-client speech + Braille backend on Windows (vendored nvdaControllerClient.dll ships in the Windows zip), macOS `say` speech; Settings > Announcements page with per-event mode choices + Test button; wired events so far: start_update, refresh-complete (general), favorite_toggle, status_toggle. Remaining: JAWS COM backend (Python falls back to it after NVDA), accessible-output2 layer, and wiring for playback_speed / media_navigation / sponsor_skip as those features land (filter_change wired v0.1.13) |
 | Single instance, runtime env, self-test | single_instance.py; runtime_env.py; runtime_self_test.py | **missing** |
 | Platform integration (Windows/macOS) | windows_integration.py; macos_integration.py | **missing** |
 | Screen-reader announcements | screen_reader_announce.py | **partial** — status-bar text; no dedicated announce channel yet |
 | i18n (17 locales) + po compile | i18n.py; po_compile.py | **partial** — PO parser + catalog load + language resolution done, main-window labels wired (Refresh); full string sweep + .mo compile step missing |
 | Help system (80 top-level topics; guide in 17 locales) | help_topics.py; docs/help/*.md | **partial** — guide loader with locale fallback, topic split, plain-text viewer dialog done; context-sensitive help mapping (help_topics.py: topic per dialog/command) not wired; release zips do not bundle the guide/locale assets yet |
-| Shortcuts registry (70 actions, remappable) | shortcuts.py 439; gui/shortcut_keys.py; gui/hotkeys.py | **partial** — full registry extracted from Python, normalisation/conflicts, overrides dialog; live key dispatch for wired actions missing |
+| Shortcuts registry (70 actions, remappable) | shortcuts.py 439; gui/shortcut_keys.py; gui/hotkeys.py | **partial** — full registry extracted from Python, normalisation/conflicts, overrides dialog; live key dispatch for the main-window commands since v0.1.13 (see §7.5); remaining commands dispatch as their features land |
 
 ## 3. GUI surface (Python `gui/`)
 
@@ -373,7 +373,15 @@ surface audits missed, in port order:
 5. Keyboard model: frame-level char hook; Ctrl+1..6 filters,
    Backspace toggle-read, F5/Shift+F5 refresh start/stop,
    Ctrl+D favorite, find-in-article with spoken results —
-   **missing** (registry exists, no dispatch).
+   **done** (v0.1.13: CHAR_HOOK binding on the frame resolves
+   keys through the registry + user overrides and dispatches
+   refresh/stop/refresh-selected/add/feed-errors/favorite/
+   play-pause, the six filter commands (announced via
+   filter_change), the sort commands, and view.focus_search;
+   plain Backspace in the article list toggles read (the search
+   box is focus-tracked so its editing is never eaten); Ctrl+F /
+   F3 / Ctrl+G run find-in-article with spoken Found/Not found.
+   Remaining registry commands dispatch as their features land.)
 6. Full-text arbitration: web vs feed vs provider server-side
    fetch (Miniflux fetch-content), completeness wins, cacheable
    flag, per-feed encoding override, enrichment on the same fetch

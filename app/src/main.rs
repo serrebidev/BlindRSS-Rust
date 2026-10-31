@@ -274,6 +274,19 @@ struct State {
     refresh_stopped: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// When the last refresh finished (scheduled-refresh timer).
     last_refresh_end: Option<std::time::Instant>,
+    /// Article view filters (Python's Ctrl+1..6): read filter
+    /// 0 = all, 1 = unread only, 2 = read only; media filter
+    /// 0 = all, 1 = with media, 2 = without media.
+    read_filter: u8,
+    media_filter: u8,
+    /// Article sort (config article_sort_by / article_sort_ascending).
+    sort_by: String,
+    sort_ascending: bool,
+    /// Last find-in-article query (Ctrl+F / F3 repeat it).
+    find_query: String,
+    /// True while the search text box has keyboard focus; the
+    /// Backspace toggle-read shortcut must not eat its editing.
+    search_focused: bool,
 }
 
 enum RefreshMsg {
@@ -350,6 +363,19 @@ const M_DEL_CAT: i32 = 2158;
 const M_IMPORT_HERE: i32 = 2159;
 const M_EXPORT_CAT: i32 = 2160;
 const M_FEED_ERRORS: i32 = 2161;
+const M_FILTER_ALL: i32 = 2170;
+const M_FILTER_UNREAD: i32 = 2171;
+const M_FILTER_READ: i32 = 2172;
+const M_MEDIA_ALL: i32 = 2173;
+const M_MEDIA_WITH: i32 = 2174;
+const M_MEDIA_WITHOUT: i32 = 2175;
+const M_SORT_DATE: i32 = 2176;
+const M_SORT_NAME: i32 = 2177;
+const M_SORT_AUTHOR: i32 = 2178;
+const M_SORT_FEED: i32 = 2179;
+const M_SORT_DIR: i32 = 2180;
+const M_FIND: i32 = 2181;
+const M_FIND_NEXT: i32 = 2182;
 
 /// Format a unix timestamp as "YYYY-MM-DD HH:MM" UTC (civil-date
 /// conversion, no date crate needed at this precision).
@@ -395,6 +421,63 @@ fn feeds_in_category(feeds: &[Feed], path: &str) -> Vec<Feed> {
         })
         .cloned()
         .collect()
+}
+
+/// Build the live shortcut map: effective accelerator string ->
+/// command id, from the registry plus the user's
+/// `keyboard_shortcuts` overrides. Empty accelerators are skipped.
+fn build_keymap() -> std::collections::HashMap<String, String> {
+    let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+    let mut overrides = std::collections::HashMap::new();
+    if let Some(obj) = cfg
+        .raw()
+        .get("keyboard_shortcuts")
+        .and_then(|v| v.as_object())
+    {
+        for (k, v) in obj {
+            if let Some(s) = v.as_str() {
+                overrides.insert(k.clone(), s.to_string());
+            }
+        }
+    }
+    blindrss_core::shortcuts::effective(&overrides)
+        .into_iter()
+        .filter(|(_, accel)| !accel.is_empty())
+        .map(|(id, accel)| (accel, id))
+        .collect()
+}
+
+/// Case-insensitive substring search over chars, starting at
+/// `from` (a char index) and wrapping once. Returns the match's
+/// (start, end) char positions.
+fn find_in_text(text: &str, query: &str, from: usize) -> Option<(i64, i64)> {
+    let hay: Vec<char> = text.chars().collect();
+    let needle: Vec<char> = query.chars().collect();
+    if needle.is_empty() || hay.len() < needle.len() {
+        return None;
+    }
+    let eq = |a: char, b: char| {
+        a.to_lowercase().next().unwrap_or(a) == b.to_lowercase().next().unwrap_or(b)
+    };
+    let matches_at = |start: usize| -> bool {
+        needle
+            .iter()
+            .enumerate()
+            .all(|(i, n)| eq(hay[start + i], *n))
+    };
+    let last_start = hay.len() - needle.len();
+    let from = from.min(last_start);
+    for start in from..=last_start {
+        if matches_at(start) {
+            return Some((start as i64, (start + needle.len()) as i64));
+        }
+    }
+    for start in 0..from {
+        if matches_at(start) {
+            return Some((start as i64, (start + needle.len()) as i64));
+        }
+    }
+    None
 }
 
 fn feed_label(db: &Db, feed: &Feed) -> String {
@@ -555,6 +638,7 @@ fn refill_articles(state: &mut State, list: &ListCtrl) {
     state.articles.clear();
     let Some(db) = state.db.as_ref() else { return };
     let filter = state.selected_feed.as_deref();
+    let mut loaded: Vec<Article> = Vec::new();
     // Smart folder selection: evaluate the folder's rule over all
     // articles instead of a feed filter.
     if let Some(smart_id) = filter.and_then(|f| f.strip_prefix("smart:"))
@@ -583,15 +667,10 @@ fn refill_articles(state: &mut State, list: &ListCtrl) {
                         blindrss_core::rules::rule_matches(&rule, &view)
                     })
                     .collect();
-                for (i, a) in matched.iter().enumerate() {
-                    list.insert_item(i as i64, &a.title, None);
-                    list.set_item_text_by_column(i as i64, 1, a.date.as_deref().unwrap_or(""));
-                    list.set_item_text_by_column(i as i64, 2, &a.feed_id);
-                }
-                state.articles = matched;
+                loaded = matched;
             }
         }
-        return;
+        return finish_refill(state, list, loaded);
     }
     // Category selection: articles across every feed in the
     // category, subcategories included.
@@ -600,24 +679,60 @@ fn refill_articles(state: &mut State, list: &ListCtrl) {
             .iter()
             .map(|f| f.id.clone())
             .collect();
-        if let Ok(articles) = db.articles_for_feeds(&ids, 500) {
-            for (i, a) in articles.iter().enumerate() {
-                list.insert_item(i as i64, &a.title, None);
-                list.set_item_text_by_column(i as i64, 1, a.date.as_deref().unwrap_or(""));
-                list.set_item_text_by_column(i as i64, 2, &a.feed_id);
-            }
-            state.articles = articles;
-        }
-        return;
+        let loaded = db.articles_for_feeds(&ids, 500).unwrap_or_default();
+        return finish_refill(state, list, loaded);
     }
-    if let Ok(articles) = db.articles(filter, 300) {
-        for (i, a) in articles.iter().enumerate() {
-            list.insert_item(i as i64, &a.title, None);
-            list.set_item_text_by_column(i as i64, 1, a.date.as_deref().unwrap_or(""));
-            list.set_item_text_by_column(i as i64, 2, &a.feed_id);
-        }
-        state.articles = articles;
+    let loaded = db.articles(filter, 300).unwrap_or_default();
+    finish_refill(state, list, loaded);
+}
+
+/// Apply the view filters (read + media) and the sort, then render.
+/// Python applies the same two filter groups (Ctrl+1..6) over
+/// whatever the current view loaded.
+fn finish_refill(state: &mut State, list: &ListCtrl, mut loaded: Vec<Article>) {
+    match state.read_filter {
+        1 => loaded.retain(|a| !a.is_read),
+        2 => loaded.retain(|a| a.is_read),
+        _ => {}
     }
+    match state.media_filter {
+        1 => loaded.retain(|a| a.media_url.as_deref().is_some_and(|m| !m.is_empty())),
+        2 => loaded.retain(|a| a.media_url.as_deref().is_none_or(|m| m.is_empty())),
+        _ => {}
+    }
+    let feed_titles: std::collections::HashMap<&str, &str> = state
+        .feeds
+        .iter()
+        .map(|f| (f.id.as_str(), f.title.as_str()))
+        .collect();
+    match state.sort_by.as_str() {
+        "name" => loaded.sort_by_key(|a| a.title.to_lowercase()),
+        "author" => loaded.sort_by_key(|a| a.author.as_deref().unwrap_or("").to_lowercase()),
+        "feed" => loaded.sort_by_key(|a| {
+            feed_titles
+                .get(a.feed_id.as_str())
+                .copied()
+                .unwrap_or("")
+                .to_lowercase()
+        }),
+        _ => {} // "date": the queries already return newest first.
+    }
+    // Non-date sorts are built ascending and flipped when the
+    // direction is descending; the stored date order is already
+    // descending, so ascending flips it instead.
+    if state.sort_by == "date" {
+        if state.sort_ascending {
+            loaded.reverse();
+        }
+    } else if !state.sort_ascending {
+        loaded.reverse();
+    }
+    for (i, a) in loaded.iter().enumerate() {
+        list.insert_item(i as i64, &a.title, None);
+        list.set_item_text_by_column(i as i64, 1, a.date.as_deref().unwrap_or(""));
+        list.set_item_text_by_column(i as i64, 2, &a.feed_id);
+    }
+    state.articles = loaded;
 }
 
 /// UI language: config `language` ("auto"/missing = OS locale),
@@ -797,6 +912,12 @@ fn main() {
             cancel_refresh: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             refresh_stopped: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_refresh_end: None,
+            read_filter: 0,
+            media_filter: 0,
+            sort_by: "date".to_string(),
+            sort_ascending: false,
+            find_query: String::new(),
+            search_focused: false,
         }));
 
         // A staged restore (Python backup.py semantics) applies
@@ -826,6 +947,8 @@ fn main() {
             let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
             let mut st = state.borrow_mut();
             st.remember_last_feed = cfg.get_bool("remember_last_feed", false);
+            st.sort_by = cfg.get_str("article_sort_by", "date").to_string();
+            st.sort_ascending = cfg.get_bool("article_sort_ascending", false);
             if st.remember_last_feed {
                 let last = cfg.get_str("last_selected_feed", "");
                 if !last.is_empty() {
@@ -837,6 +960,19 @@ fn main() {
             let mut st = state.borrow_mut();
             rebuild_tree(&mut st, &tree);
             refill_articles(&mut st, &list);
+        }
+
+        // Track search-box focus so the list's Backspace
+        // shortcut never eats text editing there.
+        {
+            let state_sf = state.clone();
+            search_box.on_set_focus(move |_| {
+                state_sf.borrow_mut().search_focused = true;
+            });
+            let state_kf = state.clone();
+            search_box.on_kill_focus(move |_| {
+                state_kf.borrow_mut().search_focused = false;
+            });
         }
 
         // Tree selection filters the article list.
@@ -1996,6 +2132,11 @@ fn main() {
             settings_btn.on_click(move |_| a());
         }
 
+        // The live shortcut map for the frame char hook; the
+        // shortcuts dialog refreshes it when it closes.
+        let keymap: Rc<RefCell<std::collections::HashMap<String, String>>> =
+            Rc::new(RefCell::new(build_keymap()));
+
         // Help viewer + shortcuts registry dialogs.
         let frame_help = frame;
         let state_help = state.clone();
@@ -2014,8 +2155,10 @@ fn main() {
         let state_keys = state.clone();
         let tree_keys = tree;
         let list_keys = list;
+        let keymap_keys = keymap.clone();
         let act_keys: Rc<dyn Fn()> = Rc::new(move || {
             keys::show_shortcuts(&frame_keys, &config_path());
+            *keymap_keys.borrow_mut() = build_keymap();
             restore_focus(&state_keys.borrow(), &tree_keys, &list_keys);
         });
         {
@@ -2505,6 +2648,149 @@ fn main() {
             })
         };
 
+        // View filters (Python's Ctrl+1..6 groups), sort, and
+        // find-in-article: one implementation for the View menu
+        // and the keyboard dispatch below.
+        let filter_action = {
+            let state_f = state.clone();
+            let frame_f = frame;
+            move |group: u8, mode: u8, label: &'static str| -> Rc<dyn Fn()> {
+                let state_c = state_f.clone();
+                Rc::new(move || {
+                    {
+                        let mut st = state_c.borrow_mut();
+                        if group == 0 {
+                            st.read_filter = mode;
+                        } else {
+                            st.media_filter = mode;
+                        }
+                        refill_articles(&mut st, &list);
+                    }
+                    frame_f.set_status_text(label, 0);
+                    // Python announces the menu label on filter
+                    // changes (issue #67).
+                    announce("filter_change", label);
+                })
+            }
+        };
+        let act_filter_all = filter_action(0, 0, "All Articles");
+        let act_filter_unread = filter_action(0, 1, "Unread Only");
+        let act_filter_read = filter_action(0, 2, "Read Only");
+        let act_media_all = filter_action(1, 0, "Media and Non-media");
+        let act_media_with = filter_action(1, 1, "With Media Only");
+        let act_media_without = filter_action(1, 2, "Without Media Only");
+
+        fn persist_sort(st: &State) {
+            let path = config_path();
+            let mut cfg = blindrss_core::config::Config::load(&path).unwrap_or_default();
+            cfg.set_path("article_sort_by", serde_json::json!(st.sort_by));
+            cfg.set_path(
+                "article_sort_ascending",
+                serde_json::json!(st.sort_ascending),
+            );
+            let _ = cfg.save(&path);
+        }
+        let sort_action = {
+            let state_s = state.clone();
+            let frame_s = frame;
+            move |key: &'static str, label: &'static str| -> Rc<dyn Fn()> {
+                let state_c = state_s.clone();
+                Rc::new(move || {
+                    {
+                        let mut st = state_c.borrow_mut();
+                        st.sort_by = key.to_string();
+                        persist_sort(&st);
+                        refill_articles(&mut st, &list);
+                    }
+                    frame_s.set_status_text(label, 0);
+                })
+            }
+        };
+        let act_sort_date = sort_action("date", "Sort by Date");
+        let act_sort_name = sort_action("name", "Sort by Name");
+        let act_sort_author = sort_action("author", "Sort by Author");
+        let act_sort_feed = sort_action("feed", "Sort by Feed");
+        let act_sort_dir: Rc<dyn Fn()> = {
+            let state_sd = state.clone();
+            let frame_sd = frame;
+            Rc::new(move || {
+                let ascending = {
+                    let mut st = state_sd.borrow_mut();
+                    st.sort_ascending = !st.sort_ascending;
+                    persist_sort(&st);
+                    refill_articles(&mut st, &list);
+                    st.sort_ascending
+                };
+                frame_sd.set_status_text(
+                    if ascending {
+                        "Sort ascending"
+                    } else {
+                        "Sort descending"
+                    },
+                    0,
+                );
+            })
+        };
+
+        fn run_find(reader: &TextCtrl, frame: &Frame, query: &str, from: Option<i64>) {
+            let text = reader.get_value();
+            let start = from
+                .unwrap_or_else(|| reader.get_insertion_point().max(0))
+                .max(0) as usize;
+            match find_in_text(&text, query, start) {
+                Some((a, b)) => {
+                    reader.set_selection(a, b);
+                    reader.set_insertion_point(b);
+                    reader.set_focus();
+                    let line = reader
+                        .position_to_xy(b)
+                        .map(|(_, y)| reader.get_line_text(y))
+                        .unwrap_or_default();
+                    let line = line.trim();
+                    frame.set_status_text(&format!("Found: {line}"), 0);
+                    announce("general", &format!("Found: {line}"));
+                }
+                None => {
+                    frame.set_status_text(&format!("Not found: {query}"), 0);
+                    announce("general", "Not found");
+                }
+            }
+        }
+        let act_find: Rc<dyn Fn()> = {
+            let state_fd = state.clone();
+            let frame_fd = frame;
+            Rc::new(move || {
+                let current = state_fd.borrow().find_query.clone();
+                let query = prompt_focus(
+                    &frame_fd,
+                    "Find in article:",
+                    "Find",
+                    &current,
+                    &state_fd.borrow(),
+                    &tree,
+                    &list,
+                );
+                let Some(query) = query.filter(|q| !q.trim().is_empty()) else {
+                    return;
+                };
+                state_fd.borrow_mut().find_query = query.clone();
+                run_find(&reader, &frame_fd, &query, Some(0));
+            })
+        };
+        let act_find_next: Rc<dyn Fn()> = {
+            let state_fn = state.clone();
+            let frame_fn = frame;
+            let act_find_again = act_find.clone();
+            Rc::new(move || {
+                let query = state_fn.borrow().find_query.clone();
+                if query.is_empty() {
+                    act_find_again();
+                    return;
+                }
+                run_find(&reader, &frame_fn, &query, None);
+            })
+        };
+
         let file_menu = Menu::builder()
             .append_item(M_ADD_FEED, "&Add Feed...", "Subscribe to a feed")
             .append_item(
@@ -2635,6 +2921,36 @@ fn main() {
             )
             .append_item(M_SEARCH, "&Search", "Search with the current search text")
             .build();
+        let view_menu = Menu::builder()
+            .append_item(M_FILTER_ALL, "&All Articles", "Show all articles")
+            .append_item(M_FILTER_UNREAD, "&Unread Only", "Show unread articles")
+            .append_item(M_FILTER_READ, "&Read Only", "Show read articles")
+            .append_separator()
+            .append_item(
+                M_MEDIA_ALL,
+                "Media and &Non-media",
+                "Show articles with and without media",
+            )
+            .append_item(M_MEDIA_WITH, "&With Media Only", "Show articles with media")
+            .append_item(
+                M_MEDIA_WITHOUT,
+                "Wit&hout Media Only",
+                "Show articles without media",
+            )
+            .append_separator()
+            .append_item(M_SORT_DATE, "Sort by &Date", "Sort articles by date")
+            .append_item(M_SORT_NAME, "Sort by &Name", "Sort articles by title")
+            .append_item(M_SORT_AUTHOR, "Sort by &Author", "Sort articles by author")
+            .append_item(M_SORT_FEED, "Sort by &Feed", "Sort articles by feed")
+            .append_item(
+                M_SORT_DIR,
+                "Toggle &Ascending Sort",
+                "Reverse the sort direction",
+            )
+            .append_separator()
+            .append_item(M_FIND, "&Find in Article...", "Search the article text")
+            .append_item(M_FIND_NEXT, "Find &Next", "Repeat the last find")
+            .build();
         let tools_menu = Menu::builder()
             .append_item(M_SETTINGS, "&Settings...", "Provider accounts and options")
             .append_item(
@@ -2665,6 +2981,7 @@ fn main() {
             .append(file_menu, "&File")
             .append(feeds_menu, "&Feeds")
             .append(article_menu, "&Article")
+            .append(view_menu, "&View")
             .append(tools_menu, "&Tools")
             .append(help_menu, "&Help")
             .build();
@@ -2708,6 +3025,19 @@ fn main() {
             (M_PRUNE, act_prune.clone()),
             (M_UPDATE, act_update.clone()),
             (M_HELP, act_help.clone()),
+            (M_FILTER_ALL, act_filter_all.clone()),
+            (M_FILTER_UNREAD, act_filter_unread.clone()),
+            (M_FILTER_READ, act_filter_read.clone()),
+            (M_MEDIA_ALL, act_media_all.clone()),
+            (M_MEDIA_WITH, act_media_with.clone()),
+            (M_MEDIA_WITHOUT, act_media_without.clone()),
+            (M_SORT_DATE, act_sort_date.clone()),
+            (M_SORT_NAME, act_sort_name.clone()),
+            (M_SORT_AUTHOR, act_sort_author.clone()),
+            (M_SORT_FEED, act_sort_feed.clone()),
+            (M_SORT_DIR, act_sort_dir.clone()),
+            (M_FIND, act_find.clone()),
+            (M_FIND_NEXT, act_find_next.clone()),
             (M_COPY_URL, act_copy_url.clone()),
             (M_COPY_MEDIA, act_copy_media.clone()),
             (M_COPY_FEED_URL, act_copy_feed_url.clone()),
@@ -2793,6 +3123,176 @@ fn main() {
                 _ => frame_enter.set_status_text("Article has no media or link", 0),
             }
         });
+
+        // Keyboard dispatch (PARITY 7.5): a frame-level char hook
+        // resolves keys through the shortcut registry (defaults +
+        // user overrides), exactly Python's model. Handled keys are
+        // consumed; everything else skips through to the control.
+        {
+            let state_hook = state.clone();
+            let keymap_hook = keymap.clone();
+            let h_refresh = act_refresh.clone();
+            let h_stop = act_stop_refresh.clone();
+            let h_refresh_feed = act_refresh_feed.clone();
+            let h_add = act_add.clone();
+            let h_errors = act_feed_errors.clone();
+            let h_toggle_read = act_toggle_read.clone();
+            let h_fav = act_fav.clone();
+            let h_play = act_play.clone();
+            let h_f_all = act_filter_all.clone();
+            let h_f_unread = act_filter_unread.clone();
+            let h_f_read = act_filter_read.clone();
+            let h_m_all = act_media_all.clone();
+            let h_m_with = act_media_with.clone();
+            let h_m_without = act_media_without.clone();
+            let h_s_date = act_sort_date.clone();
+            let h_s_name = act_sort_name.clone();
+            let h_s_author = act_sort_author.clone();
+            let h_s_feed = act_sort_feed.clone();
+            let h_s_dir = act_sort_dir.clone();
+            let h_find = act_find.clone();
+            let h_find_next = act_find_next.clone();
+            frame.bind_internal(EventType::CHAR_HOOK, move |ev| {
+                let code = ev.get_key_code().unwrap_or(0);
+                let ctrl = ev.control_down() || ev.cmd_down();
+                let shift = ev.shift_down();
+                if ev.alt_down() {
+                    ev.skip(true);
+                    return;
+                }
+                // Plain Backspace in the article list toggles
+                // read state (Python's binding); elsewhere it is
+                // ordinary editing/navigation.
+                if code == 8 && !ctrl && !shift {
+                    let in_list = {
+                        let st = state_hook.borrow();
+                        st.focus_list && !st.search_focused
+                    };
+                    if in_list {
+                        h_toggle_read();
+                        ev.skip(false);
+                    } else {
+                        ev.skip(true);
+                    }
+                    return;
+                }
+                let key_name: Option<String> = if (340..=351).contains(&code) {
+                    Some(format!("F{}", code - 339))
+                } else {
+                    let uni = ev.get_unicode_key().unwrap_or(0);
+                    let c = if (32..127).contains(&uni) { uni } else { code };
+                    if (33..127).contains(&c) {
+                        char::from_u32(c as u32).map(|ch| ch.to_uppercase().collect::<String>())
+                    } else {
+                        None
+                    }
+                };
+                let Some(key_name) = key_name else {
+                    ev.skip(true);
+                    return;
+                };
+                let mut combo = String::new();
+                if ctrl {
+                    combo.push_str("Ctrl+");
+                }
+                if shift {
+                    combo.push_str("Shift+");
+                }
+                combo.push_str(&key_name);
+                // Find pair: reader-local, not registry commands.
+                if combo == "Ctrl+F" {
+                    h_find();
+                    ev.skip(false);
+                    return;
+                }
+                if combo == "F3" || combo == "Ctrl+G" {
+                    h_find_next();
+                    ev.skip(false);
+                    return;
+                }
+                let cmd = keymap_hook.borrow().get(&combo).cloned();
+                let handled = match cmd.as_deref() {
+                    Some("feeds.refresh_all") => {
+                        h_refresh();
+                        true
+                    }
+                    Some("feeds.stop_refresh") => {
+                        h_stop();
+                        true
+                    }
+                    Some("feeds.refresh_selected") => {
+                        h_refresh_feed();
+                        true
+                    }
+                    Some("feeds.add") => {
+                        h_add();
+                        true
+                    }
+                    Some("feeds.view_errors") => {
+                        h_errors();
+                        true
+                    }
+                    Some("article.toggle_favorite") => {
+                        h_fav();
+                        true
+                    }
+                    Some("player.play_pause") => {
+                        h_play();
+                        true
+                    }
+                    Some("filter.read_all") => {
+                        h_f_all();
+                        true
+                    }
+                    Some("filter.read_unread") => {
+                        h_f_unread();
+                        true
+                    }
+                    Some("filter.read_read") => {
+                        h_f_read();
+                        true
+                    }
+                    Some("filter.media_all") => {
+                        h_m_all();
+                        true
+                    }
+                    Some("filter.media_with") => {
+                        h_m_with();
+                        true
+                    }
+                    Some("filter.media_without") => {
+                        h_m_without();
+                        true
+                    }
+                    Some("sort.date") => {
+                        h_s_date();
+                        true
+                    }
+                    Some("sort.name") => {
+                        h_s_name();
+                        true
+                    }
+                    Some("sort.author") => {
+                        h_s_author();
+                        true
+                    }
+                    Some("sort.feed") => {
+                        h_s_feed();
+                        true
+                    }
+                    Some("sort.ascending") => {
+                        h_s_dir();
+                        true
+                    }
+                    Some("view.focus_search") => {
+                        search_box.set_focus();
+                        true
+                    }
+                    _ => false,
+                };
+                ev.skip(!handled);
+            });
+        }
 
         let timer = Box::leak(Box::new(Timer::new(&frame)));
         let state_tick = state.clone();
