@@ -119,3 +119,44 @@ pub fn refresh_all(db: &Db) -> Vec<(String, Result<usize, String>)> {
         .map(|f| (f.title.clone(), refresh_feed(db, f)))
         .collect()
 }
+
+/// Apply the whole filter-rule pipeline to articles already in
+/// the database (the rules dialog's "Apply to existing articles").
+/// Returns how many articles any rule acted on.
+pub fn apply_rules_to_existing(db: &Db) -> Result<usize, String> {
+    let rules = db.filter_rules().map_err(|e| format!("{e}"))?;
+    if rules.is_empty() {
+        return Ok(0);
+    }
+    let feed_titles: std::collections::HashMap<String, String> = db
+        .feeds()
+        .map_err(|e| format!("{e}"))?
+        .into_iter()
+        .map(|f| (f.id, f.title))
+        .collect();
+    let articles = db.articles(None, 100_000).map_err(|e| format!("{e}"))?;
+    let mut changed = 0usize;
+    for article in &articles {
+        let view = crate::rules::RuleArticle {
+            article,
+            feed_title: feed_titles
+                .get(&article.feed_id)
+                .map(|s| s.as_str())
+                .unwrap_or(""),
+            opened: false,
+            updated: false,
+            tags: &[],
+        };
+        let eff = crate::rules::evaluate_pipeline(&rules, &view);
+        if eff.mark_read
+            || eff.mark_favorite
+            || eff.delete
+            || eff.move_to.is_some()
+            || !eff.labels.is_empty()
+        {
+            changed += 1;
+            apply_filter_pipeline(db, &rules, article, view.feed_title);
+        }
+    }
+    Ok(changed)
+}

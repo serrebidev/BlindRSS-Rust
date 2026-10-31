@@ -511,6 +511,57 @@ impl Db {
         Ok(id)
     }
 
+    /// Update a smart folder's name and rule (the editor dialog).
+    pub fn update_smart_folder(
+        &self,
+        id: &str,
+        name: &str,
+        rule_json: &str,
+    ) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE smart_folders SET name = ?2, rule_json = ?3 WHERE id = ?1",
+            params![id, name, rule_json],
+        )?;
+        Ok(())
+    }
+
+    /// Update a filter rule in place (the editor dialog).
+    pub fn update_filter_rule(
+        &self,
+        id: &str,
+        name: &str,
+        rule_json: &str,
+        actions_json: &str,
+        enabled: bool,
+        stop: bool,
+    ) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE filter_rules SET name = ?2, rule_json = ?3, actions_json = ?4, \
+             enabled = ?5, stop = ?6 WHERE id = ?1",
+            params![
+                id,
+                name,
+                rule_json,
+                actions_json,
+                enabled as i64,
+                stop as i64
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Rewrite filter-rule positions from an ordered id list
+    /// (the rules dialog's Move Up/Down).
+    pub fn reorder_filter_rules(&self, ordered_ids: &[String]) -> rusqlite::Result<()> {
+        for (i, id) in ordered_ids.iter().enumerate() {
+            self.conn.execute(
+                "UPDATE filter_rules SET position = ?2 WHERE id = ?1",
+                params![id, i as i64],
+            )?;
+        }
+        Ok(())
+    }
+
     pub fn delete_filter_rule(&self, id: &str) -> rusqlite::Result<()> {
         self.conn
             .execute("DELETE FROM filter_rules WHERE id = ?1", params![id])?;
