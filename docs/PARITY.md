@@ -51,7 +51,10 @@ Base-interface method groups (54) and where they stand in Rust core:
 - Full text: fetch_full_content — **partial** (cascade wired into
   the app via Read Full Text, slice 6; fetch fallback chain missing)
 - Media/chapters: get_article_chapters, HostedArticleMediaMixin
-  (update_article_media) — **missing**
+  (update_article_media) — **partial** (chapters stored/listed and
+  navigated in the player since slice 7, update_article_media
+  landed with the v0.1.10 playback-resolution pass; the hosted
+  mixin's remote media table is batch 8)
 - Delete/restore: supports_article_delete, delete_article,
   supports_restore_deleted, restore_article — **done** (local)
 - Smart folders: supports_smart_folders, get/create/update/delete —
@@ -83,8 +86,8 @@ Base-interface method groups (54) and where they stand in Rust core:
 | YouTube Takeout import | youtube_takeout.py | **done** — ZIP subscriptions/playlists/history import (slice 12) |
 | Forum sources (Reddit/Lemmy/Groups.io) | forum_sources.py 551; groups_io.py 448 | **missing** |
 | Rumble / Odysee / NPR / Sky sources | rumble.py 582; odysee.py; npr.py; sky.py | **missing** |
-| SponsorBlock | sponsorblock.py | **missing** |
-| Audio silence detection + skip | audio_silence.py 534 | **missing** |
+| SponsorBlock | sponsorblock.py | **done** (v0.1.14: core/sponsorblock.rs — YouTube id extraction, skipSegments fetch + category filter; the player applies segments on its tick with the already-skipped guard and sponsor_skip announcements) |
+| Audio silence detection + skip | audio_silence.py 534 | **partial** (v0.1.14: core/silence.rs — ffmpeg silencedetect with Python's RMS-fallback parameters, merge-gap + padding post-processing; the player analyses on a worker and skips with announcements. Python's primary WebRTC-VAD detector is not ported — no Rust VAD binding exists; the threshold detector is the documented substitute) |
 | Playback state persistence | playback_state.py | **done** (slice 7: get/upsert/delete against the Python table) |
 | Equalizer (libVLC 10-band presets) | equalizer.py | **missing** |
 | User agents / fetch identity | user_agents.py 540; http_headers.py | **partial** — UA set on full-text fetch; presets + per-feed identity missing |
@@ -94,7 +97,7 @@ Base-interface method groups (54) and where they stand in Rust core:
 | Metadata enrichment | metadata_enrich.py | **missing** |
 | Media URL resolution | media_url.py; download_formats.py | **partial** — yt-dlp info/stream resolution + download presets done; playback resolution chain ported v0.1.10 (enclosures keep their MIME type, audio/video enclosure preferred over images, yt-dlp gated to Python's supported-site allowlist, page media detection scans stored content then the fetched page, detected media persisted via update_article_media, yt-dlp generic only as last resort — fixes Brandon's Double Tap "Unsupported URL" failure); media_url.py normalize rules + download_formats.py presets still missing |
 | Article language detect | article_lang.py | **missing** |
-| Announcements | announcements.py | **partial** — event table + mode resolution ported (v0.1.12, core/announce.rs, Python's normalize_modes semantics); NVDA controller-client speech + Braille backend on Windows (vendored nvdaControllerClient.dll ships in the Windows zip), macOS `say` speech; Settings > Announcements page with per-event mode choices + Test button; wired events so far: start_update, refresh-complete (general), favorite_toggle, status_toggle. Remaining: JAWS COM backend (Python falls back to it after NVDA), accessible-output2 layer, and wiring for playback_speed / media_navigation / sponsor_skip as those features land (filter_change wired v0.1.13) |
+| Announcements | announcements.py | **partial** — event table + mode resolution ported (v0.1.12, core/announce.rs, Python's normalize_modes semantics); NVDA controller-client speech + Braille backend on Windows (vendored nvdaControllerClient.dll ships in the Windows zip), macOS `say` speech; Settings > Announcements page with per-event mode choices + Test button; wired events: start_update, refresh-complete (general), favorite_toggle, status_toggle, filter_change, playback_speed, media_navigation, sponsor_skip. Remaining: JAWS COM backend (Python falls back to it after NVDA), accessible-output2 layer (filter_change wired v0.1.13; playback_speed / media_navigation / sponsor_skip wired v0.1.14) |
 | Single instance, runtime env, self-test | single_instance.py; runtime_env.py; runtime_self_test.py | **missing** |
 | Platform integration (Windows/macOS) | windows_integration.py; macos_integration.py | **missing** |
 | Screen-reader announcements | screen_reader_announce.py | **partial** — status-bar text; no dedicated announce channel yet |
@@ -389,4 +392,10 @@ surface audits missed, in port order:
    v0.1.6 via core html_to_text.
 7. Player behaviours: raise on play, announced speed control,
    accessible chapter presentation, announced SponsorBlock/
-   silence skips — **partial**.
+   silence skips — **done** (v0.1.14: Slower/Faster ladder with
+   playback_speed announcements, Previous/Next Chapter buttons +
+   chapter-crossing announcements via media_navigation, seek
+   slider, seek/volume steps and start speed from config,
+   show_player_on_play gates the raise, SponsorBlock + silence
+   ranges applied on the player tick with sponsor_skip
+   announcements).

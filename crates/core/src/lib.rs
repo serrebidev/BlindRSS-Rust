@@ -28,6 +28,8 @@ pub mod refresh;
 pub mod rules;
 pub mod shortcuts;
 pub mod shortcuts_data;
+pub mod silence;
+pub mod sponsorblock;
 pub mod takeout;
 
 pub use db::{Article, Category, Chapter, Db, Feed, PlaybackState};
