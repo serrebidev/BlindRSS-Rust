@@ -48,36 +48,63 @@ struct PlayerState {
     /// Last play state the Play/Pause button label was synced
     /// to (the tick reconciles them).
     last_playing: Option<bool>,
+    /// Autoplay watchdog: a wx MediaCtrl load can report
+    /// success before the DirectShow graph is ready, and the
+    /// immediate play() then silently no-ops — the episode
+    /// sits stopped until played by hand (Brandon's log,
+    /// 2026-10-31: player opened, state fell back to stopped
+    /// within a second, a manual Space played fine). While
+    /// active, the tick re-plays and, if the stream keeps
+    /// dying, escalates direct -> proxy -> ffmpeg.
+    autoplay_active: bool,
+    autoplay_ticks: u8,
+    /// Current fallback level for `stream` (0 direct,
+    /// 1 proxy /stream, 2 ffmpeg /play).
+    autoplay_level: u8,
+    /// Raw stream URL of the current load (for escalation).
+    stream: String,
+    /// Last text written to the position readout.
+    last_pos_text: String,
+    /// Position at the last playback-state save (saves are
+    /// throttled to real movement; opening the DB every tick
+    /// was needless UI-thread I/O).
+    last_saved_pos: i64,
 }
 
-/// Custom accessibility for the seek slider: name "Seek" and
-/// a VALUE TEXT in time units. NVDA reads a stock wx slider's
-/// value as a raw 0-1000 number; the accessible value is what
-/// makes the slider usable ("12:34 of 45:00"). Everything not
+/// Custom accessibility for the seek slider: a VALUE TEXT in
+/// time units. NVDA reads a stock wx slider's value as a raw
+/// 0-1000 number; the accessible value is what makes the
+/// slider usable ("12:34 of 45:00"). Everything not
 /// overridden falls back to wx's built-in behaviour
 /// (wxdragon's AccessibleImpl defaults do exactly that).
 /// Windows only — wxdragon's accessible module is MSAA-bound;
 /// elsewhere the slider's window name (set at creation) is
 /// what the platform accessibility layer exposes.
+///
+/// The value comes from a lock-free snapshot the UI-thread
+/// tick refreshes every second — NEVER from the media
+/// control itself. MSAA callbacks run on NVDA's RPC thread,
+/// not the UI thread, and wx/DirectShow calls from there
+/// race the UI thread's own calls on the same graph; that
+/// cross-thread access is the prime suspect for the freeze
+/// Brandon hit on v0.1.29 ("it eventually freezes").
 #[cfg(windows)]
 struct SeekAccessible {
-    media: MediaCtrl,
+    pos: std::sync::Arc<std::sync::atomic::AtomicI64>,
+    len: std::sync::Arc<std::sync::atomic::AtomicI64>,
 }
 
 #[cfg(windows)]
 impl wxdragon::accessible::AccessibleImpl for SeekAccessible {
-    fn get_name(&self, _child_id: i32) -> (wxdragon::accessible::AccStatus, Option<String>) {
-        (wxdragon::accessible::AccStatus::Ok, Some(crate::tr("Seek")))
-    }
-
     fn get_value(&self, _child_id: i32) -> (wxdragon::accessible::AccStatus, Option<String>) {
-        let len = self.media.length();
+        let len = self.len.load(std::sync::atomic::Ordering::Relaxed);
         if len <= 0 {
             return (wxdragon::accessible::AccStatus::NotImplemented, None);
         }
+        let pos = self.pos.load(std::sync::atomic::Ordering::Relaxed);
         (
             wxdragon::accessible::AccStatus::Ok,
-            Some(format!("{} of {}", fmt_ms(self.media.tell()), fmt_ms(len))),
+            Some(format!("{} of {}", fmt_ms(pos), fmt_ms(len))),
         )
     }
 }
@@ -383,12 +410,20 @@ fn open_player_impl(
         .with_style(TextCtrlStyle::ReadOnly)
         .build();
     pos_label.set_value(&crate::tr("0:00:00 / 0:00:00"));
+    // Position snapshot for the seek slider's accessible
+    // value: the tick (UI thread) stores, the MSAA callback
+    // (NVDA's thread) only loads. See SeekAccessible.
+    let seek_pos = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
+    let seek_len = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
     let seek_slider = Slider::builder(&frame).build();
     seek_slider.set_range(0, 1000);
     #[cfg(windows)]
     seek_slider.set_accessible(wxdragon::accessible::Accessible::new(
         &seek_slider,
-        SeekAccessible { media },
+        SeekAccessible {
+            pos: seek_pos.clone(),
+            len: seek_len.clone(),
+        },
     ));
     let chapter_list = ListBox::builder(&frame).build();
     // Accessible names: NVDA reads a bare slider as just
@@ -451,6 +486,12 @@ fn open_player_impl(
         last_chapter: None,
         slider_guard: false,
         last_playing: None,
+        autoplay_active: false,
+        autoplay_ticks: 0,
+        autoplay_level: 0,
+        stream: String::new(),
+        last_pos_text: String::new(),
+        last_saved_pos: -1,
         queue: queue.map(|(entries, index)| {
             let (tx, rx) = std::sync::mpsc::channel();
             QueueCtx {
@@ -491,6 +532,18 @@ fn open_player_impl(
             },
             0,
         );
+        // Arm the autoplay watchdog: load success is not
+        // playback (see PlayerState::autoplay_active).
+        let mut s = state.borrow_mut();
+        s.stream = stream_url.clone();
+        s.autoplay_level = match via {
+            "proxy" => 1,
+            "ffmpeg" => 2,
+            _ if wrapped != stream_url => 2,
+            _ => 0,
+        };
+        s.autoplay_ticks = 0;
+        s.autoplay_active = true;
     } else {
         frame.set_status_text("Could not load media", 0);
         crate::announce("general", "Could not load media");
@@ -529,9 +582,13 @@ fn open_player_impl(
     }
 
     let m = media;
+    let st_pp = state.clone();
     play_btn.on_click(move |_| {
         if m.get_state() == MediaState::Playing {
             m.pause();
+            // A deliberate pause/stop cancels the autoplay
+            // watchdog — it must never fight the user.
+            st_pp.borrow_mut().autoplay_active = false;
             crate::announce("general", "Paused");
         } else {
             m.play();
@@ -542,6 +599,7 @@ fn open_player_impl(
     let st = state.clone();
     stop_btn.on_click(move |_| {
         m.stop();
+        st.borrow_mut().autoplay_active = false;
         save_position(&st.borrow(), &m, false);
     });
     let m = media;
@@ -671,6 +729,7 @@ fn open_player_impl(
     {
         let frame_k = frame;
         let m = media;
+        let st_k = state.clone();
         let btn_handles: Vec<usize> = [
             play_btn,
             stop_btn,
@@ -717,6 +776,7 @@ fn open_player_impl(
                 32 if !on_button => {
                     if m.get_state() == MediaState::Playing {
                         m.pause();
+                        st_k.borrow_mut().autoplay_active = false;
                         crate::announce("general", "Paused");
                     } else {
                         m.play();
@@ -784,9 +844,15 @@ fn open_player_impl(
     let st = state.clone();
     let frame_tick = frame;
     let chapters_tick = chapters_live.clone();
+    let seek_pos_t = seek_pos.clone();
+    let seek_len_t = seek_len.clone();
     timer.on_tick(move |_| {
         let len = m.length();
         let pos = m.tell();
+        // Refresh the seek slider's accessible-value snapshot
+        // (the only writer; MSAA callbacks only read it).
+        seek_pos_t.store(pos, std::sync::atomic::Ordering::Relaxed);
+        seek_len_t.store(len, std::sync::atomic::Ordering::Relaxed);
         let mut seek_to: Option<(i64, String)> = None;
         let mut queue_load: Option<(String, String, String)> = None;
         let mut queue_error: Option<String> = None;
@@ -879,6 +945,18 @@ fn open_player_impl(
             };
             if via != "failed" {
                 m.play();
+                {
+                    let mut s = st.borrow_mut();
+                    s.stream = raw.clone();
+                    s.autoplay_level = match via {
+                        "proxy" => 1,
+                        "ffmpeg" => 2,
+                        _ if wrapped != raw => 2,
+                        _ => 0,
+                    };
+                    s.autoplay_ticks = 0;
+                    s.autoplay_active = true;
+                }
                 // A fresh load can reset the backend volume; the
                 // persisted level is the one in the config.
                 let cfg_q =
@@ -893,11 +971,43 @@ fn open_player_impl(
             frame_tick.set_status_text(&format!("Queue: {e}"), 0);
             crate::announce("general", &format!("Queue: {e}"));
         }
+        let playing_now = m.get_state() == MediaState::Playing;
+        // Autoplay watchdog (see PlayerState): re-play a load
+        // the backend accepted but never started; escalate the
+        // fallback level if it keeps dying; give up loudly at
+        // ~14 s instead of sitting silent.
+        {
+            let mut s = st.borrow_mut();
+            if s.autoplay_active {
+                if playing_now {
+                    s.autoplay_active = false;
+                } else {
+                    s.autoplay_ticks = s.autoplay_ticks.saturating_add(1);
+                    let t = s.autoplay_ticks;
+                    if (t == 3 || t == 6) && len > 0 {
+                        m.play();
+                    } else if t == 9 && s.autoplay_level < 2 {
+                        s.autoplay_level += 1;
+                        let next = if s.autoplay_level == 1 {
+                            blindrss_core::proxy::stream_url(&s.stream)
+                        } else {
+                            blindrss_core::proxy::play_url(&s.stream)
+                        };
+                        if m.load_uri(&next) {
+                            m.play();
+                        }
+                    } else if t >= 14 {
+                        s.autoplay_active = false;
+                        frame_tick.set_status_text("Could not play this media", 0);
+                        crate::announce("general", "Could not play this media");
+                    }
+                }
+            }
+        }
         // Keep the Play/Pause button's label honest about the
         // state — the label is its accessible name, so NVDA
         // users hear "Pause" while playing and "Play" while
         // paused instead of a static "Play/Pause".
-        let playing_now = m.get_state() == MediaState::Playing;
         {
             let mut s = st.borrow_mut();
             if s.last_playing != Some(playing_now) {
@@ -910,14 +1020,28 @@ fn open_player_impl(
                 play_btn.set_label(&label);
             }
         }
-        pos_label.set_value(&format!("{} / {}", fmt_ms(m.tell()), fmt_ms(len)));
+        {
+            let text = format!("{} / {}", fmt_ms(pos), fmt_ms(len));
+            let mut s = st.borrow_mut();
+            if s.last_pos_text != text {
+                s.last_pos_text = text.clone();
+                drop(s);
+                pos_label.set_value(&text);
+            }
+        }
         if len > 0 {
             let mut s = st.borrow_mut();
             s.slider_guard = true;
-            seek_slider.set_value((m.tell() * 1000 / len) as i32);
+            seek_slider.set_value((pos * 1000 / len) as i32);
             s.slider_guard = false;
         }
-        save_position(&st.borrow(), &m, false);
+        {
+            let mut s = st.borrow_mut();
+            if s.last_saved_pos < 0 || (pos - s.last_saved_pos).abs() >= 5_000 {
+                s.last_saved_pos = pos;
+                save_position(&s, &m, false);
+            }
+        }
     });
     timer.start(1000, false);
 

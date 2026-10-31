@@ -865,6 +865,36 @@ toggles play/pause, Left/Right seek, Up/Down change volume
 Escape closes — always deferring to the native key handling
 of the control that has focus (buttons, slider, list).
 
+Batch 30 resolution (v0.1.30, Brandon's NVDA log of
+v0.1.29 in use): the log proved Enter now opens the player
+(title set, focus on the Pause button) — and proved the
+real autoplay bug: within ~1 s the button read "Play"
+again, i.e. the backend had dropped out of Playing; his
+manual Space then played the same URL without trouble.
+Root cause: wx MediaCtrl load success is not readiness —
+the immediate play() raced the DirectShow graph and
+silently no-oped, and the v0.1.28 fallback chain never
+engaged because it only triggers on load FAILURE. The
+player now runs an autoplay watchdog in its 1 s tick: a
+fresh load that is not Playing gets re-played at ticks 3
+and 6, escalates one fallback level (direct -> proxy ->
+ffmpeg) at tick 9, and at ~14 s reports "Could not play
+this media" in the status bar and by announcement instead
+of sitting silent; a deliberate pause or stop cancels the
+watchdog immediately. Freeze audit (Brandon: "it
+eventually freezes"): the prime suspect was batch 29's own
+SeekAccessible — its get_value called MediaCtrl
+length()/tell() from the MSAA callback, which runs on
+NVDA's in-process RPC thread, racing the UI thread on the
+same DirectShow graph (wx is not thread-safe). The
+accessible now reads only a lock-free atomic snapshot the
+UI-thread tick refreshes, and its name override was
+dropped (the slider's window name already covers it). Also
+in the freeze pass: the position readout is rewritten only
+when its text changes, and the per-second playback-state
+save (a Db::open + upsert on the UI thread every tick) is
+throttled to 5 s of actual position movement.
+
 Open residual (playback engine): Python's player is libVLC
 end to end (7,276-line gui/player.py: VLC caching knobs,
 preferred soundcard, resume_* family, HTTP header control).
