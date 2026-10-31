@@ -153,3 +153,36 @@ fn zero_width_characters_are_stripped() {
     assert!(!text.contains('\u{200D}'));
     assert!(text.contains("Hello world"));
 }
+
+#[test]
+fn html_to_text_strips_markup_and_decodes_entities() {
+    use blindrss_core::extract::html_to_text;
+    let html = "<p>Tom &amp; Jerry &#8212; back&nbsp;again.</p>\
+        <p>Second <a href=\"https://x.test\">para</a> with <b>bold</b>.</p>\
+        <script>var tracker = 1;</script>\
+        <ul><li>First item</li><li>Second item</li></ul>\
+        <p>It&rsquo;s &#x201C;fine&#x201D;.</p>";
+    let text = html_to_text(html);
+    assert!(!text.contains('<'), "markup leaked: {text}");
+    assert!(!text.contains("tracker"), "script leaked: {text}");
+    assert!(text.contains("Tom & Jerry \u{2014} back again."));
+    assert!(text.contains("Second para with bold."));
+    assert!(text.contains("First item\nSecond item"), "{text}");
+    assert!(text.contains("It\u{2019}s \u{201C}fine\u{201D}."));
+    // A bare less-than in prose is not a tag.
+    assert!(html_to_text("5 < 10 and 10 > 5").contains("5 < 10 and 10 > 5"));
+}
+
+#[test]
+fn feed_fallback_returns_clean_text_not_html() {
+    let page = "<html><body><nav>Only nav here</nav></body></html>";
+    let feed = format!("<p>Feed body here. {LONG_PARA}</p><p>{LONG_PARA}</p>");
+    let (text, source) = article_text(extract_article(
+        page,
+        "https://example.com/nav-only",
+        Some(&feed),
+    ));
+    assert_eq!(source, "feed");
+    assert!(!text.contains('<'), "feed fallback leaked markup: {text}");
+    assert!(text.contains("Feed body here."));
+}

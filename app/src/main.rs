@@ -604,6 +604,8 @@ fn main() {
                 .filter(|c| !c.trim().is_empty())
                 .or_else(|| a.description.clone())
                 .unwrap_or_else(|| "(no stored text)".to_string());
+            // Stored bodies are HTML; the reader shows clean text.
+            let body = blindrss_core::extract::html_to_text(&body);
             reader.set_value(&format!("{}\n\n{}", a.title, body));
             if !a.is_read {
                 if let Some(db) = st.db.as_ref() {
@@ -2170,6 +2172,10 @@ fn main() {
         timer.start(150, false);
 
         frame.show(true);
+        // Python `_focus_default_control`: focus lands in the tree
+        // when the app opens, so keyboard and screen reader start
+        // in the feed list.
+        tree.set_focus();
         frame.centre();
     });
 }

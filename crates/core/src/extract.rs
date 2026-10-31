@@ -170,9 +170,9 @@ fn unescape_entities(s: &str) -> String {
         .replace("&nbsp;", " ")
 }
 
-/// Convert an HTML fragment to plain text (tag strip + unescape).
+/// Convert an HTML fragment to plain text.
 fn fragment_to_text(fragment: &str) -> String {
-    unescape_entities(&strip_tags(fragment))
+    html_to_text(fragment)
 }
 
 /// Extract the text inside every `<tag ...>...</tag>` block whose open
@@ -434,6 +434,174 @@ pub fn fetch_html_with_cookies(url: &str, cookie_header: &str) -> Result<String,
         .map_err(|e| format!("read failed: {e}"))
 }
 
+/// Convert an HTML fragment (feed content, articleBody payloads,
+/// stored bodies) to clean readable plain text. Feed content is
+/// stored as HTML; showing it raw put markup in the reader
+/// (Brandon, 2026-10-30). Rules: script/style/svg dropped with
+/// their contents; block elements become paragraph breaks; list
+/// items become lines; entities decoded (named common set +
+/// numeric); whitespace normalized (never more than one blank
+/// line).
+pub fn html_to_text(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let lower = html.to_lowercase();
+    let bytes = html.as_bytes();
+    let mut i = 0usize;
+    let mut skipping: Option<&'static str> = None;
+    while i < bytes.len() {
+        if let Some(close) = skipping {
+            if lower[i..].starts_with(close) {
+                i += close.len();
+                skipping = None;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        if bytes[i] == b'<'
+            && i + 1 < bytes.len()
+            && (bytes[i + 1].is_ascii_alphabetic() || bytes[i + 1] == b'/' || bytes[i + 1] == b'!')
+        {
+            let Some(end) = html[i..].find('>') else {
+                break;
+            };
+            let tag_src = &lower[i + 1..i + end];
+            let is_close = tag_src.starts_with('/');
+            let tag = tag_src
+                .trim_start_matches('/')
+                .split([' ', '\t', '\n', '/'])
+                .next()
+                .unwrap_or("");
+            // Breaks come from opening tags only; a close tag right
+            // after would double every paragraph/list break.
+            if is_close {
+                i += end + 1;
+                continue;
+            }
+            match tag {
+                "script" => skipping = Some("</script"),
+                "style" => skipping = Some("</style"),
+                "svg" => skipping = Some("</svg"),
+                "br" | "hr" => out.push('\n'),
+                "p" | "div" | "section" | "article" | "header" | "footer" | "main" | "aside"
+                | "nav" | "blockquote" | "pre" | "table" | "tr" | "ul" | "ol" | "figure"
+                | "figcaption" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
+                    out.push_str("\n\n");
+                }
+                "li" => out.push('\n'),
+                "td" | "th" => out.push(' '),
+                _ => {}
+            }
+            i += end + 1;
+            continue;
+        }
+        if bytes[i] == b'&' {
+            let Some(semi) = html[i..].find(';').filter(|s| *s <= 12) else {
+                out.push('&');
+                i += 1;
+                continue;
+            };
+            let entity = &html[i + 1..i + semi];
+            let decoded = decode_entity(entity);
+            match decoded {
+                Some(text) => {
+                    out.push_str(&text);
+                    i += semi + 1;
+                }
+                None => {
+                    out.push('&');
+                    i += 1;
+                }
+            }
+            continue;
+        }
+        // A '<' that does not open a tag (prose like "5 < 10") is
+        // literal text; consume it singly so the run below always
+        // makes progress.
+        if bytes[i] == b'<' {
+            out.push('<');
+            i += 1;
+            continue;
+        }
+        // Plain text run up to the next tag/entity.
+        let start = i;
+        while i < bytes.len() && bytes[i] != b'<' && bytes[i] != b'&' {
+            i += 1;
+        }
+        out.push_str(&html[start..i]);
+    }
+    normalize_text(&out)
+}
+
+fn decode_entity(entity: &str) -> Option<String> {
+    if let Some(num) = entity.strip_prefix('#') {
+        let code = if let Some(hex) = num.strip_prefix('x').or_else(|| num.strip_prefix('X')) {
+            u32::from_str_radix(hex, 16).ok()?
+        } else {
+            num.parse::<u32>().ok()?
+        };
+        return char::from_u32(code).map(|c| c.to_string());
+    }
+    let named = match entity {
+        "amp" => "&",
+        "lt" => "<",
+        "gt" => ">",
+        "quot" => "\"",
+        "apos" => "'",
+        "nbsp" => " ",
+        "rsquo" => "\u{2019}",
+        "lsquo" => "\u{2018}",
+        "rdquo" => "\u{201D}",
+        "ldquo" => "\u{201C}",
+        "hellip" => "\u{2026}",
+        "mdash" => "\u{2014}",
+        "ndash" => "\u{2013}",
+        "copy" => "\u{00A9}",
+        "reg" => "\u{00AE}",
+        "trade" => "\u{2122}",
+        "laquo" => "\u{00AB}",
+        "raquo" => "\u{00BB}",
+        "middot" => "\u{00B7}",
+        "bull" => "\u{2022}",
+        "dagger" => "\u{2020}",
+        "permil" => "\u{2030}",
+        "euro" => "\u{20AC}",
+        "pound" => "\u{00A3}",
+        "yen" => "\u{00A5}",
+        "cent" => "\u{00A2}",
+        "deg" => "\u{00B0}",
+        "plusmn" => "\u{00B1}",
+        "times" => "\u{00D7}",
+        "divide" => "\u{00F7}",
+        "micro" => "\u{00B5}",
+        "sect" => "\u{00A7}",
+        "para" => "\u{00B6}",
+        _ => return None,
+    };
+    Some(named.to_string())
+}
+
+/// Collapse runs of spaces/tabs, cap blank lines at one, trim lines.
+fn normalize_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut blank_run = 0usize;
+    for line in text.lines() {
+        let cleaned: String = line.split_whitespace().collect::<Vec<_>>().join(" ");
+        if cleaned.is_empty() {
+            blank_run += 1;
+            if blank_run > 1 {
+                continue;
+            }
+            out.push('\n');
+        } else {
+            blank_run = 0;
+            out.push_str(&cleaned);
+            out.push('\n');
+        }
+    }
+    out.trim().to_string()
+}
+
 fn strip_tags(html: &str) -> String {
     let mut out = String::with_capacity(html.len());
     let mut in_tag = false;
@@ -472,6 +640,12 @@ pub fn extract_article(html_in: &str, url: &str, feed_text: Option<&str>) -> Ext
     };
     let html_lower = html.to_lowercase();
     let marker = gate_marker(&html_lower);
+
+    // Feed bodies are stored HTML: convert once, so the length
+    // comparisons and the feed fallbacks all work on the same clean
+    // text the reader will show (never raw markup).
+    let feed_owned = feed_text.map(html_to_text);
+    let feed_text = feed_owned.as_deref();
 
     // Base engine: rust-trafilatura.
     let base = rust_trafilatura::extract(html.as_bytes(), &rust_trafilatura::Options::default())

@@ -330,3 +330,33 @@ workspace; raw extraction audit3-features.json. Newly inventoried:
   article_lang.py (content-language priority order) — **missing**.
 
 </content>
+
+## 7. Deep audit additions (2026-10-30, behaviour pass)
+
+Full report: reports/deep-audit-2026-10-30.md in the migration
+workspace; raw extraction deep-audit.json. Behaviour systems the
+surface audits missed, in port order:
+
+1. Focus choreography: startup focus in tree (FIXED v0.1.6),
+   focus restore after dialogs, reader-surface focus, large-reader
+   mode — **mostly missing**.
+2. Startup state restore: remember_last_feed/last_selected_feed,
+   tree expansion default, start maximized — **missing**.
+3. AccessibleBrowserFrame + accessible view entries (flattened
+   speech-first view model with special views and category
+   hierarchy) — **missing entirely**.
+4. Announcements: 9 events x none/speech/braille/both modes
+   (config["announcements"]), NVDA speech + braille channel —
+   **missing** (status bar only).
+5. Keyboard model: frame-level char hook; Ctrl+1..6 filters,
+   Backspace toggle-read, F5/Shift+F5 refresh start/stop,
+   Ctrl+D favorite, find-in-article with spoken results —
+   **missing** (registry exists, no dispatch).
+6. Full-text arbitration: web vs feed vs provider server-side
+   fetch (Miniflux fetch-content), completeness wins, cacheable
+   flag, per-feed encoding override, enrichment on the same fetch
+   — **partial** (local cascade only). HTML in reader FIXED
+   v0.1.6 via core html_to_text.
+7. Player behaviours: raise on play, announced speed control,
+   accessible chapter presentation, announced SponsorBlock/
+   silence skips — **partial**.
