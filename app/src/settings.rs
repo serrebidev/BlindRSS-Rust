@@ -384,6 +384,18 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
         cfg.get_str("global_show_hide_hotkey", "Ctrl+Alt+B"),
         false,
     );
+    // Start at login (Python windows_integration): the checkbox
+    // mirrors the config key; saving applies the OS registration
+    // when the value changed. Disabled where unsupported.
+    let start_login_cb = add_check(
+        &dialog,
+        &sizer,
+        crate::startup::setting_label(),
+        cfg.get_bool("start_on_windows_login", false),
+    );
+    if !crate::startup::supported() {
+        start_login_cb.enable(false);
+    }
 
     // Refresh scheduling (Python keys: refresh_on_startup defaults
     // on, refresh_interval is in seconds, 300 default, 0 = off).
@@ -514,6 +526,64 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
         &sizer,
         "Confirm before deleting an article",
         cfg.get_bool("confirm_article_delete", true),
+    );
+    let show_alt_cb = add_check(
+        &dialog,
+        &sizer,
+        "Show image alt text",
+        cfg.get_bool("show_image_alt", false),
+    );
+    // Article opening (Python issue #31): default browser or a
+    // custom command template with %1 for the URL.
+    let open_method_choice = add_choice(
+        &dialog,
+        &sizer,
+        "Article opening method",
+        &["Default browser", "Custom command"],
+        if cfg
+            .get_str("article_open_method", "default")
+            .eq_ignore_ascii_case("custom")
+        {
+            1
+        } else {
+            0
+        },
+    );
+    let open_cmd_field = add_field(
+        &dialog,
+        &sizer,
+        "Custom command (%1 = article URL)",
+        cfg.get_str("article_open_command", ""),
+        false,
+    );
+    let open_cmd_test_btn = Button::builder(&dialog)
+        .with_label("Test Custom Command")
+        .build();
+    sizer.add(&open_cmd_test_btn, 0, SizerFlag::All, 2);
+
+    // External tools: user-chosen executable paths take the
+    // highest detection priority (blank = auto-detect).
+    add_heading(&dialog, &sizer, "External Tools");
+    let ffmpeg_path_field = add_field(
+        &dialog,
+        &sizer,
+        "ffmpeg path (blank = auto)",
+        cfg.get_str("custom_ffmpeg_path", ""),
+        false,
+    );
+    let ffprobe_path_field = add_field(
+        &dialog,
+        &sizer,
+        "ffprobe path (blank = auto)",
+        cfg.get_str("custom_ffprobe_path", ""),
+        false,
+    );
+    let ytdlp_path_field = add_field(
+        &dialog,
+        &sizer,
+        "yt-dlp path (blank = auto)",
+        cfg.get_str("custom_ytdlp_path", ""),
+        false,
     );
 
     // Downloads.
@@ -1055,6 +1125,8 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
     let cfg_path_connect = config_path.to_path_buf();
     // One save routine shared by Save and the maintenance buttons.
     let cfg_rc = std::rc::Rc::new(std::cell::RefCell::new(cfg));
+    let startup_was = cfg_rc.borrow().get_bool("start_on_windows_login", false);
+    let dialog_s = dialog;
     let save_all: std::rc::Rc<dyn Fn()> = {
         let cfg_s = cfg_rc.clone();
         let path_s = cfg_path_buf.clone();
@@ -1335,7 +1407,54 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
                 "captcha_solver_api_key",
                 serde_json::json!(captcha_key_field.get_value()),
             );
+            // Audit 4 additions: reading (image alt, article
+            // opening), external tool paths, start at login.
+            cfg.set_path(
+                "show_image_alt",
+                serde_json::json!(show_alt_cb.is_checked()),
+            );
+            let open_method = match open_method_choice.get_selection() {
+                Some(1) => "custom",
+                _ => "default",
+            };
+            cfg.set_path("article_open_method", serde_json::json!(open_method));
+            cfg.set_path(
+                "article_open_command",
+                serde_json::json!(open_cmd_field.get_value()),
+            );
+            cfg.set_path(
+                "custom_ffmpeg_path",
+                serde_json::json!(ffmpeg_path_field.get_value()),
+            );
+            cfg.set_path(
+                "custom_ffprobe_path",
+                serde_json::json!(ffprobe_path_field.get_value()),
+            );
+            cfg.set_path(
+                "custom_ytdlp_path",
+                serde_json::json!(ytdlp_path_field.get_value()),
+            );
+            let login_new = start_login_cb.is_checked();
+            cfg.set_path("start_on_windows_login", serde_json::json!(login_new));
             let _ = cfg.save(&path_s);
+            // Apply the OS registration when the login setting
+            // changed (Python applies it on settings save and
+            // reverts the stored key when registration fails).
+            if login_new != startup_was
+                && crate::startup::supported()
+                && let Err(e) = crate::startup::set_enabled(login_new)
+            {
+                cfg.set_path("start_on_windows_login", serde_json::json!(startup_was));
+                let _ = cfg.save(&path_s);
+                let md = MessageDialog::builder(
+                    &dialog_s,
+                    &format!("Could not update the startup setting: {e}"),
+                    "Startup",
+                )
+                .with_style(MessageDialogStyle::OK | MessageDialogStyle::IconWarning)
+                .build();
+                md.show_modal();
+            }
         })
     };
     let frame_test = dialog;
@@ -1415,6 +1534,62 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
         });
     }
     test_notif_btn.on_click(move |_| test_notify());
+    {
+        let frame_oc = dialog;
+        open_cmd_test_btn.on_click(move |_| {
+            let template = open_cmd_field.get_value();
+            let template = template.trim();
+            if template.is_empty() {
+                let md = MessageDialog::builder(
+                    &frame_oc,
+                    "Enter a command to test. Use %1 where the article URL should go.",
+                    "Nothing to test",
+                )
+                .with_style(MessageDialogStyle::OK | MessageDialogStyle::IconInformation)
+                .build();
+                md.show_modal();
+                return;
+            }
+            let test_url = "https://example.com/";
+            let (msg, title, style) =
+                match blindrss_core::opencmd::build_open_command(template, test_url) {
+                    Err(e) => (
+                        format!("The command could not be parsed:\n\n{e}"),
+                        "Invalid command",
+                        MessageDialogStyle::OK | MessageDialogStyle::IconError,
+                    ),
+                    Ok(argv) => match std::process::Command::new(&argv[0])
+                        .args(&argv[1..])
+                        .spawn()
+                    {
+                        Ok(_) => (
+                            format!(
+                                "Launched the test command with a sample URL:\n\n{}\n\nCheck that your browser opened https://example.com/ as expected.",
+                                argv.join(" ")
+                            ),
+                            "Test launched",
+                            MessageDialogStyle::OK | MessageDialogStyle::IconInformation,
+                        ),
+                        Err(e) => {
+                            let err = if e.kind() == std::io::ErrorKind::NotFound {
+                                format!("Command not found: {}", argv[0])
+                            } else {
+                                e.to_string()
+                            };
+                            (
+                                format!("The command could not be run:\n\n{err}"),
+                                "Test failed",
+                                MessageDialogStyle::OK | MessageDialogStyle::IconError,
+                            )
+                        }
+                    },
+                };
+            let md = MessageDialog::builder(&frame_oc, &msg, title)
+                .with_style(style)
+                .build();
+            md.show_modal();
+        });
+    }
     let dialog_save = dialog;
     let save_for_btn = save_all.clone();
     save_btn.on_click(move |_| {

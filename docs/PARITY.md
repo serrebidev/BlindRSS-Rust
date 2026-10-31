@@ -646,3 +646,67 @@ playback is untouched. Settings gains an Equalizer section
 opening the full dialog (presets, user presets, per-band
 fields). Remaining from this pair: nothing structural;
 live proof needs Brandon's receiver and ears.
+
+Batch 25 resolution (v0.1.25, Audit 4 — Brandon ordered a fresh
+line-by-line audit of the Python tree for missing features big
+or small, each researched before deciding): twelve items
+ported. (1) The extractor's whole postprocess stage, which the
+earlier audits had missed entirely: core/postprocess.rs ports
+Python _postprocess_extracted_text with all 17 host strips
+(zdnet, thetyee, 9to5mac/google/toys, postmillennial,
+globalnews, aljazeera, axios, bbc with the published-date
+byline completion, wsj, techradar, canada.com, castanet,
+slashdot, bloomberg, sky related sections, ning activity) and
+the generic strips (leading share/ad chrome, leaked script
+source with the GitHub-page exemption, recirculation labels),
+plus the proxy-only strips on the Jina path; the regex crate
+was added for a faithful port, and Python's own tests were
+ported (batch25_slice). The cascade's old three-strip
+apply_site_cleaners now delegates to it. (2) The missing
+site-specific extractors from _extract_site_specific_text:
+socast (split-body rebuild with junk-widget removal), Reuters
+paragraph nodes, GSMArena review body, Top Tech Tidbits,
+publisher body reconstruction for Ars Technica / ZDNet, and
+DOM-boilerplate removal for The Post Millennial, Rebel News,
+and Simon Willison — all on a balanced-element scanner, since
+the existing blocks helper truncates nested same-tag elements.
+(3) Image alt text: html_to_text_opts keep_alt emits Python's
+[Image: alt] markers (alt, title fallback); resolution is the
+per-feed feeds.show_images column (NULL/1/0) over the global
+show_image_alt setting, applied at display time like Python
+(reader pane, full-text feed conversion, version viewer,
+Miniflux arbitration at the global level). Python's markdown
+path drops images unconditionally, so markdown_to_text has no
+alt variant. (4) Custom article-open command (issue #31):
+core/opencmd ports build_open_command (%1 substitution, shlex
+splitting, Windows non-POSIX mode); Enter on an article uses
+it, with Python's warn-and-fall-back dialog; Settings gains
+the method choice, command field, and Test button. (5) Delete
+Category and Its Feeds: feeds_in_category_tree +
+delete_category_tree in the Db, remote providers remove feeds
+through the provider trait, Miniflux category deletes mirror
+deepest-first. (6) View Description on the article context
+menu. (7) Player volume persists to the `volume` config key
+(int percent), read at open and on queue advance. (8) Custom
+tool paths: dependency.rs ports Python's user-tool-path
+registry (file or directory values, highest priority) for
+ffmpeg/ffprobe/yt-dlp, plus Settings fields and an ffprobe
+entry in check_tools. (9) ignore_feed_ssl_errors with
+Python's actual semantics (issue #42): NOT a global toggle —
+feed fetch only, default on, one unverified retry after a
+certificate-validation failure (http::insecure_agent +
+looks_like_ssl_cert_error with Python's markers plus rustls
+phrasings). (10) Category picker dialog (pick-or-create,
+Uncategorized first) behind Choose Category... in Feed
+Properties and in the local Add Feed flow (the pick travels
+through RefreshMsg::Added); the wxDragon ListBox has no
+double-click event, so Python's double-click-to-confirm is
+the one piece not carried over. (11) Per-feed notification
+exclusion toggle on the tree context menu (the gate already
+existed in refresh_side_effects; the Settings exclusion
+editor already existed too — the menu toggle was the missing
+surface). (12) Start at login: config key
+start_on_windows_login, applied on Settings save when changed
+(HKCU Run key via raw advapi32 on Windows, LaunchAgent plist
++ launchctl on macOS, disabled elsewhere; failure reverts the
+stored key, like Python).

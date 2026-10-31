@@ -570,6 +570,98 @@ pub fn show_filter_rules(frame: &Frame, db: &Db) {
 
 /// Feed properties (Python's FeedPropertiesDialog): custom
 /// title, feed URL, and category. Returns true when changed.
+/// Category picker (Python ChooseCategoryDialog): pick an
+/// existing category from a list, or create a new one inline
+/// without leaving the dialog. The list starts with
+/// "Uncategorized". Returns Some(path) for a category, Some("")
+/// for Uncategorized, None when cancelled.
+pub fn show_category_picker(
+    frame: &Frame,
+    db: &Db,
+    current: &str,
+    title: &str,
+    prompt: &str,
+) -> Option<String> {
+    let dialog = Dialog::builder(frame, title).build();
+    bind_f1(frame, &dialog, "ChooseCategoryDialog");
+    let sizer = BoxSizer::builder(Orientation::Vertical).build();
+    let label = StaticText::builder(&dialog).with_label(prompt).build();
+    sizer.add(&label, 0, SizerFlag::All, 4);
+    let list = ListBox::builder(&dialog).build();
+    sizer.add(&list, 1, SizerFlag::Expand | SizerFlag::All, 4);
+    // ids[0] is "" (Uncategorized); the rest are category paths.
+    let ids: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new({
+        let mut v = vec![String::new()];
+        if let Ok(cats) = db.categories() {
+            v.extend(cats.into_iter().map(|c| c.title));
+        }
+        v
+    }));
+    let reload = {
+        let ids = ids.clone();
+        move || {
+            list.clear();
+            for (i, id) in ids.borrow().iter().enumerate() {
+                list.append(if i == 0 { "Uncategorized" } else { id });
+            }
+        }
+    };
+    let reload = Rc::new(reload);
+    reload();
+    let initial = ids
+        .borrow()
+        .iter()
+        .position(|id| id == current)
+        .unwrap_or(0);
+    list.set_selection(initial as u32, true);
+    let new_btn = Button::builder(&dialog)
+        .with_label(&crate::tr("New Category..."))
+        .build();
+    sizer.add(&new_btn, 0, SizerFlag::All, 4);
+    ok_cancel(&dialog, &sizer);
+    dialog.set_sizer(sizer, true);
+    dialog.set_size(Size::new(480, 420));
+    {
+        let ids = ids.clone();
+        let reload = reload.clone();
+        let d = dialog;
+        new_btn.on_click(move |_| {
+            let entry = TextEntryDialog::builder(&d, "Category name:", "New Category").build();
+            if entry.show_modal() != 5100 {
+                return;
+            }
+            let name = entry.get_value().unwrap_or_default();
+            let name = name.trim().to_string();
+            if name.is_empty() {
+                return;
+            }
+            // add_category stores the full path; mirror remote
+            // providers the way the main window's add does is
+            // the caller's job — this dialog only writes the Db.
+            if let Ok(db) = Db::open(&crate::db_path()) {
+                let _ = db.add_category(&name);
+            }
+            let mut ids_mut = ids.borrow_mut();
+            if !ids_mut.contains(&name) {
+                ids_mut.push(name.clone());
+            }
+            let pos = ids_mut.iter().position(|id| id == &name).unwrap_or(0);
+            drop(ids_mut);
+            reload();
+            list.set_selection(pos as u32, true);
+            list.set_focus();
+        });
+    }
+    let result = if dialog.show_modal() == 5100 {
+        list.get_selection()
+            .and_then(|sel| ids.borrow().get(sel as usize).cloned())
+    } else {
+        None
+    };
+    dialog.destroy();
+    result
+}
+
 pub fn show_feed_properties(frame: &Frame, db: &Db, feed: &blindrss_core::Feed) -> bool {
     let dialog = Dialog::builder(frame, "Feed Properties").build();
     bind_f1(frame, &dialog, "FeedPropertiesDialog");
@@ -578,6 +670,30 @@ pub fn show_feed_properties(frame: &Frame, db: &Db, feed: &blindrss_core::Feed) 
     let url_ctrl = name_row(&dialog, &sizer, "Feed URL:", &feed.url);
     let cat0 = feed.category.clone().unwrap_or_default();
     let cat_ctrl = name_row(&dialog, &sizer, "Category (blank = none):", &cat0);
+    // Choose... opens the category picker (existing categories
+    // plus inline creation) and fills the field.
+    let choose_cat_btn = Button::builder(&dialog)
+        .with_label(&crate::tr("Choose Category..."))
+        .build();
+    sizer.add(&choose_cat_btn, 0, SizerFlag::All, 4);
+    {
+        let frame_cp = *frame;
+        let cat_ctrl2 = cat_ctrl;
+        choose_cat_btn.on_click(move |_| {
+            if let Ok(db2) = Db::open(&crate::db_path()) {
+                let current = cat_ctrl2.get_value();
+                if let Some(picked) = show_category_picker(
+                    &frame_cp,
+                    &db2,
+                    current.trim(),
+                    "Choose Category",
+                    "Category:",
+                ) {
+                    cat_ctrl2.set_value(&picked);
+                }
+            }
+        });
+    }
     // Per-feed encoding override (feeds.feed_settings.encoding,
     // issue #75): wins over header/meta charset detection when
     // decoding this feed's article pages.
@@ -757,9 +873,17 @@ pub fn show_article_history(frame: &Frame, db: &Db, article: &blindrss_core::Art
     let versions = Rc::new(versions);
     let show_version: Rc<dyn Fn(usize)> = {
         let versions = versions.clone();
+        let keep_alt = {
+            let cfg =
+                blindrss_core::config::Config::load(&crate::config_path()).unwrap_or_default();
+            db.feed_show_images(&article.feed_id)
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| cfg.get_bool("show_image_alt", false))
+        };
         Rc::new(move |idx: usize| {
             if let Some(v) = versions.get(idx) {
-                let body = blindrss_core::extract::html_to_text(&v.content);
+                let body = blindrss_core::extract::html_to_text_opts(&v.content, keep_alt);
                 text.set_value(&format!("{}\n\n{}", v.title, body));
             }
         })

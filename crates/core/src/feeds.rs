@@ -105,14 +105,34 @@ pub fn parse_feed(bytes: &[u8]) -> Result<ParsedFeed, String> {
 }
 
 /// Fetch a feed over HTTP and parse it. Used by the refresh path.
+///
+/// Python issue #42 semantics: when the fetch fails certificate
+/// validation and `ignore_feed_ssl_errors` is on (the default),
+/// retry once with verification disabled — public feeds behind
+/// broken certificates (self-signed, missing intermediates,
+/// expired) still load. Feed retrieval only.
 pub fn fetch_and_parse(url: &str) -> Result<ParsedFeed, String> {
-    let mut resp = crate::http::agent()
-        .get(url)
-        .call()
-        .map_err(|e| format!("fetch failed: {e}"))?;
-    let bytes = resp
-        .body_mut()
-        .read_to_vec()
-        .map_err(|e| format!("read failed: {e}"))?;
+    fn fetch(agent: ureq::Agent, url: &str) -> Result<Vec<u8>, String> {
+        let mut resp = agent
+            .get(url)
+            .call()
+            .map_err(|e| format!("fetch failed: {e}"))?;
+        resp.body_mut()
+            .read_to_vec()
+            .map_err(|e| format!("read failed: {e}"))
+    }
+    let bytes = match fetch(crate::http::agent(), url) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            if crate::http::ssl_fallback_allowed() && crate::http::looks_like_ssl_cert_error(&e) {
+                eprintln!(
+                    "blindrss: SSL certificate problem for {url} ({e}); retrying without certificate verification"
+                );
+                fetch(crate::http::insecure_agent(), url)?
+            } else {
+                return Err(e);
+            }
+        }
+    };
     parse_feed(&bytes)
 }

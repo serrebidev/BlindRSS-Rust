@@ -219,6 +219,14 @@ pub fn open_player_queue(
     );
 }
 
+/// Persist the player volume (Python config `volume`: int
+/// percent 0-100, default 100, saved whenever it changes).
+fn persist_volume(volume: f64) {
+    let mut cfg = blindrss_core::config::Config::load(&crate::config_path()).unwrap_or_default();
+    cfg.set_path("volume", serde_json::json!((volume * 100.0).round() as i64));
+    let _ = cfg.save(&crate::config_path());
+}
+
 /// When the equalizer is enabled with a non-flat shape, route
 /// playback through the local EQ stream (MediaCtrl exposes no
 /// EQ; the stream is an ffmpeg transcode with the filter
@@ -255,6 +263,8 @@ fn open_player_impl(
     let seek_back_ms = cfg.get_i64("seek_back_ms", 10_000);
     let seek_fwd_ms = cfg.get_i64("seek_forward_ms", 10_000);
     let volume_step = (cfg.get_i64("volume_step", 5) as f64 / 100.0).clamp(0.01, 0.5);
+    // Persisted volume (Python `volume`: int percent, default 100).
+    let start_volume = (cfg.get_i64("volume", 100) as f64 / 100.0).clamp(0.0, 1.0);
     let start_speed = cfg_f64(&cfg, "playback_speed", 1.0);
     let show_player = cfg.get_bool("show_player_on_play", true);
 
@@ -370,6 +380,7 @@ fn open_player_impl(
     let stream_url = eq_wrap(&stream_url, &cfg);
     let loaded = media.load_uri(&stream_url);
     if loaded {
+        media.set_volume(start_volume);
         media.play();
         if (start_speed - 1.0).abs() > 0.001 {
             media.set_playback_rate(start_speed);
@@ -437,11 +448,13 @@ fn open_player_impl(
     vdown_btn.on_click(move |_| {
         let v = (m.get_volume() - volume_step).max(0.0);
         m.set_volume(v);
+        persist_volume(v);
     });
     let m = media;
     vup_btn.on_click(move |_| {
         let v = (m.get_volume() + volume_step).min(1.0);
         m.set_volume(v);
+        persist_volume(v);
     });
     // Speed stepping through the standard ladder, announced.
     for (btn, dir) in [(slower_btn, -1i32), (faster_btn, 1i32)] {
@@ -640,6 +653,11 @@ fn open_player_impl(
             && m.load_uri(&stream)
         {
             m.play();
+            // A fresh load can reset the backend volume; the
+            // persisted level is the one in the config.
+            let cfg_q =
+                blindrss_core::config::Config::load(&crate::config_path()).unwrap_or_default();
+            m.set_volume((cfg_q.get_i64("volume", 100) as f64 / 100.0).clamp(0.0, 1.0));
             frame_tick.set_title(&format!("Playing: {title}"));
             frame_tick.set_status_text(&format!("Queue: {title}"), 0);
             crate::announce("general", &format!("Now playing: {title}"));

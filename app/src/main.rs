@@ -11,6 +11,7 @@ mod hotkey;
 mod keys;
 mod player;
 mod settings;
+mod startup;
 
 use blindrss_core::feeds::fetch_and_parse;
 use blindrss_core::{Article, Db, Feed, ParsedFeed, store_parsed};
@@ -153,7 +154,8 @@ fn arbitrate_full_text(
     else {
         return outcome;
     };
-    let remote_text = blindrss_core::extract::html_to_text(&html);
+    let remote_text =
+        blindrss_core::extract::html_to_text_opts(&html, cfg.get_bool("show_image_alt", false));
     let local_len = match &outcome {
         EO::Article { text, .. } => text.chars().count(),
         _ => 0,
@@ -554,6 +556,7 @@ fn apply_pending_update() {
 fn apply_http_config() {
     let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
     blindrss_core::http::init_from_config(&cfg);
+    blindrss_core::dependency::init_tool_paths_from_config(&cfg);
     // SAFETY: called on the UI thread before workers that read
     // these variables are spawned for a new action; this is the
     // same trade-off the process env always carries.
@@ -833,6 +836,95 @@ fn open_in_browser(url: &str) {
     let _ = std::process::Command::new("xdg-open").arg(url).spawn();
 }
 
+/// Open an article link using the configured method (Python
+/// `_open_article_url`, issue #31): with the "custom" method, run
+/// the user's command template (%1 = URL); on any failure, warn
+/// and fall back to the default browser so the user still gets
+/// their article.
+fn open_article_link(frame: &Frame, url: &str) {
+    let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+    if cfg
+        .get_str("article_open_method", "default")
+        .eq_ignore_ascii_case("custom")
+    {
+        let template = cfg.get_str("article_open_command", "").to_string();
+        if !template.trim().is_empty() {
+            let failure: Option<String> =
+                match blindrss_core::opencmd::build_open_command(&template, url) {
+                    Ok(argv) => match std::process::Command::new(&argv[0])
+                        .args(&argv[1..])
+                        .spawn()
+                    {
+                        Ok(_) => None,
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            Some(format!("Command not found: {}", argv[0]))
+                        }
+                        Err(e) => Some(e.to_string()),
+                    },
+                    Err(e) => Some(e),
+                };
+            match failure {
+                None => return,
+                Some(err) => {
+                    let dlg = MessageDialog::builder(
+                        frame,
+                        &format!(
+                            "Could not open the article with your custom command:\n\n{err}\n\nOpening in the default browser instead. You can change this in Settings > Article opening method."
+                        ),
+                        "Custom command failed",
+                    )
+                    .build();
+                    dlg.show_modal();
+                }
+            }
+        }
+    }
+    open_in_browser(url);
+}
+
+/// Resolve image-alt display for a feed (Python
+/// `_show_images_for_feed`): the per-feed override wins, else
+/// the global `show_image_alt` setting (default off).
+fn show_image_alt_for(cfg: &blindrss_core::config::Config, db: Option<&Db>, feed_id: &str) -> bool {
+    if let Some(db) = db
+        && let Ok(Some(override_)) = db.feed_show_images(feed_id)
+    {
+        return override_;
+    }
+    cfg.get_bool("show_image_alt", false)
+}
+
+/// The config's notification-excluded feed ids (Python
+/// `_get_notification_excluded_feed_ids`).
+fn notification_excluded_ids(cfg: &blindrss_core::config::Config) -> Vec<String> {
+    cfg.raw()
+        .get("windows_notifications_excluded_feeds")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Add or remove a feed from the notification exclusion list
+/// (Python `_set_notification_excluded_feed_ids`; stored sorted).
+fn set_notification_excluded(feed_id: &str, excluded: bool) {
+    let mut cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+    let mut ids = notification_excluded_ids(&cfg);
+    ids.retain(|id| id != feed_id);
+    if excluded {
+        ids.push(feed_id.to_string());
+    }
+    ids.sort();
+    cfg.set_path(
+        "windows_notifications_excluded_feeds",
+        serde_json::json!(ids),
+    );
+    let _ = cfg.save(&config_path());
+}
+
 fn prompt_text(
     parent: &impl WxWidget,
     message: &str,
@@ -951,7 +1043,7 @@ enum RefreshMsg {
     FeedDone(Feed, Result<ParsedFeed, String>),
     AllDone,
     /// Result of adding a feed by URL: (url, fetch result).
-    Added(String, Result<(String, ParsedFeed), String>),
+    Added(String, Result<(String, ParsedFeed), String>, Option<String>),
     /// Result of a hosted-provider sync: (provider name, (feeds, new)).
     ProviderDone(String, Result<(usize, usize), String>),
     /// Fetched article page HTML for full-text extraction.
@@ -1034,6 +1126,13 @@ const M_PLAY: i32 = 2127;
 const M_DOWNLOAD: i32 = 2128;
 const M_CAST: i32 = 2129;
 const M_STOP_CAST: i32 = 2207;
+const M_FEED_NOTIF: i32 = 2208;
+const M_IMGALT_DEFAULT: i32 = 2209;
+const M_IMGALT_ALWAYS: i32 = 2210;
+const M_IMGALT_NEVER: i32 = 2211;
+const M_DEL_CAT_FEEDS: i32 = 2212;
+const M_VIEW_DESC: i32 = 2213;
+const M_TOGGLE_SEARCH: i32 = 2214;
 const M_SEARCH: i32 = 2130;
 const M_HISTORY: i32 = 2131;
 const M_SETTINGS: i32 = 2141;
@@ -1888,6 +1987,14 @@ fn main() {
         sizer.add_sizer(&btn_row2, 0, SizerFlag::All, 0);
         sizer.add(&splitter, 1, SizerFlag::Expand | SizerFlag::All, 0);
         frame.set_sizer(sizer, true);
+        {
+            // Search field visibility persists (show_search_field,
+            // default shown).
+            let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+            if !cfg.get_bool("show_search_field", true) {
+                search_box.show(false);
+            }
+        }
 
         let state = Rc::new(RefCell::new(State {
             db: None,
@@ -2016,7 +2123,13 @@ fn main() {
                 .or_else(|| a.description.clone())
                 .unwrap_or_else(|| "(no stored text)".to_string());
             // Stored bodies are HTML; the reader shows clean text.
-            let body = blindrss_core::extract::html_to_text(&body);
+            // Image alt markers follow the per-feed / global
+            // show_image_alt setting.
+            let keep_alt = {
+                let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+                show_image_alt_for(&cfg, st.db.as_ref(), &a.feed_id)
+            };
+            let body = blindrss_core::extract::html_to_text_opts(&body, keep_alt);
             reader.set_value(&format!("{}\n\n{}", a.title, body));
             if !a.is_read {
                 if let Some(db) = st.db.as_ref() {
@@ -2781,6 +2894,10 @@ fn main() {
                 return;
             }
             frame_ft.set_status_text("Fetching full text...", 0);
+            let keep_alt = {
+                let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+                show_image_alt_for(&cfg, st.db.as_ref(), &article.feed_id)
+            };
             let tx = tx_ft.clone();
             let id = article.id.clone();
             let url = article.url.clone();
@@ -2806,11 +2923,12 @@ fn main() {
                                 .map(|s| s.to_string())
                         })
                         .unwrap_or_default();
-                    let (outcome, first_html) = blindrss_core::extract::fetch_full_text(
+                    let (outcome, first_html) = blindrss_core::extract::fetch_full_text_opts(
                         &url,
                         &header,
                         article_content.as_deref(),
                         &encoding,
+                        keep_alt,
                     );
                     // Full-text arbitration (PARITY 7.6): when
                     // the active provider is Miniflux, its
@@ -3473,7 +3591,7 @@ fn main() {
                         let tx = tx_vs.clone();
                         std::thread::spawn(move || {
                             let resolved = blindrss_core::discovery::resolve_subscribe_url(&url);
-                            let _ = tx.send(RefreshMsg::Added(url, resolved));
+                            let _ = tx.send(RefreshMsg::Added(url, resolved, None));
                         });
                     }
                     _ => {}
@@ -3698,7 +3816,7 @@ fn main() {
             let tx = tx_fs.clone();
             std::thread::spawn(move || {
                 let result = blindrss_core::discovery::resolve_subscribe_url(&url);
-                let _ = tx.send(RefreshMsg::Added(url, result));
+                let _ = tx.send(RefreshMsg::Added(url, result, None));
             });
         });
 
@@ -4266,11 +4384,33 @@ fn main() {
                     return;
                 }
             }
+            // Local: pick the category (picker with inline
+            // creation; the tree's current category is
+            // preselected). Cancelling the picker cancels the add.
+            let picked_category = {
+                let st = state_add.borrow();
+                let current = selected_category(&st).unwrap_or_default();
+                match st.db.as_ref() {
+                    Some(db) => dialogs::show_category_picker(
+                        &frame_add,
+                        db,
+                        &current,
+                        "Choose Category",
+                        "Category for the new feed:",
+                    ),
+                    None => Some(String::new()),
+                }
+            };
+            restore_focus(&state_add.borrow(), &tree_add, &list_add);
+            let Some(picked_category) = picked_category else {
+                frame_add.set_status_text("Add cancelled", 0);
+                return;
+            };
             std::thread::spawn(move || {
                 // Discovery chain: social transforms, direct feed,
                 // then HTML alternate links.
                 let result = blindrss_core::discovery::resolve_subscribe_url(&url);
-                let _ = tx.send(RefreshMsg::Added(url, result));
+                let _ = tx.send(RefreshMsg::Added(url, result, Some(picked_category)));
             });
         });
         {
@@ -4612,6 +4752,229 @@ fn main() {
                     Some(Err(e)) => frame_dc.set_status_text(&format!("Delete category: {e}"), 0),
                     None => frame_dc.set_status_text("No database", 0),
                 }
+            })
+        };
+
+        // Notifications for This Feed: toggle the selected feed
+        // in the notification exclusion list (the gate itself is
+        // in refresh_side_effects).
+        let act_feed_notif: Rc<dyn Fn()> = {
+            let state_nt = state.clone();
+            let frame_nt = frame;
+            Rc::new(move || {
+                let Some(feed_id) = state_nt.borrow().selected_feed.clone() else {
+                    frame_nt.set_status_text("Select a feed in the tree first", 0);
+                    return;
+                };
+                let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+                let excluded = notification_excluded_ids(&cfg).contains(&feed_id);
+                set_notification_excluded(&feed_id, !excluded);
+                frame_nt.set_status_text(
+                    if excluded {
+                        "Notifications on for this feed"
+                    } else {
+                        "Notifications off for this feed"
+                    },
+                    0,
+                );
+            })
+        };
+
+        // Image Alt Text submenu actions: per-feed override
+        // (None = use the global setting, Some = always/never).
+        let make_imgalt = |mode: Option<bool>| -> Rc<dyn Fn()> {
+            let state_ia = state.clone();
+            let frame_ia = frame;
+            Rc::new(move || {
+                let (feed_id, done) = {
+                    let st = state_ia.borrow();
+                    let feed_id = st.selected_feed.clone();
+                    let done = match (&feed_id, &st.db) {
+                        (Some(id), Some(db)) => db.set_feed_show_images(id, mode).is_ok(),
+                        _ => false,
+                    };
+                    (feed_id, done)
+                };
+                if feed_id.is_none() {
+                    frame_ia.set_status_text("Select a feed in the tree first", 0);
+                } else if done {
+                    frame_ia.set_status_text(
+                        match mode {
+                            None => "Image alt text: using the global setting for this feed",
+                            Some(true) => "Image alt text: always for this feed",
+                            Some(false) => "Image alt text: never for this feed",
+                        },
+                        0,
+                    );
+                }
+            })
+        };
+        let act_imgalt_default = make_imgalt(None);
+        let act_imgalt_always = make_imgalt(Some(true));
+        let act_imgalt_never = make_imgalt(Some(false));
+
+        // Delete Category and Its Feeds (Python
+        // on_delete_category_with_feeds): the category, its
+        // subcategories, and every feed in them are removed.
+        let act_delete_category_feeds: Rc<dyn Fn()> = {
+            let state_df = state.clone();
+            let frame_df = frame;
+            let tx_df = tx.clone();
+            Rc::new(move || {
+                let Some(path) = selected_category(&state_df.borrow()) else {
+                    frame_df.set_status_text("Select a category in the tree first", 0);
+                    return;
+                };
+                let (feeds, subcats) = {
+                    let st = state_df.borrow();
+                    let feeds = st
+                        .db
+                        .as_ref()
+                        .and_then(|db| db.feeds_in_category_tree(&path).ok())
+                        .unwrap_or_default();
+                    let prefix = format!("{path}/");
+                    let subcats = st
+                        .db
+                        .as_ref()
+                        .and_then(|db| db.categories().ok())
+                        .map(|cats| {
+                            cats.iter()
+                                .filter(|c| c.title.starts_with(&prefix))
+                                .map(|c| c.title.clone())
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    (feeds, subcats)
+                };
+                let n = feeds.len();
+                let sub_note = if subcats.is_empty() {
+                    ""
+                } else {
+                    " (including subcategories)"
+                };
+                let dlg = MessageDialog::builder(
+                    &frame_df,
+                    &format!(
+                        "Delete category '{path}'{sub_note} and its {n} feed(s)?\n\nThis will remove the feeds and their articles."
+                    ),
+                    "Delete Category and Its Feeds",
+                )
+                .with_style(MessageDialogStyle::YesNo)
+                .build();
+                let rc = dlg.show_modal();
+                restore_focus(&state_df.borrow(), &tree, &list);
+                if rc != ID_YES {
+                    return;
+                }
+                let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+                if blindrss_core::provider::active_name(&cfg) != "local" {
+                    // Remote provider: remove the feeds on a
+                    // worker (each removal also drops the local
+                    // mirror row), then the completion reload
+                    // refreshes the tree.
+                    let tx2 = tx_df.clone();
+                    let feeds2 = feeds.clone();
+                    let path2 = path.clone();
+                    std::thread::spawn(move || {
+                        let cfg =
+                            blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+                        let provider = blindrss_core::provider::get_provider(&cfg, db_path());
+                        let mut failed = 0usize;
+                        for f in &feeds2 {
+                            if provider.remove_feed(f).is_err() {
+                                failed += 1;
+                            }
+                        }
+                        let _ = tx2.send(RefreshMsg::ProviderAction(if failed == 0 {
+                            Ok(format!(
+                                "Deleted category {path2} and its {} feed(s)",
+                                feeds2.len()
+                            ))
+                        } else {
+                            Err(format!("{failed} feed(s) could not be removed"))
+                        }));
+                    });
+                }
+                // Local rows: feeds (local provider only — the
+                // remote worker handles its own), then the
+                // category tree, mirrored to Miniflux deepest
+                // first like Python.
+                let mut st = state_df.borrow_mut();
+                if let Some(db) = st.db.as_ref() {
+                    if blindrss_core::provider::active_name(&cfg) == "local" {
+                        for f in &feeds {
+                            let _ = db.remove_feed(&f.id);
+                        }
+                    }
+                    let mut deepest_first = subcats.clone();
+                    deepest_first.sort_by_key(|t| std::cmp::Reverse(t.len()));
+                    for sub in &deepest_first {
+                        mirror_miniflux_category(&tx_df, None, Some(sub.clone()));
+                    }
+                    let _ = db.delete_category_tree(&path);
+                    mirror_miniflux_category(&tx_df, None, Some(path.clone()));
+                    st.feeds = db.feeds().unwrap_or_default();
+                }
+                st.selected_feed = None;
+                rebuild_tree(&mut st, &tree);
+                refill_articles(&mut st, &list);
+                frame_df
+                    .set_status_text(&format!("Category {path} and its {n} feed(s) deleted"), 0);
+            })
+        };
+
+        // Show Search Field (Python _set_search_visible /
+        // view.toggle_search): View-menu checkable; persists
+        // show_search_field and shows/hides the box live.
+        let act_toggle_search: Rc<dyn Fn()> = {
+            let frame_ts = frame;
+            Rc::new(move || {
+                let mut cfg =
+                    blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+                let show = !cfg.get_bool("show_search_field", true);
+                cfg.set_path("show_search_field", serde_json::json!(show));
+                let _ = cfg.save(&config_path());
+                search_box.show(show);
+                frame_ts.layout();
+                if let Some(bar) = frame_ts.get_menu_bar() {
+                    bar.check_item(M_TOGGLE_SEARCH, show);
+                }
+            })
+        };
+
+        // View Description (Python on_view_feed_description):
+        // the selected article's feed-provided description in
+        // its own window.
+        let act_view_desc: Rc<dyn Fn()> = {
+            let state_vd = state.clone();
+            let frame_vd = frame;
+            Rc::new(move || {
+                let st = state_vd.borrow();
+                let Some(a) = st
+                    .selected_article
+                    .and_then(|i| st.articles.get(i))
+                    .cloned()
+                else {
+                    frame_vd.set_status_text("No article selected", 0);
+                    return;
+                };
+                let raw = a
+                    .description
+                    .clone()
+                    .filter(|c| !c.trim().is_empty())
+                    .or_else(|| a.content.clone())
+                    .unwrap_or_default();
+                let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+                let keep_alt = show_image_alt_for(&cfg, st.db.as_ref(), &a.feed_id);
+                let text = if raw.trim().is_empty() {
+                    "No feed description is available for this item.".to_string()
+                } else {
+                    blindrss_core::extract::html_to_text_opts(&raw, keep_alt)
+                };
+                dialogs::show_article_window(
+                    "Feed Description",
+                    &format!("{}\n\n{}", a.title, text),
+                );
             })
         };
 
@@ -5060,6 +5423,11 @@ fn main() {
             .append_item(M_SEARCH, "&Search", "Search with the current search text")
             .build();
         let view_menu = Menu::builder()
+            .append_check_item(
+                M_TOGGLE_SEARCH,
+                "Show &Search Field",
+                "Show or hide the search field",
+            )
             .append_item(M_FILTER_ALL, "&All Articles", "Show all articles")
             .append_item(M_FILTER_UNREAD, "&Unread Only", "Show unread articles")
             .append_item(M_FILTER_READ, "&Read Only", "Show read articles")
@@ -5165,6 +5533,12 @@ fn main() {
             .append(help_menu, "&Help")
             .build();
         frame.set_menu_bar(menu_bar);
+        {
+            let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+            if let Some(bar) = frame.get_menu_bar() {
+                bar.check_item(M_TOGGLE_SEARCH, cfg.get_bool("show_search_field", true));
+            }
+        }
         let menu_actions: Vec<(i32, Rc<dyn Fn()>)> = vec![
             (M_ADD_FEED, act_add.clone()),
             (M_IMPORT_OPML, act_import.clone()),
@@ -5178,6 +5552,13 @@ fn main() {
             (M_STOP_REFRESH, act_stop_refresh.clone()),
             (M_ADD_CAT, act_add_category.clone()),
             (M_DEL_CAT, act_delete_category.clone()),
+            (M_DEL_CAT_FEEDS, act_delete_category_feeds.clone()),
+            (M_FEED_NOTIF, act_feed_notif.clone()),
+            (M_IMGALT_DEFAULT, act_imgalt_default.clone()),
+            (M_IMGALT_ALWAYS, act_imgalt_always.clone()),
+            (M_IMGALT_NEVER, act_imgalt_never.clone()),
+            (M_VIEW_DESC, act_view_desc.clone()),
+            (M_TOGGLE_SEARCH, act_toggle_search.clone()),
             (M_IMPORT_HERE, act_import_here.clone()),
             (M_EXPORT_CAT, act_export_category.clone()),
             (M_FEED_ERRORS, act_feed_errors.clone()),
@@ -5258,6 +5639,7 @@ fn main() {
         // feed tree and the article list. Selections dispatch through
         // the frame's menu handler above (wx command events from a
         // popup propagate to the frame), so the same actions run.
+        let state_ctx_tree = state.clone();
         tree.bind_internal(EventType::CONTEXT_MENU, move |ev| {
             ev.skip(false);
             let mut menu = Menu::builder()
@@ -5268,6 +5650,7 @@ fn main() {
                 .append_separator()
                 .append_item(M_ADD_CAT, "New &Category...", "")
                 .append_item(M_DEL_CAT, "&Delete Category", "")
+                .append_item(M_DEL_CAT_FEEDS, "Delete Category and Its &Feeds", "")
                 .append_item(M_IMPORT_HERE, "Import OPML &Here...", "")
                 .append_item(M_EXPORT_CAT, "&Export Category OPML...", "")
                 .append_separator()
@@ -5279,10 +5662,47 @@ fn main() {
                 .append_item(M_SET_CAT, "Set Feed Categor&y...", "")
                 .append_item(M_ARCHIVE, "Rescan &Archive", "")
                 .append_item(M_COPY_FEED_URL, "Copy Feed &URL", "")
+                .append_check_item(M_FEED_NOTIF, "&Notifications for This Feed", "")
                 .append_separator()
                 .append_item(M_NEW_SF, "&New Smart Folder...", "")
                 .append_item(M_DEL_SF, "&Delete Smart Folder", "")
                 .build();
+            // Reflect the selection: the Notifications check
+            // (checked = notifications ON for the selected feed)
+            // and the Image Alt Text radio state.
+            let (feed_id, db) = {
+                let st = state_ctx_tree.borrow();
+                (st.selected_feed.clone(), st.db.is_some())
+            };
+            if let Some(fid) = &feed_id {
+                let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+                let excluded = notification_excluded_ids(&cfg).contains(fid);
+                menu.check_item(M_FEED_NOTIF, !excluded);
+                let mode = if db {
+                    state_ctx_tree
+                        .borrow()
+                        .db
+                        .as_ref()
+                        .and_then(|d| d.feed_show_images(fid).ok())
+                        .flatten()
+                } else {
+                    None
+                };
+                let sub = Menu::builder()
+                    .append_radio_item(M_IMGALT_DEFAULT, "Use &Default", "")
+                    .append_radio_item(M_IMGALT_ALWAYS, "&Always", "")
+                    .append_radio_item(M_IMGALT_NEVER, "&Never", "")
+                    .build();
+                sub.check_item(
+                    match mode {
+                        None => M_IMGALT_DEFAULT,
+                        Some(true) => M_IMGALT_ALWAYS,
+                        Some(false) => M_IMGALT_NEVER,
+                    },
+                    true,
+                );
+                menu.append_submenu(sub, "Image Alt Text", "");
+            }
             tree.popup_menu(&mut menu, None);
         });
         list.bind_internal(EventType::CONTEXT_MENU, move |ev| {
@@ -5290,6 +5710,7 @@ fn main() {
             let mut menu = Menu::builder()
                 .append_item(M_TOGGLE_READ, "Toggle &Read", "")
                 .append_item(M_FULLTEXT, "Read &Full Text", "")
+                .append_item(M_VIEW_DESC, "View &Description...", "")
                 .append_item(M_HISTORY, "View &History...", "")
                 .append_item(M_FAVORITE, "Toggle &Favorite", "")
                 .append_separator()
@@ -5322,7 +5743,7 @@ fn main() {
             };
             match target {
                 Some((Some(media), _)) if !media.is_empty() => play_enter(),
-                Some((_, url)) if !url.is_empty() => open_in_browser(&url),
+                Some((_, url)) if !url.is_empty() => open_article_link(&frame_enter, &url),
                 _ => frame_enter.set_status_text("Article has no media or link", 0),
             }
         });
@@ -5355,6 +5776,7 @@ fn main() {
             let h_m_with = act_media_with.clone();
             let h_m_without = act_media_without.clone();
             let h_s_date = act_sort_date.clone();
+            let h_toggle_search = act_toggle_search.clone();
             let h_s_name = act_sort_name.clone();
             let h_s_author = act_sort_author.clone();
             let h_s_feed = act_sort_feed.clone();
@@ -5551,6 +5973,10 @@ fn main() {
                         search_box.set_focus();
                         true
                     }
+                    Some("view.toggle_search") => {
+                        h_toggle_search();
+                        true
+                    }
                     _ => false,
                 };
                 ev.skip(!handled);
@@ -5625,7 +6051,7 @@ fn main() {
                         }
                         frame_tick.set_status_text(&format!("{}: {e}", feed.title), 0);
                     }
-                    Ok(RefreshMsg::Added(_url, Ok((feed_url, parsed)))) => {
+                    Ok(RefreshMsg::Added(_url, Ok((feed_url, parsed)), add_category)) => {
                         let mut st = state_tick.borrow_mut();
                         if let Some(db) = st.db.as_ref() {
                             let title = if parsed.title.trim().is_empty() {
@@ -5633,7 +6059,11 @@ fn main() {
                             } else {
                                 parsed.title.clone()
                             };
-                            match db.add_feed(&feed_url, &title, None) {
+                            match db.add_feed(
+                                &feed_url,
+                                &title,
+                                add_category.as_deref().filter(|c| !c.trim().is_empty()),
+                            ) {
                                 Ok(feed) => {
                                     let _ = store_parsed(db, &feed, &parsed);
                                     st.feeds.push(feed);
@@ -5647,7 +6077,7 @@ fn main() {
                             }
                         }
                     }
-                    Ok(RefreshMsg::Added(url, Err(e))) => {
+                    Ok(RefreshMsg::Added(url, Err(e), _)) => {
                         frame_tick.set_status_text(&format!("Could not add {url}: {e}"), 0);
                     }
                     Ok(RefreshMsg::ActivateWindow) => {

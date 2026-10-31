@@ -325,6 +325,544 @@ fn host_of(url: &str) -> String {
         .to_lowercase()
 }
 
+// ---------------------------------------------------------------------------
+// Balanced-element helpers for the Audit 4 site extractors. The
+// `blocks` helper stops at the first close tag, which truncates
+// elements nesting the same tag; these track depth instead.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+struct TagTok {
+    start: usize,
+    end: usize,
+    name: String,
+    close: bool,
+    self_closing: bool,
+}
+
+/// Tokenize a document's tags (quote-aware `>` scan). Tag names
+/// are lowercased; attribute text stays in the source slices.
+fn tag_tokens(html: &str) -> Vec<TagTok> {
+    let bytes = html.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] != b'<' || i + 1 >= bytes.len() {
+            i += 1;
+            continue;
+        }
+        let mut j = i + 1;
+        let close = bytes[j] == b'/';
+        if close {
+            j += 1;
+        }
+        if j >= bytes.len() || !bytes[j].is_ascii_alphabetic() {
+            i += 1;
+            continue;
+        }
+        let name_start = j;
+        while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'-') {
+            j += 1;
+        }
+        let name = html[name_start..j].to_lowercase();
+        let mut k = j;
+        let mut quote: Option<u8> = None;
+        while k < bytes.len() {
+            match quote {
+                Some(q) if bytes[k] == q => quote = None,
+                Some(_) => {}
+                None if bytes[k] == b'"' || bytes[k] == b'\'' => quote = Some(bytes[k]),
+                None if bytes[k] == b'>' => break,
+                None => {}
+            }
+            k += 1;
+        }
+        if k >= bytes.len() {
+            break;
+        }
+        let self_closing = !close && k > j && bytes[k - 1] == b'/';
+        out.push(TagTok {
+            start: i,
+            end: k + 1,
+            name,
+            close,
+            self_closing,
+        });
+        i = k + 1;
+    }
+    out
+}
+
+/// The value of attribute `name` in an open tag's source, if any.
+fn attr_value(open_tag: &str, name: &str) -> Option<String> {
+    let lower = open_tag.to_lowercase();
+    let mut idx = 0usize;
+    while let Some(pos) = lower[idx..].find(name) {
+        let start = idx + pos;
+        let before_ok = start > 0 && lower.as_bytes()[start - 1].is_ascii_whitespace();
+        let rest = &lower[start + name.len()..];
+        let rest_trim = rest.trim_start();
+        if before_ok && rest_trim.starts_with('=') {
+            let after_eq = start + name.len() + (rest.len() - rest_trim.len()) + 1;
+            let v = open_tag[after_eq..].trim_start();
+            if let Some(q) = v.chars().next().filter(|c| *c == '"' || *c == '\'') {
+                let end = v[1..].find(q).map(|e| e + 1).unwrap_or(v.len());
+                return Some(v[1..end].to_string());
+            }
+            let end = v
+                .find(|c: char| c.is_whitespace() || c == '>')
+                .unwrap_or(v.len());
+            return Some(v[..end].to_string());
+        }
+        idx = start + name.len();
+    }
+    None
+}
+
+/// True when the open tag's class list contains `token` as a whole
+/// class name (CSS class-selector semantics).
+fn has_class(open_tag: &str, token: &str) -> bool {
+    attr_value(open_tag, "class")
+        .map(|v| v.split_whitespace().any(|t| t == token))
+        .unwrap_or(false)
+}
+
+#[derive(Clone)]
+struct ElemSpan {
+    start: usize,
+    end: usize,
+    inner_start: usize,
+    inner_end: usize,
+}
+
+/// Top-level elements whose open tag satisfies `pred` (optionally
+/// restricted to one tag name), with balanced same-tag nesting.
+fn find_elements(html: &str, tag: Option<&str>, pred: &dyn Fn(&str) -> bool) -> Vec<ElemSpan> {
+    let toks = tag_tokens(html);
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < toks.len() {
+        let tok = &toks[i];
+        if tok.close
+            || (tag.is_some() && tok.name != tag.unwrap())
+            || !pred(&html[tok.start..tok.end])
+        {
+            i += 1;
+            continue;
+        }
+        if tok.self_closing {
+            out.push(ElemSpan {
+                start: tok.start,
+                end: tok.end,
+                inner_start: tok.end,
+                inner_end: tok.end,
+            });
+            i += 1;
+            continue;
+        }
+        // Depth-scan for the matching close tag.
+        let mut depth = 1usize;
+        let mut j = i + 1;
+        let mut found: Option<ElemSpan> = None;
+        while j < toks.len() {
+            let t2 = &toks[j];
+            if t2.name == tok.name {
+                if t2.close {
+                    depth -= 1;
+                    if depth == 0 {
+                        found = Some(ElemSpan {
+                            start: tok.start,
+                            end: t2.end,
+                            inner_start: tok.end,
+                            inner_end: t2.start,
+                        });
+                        break;
+                    }
+                } else if !t2.self_closing {
+                    depth += 1;
+                }
+            }
+            j += 1;
+        }
+        match found {
+            Some(span) => {
+                out.push(span);
+                // Continue after this element (top-level only).
+                i = j + 1;
+            }
+            None => break, // unbalanced: nothing trustworthy after
+        }
+    }
+    out
+}
+
+const VOID_TAGS: &[&str] = &[
+    "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source",
+    "track", "wbr",
+];
+
+/// Remove every element whose (tag name, open tag) satisfies
+/// `pred`, subtrees included. Returns the new text and whether
+/// anything was removed.
+fn remove_elements(html: &str, pred: &dyn Fn(&str, &str) -> bool) -> (String, bool) {
+    let toks = tag_tokens(html);
+    let mut removals: Vec<(usize, usize)> = Vec::new();
+    let mut cursor = 0usize;
+    let mut i = 0usize;
+    while i < toks.len() {
+        let tok = &toks[i];
+        if tok.close || tok.start < cursor {
+            i += 1;
+            continue;
+        }
+        if !pred(&tok.name, &html[tok.start..tok.end]) {
+            i += 1;
+            continue;
+        }
+        if tok.self_closing || VOID_TAGS.contains(&tok.name.as_str()) {
+            removals.push((tok.start, tok.end));
+            cursor = tok.end;
+            i += 1;
+            continue;
+        }
+        let mut depth = 1usize;
+        let mut j = i + 1;
+        let mut end = tok.end;
+        while j < toks.len() {
+            let t2 = &toks[j];
+            if t2.name == tok.name {
+                if t2.close {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = t2.end;
+                        break;
+                    }
+                } else if !t2.self_closing {
+                    depth += 1;
+                }
+            }
+            j += 1;
+        }
+        removals.push((tok.start, end));
+        cursor = end;
+        i = j + 1;
+    }
+    if removals.is_empty() {
+        return (html.to_string(), false);
+    }
+    let mut out = String::with_capacity(html.len());
+    let mut pos = 0usize;
+    for (s, e) in &removals {
+        out.push_str(&html[pos..*s]);
+        pos = *e;
+    }
+    out.push_str(&html[pos..]);
+    (out, true)
+}
+
+/// Remove elements matching a simple selector: `tag`, `.class`,
+/// `#id`, `tag.class`, or `tag#id`.
+fn remove_selector(html: &str, selector: &str) -> (String, bool) {
+    let (tag, kind, value) = if let Some(rest) = selector.strip_prefix('#') {
+        (None, "id", rest.to_string())
+    } else if let Some(rest) = selector.strip_prefix('.') {
+        (None, "class", rest.to_string())
+    } else if let Some((t, v)) = selector.split_once('.') {
+        (Some(t.to_lowercase()), "class", v.to_string())
+    } else if let Some((t, v)) = selector.split_once('#') {
+        (Some(t.to_lowercase()), "id", v.to_string())
+    } else {
+        (Some(selector.to_lowercase()), "", String::new())
+    };
+    remove_elements(html, &|name, open| {
+        if let Some(t) = &tag
+            && name != t
+        {
+            return false;
+        }
+        match kind {
+            "id" => attr_value(open, "id").map(|v| v == value).unwrap_or(false),
+            "class" => has_class(open, &value),
+            _ => true,
+        }
+    })
+}
+
+/// Collapse an HTML fragment's text the way BeautifulSoup's
+/// `get_text(" ", strip=True)` does: single spaces, trimmed.
+fn leaf_text(fragment: &str) -> String {
+    fragment_to_text(fragment)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Reuters dedicated extractor (Python `_extract_reuters_text`):
+/// the `data-testid="paragraph-N"` nodes inside
+/// `data-testid="ArticleBody"`, >= 200 chars.
+fn reuters_text(html: &str) -> String {
+    let containers = find_elements(html, None, &|open| {
+        attr_value(open, "data-testid")
+            .map(|v| v == "ArticleBody")
+            .unwrap_or(false)
+    });
+    let Some(c) = containers.into_iter().next() else {
+        return String::new();
+    };
+    let inner = &html[c.inner_start..c.inner_end];
+    static OPENS_NEW_TAB: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r",?\s*opens new tab\b").unwrap());
+    let mut paras = Vec::new();
+    for p in find_elements(inner, None, &|open| {
+        attr_value(open, "data-testid")
+            .map(|v| v.starts_with("paragraph-"))
+            .unwrap_or(false)
+    }) {
+        let text = leaf_text(&inner[p.inner_start..p.inner_end]);
+        let text = OPENS_NEW_TAB.replace_all(&text, "");
+        let text = crate::postprocess::normalize_whitespace(&text);
+        if !text.is_empty() {
+            paras.push(text);
+        }
+    }
+    let text = crate::postprocess::normalize_whitespace(&paras.join("\n\n"));
+    if text.chars().count() < 200 {
+        return String::new();
+    }
+    text
+}
+
+/// GSMArena dedicated extractor (Python `_extract_gsmarena_text`):
+/// heading/paragraph/list blocks of #review-body (or
+/// div.article-body) in document order, >= 300 chars.
+fn gsmarena_text(html: &str) -> String {
+    let container = find_elements(html, None, &|open| {
+        attr_value(open, "id")
+            .map(|v| v == "review-body")
+            .unwrap_or(false)
+    })
+    .into_iter()
+    .next()
+    .or_else(|| {
+        find_elements(html, Some("div"), &|open| has_class(open, "article-body"))
+            .into_iter()
+            .next()
+    });
+    let Some(c) = container else {
+        return String::new();
+    };
+    let inner = &html[c.inner_start..c.inner_end];
+    let mut found: Vec<(usize, String)> = Vec::new();
+    for tag in ["h1", "h2", "h3", "h4", "p", "li"] {
+        for sp in find_elements(inner, Some(tag), &|_| true) {
+            let frag = &inner[sp.inner_start..sp.inner_end];
+            let low = frag.to_lowercase();
+            // Skip container blocks (a block wrapping other blocks).
+            if low.contains("<p") || low.contains("<li") {
+                continue;
+            }
+            let text = leaf_text(frag);
+            if !text.is_empty() {
+                found.push((sp.start, text));
+            }
+        }
+    }
+    found.sort_by_key(|(s, _)| *s);
+    static SPACE_BEFORE_PUNCT: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"\s+([,.;:!?])").unwrap());
+    let lines: Vec<String> = found
+        .into_iter()
+        .map(|(_, t)| SPACE_BEFORE_PUNCT.replace_all(&t, "$1").into_owned())
+        .collect();
+    let text = crate::postprocess::normalize_whitespace(&lines.join("\n\n"));
+    if text.chars().count() < 300 {
+        return String::new();
+    }
+    text
+}
+
+/// Top Tech Tidbits dedicated extractor (Python
+/// `_extract_toptechtidbits_text`): isolate div.post-container,
+/// drop its share/subscribe chrome, extract the fragment,
+/// >= 2000 chars.
+fn toptechtidbits_text(html: &str) -> String {
+    let containers = find_elements(html, Some("div"), &|open| has_class(open, "post-container"));
+    let Some(c) = containers.into_iter().next() else {
+        return String::new();
+    };
+    let mut frag = html[c.inner_start..c.inner_end].to_string();
+    for sel in [
+        ".sd-content",
+        ".sharedaddy",
+        ".jp-relatedposts",
+        ".jetpack-subscription-modal",
+        ".post-meta",
+        ".post-byline",
+    ] {
+        frag = remove_selector(&frag, sel).0;
+    }
+    let text = extract_focus(&frag, rust_trafilatura::ExtractionFocus::FavorPrecision).1;
+    if text.chars().count() < 2000 {
+        return String::new();
+    }
+    text
+}
+
+/// Python `_extract_without_dom_boilerplate`: remove the given
+/// DOM sections, then run the normal base extraction on what
+/// remains. Empty when nothing was removed.
+fn extract_without_dom_boilerplate(html: &str, selectors: &[&str]) -> String {
+    let mut cleaned = html.to_string();
+    let mut removed_any = false;
+    for sel in selectors {
+        let (next, removed) = remove_selector(&cleaned, sel);
+        if removed {
+            removed_any = true;
+            cleaned = next;
+        }
+    }
+    if !removed_any {
+        return String::new();
+    }
+    extract_focus(&cleaned, rust_trafilatura::ExtractionFocus::FavorPrecision).1
+}
+
+/// Publisher body reconstruction (Python
+/// `core/article_html.py::_publisher_body_reconstruct`, as used by
+/// `_extract_site_specific_text` for arstechnica.com and
+/// zdnet.com): the verified body containers inside <article>,
+/// minus junk widgets, as text.
+fn publisher_body_text(html: &str, url: &str) -> String {
+    let host = host_of(url);
+    let host = host.strip_prefix("www.").unwrap_or(&host);
+    let (tag, class): (Option<&str>, &str) = match host {
+        "arstechnica.com" => (Some("div"), "post-content"),
+        "zdnet.com" => (None, "entry-content"),
+        _ => return String::new(),
+    };
+    let articles = find_elements(html, Some("article"), &|_| true);
+    let Some(article) = articles.into_iter().next() else {
+        return String::new();
+    };
+    let inner = &html[article.inner_start..article.inner_end];
+    let parts = find_elements(inner, tag, &|open| has_class(open, class));
+    // Nested body wrappers belong to their outer section; keep
+    // each only once (drop parts contained in another part).
+    let keep: Vec<bool> = parts
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            !parts
+                .iter()
+                .enumerate()
+                .any(|(j, q)| j != i && q.start <= p.start && p.end <= q.end)
+        })
+        .collect();
+    let mut joined = String::new();
+    for (p, k) in parts.iter().zip(keep.iter()) {
+        if *k {
+            joined.push_str(&inner[p.start..p.end]);
+        }
+    }
+    if joined.is_empty() {
+        return String::new();
+    }
+    const JUNK: &[&str] = &[
+        "ars-interlude-container",
+        "page-anchor-wrapper",
+        "articlesByTag",
+        "google-ad",
+        "wp-block-ziff-davis-exco-video",
+        "zd-disqus",
+        "articleAuthorBioFooter-container",
+        "zd-post-footer-pattern",
+    ];
+    let (cleaned, _) = remove_elements(&joined, &|_name, open| {
+        JUNK.iter().any(|c| has_class(open, c))
+    });
+    crate::postprocess::normalize_whitespace(&html_to_text(&cleaned))
+}
+
+const SOCAST_JUNK_CLASS_TOKENS: &[&str] = &[
+    "posts",
+    "items-wrapper",
+    "bnl-pp-happening",
+    "bnl-info",
+    "bnl-title",
+    "bnl-content",
+    "pp-more-wrapper",
+    "wpb_raw_html",
+    "wpb_raw_code",
+    "sc-author",
+    "entry-footer",
+    "entry-meta",
+    "report_an_error",
+    "highlight-text",
+    "newsletter",
+    "scwidgetcontainer",
+    "sc-item-detail",
+];
+
+/// Python `_is_socast_page`: socast / Pattison-portals radio-CMS
+/// article pages (split-body layout).
+fn is_socast_page(html: &str) -> bool {
+    let low = html.to_lowercase();
+    if low.contains("socastsrm.com") {
+        return true;
+    }
+    low.contains("wpb-content-wrapper") && low.contains("mainarticle") && low.contains("sc-content")
+}
+
+/// Socast dedicated extractor (Python `_extract_socast_text`):
+/// rebuild the story body from its split containers, skipping the
+/// interleaved related-post/newsletter/ad widgets.
+fn socast_text(html: &str) -> String {
+    let mut containers = find_elements(html, Some("div"), &|open| {
+        has_class(open, "wpb-content-wrapper")
+    });
+    containers.extend(find_elements(html, Some("article"), &|open| {
+        has_class(open, "mainArticle")
+    }));
+    containers.sort_by_key(|c| c.start);
+    let mut paras: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for c in &containers {
+        let frag = &html[c.inner_start..c.inner_end];
+        // Drop junk widget subtrees (Python checks each node's
+        // ancestors for the junk class tokens; removing the
+        // subtree at the junk wrapper is the same cut). Leaf
+        // blocks are exempt: Python never checks the node itself.
+        let (cleaned, _) = remove_elements(frag, &|name, open| {
+            if name == "p" || name == "li" {
+                return false;
+            }
+            let cls = attr_value(open, "class").unwrap_or_default().to_lowercase();
+            !cls.is_empty() && SOCAST_JUNK_CLASS_TOKENS.iter().any(|t| cls.contains(t))
+        });
+        let mut found: Vec<(usize, String)> = Vec::new();
+        for tag in ["p", "li"] {
+            for sp in find_elements(&cleaned, Some(tag), &|_| true) {
+                let frag_inner = &cleaned[sp.inner_start..sp.inner_end];
+                let low = frag_inner.to_lowercase();
+                if low.contains("<p") || low.contains("<li") {
+                    continue; // container block; Python skips it too
+                }
+                let text = leaf_text(frag_inner);
+                if !text.is_empty() {
+                    found.push((sp.start, text));
+                }
+            }
+        }
+        found.sort_by_key(|(s, _)| *s);
+        for (_, text) in found {
+            if seen.insert(text.to_lowercase()) {
+                paras.push(text);
+            }
+        }
+    }
+    crate::postprocess::normalize_whitespace(&paras.join("\n\n"))
+}
+
 /// True when an extracted title signals an error page (404 and
 /// friends), whatever the body looks like.
 fn error_page_title(title: &str) -> bool {
@@ -433,7 +971,27 @@ pub fn fetch_html_with_cookies(url: &str, cookie_header: &str) -> Result<String,
 /// items become lines; entities decoded (named common set +
 /// numeric); whitespace normalized (never more than one blank
 /// line).
+/// Python `core/utils.py::_image_alt_marker`: `[Image: alt]`, or
+/// `[Image]` when there is no alt text. Alt whitespace collapses
+/// so a multi-line alt reads as one line.
+pub fn image_alt_marker(alt: &str) -> String {
+    let alt = alt.split_whitespace().collect::<Vec<_>>().join(" ");
+    if alt.is_empty() {
+        "[Image]".to_string()
+    } else {
+        format!("[Image: {alt}]")
+    }
+}
+
 pub fn html_to_text(html: &str) -> String {
+    html_to_text_opts(html, false)
+}
+
+/// html_to_text with the image-alt option (Python
+/// `utils.html_to_text(include_images=...)`): when `keep_alt` is
+/// set, each <img> becomes its `[Image: alt]` marker in document
+/// order (alt, falling back to title) instead of dropping.
+pub fn html_to_text_opts(html: &str, keep_alt: bool) -> String {
     let mut out = String::with_capacity(html.len());
     let lower = html.to_lowercase();
     let bytes = html.as_bytes();
@@ -473,6 +1031,14 @@ pub fn html_to_text(html: &str) -> String {
                 "script" => skipping = Some("</script"),
                 "style" => skipping = Some("</style"),
                 "svg" => skipping = Some("</svg"),
+                "img" if keep_alt => {
+                    let tag_full = &html[i..=i + end];
+                    let alt = attr_value(tag_full, "alt")
+                        .filter(|a| !a.trim().is_empty())
+                        .or_else(|| attr_value(tag_full, "title"))
+                        .unwrap_or_default();
+                    out.push_str(&image_alt_marker(&unescape_entities(&alt)));
+                }
                 "br" | "hr" => out.push('\n'),
                 "p" | "div" | "section" | "article" | "header" | "footer" | "main" | "aside"
                 | "nav" | "blockquote" | "pre" | "table" | "tr" | "ul" | "ol" | "figure"
@@ -824,6 +1390,18 @@ pub fn normalize_gsmarena_battery_table_html(html: &str, url: &str) -> String {
 }
 
 pub fn extract_article(html_in: &str, url: &str, feed_text: Option<&str>) -> ExtractOutcome {
+    extract_article_opts(html_in, url, feed_text, false)
+}
+
+/// extract_article with the image-alt option: when `keep_alt` is
+/// set, the feed-content conversion keeps `[Image: alt]` markers
+/// (the resolved show_image_alt / per-feed setting).
+pub fn extract_article_opts(
+    html_in: &str,
+    url: &str,
+    feed_text: Option<&str>,
+    keep_alt: bool,
+) -> ExtractOutcome {
     // GSMArena's battery table arrives in the wrong order
     // (its sorter is a script we do not run); normalize first.
     let gsm_normalized;
@@ -838,25 +1416,38 @@ pub fn extract_article(html_in: &str, url: &str, feed_text: Option<&str>) -> Ext
     if let Some(text) = bloomberg_video_text(html_in, url) {
         return ExtractOutcome::Article {
             title: String::new(),
-            text,
+            text: crate::postprocess::postprocess_extracted_text(
+                &text,
+                url,
+                &crate::postprocess::published_date_label(html_in),
+            ),
             source: "bloomberg",
         };
     }
-    match extract_article_impl(html_in, url, feed_text) {
+    match extract_article_impl(html_in, url, feed_text, keep_alt) {
         ExtractOutcome::Article {
             title,
             text,
             source,
         } => ExtractOutcome::Article {
             title,
-            text: apply_site_cleaners(&text, url),
+            text: crate::postprocess::postprocess_extracted_text(
+                &text,
+                url,
+                &crate::postprocess::published_date_label(html_in),
+            ),
             source,
         },
         other => other,
     }
 }
 
-fn extract_article_impl(html_in: &str, url: &str, feed_text: Option<&str>) -> ExtractOutcome {
+fn extract_article_impl(
+    html_in: &str,
+    url: &str,
+    feed_text: Option<&str>,
+    keep_alt: bool,
+) -> ExtractOutcome {
     // Pre-clean zero-width characters from the page itself: engines
     // can mangle them into mojibake before the output strip can run.
     let cleaned;
@@ -877,7 +1468,7 @@ fn extract_article_impl(html_in: &str, url: &str, feed_text: Option<&str>) -> Ex
     // Feed bodies are stored HTML: convert once, so the length
     // comparisons and the feed fallbacks all work on the same clean
     // text the reader will show (never raw markup).
-    let feed_owned = feed_text.map(html_to_text);
+    let feed_owned = feed_text.map(|t| html_to_text_opts(t, keep_alt));
     let feed_text = feed_owned.as_deref();
 
     // Base engine: rust-trafilatura, precision-first — Python's
@@ -961,10 +1552,35 @@ fn extract_article_impl(html_in: &str, url: &str, feed_text: Option<&str>) -> Ex
     // canonical bodies the generic engines miss; JSON-LD articleBody
     // recovers bodies when the DOM scrape is thin.
     let host = host_of(url);
-    let site_text = if host.contains("theregister.com") || host.contains("theregister.co.uk") {
-        register_text(html)
+    let site_text = if host_matches(url, "arstechnica.com") || host_matches(url, "zdnet.com") {
+        publisher_body_text(html, url)
     } else if host.contains("axios.com") {
         axios_text(html)
+    } else if host.contains("theregister.com") || host.contains("theregister.co.uk") {
+        register_text(html)
+    } else if host_matches(url, "reuters.com") {
+        reuters_text(html)
+    } else if host_matches(url, "toptechtidbits.com") {
+        toptechtidbits_text(html)
+    } else if host_matches(url, "gsmarena.com") {
+        gsmarena_text(html)
+    } else if host_matches(url, "thepostmillennial.com") {
+        extract_without_dom_boilerplate(html, &["section.contributions-container"])
+    } else if host_matches(url, "rebelnews.com") {
+        extract_without_dom_boilerplate(html, &["section.posts-profile"])
+    } else if host_matches(url, "simonwillison.net") {
+        extract_without_dom_boilerplate(
+            html,
+            &[
+                "div.recent-articles",
+                "#sponsored-banner",
+                "#secondary",
+                "#ft",
+                "#smallhead",
+            ],
+        )
+    } else if is_socast_page(html) {
+        socast_text(html)
     } else {
         String::new()
     };
@@ -1194,7 +1810,11 @@ pub fn fetch_via_jina_text(url: &str) -> Option<String> {
     if text.trim().is_empty() || looks_gated(&text) {
         return None;
     }
-    Some(markdown_to_text(&text))
+    // Python's proxy path order: markdown to text, then the
+    // trailing cookie-block cut, then the edge nav-run trim.
+    let text = markdown_to_text(&text);
+    let text = crate::postprocess::strip_proxy_trailing_boilerplate(&text);
+    Some(crate::postprocess::strip_edge_nav_runs(&text))
 }
 
 /// Convert proxy Markdown to plain text: links keep their
@@ -1393,6 +2013,18 @@ pub fn fetch_full_text(
     feed_text: Option<&str>,
     encoding_override: &str,
 ) -> (ExtractOutcome, Option<String>) {
+    fetch_full_text_opts(url, cookie_header, feed_text, encoding_override, false)
+}
+
+/// fetch_full_text with the image-alt option threaded into the
+/// cascade's feed-content conversion.
+pub fn fetch_full_text_opts(
+    url: &str,
+    cookie_header: &str,
+    feed_text: Option<&str>,
+    encoding_override: &str,
+    keep_alt: bool,
+) -> (ExtractOutcome, Option<String>) {
     // Thread reconstructions (Lemmy/GitHub/Reddit/Discourse
     // APIs) beat HTML scraping for thread URLs.
     if let Some((title, text)) = crate::threads::thread_text(url) {
@@ -1412,7 +2044,7 @@ pub fn fetch_full_text(
     let mut gate_seen = false;
     if let Ok(html) = &direct {
         first_html = Some(html.clone());
-        let outcome = extract_article(html, url, feed_text);
+        let outcome = extract_article_opts(html, url, feed_text, keep_alt);
         gate_seen = matches!(outcome, ExtractOutcome::Gate { .. });
         if matches!(outcome, ExtractOutcome::Article { .. }) {
             return (outcome, first_html);
@@ -1429,7 +2061,7 @@ pub fn fetch_full_text(
     };
     // Sky via Google Translate (host-gated inside the fn).
     if let Some(html) = fetch_via_sky_translate(url) {
-        let outcome = extract_article(&html, url, feed_text);
+        let outcome = extract_article_opts(&html, url, feed_text, keep_alt);
         if matches!(outcome, ExtractOutcome::Article { .. }) {
             return (relabel(outcome, "sky"), first_html);
         }
@@ -1461,7 +2093,7 @@ pub fn fetch_full_text(
     }
     // Wayback (last resort).
     if let Some(html) = fetch_via_wayback(url, cookie_header) {
-        let outcome = extract_article(&html, url, feed_text);
+        let outcome = extract_article_opts(&html, url, feed_text, keep_alt);
         if matches!(outcome, ExtractOutcome::Article { .. }) {
             return (relabel(outcome, "wayback"), first_html);
         }
@@ -1480,8 +2112,9 @@ pub fn fetch_full_text(
 }
 
 // ---------------------------------------------------------------------------
-// Site-specific text cleaners (Python's boilerplate strips),
-// applied to every cascade Article result.
+// Site-specific text cleaners: Python's whole postprocess stage
+// lives in crate::postprocess (ported 2026-10-31, Audit 4); this
+// stays as the cascade's entry point.
 // ---------------------------------------------------------------------------
 
 fn host_matches(url: &str, domain: &str) -> bool {
@@ -1489,68 +2122,10 @@ fn host_matches(url: &str, domain: &str) -> bool {
     host == domain || host.ends_with(&format!(".{domain}"))
 }
 
-/// BBC: drop the fused "ShareSave" chrome and complete (or
-/// drop) the dangling "- Published" byline lead.
-pub fn strip_bbc_boilerplate(text: &str) -> String {
-    let mut t = text.replace("ShareSave", "");
-    let trimmed = t.trim_start().to_string();
-    if let Some(rest) = trimmed.strip_prefix("- Published\n") {
-        t = rest.to_string();
-    }
-    t
-}
-
-/// WSJ / Dow Jones: strip the trailing copyright line + the
-/// opaque tracking hash after "All Rights Reserved.".
-pub fn strip_wsj_boilerplate(text: &str) -> String {
-    let lower = text.to_lowercase();
-    if let Some(pos) = lower.rfind("copyright") {
-        let tail = &text[pos..];
-        if tail.to_lowercase().contains("dow jones")
-            && tail.to_lowercase().contains("all rights reserved.")
-        {
-            return text[..pos].trim_end().to_string();
-        }
-    }
-    text.to_string()
-}
-
-/// TechRadar (Future sites): cut the trailing comment-gate
-/// block (gate line + author bio + optional promo line above).
-pub fn strip_techradar_boilerplate(text: &str) -> String {
-    let paras: Vec<&str> = text.split("\n\n").collect();
-    let gate = paras.iter().position(|p| {
-        p.to_lowercase()
-            .starts_with("you must confirm your public display name before commenting")
-    });
-    let Some(mut cut) = gate else {
-        return text.to_string();
-    };
-    if cut >= 1 {
-        cut -= 1; // author bio above the gate
-    }
-    if cut >= 1 {
-        let above = paras[cut - 1].to_lowercase();
-        if above.starts_with("follow techradar") || above.starts_with("sign up for breaking news") {
-            cut -= 1;
-        }
-    }
-    paras[..cut].join("\n\n").trim().to_string()
-}
-
-/// Apply the site cleaners for a URL to extracted text.
+/// Apply Python's postprocess stage for a URL to extracted text
+/// (no published-date label available on this path).
 pub fn apply_site_cleaners(text: &str, url: &str) -> String {
-    let mut t = text.to_string();
-    if host_matches(url, "bbc.com") || host_matches(url, "bbc.co.uk") {
-        t = strip_bbc_boilerplate(&t);
-    }
-    if host_matches(url, "wsj.com") {
-        t = strip_wsj_boilerplate(&t);
-    }
-    if host_matches(url, "techradar.com") {
-        t = strip_techradar_boilerplate(&t);
-    }
-    t
+    crate::postprocess::postprocess_extracted_text(text, url, "")
 }
 
 /// Bloomberg video pages: the article text lives in the

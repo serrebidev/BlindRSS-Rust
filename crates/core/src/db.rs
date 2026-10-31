@@ -111,7 +111,7 @@ CREATE TABLE IF NOT EXISTS youtube_recommendations (
 
 /// Columns Python added to existing tables by migration; older
 /// databases get them on open.
-const MIGRATION_COLUMNS: [(&str, &str, &str); 10] = [
+const MIGRATION_COLUMNS: [(&str, &str, &str); 11] = [
     ("feeds", "last_error", "TEXT"),
     ("feeds", "last_error_at", "REAL"),
     ("feeds", "last_success_at", "REAL"),
@@ -122,6 +122,7 @@ const MIGRATION_COLUMNS: [(&str, &str, &str); 10] = [
     ("deleted_articles", "purged", "INTEGER DEFAULT 0"),
     ("articles", "tags", "TEXT"),
     ("feeds", "feed_settings", "TEXT"),
+    ("feeds", "show_images", "INTEGER"),
 ];
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1236,6 +1237,71 @@ impl Db {
         self.conn.execute(
             "UPDATE feeds SET feed_settings = ?2 WHERE id = ?1",
             params![feed_id, current.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Feeds whose category is `path` or a subcategory of it
+    /// (Python's delete-category-with-feeds feed collection).
+    pub fn feeds_in_category_tree(&self, path: &str) -> rusqlite::Result<Vec<Feed>> {
+        let prefix = format!("{path}/");
+        Ok(self
+            .feeds()?
+            .into_iter()
+            .filter(|f| {
+                f.category
+                    .as_deref()
+                    .map(|c| c == path || c.starts_with(&prefix))
+                    .unwrap_or(false)
+            })
+            .collect())
+    }
+
+    /// Delete a category and all its subcategories (rows only —
+    /// the caller removes or reparents the feeds first). Returns
+    /// false when the category does not exist.
+    pub fn delete_category_tree(&self, path: &str) -> rusqlite::Result<bool> {
+        let prefix = format!("{path}/");
+        let ids: Vec<String> = self
+            .categories()?
+            .into_iter()
+            .filter(|c| c.title == path || c.title.starts_with(&prefix))
+            .map(|c| c.id)
+            .collect();
+        if ids.is_empty() {
+            return Ok(false);
+        }
+        for id in &ids {
+            self.conn
+                .execute("DELETE FROM categories WHERE id = ?1", params![id])?;
+        }
+        Ok(true)
+    }
+
+    /// A feed's per-feed image-alt override (feeds.show_images,
+    /// Python `get_feed_show_images`): None = inherit the global
+    /// `show_image_alt` setting, Some(true/false) = override.
+    pub fn feed_show_images(&self, feed_id: &str) -> rusqlite::Result<Option<bool>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT show_images FROM feeds WHERE id = ?1")?;
+        let mut rows = stmt.query(params![feed_id])?;
+        match rows.next()? {
+            Some(row) => {
+                let raw: Option<i64> = row.get(0)?;
+                Ok(raw.map(|v| v != 0))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Set a feed's per-feed image-alt override (Python
+    /// `set_feed_show_images`); None clears it back to inherit.
+    pub fn set_feed_show_images(&self, feed_id: &str, value: Option<bool>) -> rusqlite::Result<()> {
+        let stored: Option<i64> = value.map(|b| if b { 1 } else { 0 });
+        self.conn.execute(
+            "UPDATE feeds SET show_images = ?2 WHERE id = ?1",
+            params![feed_id, stored],
         )?;
         Ok(())
     }
