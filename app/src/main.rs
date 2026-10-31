@@ -245,6 +245,8 @@ struct State {
     /// Surface the user is working in: false = feed tree,
     /// true = article list. Modal dialogs restore focus to it.
     focus_list: bool,
+    /// Config opt-in: persist/reopen the last selected feed.
+    remember_last_feed: bool,
 }
 
 enum RefreshMsg {
@@ -617,6 +619,7 @@ fn main() {
             selected_article: None,
             refreshing: false,
             focus_list: false,
+            remember_last_feed: false,
         }));
 
         // Open the existing database and populate.
@@ -631,6 +634,20 @@ fn main() {
                 }
                 Err(e) => {
                     frame.set_status_text(&format!("Could not open database: {e}"), 0);
+                }
+            }
+        }
+        // Startup state restore (Python parity): reopen on the
+        // feed that was selected when the app last closed, when
+        // the user opted in with remember_last_feed.
+        {
+            let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+            let mut st = state.borrow_mut();
+            st.remember_last_feed = cfg.get_bool("remember_last_feed", false);
+            if st.remember_last_feed {
+                let last = cfg.get_str("last_selected_feed", "");
+                if !last.is_empty() {
+                    st.selected_feed = Some(last.to_string());
                 }
             }
         }
@@ -651,6 +668,15 @@ fn main() {
             let mut st = state_tree.borrow_mut();
             st.selected_feed = filter;
             st.focus_list = false;
+            if st.remember_last_feed {
+                let value = st.selected_feed.clone().unwrap_or_default();
+                let path = config_path();
+                let mut cfg = blindrss_core::config::Config::load(&path).unwrap_or_default();
+                if cfg.get_str("last_selected_feed", "") != value {
+                    cfg.set_path("last_selected_feed", serde_json::json!(value));
+                    let _ = cfg.save(&path);
+                }
+            }
             refill_articles(&mut st, &list);
         });
 
@@ -2306,6 +2332,15 @@ fn main() {
         });
         timer.start(150, false);
 
+        // Python parity: start_maximized opens the window
+        // maximized (Python skips this only when starting hidden
+        // in the tray; the Rust tray has no restore path yet).
+        {
+            let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+            if cfg.get_bool("start_maximized", false) {
+                frame.maximize(true);
+            }
+        }
         frame.centre();
         frame.show(true);
         // Python `_focus_default_control`, ported faithfully: Python

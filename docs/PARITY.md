@@ -351,8 +351,13 @@ surface audits missed, in port order:
    dialog site restores focus to the tree or article list right
    after it closes, via restore_focus/prompt_focus),
    reader-surface focus, large-reader mode — **partly missing**.
-2. Startup state restore: remember_last_feed/last_selected_feed,
-   tree expansion default, start maximized — **missing**.
+2. Startup state restore: remember_last_feed/last_selected_feed
+   and start maximized (DONE v0.1.9 — Settings > Startup
+   checkboxes write the Python config keys; selection changes
+   persist last_selected_feed, startup reopens on it, and
+   start_maximized maximizes before show). Tree expansion
+   default waits on category grouping (the Rust tree is flat
+   today); start_in_system_tray waits on a tray restore path.
 3. AccessibleBrowserFrame + accessible view entries (flattened
    speech-first view model with special views and category
    hierarchy) — **missing entirely**.

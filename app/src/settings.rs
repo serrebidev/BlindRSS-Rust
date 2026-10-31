@@ -128,6 +128,20 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
         false,
     );
 
+    // Startup state (Python parity keys).
+    let startup_label = StaticText::builder(&dialog).with_label("Startup").build();
+    sizer.add(&startup_label, 0, SizerFlag::All, 4);
+    let remember_cb = CheckBox::builder(&dialog)
+        .with_label("Remember last feed")
+        .build();
+    remember_cb.set_value(cfg.get_bool("remember_last_feed", false));
+    sizer.add(&remember_cb, 0, SizerFlag::All, 4);
+    let maximized_cb = CheckBox::builder(&dialog)
+        .with_label("Start maximized")
+        .build();
+    maximized_cb.set_value(cfg.get_bool("start_maximized", false));
+    sizer.add(&maximized_cb, 0, SizerFlag::All, 4);
+
     // Maintenance actions (moved off the main window, Brandon
     // 2026-10-30): each saves the fields, closes the dialog, and
     // reports its name back so the caller runs it on the main frame.
@@ -179,7 +193,7 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
     btn_row.add(&cancel_btn, 0, SizerFlag::All, 4);
     sizer.add_sizer(&btn_row, 0, SizerFlag::All, 4);
     dialog.set_sizer(sizer, true);
-    dialog.set_size(Size::new(560, 620));
+    dialog.set_size(Size::new(560, 700));
 
     let cfg_path_buf = config_path.to_path_buf();
     let cfg_path_connect = config_path.to_path_buf();
@@ -223,6 +237,14 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
                 serde_json::json!(ino_key.get_value()),
             );
             cfg.set_path("download_path", serde_json::json!(dl_path.get_value()));
+            cfg.set_path(
+                "remember_last_feed",
+                serde_json::json!(remember_cb.is_checked()),
+            );
+            cfg.set_path(
+                "start_maximized",
+                serde_json::json!(maximized_cb.is_checked()),
+            );
             let _ = cfg.save(&path_s);
         })
     };
