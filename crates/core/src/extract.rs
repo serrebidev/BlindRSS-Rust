@@ -325,6 +325,49 @@ fn host_of(url: &str) -> String {
         .to_lowercase()
 }
 
+/// True when an extracted title signals an error page (404 and
+/// friends), whatever the body looks like.
+fn error_page_title(title: &str) -> bool {
+    let t = title.to_lowercase();
+    t.contains("404") || t.contains("not found") || t.contains("page not available")
+}
+
+/// True when the HEAD of an extracted body announces an error page
+/// ("Error 404", "can't find the page", ...). Titles alone miss
+/// these: readability may title the result after some on-page
+/// heading while the body opens with the error itself.
+fn error_page_text(text: &str) -> bool {
+    let head: String = text.chars().take(800).collect::<String>().to_lowercase();
+    [
+        "error 404",
+        "page not found",
+        "can't find the page",
+        "could not find the page",
+        "couldn't find the page",
+        "page you're looking for",
+        "page you are looking for",
+    ]
+    .iter()
+    .any(|m| head.contains(m))
+}
+
+/// Article prose shape: most of the text lives in long paragraph
+/// lines. Chrome/navigation dumps are many short fragments, so
+/// they fail this even when long overall.
+fn looks_like_prose(text: &str) -> bool {
+    let total = char_count(text);
+    if total == 0 {
+        return false;
+    }
+    let long_chars: usize = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| char_count(l) >= 120)
+        .map(char_count)
+        .sum();
+    long_chars * 2 >= total
+}
+
 /// Python `_looks_like_paywall_stub`: short body + subscribe CTA.
 fn looks_like_paywall_stub(text: &str) -> bool {
     if text.chars().count() > PAYWALL_STUB_MAX_CHARS {
@@ -453,12 +496,24 @@ pub fn extract_article(html_in: &str, url: &str, feed_text: Option<&str>) -> Ext
         .unwrap_or_default();
     let second_chars = char_count(&second.1);
 
-    // Engine-disagreement rule (BBC 404 evidence).
+    // Engine-disagreement rule: a thin base plus a much longer
+    // readability result is ambiguous — on an error page it means
+    // readability inflated the chrome (BBC 404 evidence), but on a
+    // real article it means the base engine missed and readability
+    // is right (current BBC news pages: rust-trafilatura is thin
+    // there, and the blanket rejection discarded good full text —
+    // Brandon's "full text is missing", 2026-10-30). Vet the long
+    // result: error-page titles or chrome-shaped (non-prose) text
+    // stay gated; prose falls through to the normal pick.
     if base_chars < THIN_CHARS && second_chars > base_chars * 3 && second_chars > 900 {
-        return ExtractOutcome::Gate {
-            reason: "engines disagree: thin base vs inflated readability (error/chrome page)"
-                .to_string(),
-        };
+        let errorish =
+            error_page_title(&second.0) || error_page_title(&base.0) || error_page_text(&second.1);
+        if errorish || !looks_like_prose(&second.1) {
+            return ExtractOutcome::Gate {
+                reason: "engines disagree: thin base vs inflated readability (error/chrome page)"
+                    .to_string(),
+            };
+        }
     }
     if base_chars < THIN_CHARS && second_chars < THIN_CHARS {
         // Both thin: prefer substantial feed content before giving up.

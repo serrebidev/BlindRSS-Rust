@@ -108,6 +108,42 @@ fn metered_preview_gets_notice() {
 }
 
 #[test]
+fn bbc_article_fixture_extracts() {
+    let html = include_str!("fixtures/bbc_article.html");
+    let (text, _) = article_text(extract_article(
+        html,
+        "https://www.bbc.com/news/articles/x",
+        None,
+    ));
+    assert!(text.len() > 2_000, "got {} chars", text.len());
+}
+
+#[test]
+fn bbc_current_article_fixture_extracts() {
+    // Today's live BBC article (new markup, fetched 2026-10-30).
+    let html = include_str!("fixtures/bbc_article_current.html");
+    let (text, _) = article_text(extract_article(
+        html,
+        "https://www.bbc.co.uk/news/articles/c3vgxznlx7jzo",
+        None,
+    ));
+    assert!(text.contains("Patriot"), "unexpected body: {:.100}", text);
+    assert!(text.len() > 1_500, "got {} chars", text.len());
+}
+
+#[test]
+fn bbc_404_fixture_is_gated_not_an_article() {
+    // The error page must never be presented as an article: its
+    // readability result is a headline river behind an "Error 404"
+    // body. Regression guard for the engine-disagreement vetting.
+    let html = include_str!("fixtures/bbc_404_page.html");
+    match extract_article(html, "https://www.bbc.com/news/articles/gone", None) {
+        ExtractOutcome::Gate { .. } | ExtractOutcome::Empty => {}
+        other => panic!("expected rejection, got {other:?}"),
+    }
+}
+
+#[test]
 fn zero_width_characters_are_stripped() {
     let zw = "Hel\u{200B}lo wor\u{200D}ld, this is the article body text for the reader.";
     let paras = format!("<p>{zw}</p><p>{LONG_PARA}</p><p>{LONG_PARA}</p>");
