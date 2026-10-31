@@ -828,6 +828,43 @@ timer so arrowing past a category no longer fills it — only
 the landed-on node fills. Tests: batch29_slice (proxy
 routes + live /stream pass-through).
 
+Batch 29 resolution (v0.1.29, Brandon: "When I press enter
+it should play automatically. The media player isn't good
+enough — look up Rust NVDA accessibility best practices"):
+(1) Enter did nothing in the article list — the Rust list
+had NO activation binding at all. Python's
+on_article_activate (EVT_LIST_ITEM_ACTIVATED) marks the
+article read, then plays it in the player when
+_should_play_in_player (downloaded file, yt-dlp-supported
+URL, playable enclosure, media detected in stored content)
+and opens it in the browser otherwise. The Rust port now
+mirrors that: a CHAR_HOOK Enter case for the list (vetoed
+so wx does not double-fire) plus on_item_activated for
+double-click, both running one act_activate with the same
+decision and mark-read. (2) Player accessibility pass,
+researched per Brandon's protocol: AccessKit
+(AccessKit/accesskit, the Rust accessibility standard,
+actively maintained) was evaluated and does not apply — it
+owns a custom toolkit's whole accessibility tree and cannot
+retrofit a wxWidgets window; the applicable best practice
+for wx is native controls + wxAccessible, which is what was
+applied. Against the WAI-ARIA media-player pattern (every
+control exposes name, role, value and STATE; state changes
+are announced; everything is keyboard-operable): the seek
+slider now carries a Windows wxAccessible (SeekAccessible)
+whose value is time text ("12:34 of 45:00") instead of the
+raw 0-1000 number; the Play/Pause button's label now tracks
+the real state (its label is its accessible name, so NVDA
+hears Play or Pause, never a static "Play/Pause"); the
+position readout is a focusable read-only text control;
+play/pause, volume changes, queue errors and load failures
+announce through the existing NVDA/JAWS speech channel;
+and the player window gained keyboard control — Space
+toggles play/pause, Left/Right seek, Up/Down change volume
+(each announced), Enter activates the selected chapter,
+Escape closes — always deferring to the native key handling
+of the control that has focus (buttons, slider, list).
+
 Open residual (playback engine): Python's player is libVLC
 end to end (7,276-line gui/player.py: VLC caching knobs,
 preferred soundcard, resume_* family, HTTP header control).

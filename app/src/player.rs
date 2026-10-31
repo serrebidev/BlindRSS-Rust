@@ -45,6 +45,41 @@ struct PlayerState {
     /// Play-queue context when this player was opened from the
     /// queue: media-finished advances through the entries.
     queue: Option<QueueCtx>,
+    /// Last play state the Play/Pause button label was synced
+    /// to (the tick reconciles them).
+    last_playing: Option<bool>,
+}
+
+/// Custom accessibility for the seek slider: name "Seek" and
+/// a VALUE TEXT in time units. NVDA reads a stock wx slider's
+/// value as a raw 0-1000 number; the accessible value is what
+/// makes the slider usable ("12:34 of 45:00"). Everything not
+/// overridden falls back to wx's built-in behaviour
+/// (wxdragon's AccessibleImpl defaults do exactly that).
+/// Windows only — wxdragon's accessible module is MSAA-bound;
+/// elsewhere the slider's window name (set at creation) is
+/// what the platform accessibility layer exposes.
+#[cfg(windows)]
+struct SeekAccessible {
+    media: MediaCtrl,
+}
+
+#[cfg(windows)]
+impl wxdragon::accessible::AccessibleImpl for SeekAccessible {
+    fn get_name(&self, _child_id: i32) -> (wxdragon::accessible::AccStatus, Option<String>) {
+        (wxdragon::accessible::AccStatus::Ok, Some(crate::tr("Seek")))
+    }
+
+    fn get_value(&self, _child_id: i32) -> (wxdragon::accessible::AccStatus, Option<String>) {
+        let len = self.media.length();
+        if len <= 0 {
+            return (wxdragon::accessible::AccStatus::NotImplemented, None);
+        }
+        (
+            wxdragon::accessible::AccStatus::Ok,
+            Some(format!("{} of {}", fmt_ms(self.media.tell()), fmt_ms(len))),
+        )
+    }
 }
 
 /// The play queue inside a player window (config "play_queue"
@@ -312,7 +347,7 @@ fn open_player_impl(
         .build();
     let media = MediaCtrl::builder(&frame).build();
     let play_btn = Button::builder(&frame)
-        .with_label(&crate::tr("Play/Pause"))
+        .with_label(&crate::tr("Play"))
         .build();
     let stop_btn = Button::builder(&frame)
         .with_label(&crate::tr("Stop"))
@@ -341,11 +376,20 @@ fn open_player_impl(
     let next_ch_btn = Button::builder(&frame)
         .with_label(&crate::tr("Next Chapter"))
         .build();
-    let pos_label = StaticText::builder(&frame)
-        .with_label(&crate::tr("0:00:00 / 0:00:00"))
+    // Position readout as a read-only text control, not a
+    // static text: it is focusable, so NVDA can land on it and
+    // read the position on demand.
+    let pos_label = TextCtrl::builder(&frame)
+        .with_style(TextCtrlStyle::ReadOnly)
         .build();
+    pos_label.set_value(&crate::tr("0:00:00 / 0:00:00"));
     let seek_slider = Slider::builder(&frame).build();
     seek_slider.set_range(0, 1000);
+    #[cfg(windows)]
+    seek_slider.set_accessible(wxdragon::accessible::Accessible::new(
+        &seek_slider,
+        SeekAccessible { media },
+    ));
     let chapter_list = ListBox::builder(&frame).build();
     // Accessible names: NVDA reads a bare slider as just
     // "slider" and a bare list box as just "list" — the names
@@ -406,6 +450,7 @@ fn open_player_impl(
         skipped: HashSet::new(),
         last_chapter: None,
         slider_guard: false,
+        last_playing: None,
         queue: queue.map(|(entries, index)| {
             let (tx, rx) = std::sync::mpsc::channel();
             QueueCtx {
@@ -434,6 +479,7 @@ fn open_player_impl(
     if via != "failed" {
         media.set_volume(start_volume);
         media.play();
+        play_btn.set_label(&crate::tr("Pause"));
         if (start_speed - 1.0).abs() > 0.001 {
             media.set_playback_rate(start_speed);
         }
@@ -447,6 +493,7 @@ fn open_player_impl(
         );
     } else {
         frame.set_status_text("Could not load media", 0);
+        crate::announce("general", "Could not load media");
     }
 
     // Queue advance: media finished -> resolve the next queue
@@ -485,8 +532,10 @@ fn open_player_impl(
     play_btn.on_click(move |_| {
         if m.get_state() == MediaState::Playing {
             m.pause();
+            crate::announce("general", "Paused");
         } else {
             m.play();
+            crate::announce("general", "Playing");
         }
     });
     let m = media;
@@ -508,12 +557,20 @@ fn open_player_impl(
         let v = (m.get_volume() - volume_step).max(0.0);
         m.set_volume(v);
         persist_volume(v);
+        crate::announce(
+            "general",
+            &format!("Volume {}%", (v * 100.0).round() as i64),
+        );
     });
     let m = media;
     vup_btn.on_click(move |_| {
         let v = (m.get_volume() + volume_step).min(1.0);
         m.set_volume(v);
         persist_volume(v);
+        crate::announce(
+            "general",
+            &format!("Volume {}%", (v * 100.0).round() as i64),
+        );
     });
     // Speed stepping through the standard ladder, announced.
     for (btn, dir) in [(slower_btn, -1i32), (faster_btn, 1i32)] {
@@ -581,21 +638,126 @@ fn open_player_impl(
             crate::announce("media_navigation", &label);
         });
     }
-    let m = media;
-    let chapters_live_dl = chapters_live.clone();
-    chapter_list.on_item_double_clicked(move |_| {
-        let (chapters_dl, starts_dl) = chapters_live_dl.borrow().clone();
-        if let Some(sel) = chapter_list.get_selection()
-            && let Some(ms) = starts_dl.get(sel as usize)
-        {
-            m.seek(*ms, SeekMode::FromStart);
-            m.play();
-            crate::announce(
-                "media_navigation",
-                &chapter_label(&chapters_dl, sel as usize),
-            );
-        }
-    });
+    // Seek to the chapter selected in the list — shared by
+    // double-click and by Enter in the list (a screen reader
+    // user cannot double-click; the list must be fully
+    // keyboard-operable).
+    let chapter_seek: Rc<dyn Fn()> = {
+        let m = media;
+        let chapters_live_dl = chapters_live.clone();
+        Rc::new(move || {
+            let (chapters_dl, starts_dl) = chapters_live_dl.borrow().clone();
+            if let Some(sel) = chapter_list.get_selection()
+                && let Some(ms) = starts_dl.get(sel as usize)
+            {
+                m.seek(*ms, SeekMode::FromStart);
+                m.play();
+                crate::announce(
+                    "media_navigation",
+                    &chapter_label(&chapters_dl, sel as usize),
+                );
+            }
+        })
+    };
+    {
+        let cs = chapter_seek.clone();
+        chapter_list.on_item_double_clicked(move |_| cs());
+    }
+
+    // Player keyboard control (the window had none: every
+    // action needed Tab + Space on a button). Keys are left
+    // native where a control already owns them — Space/Enter
+    // on buttons, arrows on the seek slider and chapter list.
+    {
+        let frame_k = frame;
+        let m = media;
+        let btn_handles: Vec<usize> = [
+            play_btn,
+            stop_btn,
+            back_btn,
+            fwd_btn,
+            vdown_btn,
+            vup_btn,
+            slower_btn,
+            faster_btn,
+            prev_ch_btn,
+            next_ch_btn,
+        ]
+        .iter()
+        .map(|b| b.get_handle() as usize)
+        .collect();
+        let slider_h = seek_slider.get_handle() as usize;
+        let list_h = chapter_list.get_handle() as usize;
+        frame.bind_internal(EventType::CHAR_HOOK, move |ev| {
+            if ev.control_down() || ev.cmd_down() || ev.alt_down() {
+                ev.skip(true);
+                return;
+            }
+            let code = ev.get_key_code().unwrap_or(0);
+            let focused = ev
+                .get_event_object()
+                .map(|w| w.get_handle() as usize)
+                .unwrap_or(0);
+            let on_button = btn_handles.contains(&focused);
+            let on_slider = focused == slider_h;
+            let on_list = focused == list_h;
+            match code {
+                // Escape closes the player.
+                27 => {
+                    frame_k.close(false);
+                    ev.skip(false);
+                }
+                // Enter in the chapter list seeks to the chapter.
+                13 if on_list => {
+                    chapter_seek();
+                    ev.skip(false);
+                }
+                // Space toggles play/pause anywhere a button
+                // does not already own it.
+                32 if !on_button => {
+                    if m.get_state() == MediaState::Playing {
+                        m.pause();
+                        crate::announce("general", "Paused");
+                    } else {
+                        m.play();
+                        crate::announce("general", "Playing");
+                    }
+                    ev.skip(false);
+                }
+                // Left/Right seek, Up/Down volume — outside the
+                // controls that use arrows themselves.
+                314 if !on_slider && !on_list => {
+                    m.seek(-seek_back_ms, SeekMode::FromCurrent);
+                    ev.skip(false);
+                }
+                316 if !on_slider && !on_list => {
+                    m.seek(seek_fwd_ms, SeekMode::FromCurrent);
+                    ev.skip(false);
+                }
+                315 if !on_slider && !on_list => {
+                    let v = (m.get_volume() + volume_step).min(1.0);
+                    m.set_volume(v);
+                    persist_volume(v);
+                    crate::announce(
+                        "general",
+                        &format!("Volume {}%", (v * 100.0).round() as i64),
+                    );
+                    ev.skip(false);
+                }
+                317 if !on_slider && !on_list => {
+                    let v = (m.get_volume() - volume_step).max(0.0);
+                    m.set_volume(v);
+                    persist_volume(v);
+                    crate::announce(
+                        "general",
+                        &format!("Volume {}%", (v * 100.0).round() as i64),
+                    );
+                    ev.skip(false);
+                }
+                _ => ev.skip(true),
+            }
+        });
+    }
 
     // Seek slider: user changes seek proportionally; the tick's
     // own updates are guarded out of this handler.
@@ -729,8 +891,26 @@ fn open_player_impl(
         }
         if let Some(e) = queue_error {
             frame_tick.set_status_text(&format!("Queue: {e}"), 0);
+            crate::announce("general", &format!("Queue: {e}"));
         }
-        pos_label.set_label(&format!("{} / {}", fmt_ms(m.tell()), fmt_ms(len)));
+        // Keep the Play/Pause button's label honest about the
+        // state — the label is its accessible name, so NVDA
+        // users hear "Pause" while playing and "Play" while
+        // paused instead of a static "Play/Pause".
+        let playing_now = m.get_state() == MediaState::Playing;
+        {
+            let mut s = st.borrow_mut();
+            if s.last_playing != Some(playing_now) {
+                s.last_playing = Some(playing_now);
+                let label = if playing_now {
+                    crate::tr("Pause")
+                } else {
+                    crate::tr("Play")
+                };
+                play_btn.set_label(&label);
+            }
+        }
+        pos_label.set_value(&format!("{} / {}", fmt_ms(m.tell()), fmt_ms(len)));
         if len > 0 {
             let mut s = st.borrow_mut();
             s.slider_guard = true;

@@ -3667,6 +3667,57 @@ fn main() {
             play_btn.on_click(move |_| a());
         }
 
+        // Article activation (Enter or double-click in the
+        // article list — Python's on_article_activate): an
+        // article with playable media plays in the player;
+        // anything else opens in the browser. The article is
+        // marked read either way, as Python does.
+        let state_act = state.clone();
+        let frame_act = frame;
+        let act_play_for_act = act_play.clone();
+        let act_activate: Rc<dyn Fn()> = Rc::new(move || {
+            let mut st = state_act.borrow_mut();
+            let Some(article) = st
+                .selected_article
+                .and_then(|i| st.articles.get(i))
+                .cloned()
+            else {
+                frame_act.set_status_text("No article selected", 0);
+                return;
+            };
+            let playable = article.media_url.as_deref().is_some_and(|u| {
+                !u.is_empty()
+                    && blindrss_core::media::is_playable_media(u, article.media_type.as_deref())
+            }) || blindrss_core::media::is_ytdlp_supported(&article.url)
+                || article.content.as_deref().is_some_and(|html| {
+                    blindrss_core::media::detect_media_in_page(html, &article.url).is_some()
+                });
+            let was_unread = !article.is_read;
+            if was_unread {
+                if let Some(db) = &st.db {
+                    mark_article_read(db, &article, true);
+                }
+                if let Some(row) = st.articles.iter_mut().find(|a| a.id == article.id) {
+                    row.is_read = true;
+                }
+            }
+            drop(st);
+            if was_unread {
+                propagate_read_state(&article, true);
+            }
+            if playable {
+                act_play_for_act();
+            } else if !article.url.is_empty() {
+                open_article_link(&frame_act, &article.url);
+            } else {
+                frame_act.set_status_text("Article has no media or link", 0);
+            }
+        });
+        {
+            let a = act_activate.clone();
+            list.on_item_activated(move |_| a());
+        }
+
         // New Smart Folder: the full condition editor dialog
         // (Python's SmartFolderDialog).
         let state_nsf = state.clone();
@@ -6134,6 +6185,7 @@ fn main() {
             let h_import_cookies = act_import_cookies.clone();
             let h_errors = act_feed_errors.clone();
             let h_toggle_read = act_toggle_read.clone();
+            let h_activate = act_activate.clone();
             let h_fav = act_fav.clone();
             let h_toggle_queue = act_toggle_queue.clone();
             let h_queue_open = act_queue_open.clone();
@@ -6190,6 +6242,25 @@ fn main() {
                     };
                     help::show_help_topic(&f1_frame, &f1_language, Some(topic));
                     ev.skip(false);
+                    return;
+                }
+                // Enter in the article list activates the
+                // article (play media / open in browser — the
+                // on_item_activated binding covers the mouse
+                // double-click; this covers the keyboard, and
+                // vetoing the key keeps wx from also firing
+                // ITEM_ACTIVATED for it).
+                if code == 13 && !ctrl && !shift {
+                    let in_list = {
+                        let st = state_hook.borrow();
+                        st.focus_list && !st.search_focused
+                    };
+                    if in_list {
+                        h_activate();
+                        ev.skip(false);
+                    } else {
+                        ev.skip(true);
+                    }
                     return;
                 }
                 // Plain Backspace in the article list toggles
