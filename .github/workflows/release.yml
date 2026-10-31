@@ -46,6 +46,18 @@ jobs:
         with:
           cache-on-failure: false
 
+      # Same guard as ci.yml: a restored cache can lack the
+      # WebView2 SDK lib while wxdragon-sys looks fresh (LNK1104).
+      - name: Restore WebView2 SDK if the cache dropped it (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          if ! find target -name 'WebView2LoaderStatic.lib' 2>/dev/null | grep -q .; then
+            echo "WebView2LoaderStatic.lib missing; cleaning wxdragon-sys to re-run its build script"
+            cargo clean -p wxdragon-sys || true
+            cargo clean -p wxdragon || true
+          fi
+
       - name: Validate release
         shell: bash
         run: |

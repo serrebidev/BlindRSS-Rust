@@ -45,6 +45,22 @@ jobs:
         with:
           cache-on-failure: false
 
+      # A restored rust-cache tree can lack the WebView2 SDK lib
+      # (its download lives in the wx cmake tree, which the cache
+      # round-trip drops) while cargo still treats wxdragon-sys
+      # as fresh — the link then fails with LNK1104. When the
+      # lib is absent, force the sys build script to re-run so
+      # the SDK is downloaded again.
+      - name: Restore WebView2 SDK if the cache dropped it (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          if ! find target -name 'WebView2LoaderStatic.lib' 2>/dev/null | grep -q .; then
+            echo "WebView2LoaderStatic.lib missing; cleaning wxdragon-sys to re-run its build script"
+            cargo clean -p wxdragon-sys || true
+            cargo clean -p wxdragon || true
+          fi
+
       - name: Format
         run: cargo fmt --all --check
 
