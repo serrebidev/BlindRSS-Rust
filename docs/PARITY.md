@@ -337,7 +337,7 @@ Full report: reports/deep-audit-2026-10-30.md in the migration
 workspace; raw extraction deep-audit.json. Behaviour systems the
 surface audits missed, in port order:
 
-1. Focus choreography: startup focus in tree (FIXED v0.1.6 —
+1. Focus choreography: startup focus in tree (FIXED v0.1.7 —
    re-audited against Python after Brandon's v0.1.5 report: Python
    defers via wx.CallAfter with an IsShown guard AND every tree
    build ends with SelectItem, defaulting to All Feeds. The first
