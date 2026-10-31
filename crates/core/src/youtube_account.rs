@@ -185,6 +185,186 @@ pub fn fetch_subscriptions(access: &str) -> Result<Vec<(String, String)>, String
     Ok(out)
 }
 
+pub const RECOMMENDATIONS_FEED_ID: &str = "youtube-account:recommendations";
+const BROWSE_URL: &str = "https://www.youtube.com/youtubei/v1/browse";
+
+/// Stable per-account key: sha256 of the refresh token (Python's
+/// account_key).
+pub fn account_key(refresh_token: &str) -> String {
+    use sha2::Digest;
+    if refresh_token.is_empty() {
+        return String::new();
+    }
+    let digest = sha2::Sha256::digest(refresh_token.as_bytes());
+    digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn text_runs(text: &serde_json::Value) -> String {
+    if let Some(s) = text.get("simpleText").and_then(|v| v.as_str()) {
+        return s.to_string();
+    }
+    text.get("runs")
+        .and_then(|v| v.as_array())
+        .map(|runs| {
+            runs.iter()
+                .filter_map(|r| r.get("text").and_then(|v| v.as_str()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn valid_video_id(id: &str) -> bool {
+    id.len() == 11
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// Current TV home-page videos, preserving YouTube's order —
+/// port of Python's parse_recommendations (an iterative walk
+/// collecting tileRenderer video tiles).
+pub fn parse_recommendations(data: &serde_json::Value) -> Vec<(String, String, String)> {
+    let mut found: Vec<(String, String, String)> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
+    let mut stack: Vec<&serde_json::Value> = vec![data];
+    while let Some(node) = stack.pop() {
+        match node {
+            serde_json::Value::Object(map) => {
+                if let Some(tile) = map.get("tileRenderer")
+                    && tile.get("contentType").and_then(|v| v.as_str())
+                        == Some("TILE_CONTENT_TYPE_VIDEO")
+                {
+                    let video_id = tile
+                        .get("contentId")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let metadata = tile
+                        .get("metadata")
+                        .and_then(|m| m.get("tileMetadataRenderer"));
+                    let mut title = metadata
+                        .and_then(|m| m.get("title"))
+                        .map(text_runs)
+                        .unwrap_or_default()
+                        .trim()
+                        .to_string();
+                    let lines: Vec<&serde_json::Value> = metadata
+                        .and_then(|m| m.get("lines"))
+                        .and_then(|v| v.as_array())
+                        .map(|a| a.iter().collect())
+                        .unwrap_or_default();
+                    let line_items = |line: &serde_json::Value| -> Vec<serde_json::Value> {
+                        line.get("lineRenderer")
+                            .and_then(|l| l.get("items"))
+                            .and_then(|v| v.as_array())
+                            .cloned()
+                            .unwrap_or_default()
+                    };
+                    let mut author = String::new();
+                    let overlays = tile
+                        .get("header")
+                        .and_then(|h| h.get("tileHeaderRenderer"))
+                        .and_then(|h| h.get("thumbnailOverlays"))
+                        .and_then(|v| v.as_array());
+                    let is_podcast = overlays.is_some_and(|list| {
+                        list.iter().any(|o| {
+                            o.get("thumbnailOverlayTimeStatusRenderer")
+                                .and_then(|r| r.get("icon"))
+                                .and_then(|i| i.get("iconType"))
+                                .and_then(|v| v.as_str())
+                                == Some("BROADCAST")
+                        })
+                    });
+                    if let Some(first_line) = lines.first() {
+                        let items = line_items(first_line);
+                        if let Some(item) = items.first() {
+                            let text = item
+                                .get("lineItemRenderer")
+                                .and_then(|l| l.get("text"))
+                                .cloned()
+                                .unwrap_or(serde_json::Value::Null);
+                            author = text_runs(&text);
+                            // Podcast tiles: series, episode, channel.
+                            if is_podcast
+                                && lines.len() == 2
+                                && items.len() == 1
+                                && text.get("simpleText").is_some()
+                            {
+                                let second = line_items(lines[1]);
+                                if second.len() == 1
+                                    && let Some(channel) = second[0]
+                                        .get("lineItemRenderer")
+                                        .and_then(|l| l.get("text"))
+                                        .and_then(|t| t.get("simpleText"))
+                                        .and_then(|v| v.as_str())
+                                    && !channel.is_empty()
+                                {
+                                    title = author.trim().to_string();
+                                    author = channel.trim().to_string();
+                                }
+                            }
+                        }
+                    }
+                    if valid_video_id(&video_id) && !title.is_empty() && !seen.contains(&video_id) {
+                        seen.push(video_id.clone());
+                        found.push((video_id, title, author.trim().to_string()));
+                    }
+                }
+                // Push values reversed so popping walks in
+                // document order (serde_json preserve_order).
+                let values: Vec<&serde_json::Value> = map.values().collect();
+                for value in values.into_iter().rev() {
+                    stack.push(value);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for value in items.iter().rev() {
+                    stack.push(value);
+                }
+            }
+            _ => {}
+        }
+    }
+    found
+}
+
+/// Fetch the signed-in account's home recommendations.
+pub fn list_recommendations(
+    client_id: &str,
+    client_secret: &str,
+    refresh_token: &str,
+) -> Result<Vec<(String, String, String)>, String> {
+    let access = access_token(client_id, client_secret, refresh_token)?;
+    let body = serde_json::json!({
+        "context": {"client": {
+            "clientName": "TVHTML5",
+            "clientVersion": "7.20250101.00.00",
+            "hl": "en",
+            "gl": "US",
+        }},
+        "browseId": "default",
+    });
+    let agent = crate::http::agent();
+    let payload = serde_json::to_string(&body).map_err(|e| e.to_string())?;
+    let mut resp = agent
+        .post(BROWSE_URL)
+        .header("Authorization", &format!("Bearer {access}"))
+        .header("Content-Type", "application/json")
+        .send(payload.as_str())
+        .map_err(|e| format!("recommendations request failed: {e}"))?;
+    let text = resp
+        .body_mut()
+        .read_to_string()
+        .map_err(|e| format!("recommendations read failed: {e}"))?;
+    let value: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| format!("recommendations response was not JSON: {e}"))?;
+    let videos = parse_recommendations(&value);
+    if videos.is_empty() {
+        return Err("YouTube returned no recommendations".to_string());
+    }
+    Ok(videos)
+}
+
 /// Sync the account's subscriptions into the database as
 /// feeds (the provider wrapper's auto-add). Returns how many
 /// feeds were newly added. Updates the known-channels list

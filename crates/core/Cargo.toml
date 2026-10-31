@@ -1,6 +1,6 @@
 [package]
 name = "blindrss-core"
-version = "0.1.21"
+version = "0.1.22"
 edition.workspace = true
 license.workspace = true
 
@@ -10,7 +10,7 @@ feed-rs = "3"
 rust-trafilatura = "2.2.8"
 dom_smoothie = "0.19.0"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
 encoding_rs = "0.8"
 sha2 = "0.11"
 ureq = { version = "3", features = ["rustls"] }

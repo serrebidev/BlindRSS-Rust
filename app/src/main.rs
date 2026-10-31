@@ -234,7 +234,33 @@ fn maybe_cache_youtube(article: &Article, stream_url: &str, via_ytdlp: bool) -> 
     }
 }
 
+/// Read/favorite writes route to the recommendations table for
+/// virtual-feed articles (their ids are not in `articles`).
+fn mark_article_read(db: &blindrss_core::db::Db, article: &blindrss_core::db::Article, read: bool) {
+    if article.feed_id == blindrss_core::youtube_account::RECOMMENDATIONS_FEED_ID {
+        let _ = db.set_recommendation_state(&article.id, Some(read), None);
+    } else {
+        let _ = db.mark_read(&article.id, read);
+    }
+}
+
+fn mark_article_favorite(
+    db: &blindrss_core::db::Db,
+    article: &blindrss_core::db::Article,
+    favorite: bool,
+) {
+    if article.feed_id == blindrss_core::youtube_account::RECOMMENDATIONS_FEED_ID {
+        let _ = db.set_recommendation_state(&article.id, None, Some(favorite));
+    } else {
+        let _ = db.set_favorite(&article.id, favorite);
+    }
+}
+
 fn propagate_read_state(article: &blindrss_core::db::Article, read: bool) {
+    // Recommendations are local-only state.
+    if article.feed_id == blindrss_core::youtube_account::RECOMMENDATIONS_FEED_ID {
+        return;
+    }
     let article = article.clone();
     std::thread::spawn(move || {
         let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
@@ -829,6 +855,9 @@ enum RefreshMsg {
     /// The Windows global show/hide hotkey fired.
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     ToggleWindow,
+    /// Background watcher (cookie auto-import, translation
+    /// updates) reporting through the status bar.
+    StatusNote(String),
     /// Startup dependency check found missing tools (names).
     DepsMissing(Vec<String>),
     /// Managed yt-dlp download finished.
@@ -1143,6 +1172,21 @@ fn rebuild_tree(state: &mut State, tree: &TreeCtrl) {
             tree.expand(item);
         }
     }
+    // YouTube Recommendations virtual feed (the account
+    // provider wrapper injects it whenever signed in).
+    let yt_token = blindrss_core::config::Config::load(&config_path())
+        .unwrap_or_default()
+        .get_str("youtube_account_refresh_token", "")
+        .to_string();
+    if !yt_token.is_empty() {
+        tree.append_item_with_data(
+            &root,
+            "Recommendations",
+            blindrss_core::youtube_account::RECOMMENDATIONS_FEED_ID.to_string(),
+            None,
+            None,
+        );
+    }
     // Smart folders: item data is "smart:<id>".
     if let Ok(folders) = db.smart_folders()
         && !folders.is_empty()
@@ -1268,6 +1312,16 @@ fn refill_articles(state: &mut State, list: &ListCtrl) {
         }
         return finish_refill(state, list, loaded);
     }
+    // YouTube Recommendations virtual feed.
+    if filter == Some(blindrss_core::youtube_account::RECOMMENDATIONS_FEED_ID) {
+        let token = blindrss_core::config::Config::load(&config_path())
+            .unwrap_or_default()
+            .get_str("youtube_account_refresh_token", "")
+            .to_string();
+        let account = blindrss_core::youtube_account::account_key(&token);
+        let loaded = db.recommendations(&account).unwrap_or_default();
+        return finish_refill(state, list, loaded);
+    }
     // Category selection: articles across every feed in the
     // category, subcategories included.
     if let Some(path) = filter.and_then(|f| f.strip_prefix("cat:")) {
@@ -1345,16 +1399,27 @@ fn finish_refill(state: &mut State, list: &ListCtrl, mut loaded: Vec<Article>) {
 /// fall back to English (Python's gettext behaviour).
 static I18N: std::sync::OnceLock<blindrss_core::i18n::Catalog> = std::sync::OnceLock::new();
 
+/// Bundled locale roots, best first (the exe's locale/ in
+/// releases, the repo's locale/ in dev).
+pub fn locale_roots() -> Vec<std::path::PathBuf> {
+    let mut roots = vec![std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../locale")];
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        roots.insert(0, dir.join("locale"));
+    }
+    roots
+}
+
 pub fn tr(text: &str) -> String {
     let catalog = I18N.get_or_init(|| {
         let lang = ui_language();
-        let mut roots =
-            vec![std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../locale")];
-        if let Ok(exe) = std::env::current_exe()
-            && let Some(dir) = exe.parent()
-        {
-            roots.insert(0, dir.join("locale"));
-        }
+        // Downloaded translation updates shadow the bundled
+        // catalogs (translation_updates.override_root).
+        let mut roots = vec![blindrss_core::translation_updates::override_root(
+            &data_dir(),
+        )];
+        roots.extend(locale_roots());
         for root in roots {
             let cat = blindrss_core::i18n::Catalog::load(&root, &lang);
             if !cat.is_empty() {
@@ -1399,6 +1464,80 @@ fn locale_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../blindrss-work/locale")
 }
 
+/// One pass of the background watcher (Python's
+/// CookieImportWatcher tick + the translation-update scheduler):
+/// hands-free cookie imports from Downloads and browser profiles,
+/// plus a due translation-catalog check. Runs on a worker thread;
+/// findings land in the status bar via StatusNote.
+fn run_watcher_once(tx: &std::sync::mpsc::Sender<RefreshMsg>) {
+    use blindrss_core::cookies_import as ci;
+    use blindrss_core::translation_updates as tu;
+    let cfg_path = config_path();
+    let mut cfg = blindrss_core::config::Config::load(&cfg_path).unwrap_or_default();
+    let dir = data_dir();
+    let jar = dir.join(ci::SITE_JAR_FILENAME);
+    let now_s = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    let markers_before = cfg.raw().get("site_cookies_profile_mtimes").cloned();
+    let mut notes: Vec<String> = Vec::new();
+    let mut dirty = false;
+    if ci::auto_import_youtube_cookies(&mut cfg, &dir, None, now_s).is_some() {
+        notes.push("YouTube cookies imported for yt-dlp".to_string());
+        dirty = true;
+    }
+    if ci::auto_import_downloads(&mut cfg, &jar, None, now_s).is_some() {
+        notes.push("Site cookies updated from a Downloads export".to_string());
+        dirty = true;
+    }
+    let stored = ci::auto_import_browser_profiles(&mut cfg, &jar, now_s as i64);
+    if stored > 0 {
+        notes.push(format!(
+            "Site cookies refreshed from browser profiles ({stored} cookies)"
+        ));
+        dirty = true;
+    }
+    if cfg.raw().get("site_cookies_profile_mtimes").cloned() != markers_before {
+        dirty = true;
+    }
+    if cfg.get_bool(tu::CFG_ENABLED, true) {
+        let frequency = cfg
+            .get_str(tu::CFG_FREQUENCY, tu::DEFAULT_FREQUENCY)
+            .to_string();
+        if tu::is_due(&dir, &frequency, now_s as i64) {
+            let mut langs: Vec<String> = Vec::new();
+            for root in locale_roots() {
+                if let Ok(entries) = std::fs::read_dir(&root) {
+                    for entry in entries.flatten() {
+                        if entry.path().is_dir()
+                            && let Some(name) = entry.file_name().to_str()
+                            && name != "en"
+                            && !langs.contains(&name.to_string())
+                        {
+                            langs.push(name.to_string());
+                        }
+                    }
+                }
+            }
+            let result =
+                tu::check_and_update(&dir, &locale_roots(), &langs, &tu::HttpFetch, now_s as i64);
+            if result.changed() {
+                notes.push(format!(
+                    "Translation updates installed for {}; they apply on next launch",
+                    result.updated.join(", ")
+                ));
+            }
+        }
+    }
+    if dirty {
+        let _ = cfg.save(&cfg_path);
+    }
+    if !notes.is_empty() {
+        let _ = tx.send(RefreshMsg::StatusNote(notes.join("; ")));
+    }
+}
+
 fn main() {
     // Panics land in blindrss.log in the data dir instead of dying
     // silently (a screen reader user gets no console to read).
@@ -1422,6 +1561,13 @@ fn main() {
         db_path().display(),
         config_path().display()
     ));
+    // Translation overrides from a previous version stand down
+    // before the catalog loads (translation_updates).
+    blindrss_core::translation_updates::prepare_overrides_for_app_version(
+        &data_dir(),
+        &locale_roots(),
+        env!("CARGO_PKG_VERSION"),
+    );
     // Single instance: hand activation to the running copy
     // and exit when one answers.
     if blindrss_core::single_instance::signal_existing() {
@@ -1736,7 +1882,7 @@ fn main() {
             reader.set_value(&format!("{}\n\n{}", a.title, body));
             if !a.is_read {
                 if let Some(db) = st.db.as_ref() {
-                    let _ = db.mark_read(&a.id, true);
+                    mark_article_read(db, &a, true);
                 }
                 if let Some(slot) = st.articles.get_mut(idx as usize) {
                     slot.is_read = true;
@@ -2019,9 +2165,14 @@ fn main() {
                             if let Some(section) = providers.get("inoreader") {
                                 let token = get(section, "token");
                                 if !token.is_empty() {
+                                    let cfg = blindrss_core::config::Config::load(&config_path())
+                                        .unwrap_or_default();
                                     return GReaderClient::with_oauth(
                                         GReaderService::Inoreader,
                                         &token,
+                                    )
+                                    .with_article_page_size(
+                                        blindrss_core::providers::page_size_from_config(&cfg),
                                     )
                                     .refresh_feed(&db, &feed2.id);
                                 }
@@ -2099,7 +2250,9 @@ fn main() {
             }
             let mut st = state_del.borrow_mut();
             if let Some(db) = st.db.as_ref() {
-                if behavior == "purge" {
+                if a.feed_id == blindrss_core::youtube_account::RECOMMENDATIONS_FEED_ID {
+                    let _ = db.delete_recommendation(&a.id);
+                } else if behavior == "purge" {
                     let _ = db.purge_article(&a.id);
                 } else {
                     let _ = db.delete_article(&a.id);
@@ -2127,7 +2280,7 @@ fn main() {
             };
             let new_value = !a.is_favorite;
             if let Some(db) = st.db.as_ref() {
-                let _ = db.set_favorite(&a.id, new_value);
+                mark_article_favorite(db, &a, new_value);
             }
             if let Some(slot) = st.articles.get_mut(idx) {
                 slot.is_favorite = new_value;
@@ -2135,7 +2288,8 @@ fn main() {
             // Hosted backend: favorites are the server's
             // starred/bookmarked state — push through the
             // active provider (cache write is idempotent).
-            {
+            // Recommendations are local-only.
+            if a.feed_id != blindrss_core::youtube_account::RECOMMENDATIONS_FEED_ID {
                 let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
                 if blindrss_core::provider::active_name(&cfg) != "local" {
                     let a2 = a.clone();
@@ -2321,9 +2475,45 @@ fn main() {
                         .and_then(|db| {
                             let mut cfg2 =
                                 blindrss_core::config::Config::load(&cpath).unwrap_or_default();
-                            blindrss_core::youtube_account::sync_account(&mut cfg2, &cpath, &db)
-                        })
-                        .map(|added| format!("YouTube account: {added} new channel feed(s)"));
+                            let added = blindrss_core::youtube_account::sync_account(
+                                &mut cfg2, &cpath, &db,
+                            )?;
+                            // Recommendations snapshot (the
+                            // provider wrapper's other half);
+                            // its failure does not fail the sync.
+                            let token = cfg2
+                                .get_str("youtube_account_refresh_token", "")
+                                .to_string();
+                            let client_id = {
+                                let v = cfg2.get_str("youtube_account_client_id", "");
+                                if v.is_empty() {
+                                    blindrss_core::youtube_account::CLIENT_ID
+                                } else {
+                                    v
+                                }
+                                .to_string()
+                            };
+                            let secret =
+                                cfg2.get_str("youtube_account_client_secret", "").to_string();
+                            let recs = blindrss_core::youtube_account::list_recommendations(
+                                &client_id, &secret, &token,
+                            )
+                            .and_then(|videos| {
+                                let account =
+                                    blindrss_core::youtube_account::account_key(&token);
+                                db.save_recommendations(&account, &videos)
+                                    .map_err(|e| format!("{e}"))?;
+                                Ok(videos.len())
+                            });
+                            Ok(match recs {
+                                Ok(n) => format!(
+                                    "YouTube account: {added} new channel feed(s), {n} recommendations"
+                                ),
+                                Err(e) => format!(
+                                    "YouTube account: {added} new channel feed(s) (recommendations: {e})"
+                                ),
+                            })
+                        });
                     let _ = tx.send(RefreshMsg::ProviderAction(result));
                 });
             }
@@ -2371,11 +2561,13 @@ fn main() {
                     let tx = tx_sync.clone();
                     let path = db_path();
                     std::thread::spawn(move || {
+                        let page_size = blindrss_core::providers::page_size_from_config(&cfg);
                         let result = Db::open(&path).map_err(|e| format!("{e}")).and_then(|db| {
                             blindrss_core::providers::GReaderClient::with_oauth(
                                 blindrss_core::providers::GReaderService::Inoreader,
                                 &token,
                             )
+                            .with_article_page_size(page_size)
                             .sync(&db, 100)
                         });
                         let _ = tx.send(RefreshMsg::ProviderDone("inoreader".to_string(), result));
@@ -2535,12 +2727,19 @@ fn main() {
                 frame_tl.set_status_text("Nothing to translate", 0);
                 return;
             }
-            let target = cfg.get_str("translation_target_language", "en").to_string();
+            // Normalize the configured target to a BCP-47 tag
+            // (article_lang.normalize_lang); junk falls back to
+            // English rather than reaching the provider as-is.
+            let target = blindrss_core::article_lang::normalize_lang(Some(
+                cfg.get_str("translation_target_language", "en"),
+            ))
+            .unwrap_or_else(|| "en".to_string());
             // Skip work when the text already reads as the
             // target language (article_lang priority: declared
             // language wins — here the heuristic over the text).
             let detected = blindrss_core::translate::detect_language(&text);
-            if !detected.is_empty() && detected == target {
+            let target_primary = target.split('-').next().unwrap_or("en");
+            if !detected.is_empty() && detected == target_primary {
                 frame_tl.set_status_text("Article is already in the target language", 0);
                 return;
             }
@@ -2571,7 +2770,7 @@ fn main() {
             };
             let new_state = !article.is_read;
             if let Some(db) = &st.db {
-                let _ = db.mark_read(&article.id, new_state);
+                mark_article_read(db, &article, new_state);
             }
             if let Some(row) = st.articles.iter_mut().find(|a| a.id == article.id) {
                 row.is_read = new_state;
@@ -3048,14 +3247,18 @@ fn main() {
             ) else {
                 return;
             };
-            let url = url.trim().to_string();
+            // Clean the paste the Python way (media_url.py):
+            // scheme-less and protocol-relative pastes work,
+            // search phrases and mailto:/magnet: do not.
+            let url = blindrss_core::media_url::normalize_media_url(url.trim());
             if url.is_empty() {
+                frame_om.set_status_text("That does not look like a media URL", 0);
                 return;
             }
             let article = blindrss_core::Article {
                 id: url.clone(),
                 feed_id: String::new(),
-                title: url.clone(),
+                title: blindrss_core::media_url::title_from_url(&url),
                 url: url.clone(),
                 content: None,
                 description: None,
@@ -5180,6 +5383,34 @@ fn main() {
             });
         }
 
+        // Background watcher (Python's 45-second cookie-import
+        // tick): first pass at startup, then every 45 seconds,
+        // never overlapping itself.
+        let watcher_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let flag = watcher_in_flight.clone();
+            let tx0 = tx.clone();
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            std::thread::spawn(move || {
+                run_watcher_once(&tx0);
+                flag.store(false, std::sync::atomic::Ordering::SeqCst);
+            });
+        }
+        let watch_timer = Box::leak(Box::new(Timer::new(&frame)));
+        let tx_watch = tx.clone();
+        watch_timer.on_tick(move |_| {
+            if watcher_in_flight.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            let flag = watcher_in_flight.clone();
+            let tx2 = tx_watch.clone();
+            std::thread::spawn(move || {
+                run_watcher_once(&tx2);
+                flag.store(false, std::sync::atomic::Ordering::SeqCst);
+            });
+        });
+        watch_timer.start(45_000, false);
+
         let timer = Box::leak(Box::new(Timer::new(&frame)));
         let state_tick = state.clone();
         let frame_tick = frame;
@@ -5248,6 +5479,9 @@ fn main() {
                     Ok(RefreshMsg::ActivateWindow) => {
                         frame_tick.show(true);
                         frame_tick.raise();
+                    }
+                    Ok(RefreshMsg::StatusNote(note)) => {
+                        frame_tick.set_status_text(&note, 0);
                     }
                     Ok(RefreshMsg::ToggleWindow) => {
                         // Global show/hide hotkey (Windows): hide

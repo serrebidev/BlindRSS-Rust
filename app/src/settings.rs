@@ -795,6 +795,104 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
         tr_fields.push((key_field, model_field));
     }
 
+    // Translation updates (OTA catalog channel).
+    add_heading(&dialog, &sizer, "Translation Updates");
+    let tu_enabled_cb = add_check(
+        &dialog,
+        &sizer,
+        "Update translations automatically",
+        cfg.get_bool(blindrss_core::translation_updates::CFG_ENABLED, true),
+    );
+    let tu_freq_values = ["ten_minutes", "daily", "weekly", "monthly"];
+    let tu_freq_sel = tu_freq_values
+        .iter()
+        .position(|v| {
+            *v == cfg.get_str(
+                blindrss_core::translation_updates::CFG_FREQUENCY,
+                blindrss_core::translation_updates::DEFAULT_FREQUENCY,
+            )
+        })
+        .unwrap_or(1);
+    let tu_freq_choice = add_choice(
+        &dialog,
+        &sizer,
+        "Check for updates:",
+        &["10 minutes", "Daily", "Weekly", "Monthly"],
+        tu_freq_sel,
+    );
+    let tu_status = StaticText::builder(&dialog).with_label("").build();
+    {
+        let row = BoxSizer::builder(Orientation::Horizontal).build();
+        let check_btn = Button::builder(&dialog)
+            .with_label(&crate::tr("Check for Updates"))
+            .build();
+        row.add(&check_btn, 0, SizerFlag::All, 4);
+        row.add(&tu_status, 0, SizerFlag::All, 4);
+        sizer.add_sizer(&row, 0, SizerFlag::Expand | SizerFlag::All, 2);
+        let (txc, rxc) = std::sync::mpsc::channel::<String>();
+        let rxc = std::rc::Rc::new(std::cell::RefCell::new(rxc));
+        let timer = Box::leak(Box::new(Timer::new(&dialog)));
+        timer.start(200, false);
+        {
+            let rxc_tick = rxc.clone();
+            timer.on_tick(move |_| {
+                if let Ok(note) = rxc_tick.borrow().try_recv() {
+                    tu_status.set_label(&note);
+                }
+            });
+        }
+        check_btn.on_click(move |_| {
+            tu_status.set_label("Checking...");
+            let txc = txc.clone();
+            std::thread::spawn(move || {
+                let cfg =
+                    blindrss_core::config::Config::load(&crate::config_path()).unwrap_or_default();
+                let mut langs: Vec<String> = Vec::new();
+                for root in crate::locale_roots() {
+                    if let Ok(entries) = std::fs::read_dir(&root) {
+                        for entry in entries.flatten() {
+                            if entry.path().is_dir()
+                                && let Some(name) = entry.file_name().to_str()
+                                && name != "en"
+                                && !langs.contains(&name.to_string())
+                            {
+                                langs.push(name.to_string());
+                            }
+                        }
+                    }
+                }
+                // The UI language goes first: it is the one the
+                // user can see.
+                let ui = crate::ui_language();
+                langs.retain(|l| l != &ui);
+                langs.insert(0, ui);
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0) as i64;
+                let result = blindrss_core::translation_updates::check_and_update(
+                    &crate::data_dir(),
+                    &crate::locale_roots(),
+                    &langs,
+                    &blindrss_core::translation_updates::HttpFetch,
+                    now,
+                );
+                let _ = cfg;
+                let note = if result.changed() {
+                    format!(
+                        "Updated: {}. Applies on next launch.",
+                        result.updated.join(", ")
+                    )
+                } else if let Some(e) = result.error {
+                    format!("Check failed: {e}")
+                } else {
+                    "Translations are up to date.".to_string()
+                };
+                let _ = txc.send(note);
+            });
+        });
+    }
+
     add_heading(&dialog, &sizer, "Advanced");
     let mut ua_items: Vec<&str> = vec!["Automatic (matches this computer)"];
     ua_items.extend(
@@ -1192,6 +1290,18 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
                 "translation_target_language",
                 serde_json::json!(tr_target_field.get_value()),
             );
+            cfg.set_path(
+                blindrss_core::translation_updates::CFG_ENABLED,
+                serde_json::json!(tu_enabled_cb.is_checked()),
+            );
+            if let Some(sel) = tu_freq_choice.get_selection()
+                && let Some(v) = tu_freq_values.get(sel as usize)
+            {
+                cfg.set_path(
+                    blindrss_core::translation_updates::CFG_FREQUENCY,
+                    serde_json::json!(v),
+                );
+            }
             for (key, (key_field, model_field)) in blindrss_core::translate::PROVIDERS
                 .iter()
                 .zip(tr_fields.iter())

@@ -15,11 +15,11 @@ Implementations found in Python (7):
 | Provider | Python size | Interface coverage in Python | Rust status |
 |---|---|---|---|
 | Local (`providers/local.py`) | 6,063 lines, 55 public methods | Full interface + smart folders, filter rules, feed errors, retention, podcast archive | **partial** — refresh/store, feed CRUD, OPML, categories, search, favorites, delete/restore, smart folders + filter rules (evaluate on store), retention prune done; category hierarchy + tree grouping, feed-errors view + recording, refresh cancel, scheduled + startup refresh done (v0.1.13) |
-| Miniflux (`providers/miniflux.py`) | 2,945 lines, 33 public | + test_connection, podcast archive, article delete, fetch_full_content, browser fallbacks for some endpoints | **partial** — sync + remote state + enclosures done; v0.1.19 adds test_connection (Settings button), OPML export/import via API, fetch-content (v0.1.18 arbitration), per-feed refresh, create/delete feed, bookmark toggle. Remaining: remote categories management, article delete (Miniflux has no entry-delete API; Python's is local too), browser fallbacks |
-| Inoreader (`providers/inoreader.py`) | 1,110 lines, 24 public | GReader protocol + OAuth2 (`core/inoreader_oauth.py`), rate-limit handling, metadata/article caches | **partial** — OAuth-token sync (slice 5); v0.1.18/19: paste-URL OAuth + local HTTPS-listener OAuth (rcgen self-signed on 127.0.0.1:18423), 429 Retry-After backoff on the GReader API surface, metadata/article caches with Python's TTL keys + clamps (manual refresh invalidates), enclosures. Remaining: page-size key wiring |
+| Miniflux (`providers/miniflux.py`) | 2,945 lines, 33 public | + test_connection, podcast archive, article delete, fetch_full_content, browser fallbacks for some endpoints | **partial** — sync + remote state + enclosures done; v0.1.19 adds test_connection (Settings button), OPML export/import via API, fetch-content (v0.1.18 arbitration), per-feed refresh, create/delete feed, bookmark toggle. Remaining: remote category CRUD via /v1/categories (the client resolves category titles on add_feed; no rename/delete surface), browser fallbacks |
+| Inoreader (`providers/inoreader.py`) | 1,110 lines, 24 public | GReader protocol + OAuth2 (`core/inoreader_oauth.py`), rate-limit handling, metadata/article caches | **partial** — OAuth-token sync (slice 5); v0.1.18/19: paste-URL OAuth + local HTTPS-listener OAuth (rcgen self-signed on 127.0.0.1:18423), 429 Retry-After backoff on the GReader API surface, metadata/article caches with Python's TTL keys + clamps (manual refresh invalidates), enclosures. page-size key wired v0.1.22 (article_request_page_size, default 100, clamped 20..=1000, Inoreader stream requests) |
 | BazQux (`providers/bazqux.py`) | 765 lines, 24 public | GReader protocol | **partial** — ClientLogin sync (slice 5); v0.1.17/19: remote subscribe/unsubscribe, per-feed refresh, category set, batch mark-read, starred favorites, enclosures via the shared GReader client |
 | The Old Reader (`providers/theoldreader.py`) | 744 lines, 23 public | GReader protocol; defines the family's stream-id helpers | **partial** — same as BazQux |
-| YouTube account (`providers/youtube_account.py`) | 231 lines, 22 public | Wraps another provider: subscriptions/recommendations from a signed-in YouTube account (device-code sign-in) | **partial** — v0.1.19: device-code sign-in dialog (core/youtube_account.rs; the TV client's public client id is built in, its secret is read from youtube_account_client_secret config rather than embedded), subscription auto-add sync under Sync Providers (category + known-channels tracking). Remaining: the Recommendations virtual feed |
+| YouTube account (`providers/youtube_account.py`) | 231 lines, 22 public | Wraps another provider: subscriptions/recommendations from a signed-in YouTube account (device-code sign-in) | **partial** — v0.1.19: device-code sign-in dialog (core/youtube_account.rs; the TV client's public client id is built in, its secret is read from youtube_account_client_secret config rather than embedded), subscription auto-add sync under Sync Providers (category + known-channels tracking). Recommendations virtual feed landed v0.1.22 (TV browse parse + youtube_recommendations snapshot with retained state, tree node + read/favorite/delete routing, sync under Sync Providers) |
 | Hosted podcast archive (`providers/hosted_podcast_archive.py`) | 313 lines, mixin (4 public) | Archive state + refresh for hosted providers | **partial** — hosted articles now carry their enclosures as media (v0.1.19, the mixin's data half: GReader + Miniflux enclosure mapping in sync); the archive-state lineage tracking for hosted feeds is still missing |
 
 Base-interface method groups (54) and where they stand in Rust core:
@@ -31,14 +31,17 @@ Base-interface method groups (54) and where they stand in Rust core:
   cancel flag between feeds, a 60s tick fires refreshes on
   refresh_interval, refresh_on_startup fires shortly after launch)
 - Feeds: get_feeds, add_feed, remove_feed, supports/update feed edit
-  and URL update, supports/reset feed title — **partial**
-  (add/remove done; edit dialog, URL update, title reset missing)
+  and URL update, supports/reset feed title — **done**
+  (add/remove, Edit Feed title+URL prompts, Feed Properties dialog
+  with per-feed settings, v0.1.13-v0.1.15)
 - Articles: get_articles, get_articles_page, get_article_by_id,
-  get_feed_errors — **partial** (list done; paging-by-provider,
-  by-id, feed errors missing)
+  get_feed_errors — **partial** (list + by-id + the Feed Errors
+  view/recording done v0.1.13; provider-paged listing is the
+  hosted cache's shape instead, no separate pager)
 - Read state: mark_read, mark_unread, mark_read_batch, mark_all_read —
-  **partial** (local read/all done; unread, batch, remote propagation
-  for GReader/Miniflux partial: mark_read_remote exists, not wired)
+  **done** (local + batch; remote propagation wired: GReader
+  set_read_remote and Miniflux entry state ride the toggle actions,
+  and the active provider writes through its cache + server)
 - Favorites: supports_favorites, toggle_favorite, set_favorite — **done** locally
 - OPML: import_opml, export_opml — **done** (local)
 - Categories: get_categories, add/rename/delete, move_category,
@@ -48,19 +51,21 @@ Base-interface method groups (54) and where they stand in Rust core:
   ensure_category_path/delete_category_path with Python's
   reparenting, rename moves the subtree, the tree groups feeds
   under nested category nodes)
-- Full text: fetch_full_content — **partial** (cascade wired into
-  the app via Read Full Text, slice 6; fetch fallback chain missing)
+- Full text: fetch_full_content — **done** (cascade wired into
+  the app via Read Full Text; the fetch fallback chain landed
+  v0.1.18, arbitration v0.1.18)
 - Media/chapters: get_article_chapters, HostedArticleMediaMixin
-  (update_article_media) — **partial** (chapters stored/listed and
-  navigated in the player since slice 7, update_article_media
-  landed with the v0.1.10 playback-resolution pass; the hosted
-  mixin's remote media table is batch 8)
+  (update_article_media) — **done** (chapters stored/listed and
+  navigated in the player; update_article_media landed v0.1.11;
+  hosted enclosures map into local media v0.1.19)
 - Delete/restore: supports_article_delete, delete_article,
   supports_restore_deleted, restore_article — **done** (local)
 - Smart folders: supports_smart_folders, get/create/update/delete —
-  **partial** (CRUD + rule evaluation + tree display done; update/rename + full rule editor dialog missing)
+  **done** (CRUD + rule evaluation + tree display; the full
+  condition editor dialog landed v0.1.15)
 - Filter rules (LocalProvider extension): get/create/update/delete,
-  reorder, apply to existing — **partial** (CRUD + pipeline applied on store done; reorder, apply-to-existing, editor dialog missing)
+  reorder, apply to existing — **done** (update/reorder +
+  apply-to-existing v0.1.14; the editor dialog v0.1.15)
 
 ## 2. Core feature areas (Python `core/`, 46k lines)
 
@@ -72,12 +77,12 @@ Base-interface method groups (54) and where they stand in Rust core:
 | Article extraction (layered cascade) | article_extractor.py 5,098 | **partial** — cascade + full gate-marker list, paywall/link-list rejection, JSON-LD, Register + Axios dedicated extractors, metered notice, zero-width strip (slices 1, 6); engine-disagreement vetting hardened v0.1.4 (error-page title/body markers + prose shape, with BBC article + BBC 404 fixture regression tests — a blanket disagreement rejection discarded good extractions); precision-first base + lean lead recovery v0.1.11 (Python's favor_precision recipe: balanced mode dragged footer/affiliate boilerplate into Brandon's 9to5Mac full text; precision reproduced Python's output exactly; regression fixtures 9to5mac_whatsapp.html + cbc_syndicated.html); remaining: Python's meta-description lead recovery depth. Landed v0.1.18: fetch fallback chain (stored cookies -> Sky News via Google Translate -> Jina-as-text on gates -> Smry -> Wayback raw snapshots; curl_cffi TLS impersonation and the warm-browser stage are documented non-ports — no Rust equivalent exists for either), byte-accurate decoding (override -> BOM -> header charset -> meta charset -> UTF-8, encoding_rs), BBC/WSJ/TechRadar boilerplate strips, Bloomberg video JSON-LD text, GSMArena battery-table sort (HTML-level; not ported — the table extracts unsorted), thread rebuilds for the API platforms (Lemmy api/v3, GitHub REST, Reddit .json, Discourse .json — core/threads.rs; the HTML-selector forum configs (Invision/vBulletin/XenForo/Google Groups) are not ported: no CSS-selector engine), captcha solver client (core/captcha.rs; its only Python caller is the browser stage) |
 | HTML rendering of articles | article_html.py 1,190 | **missing** (native TextCtrl reader instead; rich view is a Phase-6 manual gate) |
 | Utilities (dates, text, URLs) | utils.py 2,893 | **partial** — pulled in as needed |
-| Browser cookies (Chromium) + site cookies + clearance | chromium_cookies.py 2,184; site_cookies.py 1,533 | **done (v0.1.21)** — Netscape jar + matching + 8KB budget + fetch wiring; Chromium import: profile discovery for the full Chromium family on all 3 OSes, v10 keys (Windows DPAPI + AES-256-GCM; macOS Keychain PBKDF2 + AES-128-CBC; Linux peanuts default), DB copy/read/decrypt with domain-hash strip + merge into the jar (core/chromium.rs) + Tools > Import Site Cookies dialog. NOT ported: the v20 app-bound scheme (Python resolves it via SYSTEM impersonation + CNG + a UAC-elevated helper; the Rust app ships no elevation machinery) — v20 rows are counted as skipped; the exported-jar auto-import watcher (cookies_import.py) also remains unported |
-| Range cache proxy / stream proxy / play cache | range_cache_proxy.py 2,000; stream_proxy.py 818; play_cache.py | **missing** |
-| Dependency check (yt-dlp, ffmpeg, VLC…) | dependency_check.py 1,868 | **missing** |
-| Casting adapter | casting.py 1,609 (+ Caster engine, see Phase 5 report) | **partial** — caster-core in core: SSDP discovery, hand-rolled CASTv2 wire + TLS session, receiver launch, media load/control, Cast button; DLNA/AirPlay/queue missing |
-| Updater + translation updates | updater.py 1,283; translation_updates.py | **partial** — check + button + verified download/stage/apply landed v0.1.16 (SHA256SUMS asset ships with each release); translation updates still missing (batch 9) |
-| Translation (LLM clients) | translation.py 1,020 | **missing** |
+| Browser cookies (Chromium) + site cookies + clearance | chromium_cookies.py 2,184; site_cookies.py 1,533 | **done (v0.1.21)** — Netscape jar + matching + 8KB budget + fetch wiring; Chromium import: profile discovery for the full Chromium family on all 3 OSes, v10 keys (Windows DPAPI + AES-256-GCM; macOS Keychain PBKDF2 + AES-128-CBC; Linux peanuts default), DB copy/read/decrypt with domain-hash strip + merge into the jar (core/chromium.rs) + Tools > Import Site Cookies dialog. NOT ported: the v20 app-bound scheme (Python resolves it via SYSTEM impersonation + CNG + a UAC-elevated helper; the Rust app ships no elevation machinery) — v20 rows are counted as skipped; the exported-jar auto-import watcher landed v0.1.22 (core/cookies_import.rs: YouTube export auto-import with mtime persistence, Downloads exports merged into the site jar, changed Chromium profiles re-read hands-free; a 45-second watcher timer in the app mirrors CookieImportWatcher) |
+| Range cache proxy / stream proxy / play cache | range_cache_proxy.py 2,000; stream_proxy.py 818; play_cache.py | **partial** — the cast LAN proxy (Range passthrough + ffmpeg HLS) and the YouTube play cache landed v0.1.20 (core/proxy.rs, core/play_cache.rs); Python's general range-cache proxy for ordinary playback is not ported (MediaCtrl streams directly) |
+| Dependency check (yt-dlp, ffmpeg, VLC…) | dependency_check.py 1,868 | **done (v0.1.20)** — core/dependency.rs: tool detection, managed yt-dlp download/update, startup prompt gated by prompt_missing_dependencies_on_startup, Settings surface |
+| Casting adapter | casting.py 1,609 (+ Caster engine, see Phase 5 report) | **partial** — caster-core in core: SSDP discovery, hand-rolled CASTv2 wire + TLS session, receiver launch, media load/control, Cast button; DLNA/Sonos/Roku/Kodi landed v0.1.20 (core/castupnp.rs, cast.rs discovery incl. mDNS); AirPlay and the cast queue UI remain |
+| Updater + translation updates | updater.py 1,283; translation_updates.py | **partial** — check + button + verified download/stage/apply landed v0.1.16 (SHA256SUMS asset ships with each release); translation updates landed v0.1.22 (core/translation_updates.rs: ETag-conditional catalog fetch from the repo's main branch into the data-dir override tree the loader prefers, version-transition reset, MIN_SANE_MESSAGES sanity gate, Settings section with frequency + Check Now, background due-checks on the watcher tick) |
+| Translation (LLM clients) | translation.py 1,020 | **done (v0.1.20)** — core/translate.rs: six providers, Python's system prompt, chunking + caps, language detection; Translate action + Settings section |
 | Browser feed detection | browser_feed.py 963 | **missing** |
 | GitHub-as-source feeds | github_source.py 946 | **missing** |
 | Podcast archive | podcast_archive.py 716 | **partial** — rescan (live + Wayback union) done; dialog/lineage depth missing |
@@ -95,8 +100,8 @@ Base-interface method groups (54) and where they stand in Rust core:
 | Retention/purge | retention.py | **done** (v0.1.16: named policies ported in core/retention.rs incl. the hidden 2_days/3_months ids; article prune honours article_retention, downloads pruned by download_retention at startup) |
 | Smart folders / filters logic | smart_folders.py; filters.py | **partial** — rule tree evaluator + action pipeline ported and tested (tag field awaits articles.tags) |
 | Metadata enrichment | metadata_enrich.py | **done** (v0.1.18: core/enrich.rs — meta tags + JSON-LD author/keywords/section; Db::apply_enrichment fills a missing author and merges tags into articles.tags with Python's dedupe/caps; the full-text drain enriches from the fetched page; smart-folder Tag rules read the stored tags) |
-| Media URL resolution | media_url.py; download_formats.py | **partial** — yt-dlp info/stream resolution + download presets done; playback resolution chain ported v0.1.10 (enclosures keep their MIME type, audio/video enclosure preferred over images, yt-dlp gated to Python's supported-site allowlist, page media detection scans stored content then the fetched page, detected media persisted via update_article_media, yt-dlp generic only as last resort — fixes Brandon's Double Tap "Unsupported URL" failure); media_url.py normalize rules still missing; download_formats.py presets **done** v0.1.16 (core/download.rs: 8 named formats, Python's exact selectors + mp3 bitrates) |
-| Article language detect | article_lang.py | **missing** |
+| Media URL resolution | media_url.py; download_formats.py | **partial** — yt-dlp info/stream resolution + download presets done; playback resolution chain ported v0.1.10 (enclosures keep their MIME type, audio/video enclosure preferred over images, yt-dlp gated to Python's supported-site allowlist, page media detection scans stored content then the fetched page, detected media persisted via update_article_media, yt-dlp generic only as last resort — fixes Brandon's Double Tap "Unsupported URL" failure); media_url.py normalize rules landed v0.1.22 (core/media_url.rs, wired into Open Media URL + title_from_url naming); download_formats.py presets **done** v0.1.16 (core/download.rs: 8 named formats, Python's exact selectors + mp3 bitrates) |
+| Article language detect | article_lang.py | **done (v0.1.22)** — core/article_lang.rs: BCP-47 normalize_lang, lang_from_page_html, resolve_content_language priority chain; wired into the Translate action (target normalization + already-in-language check). Content lang marking of the reader itself awaits the rich reader (Phase-6 gate) |
 | Announcements | announcements.py | **partial** — event table + mode resolution ported (v0.1.12, core/announce.rs, Python's normalize_modes semantics); NVDA controller-client speech + Braille backend on Windows (vendored nvdaControllerClient.dll ships in the Windows zip), macOS `say` speech; Settings > Announcements page with per-event mode choices + Test button; wired events: start_update, refresh-complete (general), favorite_toggle, status_toggle, filter_change, playback_speed, media_navigation, sponsor_skip. JAWS COM backend landed v0.1.21 (FreedomSci.JawsApi SayString via hand-rolled IDispatch, gated on a live jfw/jaws/fusion process, tried after NVDA exactly as Python; Braille stays NVDA-only as in Python). Remaining: accessible-output2 layer (filter_change wired v0.1.13; playback_speed / media_navigation / sponsor_skip wired v0.1.14) |
 | Single instance, runtime env, self-test | single_instance.py; runtime_env.py; runtime_self_test.py | **missing** |
 | Platform integration (Windows/macOS) | windows_integration.py; macos_integration.py | **missing** |
@@ -534,3 +539,29 @@ surface audits missed, in port order:
    show_player_on_play gates the raise, SponsorBlock + silence
    ranges applied on the player tick with sponsor_skip
    announcements).
+
+Batch 22 resolution (final sweep, v0.1.22): media_url and
+article_lang ported with the Python test cases; translation
+updates (OTA catalogs) ported and wired (override tree preferred
+by the loader, version-transition reset, Settings section,
+watcher due-checks); the cookie auto-import watcher ported
+(YouTube exports, Downloads exports into the site jar, Chromium
+profile re-reads on a 45-second tick); Inoreader
+article_request_page_size wired; the YouTube Recommendations
+virtual feed landed end-to-end. This sweep also reconciled the
+section 1/2 rows against the tree: several rows still said
+"missing" for work that shipped in v0.1.15-v0.1.20 (dependency
+check, translation, stream proxy + play cache, DLNA casting,
+filter-rule and smart-folder editors, the full-text fallback
+chain) and now say so. What remains after v0.1.22, deliberately:
+the rich HTML reader and WebView (Phase-6 manual NVDA/JAWS
+gate); the libVLC equalizer (no MediaCtrl equivalent); AirPlay
+and the cast queue UI; Miniflux remote category CRUD and
+provider browser fallbacks; github_source and forum/rumble/
+odysee/npr/sky source-feed types (thread reconstruction for
+forums landed in v0.1.18; source-feed subscriptions did not);
+browser_feed detection; the general range-cache proxy for
+ordinary playback; the full i18n string sweep (menus, field
+labels, status strings unwrapped); Chromium v20 cookies;
+the warm-browser and curl_cffi extraction stages; GSMArena
+table sort; WebRTC VAD (ffmpeg detector stands in).

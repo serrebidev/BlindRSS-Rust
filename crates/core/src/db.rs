@@ -99,6 +99,14 @@ CREATE TABLE IF NOT EXISTS article_versions (id INTEGER PRIMARY KEY
     content_hash TEXT NOT NULL, title TEXT, content TEXT);
 CREATE INDEX IF NOT EXISTS idx_article_versions_article
     ON article_versions (article_id, captured_at);
+CREATE TABLE IF NOT EXISTS youtube_recommendations (
+    account TEXT NOT NULL, video_id TEXT NOT NULL,
+    title TEXT NOT NULL, author TEXT NOT NULL, date TEXT NOT NULL,
+    position INTEGER NOT NULL, current INTEGER NOT NULL DEFAULT 1,
+    is_read INTEGER NOT NULL DEFAULT 0,
+    is_favorite INTEGER NOT NULL DEFAULT 0,
+    is_deleted INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (account, video_id));
 ";
 
 /// Columns Python added to existing tables by migration; older
@@ -130,6 +138,32 @@ pub struct Article {
     pub is_favorite: bool,
     pub media_url: Option<String>,
     pub media_type: Option<String>,
+}
+
+/// ISO-8601 UTC stamp ("2026-10-31T09:00:00.000000+00:00"),
+/// matching Python's datetime.isoformat for aware UTC values.
+fn iso_utc(stamp: std::time::Duration) -> String {
+    let secs = stamp.as_secs() as i64;
+    let micros = stamp.subsec_micros();
+    let days = secs.div_euclid(86_400);
+    let tod = secs.rem_euclid(86_400);
+    // Civil-from-days (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { y + 1 } else { y };
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{micros:06}+00:00",
+        tod / 3600,
+        (tod / 60) % 60,
+        tod % 60
+    )
 }
 
 pub struct Db {
@@ -215,6 +249,124 @@ impl Db {
 
     /// Articles for one feed, newest first (Python orders by date in its
     /// list views). `feed_id == None` returns articles across all feeds.
+    /// Replace the visible recommendations snapshot atomically,
+    /// retaining read/favorite/deleted state (Python's
+    /// save_recommendations). `videos` is (video_id, title, author)
+    /// in YouTube's order; dates are stamped now minus position
+    /// microseconds, exactly as Python does.
+    pub fn save_recommendations(
+        &self,
+        account: &str,
+        videos: &[(String, String, String)],
+    ) -> rusqlite::Result<()> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "UPDATE youtube_recommendations SET current = 0 WHERE account = ?1",
+            [account],
+        )?;
+        for (position, (video_id, title, author)) in videos.iter().enumerate() {
+            let stamp = now - std::time::Duration::from_micros(position as u64);
+            tx.execute(
+                "INSERT INTO youtube_recommendations (account, video_id, title, author, date, position) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                 ON CONFLICT(account, video_id) DO UPDATE SET \
+                 title = excluded.title, author = excluded.author, \
+                 date = excluded.date, position = excluded.position, current = 1",
+                rusqlite::params![
+                    account,
+                    video_id,
+                    title,
+                    author,
+                    iso_utc(stamp),
+                    position as i64
+                ],
+            )?;
+        }
+        tx.commit()
+    }
+
+    /// The account's current recommendations as articles in the
+    /// virtual feed (Python's YouTubeAccountProvider._articles).
+    pub fn recommendations(&self, account: &str) -> rusqlite::Result<Vec<Article>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT video_id, title, author, date, is_read, is_favorite \
+             FROM youtube_recommendations \
+             WHERE account = ?1 AND current = 1 AND is_deleted = 0 \
+             ORDER BY current DESC, position, date DESC",
+        )?;
+        let rows = stmt.query_map([account], |row| {
+            let video_id: String = row.get(0)?;
+            let url = format!("https://www.youtube.com/watch?v={video_id}");
+            Ok(Article {
+                id: format!(
+                    "{}:{account}:{video_id}",
+                    crate::youtube_account::RECOMMENDATIONS_FEED_ID
+                ),
+                feed_id: crate::youtube_account::RECOMMENDATIONS_FEED_ID.to_string(),
+                title: row.get(1)?,
+                url: url.clone(),
+                content: None,
+                description: None,
+                date: row.get(3)?,
+                author: row.get(2)?,
+                is_read: row.get::<_, i64>(4)? != 0,
+                is_favorite: row.get::<_, i64>(5)? != 0,
+                media_url: Some(url),
+                media_type: Some("video/youtube".to_string()),
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// Soft-delete a recommendations article (Python's provider
+    /// wrapper sets is_deleted; the row's state survives for a
+    /// later snapshot).
+    pub fn delete_recommendation(&self, article_id: &str) -> rusqlite::Result<bool> {
+        let Some(rest) = article_id.strip_prefix("youtube-account:recommendations:") else {
+            return Ok(false);
+        };
+        let Some((account, video_id)) = rest.split_once(':') else {
+            return Ok(false);
+        };
+        let n = self.conn.execute(
+            "UPDATE youtube_recommendations SET is_deleted = 1 WHERE account = ?1 AND video_id = ?2",
+            rusqlite::params![account, video_id],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Read/favorite state for a recommendations article id
+    /// ("youtube-account:recommendations:<account>:<video_id>").
+    pub fn set_recommendation_state(
+        &self,
+        article_id: &str,
+        read: Option<bool>,
+        favorite: Option<bool>,
+    ) -> rusqlite::Result<bool> {
+        let Some(rest) = article_id.strip_prefix("youtube-account:recommendations:") else {
+            return Ok(false);
+        };
+        let Some((account, video_id)) = rest.split_once(':') else {
+            return Ok(false);
+        };
+        if let Some(read) = read {
+            self.conn.execute(
+                "UPDATE youtube_recommendations SET is_read = ?1 WHERE account = ?2 AND video_id = ?3",
+                rusqlite::params![read as i64, account, video_id],
+            )?;
+        }
+        if let Some(favorite) = favorite {
+            self.conn.execute(
+                "UPDATE youtube_recommendations SET is_favorite = ?1 WHERE account = ?2 AND video_id = ?3",
+                rusqlite::params![favorite as i64, account, video_id],
+            )?;
+        }
+        Ok(true)
+    }
+
     pub fn articles(&self, feed_id: Option<&str>, limit: usize) -> rusqlite::Result<Vec<Article>> {
         let sql = "SELECT id, feed_id, title, url, content, description, date, \
                    author, is_read, is_favorite, media_url, media_type \

@@ -160,7 +160,8 @@ impl HostedProvider {
                         .parse::<i64>()
                         .unwrap_or(90);
                     Ok(GReaderClient::with_oauth(service, &token)
-                        .with_cache_ttls(meta_ttl, article_ttl))
+                        .with_cache_ttls(meta_ttl, article_ttl)
+                        .with_article_page_size(crate::providers::page_size_from_config(&self.cfg)))
                 } else {
                     let (email, password) = (self.cred("email"), self.cred("password"));
                     if email.is_empty() || password.is_empty() {

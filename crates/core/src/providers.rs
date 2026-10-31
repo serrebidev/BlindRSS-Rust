@@ -62,6 +62,8 @@ pub struct GReaderClient {
     /// quota is small (100 req/day on the free tier).
     meta_ttl: std::time::Duration,
     article_ttl: std::time::Duration,
+    /// Inoreader stream page size (article_request_page_size).
+    article_page_size: Option<usize>,
 }
 
 /// Process-wide Inoreader caches (see GReaderClient's TTLs).
@@ -172,6 +174,21 @@ fn pick_enclosure(enclosures: &[LinkHref]) -> Option<(String, Option<String>)> {
     Some((chosen.href.clone(), chosen.link_type.clone()))
 }
 
+/// The configured Inoreader page size: top-level config key
+/// `article_request_page_size` (number or numeric string),
+/// default 100, clamped 20..=1000 (Python's _articles_page_n).
+pub fn page_size_from_config(cfg: &crate::config::Config) -> usize {
+    let raw = cfg.raw().get("article_request_page_size");
+    let n: i64 = match raw {
+        Some(v) => v
+            .as_i64()
+            .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+            .unwrap_or(100),
+        None => 100,
+    };
+    n.clamp(20, 1000) as usize
+}
+
 impl GReaderClient {
     pub fn new(service: GReaderService, email: &str, password: &str) -> Self {
         Self {
@@ -184,6 +201,7 @@ impl GReaderClient {
             token: RefCell::new(None),
             meta_ttl: std::time::Duration::from_secs(3600),
             article_ttl: std::time::Duration::from_secs(90),
+            article_page_size: None,
         }
     }
 
@@ -202,6 +220,25 @@ impl GReaderClient {
         self.meta_ttl = std::time::Duration::from_secs(meta_secs.clamp(60, 86_400) as u64);
         self.article_ttl = std::time::Duration::from_secs(article_secs.clamp(5, 900) as u64);
         self
+    }
+
+    /// Set the Inoreader stream page size from the top-level
+    /// `article_request_page_size` config key (Python's
+    /// _articles_page_n: default 100, clamped 20..=1000). Only
+    /// the Inoreader flavor consults it.
+    pub fn with_article_page_size(mut self, n: usize) -> Self {
+        self.article_page_size = Some(n.clamp(20, 1000));
+        self
+    }
+
+    /// The page size a stream request should use: for Inoreader
+    /// the configured size wins over the caller's count.
+    fn effective_count(&self, requested: usize) -> usize {
+        if self.service == GReaderService::Inoreader {
+            self.article_page_size.unwrap_or(100).clamp(20, 1000)
+        } else {
+            requested
+        }
     }
 
     /// Drop the Inoreader caches (a manual refresh bypasses
@@ -334,6 +371,7 @@ impl GReaderClient {
     /// Fetch a stream's items as articles (not yet stored).
     /// Inoreader results ride the short-lived article cache.
     pub fn stream_articles(&self, stream_id: &str, count: usize) -> Result<Vec<Article>, String> {
+        let count = self.effective_count(count);
         if self.service == GReaderService::Inoreader {
             let key = format!("{stream_id}|{count}");
             {
