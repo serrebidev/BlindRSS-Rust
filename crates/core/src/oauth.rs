@@ -93,7 +93,8 @@ fn post_token(form: &[(&str, String)]) -> Result<serde_json::Value, String> {
         .map(|(k, v)| format!("{}={}", url_encode(k), url_encode(v)))
         .collect::<Vec<_>>()
         .join("&");
-    let mut resp = ureq::post(TOKEN_URL)
+    let mut resp = crate::http::agent()
+        .post(TOKEN_URL)
         .header("Accept", "application/json")
         .send(&body)
         .map_err(|e| format!("token request: {e}"))?;

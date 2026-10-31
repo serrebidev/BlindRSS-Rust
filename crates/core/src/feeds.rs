@@ -106,8 +106,8 @@ pub fn parse_feed(bytes: &[u8]) -> Result<ParsedFeed, String> {
 
 /// Fetch a feed over HTTP and parse it. Used by the refresh path.
 pub fn fetch_and_parse(url: &str) -> Result<ParsedFeed, String> {
-    let mut resp = ureq::get(url)
-        .header("User-Agent", "BlindRSS-Rust/0.1")
+    let mut resp = crate::http::agent()
+        .get(url)
         .call()
         .map_err(|e| format!("fetch failed: {e}"))?;
     let bytes = resp

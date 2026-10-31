@@ -149,3 +149,111 @@ pub fn apply_pending_restore(data_dir: &std::path::Path) -> bool {
     let _ = std::fs::remove_dir_all(&pending);
     applied
 }
+
+/// The platform asset name suffix for update downloads.
+fn platform_asset_suffix() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "-Windows.zip"
+    } else if cfg!(target_os = "macos") {
+        "-macOS.zip"
+    } else {
+        "-Linux.zip"
+    }
+}
+
+/// Fetch the latest release and pick this platform's zip plus
+/// the SHA256SUMS asset: (tag, zip url, sums url).
+pub fn latest_release_assets() -> Result<(String, Option<String>, Option<String>), String> {
+    let mut resp = crate::http::agent()
+        .get("https://api.github.com/repos/serrebidev/BlindRSS-Rust/releases/latest")
+        .call()
+        .map_err(|e| format!("update check: {e}"))?;
+    let text = resp
+        .body_mut()
+        .read_to_string()
+        .map_err(|e| format!("update check: {e}"))?;
+    let value: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("update response: {e}"))?;
+    let tag = value
+        .get("tag_name")
+        .and_then(|t| t.as_str())
+        .ok_or("no tag in release response")?
+        .to_string();
+    let suffix = platform_asset_suffix();
+    let mut zip_url = None;
+    let mut sums_url = None;
+    if let Some(assets) = value.get("assets").and_then(|a| a.as_array()) {
+        for a in assets {
+            let name = a.get("name").and_then(|n| n.as_str()).unwrap_or("");
+            let url = a
+                .get("browser_download_url")
+                .and_then(|u| u.as_str())
+                .map(|s| s.to_string());
+            if name.ends_with(suffix) {
+                zip_url = url.clone();
+            }
+            if name == "SHA256SUMS" {
+                sums_url = url;
+            }
+        }
+    }
+    Ok((tag, zip_url, sums_url))
+}
+
+/// Download the latest platform zip, verify it against the
+/// release's SHA256SUMS, and stage it under
+/// `<data_dir>/update_pending/` for the next start to apply.
+/// Returns the staged tag.
+pub fn download_and_stage_update(data_dir: &std::path::Path) -> Result<String, String> {
+    use sha2::Digest;
+    let (tag, zip_url, sums_url) = latest_release_assets()?;
+    let zip_url = zip_url.ok_or("no platform zip in the latest release")?;
+    let sums_url = sums_url.ok_or("release has no SHA256SUMS to verify against")?;
+    let mut resp = crate::http::agent()
+        .get(&sums_url)
+        .call()
+        .map_err(|e| format!("checksums: {e}"))?;
+    let sums = resp
+        .body_mut()
+        .read_to_string()
+        .map_err(|e| format!("checksums: {e}"))?;
+    let zip_name = zip_url.rsplit('/').next().unwrap_or("");
+    let expected = sums
+        .lines()
+        .find_map(|line| {
+            let (hash, name) = line.split_once(char::is_whitespace)?;
+            if name.trim().trim_start_matches('*') == zip_name {
+                Some(hash.trim().to_lowercase())
+            } else {
+                None
+            }
+        })
+        .ok_or("platform zip not listed in SHA256SUMS")?;
+    let mut resp = crate::http::agent()
+        .get(&zip_url)
+        .call()
+        .map_err(|e| format!("update download: {e}"))?;
+    let bytes = resp
+        .body_mut()
+        .read_to_vec()
+        .map_err(|e| format!("update download: {e}"))?;
+    let digest = sha2::Sha256::digest(&bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    if digest != expected {
+        return Err("update download failed checksum verification".to_string());
+    }
+    let pending = data_dir.join("update_pending");
+    if pending.exists() {
+        let _ = std::fs::remove_dir_all(&pending);
+    }
+    std::fs::create_dir_all(&pending).map_err(|e| format!("stage dir: {e}"))?;
+    let cursor = std::io::Cursor::new(bytes);
+    let mut archive = zip::ZipArchive::new(cursor).map_err(|e| format!("update zip: {e}"))?;
+    archive
+        .extract(&pending)
+        .map_err(|e| format!("update extract: {e}"))?;
+    std::fs::write(pending.join("VERSION"), &tag).map_err(|e| format!("stage: {e}"))?;
+    Ok(tag)
+}

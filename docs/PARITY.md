@@ -76,7 +76,7 @@ Base-interface method groups (54) and where they stand in Rust core:
 | Range cache proxy / stream proxy / play cache | range_cache_proxy.py 2,000; stream_proxy.py 818; play_cache.py | **missing** |
 | Dependency check (yt-dlp, ffmpeg, VLC…) | dependency_check.py 1,868 | **missing** |
 | Casting adapter | casting.py 1,609 (+ Caster engine, see Phase 5 report) | **partial** — caster-core in core: SSDP discovery, hand-rolled CASTv2 wire + TLS session, receiver launch, media load/control, Cast button; DLNA/AirPlay/queue missing |
-| Updater + translation updates | updater.py 1,283; translation_updates.py | **partial** — GitHub latest-release check + app button done; download/apply + translation updates missing |
+| Updater + translation updates | updater.py 1,283; translation_updates.py | **partial** — check + button + verified download/stage/apply landed v0.1.16 (SHA256SUMS asset ships with each release); translation updates still missing (batch 9) |
 | Translation (LLM clients) | translation.py 1,020 | **missing** |
 | Browser feed detection | browser_feed.py 963 | **missing** |
 | GitHub-as-source feeds | github_source.py 946 | **missing** |
@@ -90,12 +90,12 @@ Base-interface method groups (54) and where they stand in Rust core:
 | Audio silence detection + skip | audio_silence.py 534 | **partial** (v0.1.14: core/silence.rs — ffmpeg silencedetect with Python's RMS-fallback parameters, merge-gap + padding post-processing; the player analyses on a worker and skips with announcements. Python's primary WebRTC-VAD detector is not ported — no Rust VAD binding exists; the threshold detector is the documented substitute) |
 | Playback state persistence | playback_state.py | **done** (slice 7: get/upsert/delete against the Python table) |
 | Equalizer (libVLC 10-band presets) | equalizer.py | **missing** |
-| User agents / fetch identity | user_agents.py 540; http_headers.py | **partial** — UA set on full-text fetch; presets + per-feed identity missing |
+| User agents / fetch identity | user_agents.py 540; http_headers.py | **partial** — all fetches ride the shared http agent with the resolved UA (8 presets + custom + auto=platform preset) and yt-dlp gets the same UA, v0.1.16; installed-browser version detection + per-feed identity + http_headers.py per-channel headers missing |
 | Backup/restore | backup.py | **done** — ZIP backup (VACUUM INTO + config) + restore + app buttons; restore is staged to restore_pending/ and applied at startup before the DB opens, replaced files kept as .pre-restore (Python semantics; the earlier live swap was a correctness bug, fixed v0.1.13) |
-| Retention/purge | retention.py | **partial** — prune read non-favorites + old tombstones (30d button) done; policy options missing |
+| Retention/purge | retention.py | **done** (v0.1.16: named policies ported in core/retention.rs incl. the hidden 2_days/3_months ids; article prune honours article_retention, downloads pruned by download_retention at startup) |
 | Smart folders / filters logic | smart_folders.py; filters.py | **partial** — rule tree evaluator + action pipeline ported and tested (tag field awaits articles.tags) |
 | Metadata enrichment | metadata_enrich.py | **missing** |
-| Media URL resolution | media_url.py; download_formats.py | **partial** — yt-dlp info/stream resolution + download presets done; playback resolution chain ported v0.1.10 (enclosures keep their MIME type, audio/video enclosure preferred over images, yt-dlp gated to Python's supported-site allowlist, page media detection scans stored content then the fetched page, detected media persisted via update_article_media, yt-dlp generic only as last resort — fixes Brandon's Double Tap "Unsupported URL" failure); media_url.py normalize rules + download_formats.py presets still missing |
+| Media URL resolution | media_url.py; download_formats.py | **partial** — yt-dlp info/stream resolution + download presets done; playback resolution chain ported v0.1.10 (enclosures keep their MIME type, audio/video enclosure preferred over images, yt-dlp gated to Python's supported-site allowlist, page media detection scans stored content then the fetched page, detected media persisted via update_article_media, yt-dlp generic only as last resort — fixes Brandon's Double Tap "Unsupported URL" failure); media_url.py normalize rules still missing; download_formats.py presets **done** v0.1.16 (core/download.rs: 8 named formats, Python's exact selectors + mp3 bitrates) |
 | Article language detect | article_lang.py | **missing** |
 | Announcements | announcements.py | **partial** — event table + mode resolution ported (v0.1.12, core/announce.rs, Python's normalize_modes semantics); NVDA controller-client speech + Braille backend on Windows (vendored nvdaControllerClient.dll ships in the Windows zip), macOS `say` speech; Settings > Announcements page with per-event mode choices + Test button; wired events: start_update, refresh-complete (general), favorite_toggle, status_toggle, filter_change, playback_speed, media_navigation, sponsor_skip. Remaining: JAWS COM backend (Python falls back to it after NVDA), accessible-output2 layer (filter_change wired v0.1.13; playback_speed / media_navigation / sponsor_skip wired v0.1.14) |
 | Single instance, runtime env, self-test | single_instance.py; runtime_env.py; runtime_self_test.py | **missing** |
@@ -231,6 +231,53 @@ folder (13 paths). Missing families, by config key group:
   auto_backup_{enabled,dir,last} (scheduled auto-backup — Rust has
   manual backup only).
 - Inoreader depth keys: article/metadata cache TTLs, page size.
+
+Batch 5 resolution (v0.1.16): the Settings dialog now carries
+pages/sections for all of the above families except the ones
+called out below, and the behaviours behind the keys landed:
+refresh engine (worker pool = max_concurrent_refreshes,
+per-host gate = per_host_max_connections, retries =
+feed_retry_attempts, timeout + UA on the shared http agent =
+feed_timeout_seconds / user_agent_mode+custom with Python's 8
+presets; "auto" resolves to the platform preset — installed-
+browser version detection is not ported), search_mode
+(title_only honoured by Db::search_articles_mode),
+delete_behavior (global + per-feed feeds.delete_behavior
+column; "deleted" / "purge" / "category:<path>") +
+confirm_article_delete prompt, downloads (downloads_enabled
+gate, download_format named presets with Python's exact
+selectors + mp3 bitrates, download_retention pruning),
+article_retention policies replacing the fixed 30-day prune,
+player keys (seek back/forward, volume step, start speed,
+SponsorBlock categories, silence threshold/minimum — all read
+by the player since batch 3), notifications
+(windows_notifications_* with excluded-feeds picker storing
+feed IDs + Test button; tray balloon on Windows, notify-send /
+osascript elsewhere), sounds (sounds_enabled; Python's
+refresh_complete.wav / refresh_error.wav now bundled in the
+zips under sounds/ and played on refresh end), tray
+(close_to_tray via CLOSE_WINDOW veto + hide, start_in_
+system_tray, popup menu Show/Refresh/Exit, double-click
+restore; minimize_to_tray is stored but the wxDragon binding
+exposes no ICONIZE event to hook), auto-backup (24h due check
+at startup, BlindRSS-auto-backup-*.zip, keep 7,
+auto_backup_last), updates (auto_check_updates at startup;
+install_updates_automatically downloads the platform zip,
+verifies it against the release's SHA256SUMS asset, stages it
+in update_pending/, and the next start swaps it in via the
+rename-aside trick). Still open from this list:
+article_columns (batch 9), article_structure_* / rich view /
+max_cached_views (native-reader design differences, §7.3),
+streaming caches (batch 9), translation (batch 9),
+resume_* family + preferred_soundcard + vlc knobs
+(engine-specific to libVLC; MediaCtrl resumes via
+playback_state only), start_on_windows_login + OS shortcut
+integration, github/groups_io/newsapi keys (batch 7/8
+features), captcha_solver (keys stored; the solver runs as
+the fetch chain's last resort, batch 7), data_location move
+(the current folder is shown; relocating is Python's
+app_folder/user_data choice — Rust resolves one location the
+Python way), global_show_hide_hotkey (batch 9).
 
 ### 5C. Menu bar and context menus (structural)
 Python: full menu bar (File/Feeds/Edit/View/Player/Tools/Help) +

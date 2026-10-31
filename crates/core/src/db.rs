@@ -89,13 +89,15 @@ CREATE TABLE IF NOT EXISTS article_labels (article_id TEXT,
 
 /// Columns Python added to existing tables by migration; older
 /// databases get them on open.
-const MIGRATION_COLUMNS: [(&str, &str, &str); 6] = [
+const MIGRATION_COLUMNS: [(&str, &str, &str); 8] = [
     ("feeds", "last_error", "TEXT"),
     ("feeds", "last_error_at", "REAL"),
     ("feeds", "last_success_at", "REAL"),
     ("feeds", "consecutive_failures", "INTEGER DEFAULT 0"),
     ("categories", "parent_id", "TEXT"),
     ("articles", "category_override", "TEXT"),
+    ("feeds", "delete_behavior", "TEXT"),
+    ("deleted_articles", "purged", "INTEGER DEFAULT 0"),
 ];
 
 #[derive(Debug, Clone, PartialEq)]
@@ -995,6 +997,82 @@ impl Db {
         Ok(removed + removed_tomb)
     }
 
+    /// Permanently delete an article (Python delete_behavior
+    /// "purge"): the tombstone is kept but flagged purged, so
+    /// it stays out of the Deleted view and cannot be restored.
+    pub fn purge_article(&self, article_id: &str) -> rusqlite::Result<bool> {
+        let deleted = self.delete_article(article_id)?;
+        self.conn.execute(
+            "UPDATE deleted_articles SET purged = 1 WHERE article_id = ?1",
+            params![article_id],
+        )?;
+        Ok(deleted)
+    }
+
+    /// A feed's delete-behavior override (feeds.delete_behavior),
+    /// when set: "deleted", "purge", or "category:<path>".
+    pub fn feed_delete_behavior(&self, feed_id: &str) -> rusqlite::Result<Option<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT delete_behavior FROM feeds WHERE id = ?1")?;
+        let mut rows = stmt.query(params![feed_id])?;
+        match rows.next()? {
+            Some(row) => Ok(row.get::<_, Option<String>>(0)?.filter(|s| !s.is_empty())),
+            None => Ok(None),
+        }
+    }
+
+    /// Set or clear a feed's delete-behavior override.
+    pub fn set_feed_delete_behavior(
+        &self,
+        feed_id: &str,
+        behavior: Option<&str>,
+    ) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE feeds SET delete_behavior = ?2 WHERE id = ?1",
+            params![feed_id, behavior],
+        )?;
+        Ok(())
+    }
+
+    /// Search honouring the `search_mode` setting: title_only
+    /// restricts the match to titles.
+    pub fn search_articles_mode(
+        &self,
+        query: &str,
+        limit: usize,
+        title_only: bool,
+    ) -> rusqlite::Result<Vec<Article>> {
+        if !title_only {
+            return self.search_articles(query, limit);
+        }
+        let like = format!("%{}%", query.replace('%', "\\%").replace('_', "\\_"));
+        let mut stmt = self.conn.prepare(
+            "SELECT id, feed_id, title, url, content, description, date, \
+             author, is_read, is_favorite, media_url, media_type \
+             FROM articles \
+             WHERE title LIKE ?1 ESCAPE '\\' \
+             ORDER BY date DESC, id DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![like, limit as i64], |r| {
+            Ok(Article {
+                id: r.get(0)?,
+                feed_id: r.get(1)?,
+                title: r.get(2)?,
+                url: r.get(3)?,
+                content: r.get(4)?,
+                description: r.get(5)?,
+                date: r.get(6)?,
+                author: r.get(7)?,
+                is_read: r.get(8)?,
+                is_favorite: r.get(9)?,
+                media_url: r.get(10)?,
+                media_type: r.get(11)?,
+            })
+        })?;
+        rows.collect()
+    }
+
     /// Restore a deleted article from its tombstone. Read/favorite state
     /// is not part of the tombstone schema, so a restored article comes
     /// back unread and unfavorited (same as Python).
@@ -1031,6 +1109,7 @@ impl Db {
         let mut stmt = self.conn.prepare(
             "SELECT article_id, feed_id, title, url, content, description, date, \
              author, media_url, media_type FROM deleted_articles \
+             WHERE COALESCE(purged, 0) = 0 \
              ORDER BY deleted_at DESC",
         )?;
         let rows = stmt.query_map([], |r| {

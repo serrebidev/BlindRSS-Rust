@@ -210,6 +210,310 @@ fn queue_entry_article(e: &serde_json::Value) -> Article {
     }
 }
 
+/// Apply a staged update (maintenance::download_and_stage_
+/// update) before anything else starts: the staged tree
+/// replaces the executable's folder contents. The running
+/// binary is renamed aside first (Windows allows renaming a
+/// running exe; the old copy is cleaned up on a later start),
+/// then the staged files are copied over.
+fn apply_pending_update() {
+    let pending = data_dir().join("update_pending");
+    let staged_root = pending.join("BlindRSS");
+    let exe_name = if cfg!(target_os = "windows") {
+        "blindrss.exe"
+    } else {
+        "blindrss"
+    };
+    let staged_exe = staged_root.join(exe_name);
+    if !staged_exe.exists() {
+        return;
+    }
+    let Ok(current) = std::env::current_exe() else {
+        return;
+    };
+    let Some(exe_dir) = current.parent().map(|p| p.to_path_buf()) else {
+        return;
+    };
+    // Clean a previous swap's leftovers.
+    let old = exe_dir.join("blindrss.old");
+    if old.exists() {
+        let _ = std::fs::remove_file(&old);
+    }
+    let _ = std::fs::rename(&current, &old);
+    // Copy the whole staged tree over the install folder.
+    fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+        if let Ok(rd) = std::fs::read_dir(from) {
+            for entry in rd.flatten() {
+                let dest = to.join(entry.file_name());
+                let path = entry.path();
+                if path.is_dir() {
+                    let _ = std::fs::create_dir_all(&dest);
+                    copy_tree(&path, &dest);
+                } else {
+                    let _ = std::fs::copy(&path, &dest);
+                }
+            }
+        }
+    }
+    copy_tree(&staged_root, &exe_dir);
+    let _ = std::fs::remove_dir_all(&pending);
+}
+
+/// Apply the fetch-identity config to the shared HTTP agent
+/// and to the environment yt-dlp reads (cookies file + UA).
+/// Called at startup and after Settings changes.
+fn apply_http_config() {
+    let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+    blindrss_core::http::init_from_config(&cfg);
+    // SAFETY: called on the UI thread before workers that read
+    // these variables are spawned for a new action; this is the
+    // same trade-off the process env always carries.
+    unsafe {
+        std::env::set_var(
+            "BLINDRSS_YTDLP_COOKIES",
+            cfg.get_str("ytdlp_cookies_file", ""),
+        );
+        std::env::set_var("BLINDRSS_USER_AGENT", blindrss_core::http::user_agent());
+    }
+}
+
+/// Play a sound file with the platform's command-line player
+/// (no audio dependency in the tree): PowerShell SoundPlayer
+/// on Windows, afplay on macOS, paplay/aplay on Linux.
+fn play_sound_file(path: &std::path::Path) {
+    if !path.exists() {
+        return;
+    }
+    let p = path.to_string_lossy().to_string();
+    #[cfg(target_os = "windows")]
+    {
+        let script = format!(
+            "(New-Object System.Media.SoundPlayer '{}').PlaySync()",
+            p.replace('\'', "''")
+        );
+        let _ = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command", &script])
+            .spawn();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("afplay").arg(&p).spawn();
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        if std::process::Command::new("paplay")
+            .arg(&p)
+            .spawn()
+            .is_err()
+        {
+            let _ = std::process::Command::new("aplay").arg(&p).spawn();
+        }
+    }
+}
+
+/// Resolve a configured sound path ("sounds/refresh_complete.
+/// wav" in Python's config): beside the executable first (the
+/// release zips carry a sounds/ folder), then the data dir,
+/// then as given.
+fn resolve_sound(
+    cfg: &blindrss_core::config::Config,
+    key: &str,
+    default: &str,
+) -> std::path::PathBuf {
+    let raw = cfg.get_str(key, default);
+    let rel = std::path::Path::new(raw);
+    if rel.is_absolute() {
+        return rel.to_path_buf();
+    }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        let candidate = dir.join(rel);
+        if candidate.exists() {
+            return candidate;
+        }
+    }
+    let in_data = data_dir().join(rel);
+    if in_data.exists() {
+        return in_data;
+    }
+    rel.to_path_buf()
+}
+
+/// Startup maintenance on a worker: automatic backup when due
+/// (24h, keep newest 7) and download-folder retention pruning.
+fn startup_maintenance() {
+    std::thread::spawn(move || {
+        let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+        if cfg.get_bool("auto_backup_enabled", false) {
+            let last = cfg
+                .raw()
+                .get("auto_backup_last")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(0.0);
+            if now - last >= 86_400.0 {
+                let raw_dir = cfg.get_str("auto_backup_dir", "").trim().to_string();
+                let dir = if raw_dir.is_empty() {
+                    data_dir().join("backups")
+                } else {
+                    PathBuf::from(raw_dir)
+                };
+                if std::fs::create_dir_all(&dir).is_ok() {
+                    // Local-time-free stamp: seconds since epoch
+                    // keeps names sortable without a date crate.
+                    let stamp = format!("{}", now as i64);
+                    let dest = dir.join(format!("BlindRSS-auto-backup-{stamp}.zip"));
+                    if blindrss_core::maintenance::create_backup(&db_path(), &config_path(), &dest)
+                        .is_ok()
+                    {
+                        let mut autos: Vec<PathBuf> = std::fs::read_dir(&dir)
+                            .map(|rd| {
+                                rd.filter_map(|e| e.ok().map(|e| e.path()))
+                                    .filter(|p| {
+                                        p.file_name()
+                                            .map(|n| {
+                                                n.to_string_lossy()
+                                                    .starts_with("BlindRSS-auto-backup-")
+                                            })
+                                            .unwrap_or(false)
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        autos.sort();
+                        while autos.len() > 7 {
+                            let old = autos.remove(0);
+                            let _ = std::fs::remove_file(old);
+                        }
+                        let mut cfg2 =
+                            blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+                        cfg2.set_path("auto_backup_last", serde_json::json!(now));
+                        let _ = cfg2.save(&config_path());
+                    }
+                }
+            }
+        }
+        // Download retention: delete files older than the policy.
+        if let Some(days) =
+            blindrss_core::retention::retention_days(cfg.get_str("download_retention", "unlimited"))
+        {
+            let dir = cfg
+                .raw()
+                .get("download_path")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from);
+            if let Some(dir) = dir {
+                let cutoff = std::time::SystemTime::now()
+                    - std::time::Duration::from_secs((days.max(0) as u64) * 86_400);
+                if let Ok(rd) = std::fs::read_dir(&dir) {
+                    for entry in rd.flatten() {
+                        let path = entry.path();
+                        let old = entry
+                            .metadata()
+                            .and_then(|m| m.modified())
+                            .map(|t| t < cutoff)
+                            .unwrap_or(false);
+                        if old && path.is_file() {
+                            let _ = std::fs::remove_file(path);
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// Side effects at the end of a refresh (Python's Sounds +
+/// Notifications pages): completion/error sounds and desktop
+/// notifications for feeds with new articles.
+fn refresh_side_effects(tray: &TaskBarIcon, new_by_feed: &[(String, String, usize)], failed: bool) {
+    let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+    if cfg.get_bool("sounds_enabled", true) {
+        let (key, default) = if failed {
+            ("sound_refresh_error", "sounds/refresh_error.wav")
+        } else {
+            ("sound_refresh_complete", "sounds/refresh_complete.wav")
+        };
+        play_sound_file(&resolve_sound(&cfg, key, default));
+    }
+    if !cfg.get_bool("windows_notifications_enabled", false) {
+        return;
+    }
+    let excluded: Vec<String> = cfg
+        .raw()
+        .get("windows_notifications_excluded_feeds")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let include_name = cfg.get_bool("windows_notifications_include_feed_name", true);
+    let items: Vec<&(String, String, usize)> = new_by_feed
+        .iter()
+        .filter(|(id, _, _)| !excluded.iter().any(|x| x == id))
+        .collect();
+    if items.is_empty() {
+        return;
+    }
+    let cap = cfg.get_i64("windows_notifications_max_per_refresh", 0);
+    let shown = if cap <= 0 {
+        items.len()
+    } else {
+        (cap as usize).min(items.len())
+    };
+    for (_, title, n) in &items[..shown] {
+        let body = if include_name {
+            format!("{n} new article(s) in {title}")
+        } else {
+            format!("{n} new article(s)")
+        };
+        notify_desktop(tray, "BlindRSS", &body);
+    }
+    if shown < items.len() && cfg.get_bool("windows_notifications_show_summary_when_capped", true) {
+        let total: usize = items.iter().map(|(_, _, n)| n).sum();
+        notify_desktop(
+            tray,
+            "BlindRSS",
+            &format!("{total} new article(s) in {} feed(s)", items.len()),
+        );
+    }
+}
+
+/// One desktop notification: the tray balloon on Windows
+/// (wxTaskBarIcon::ShowBalloon), notify-send on Linux,
+/// osascript on macOS.
+fn notify_desktop(tray: &TaskBarIcon, title: &str, body: &str) {
+    #[cfg(target_os = "windows")]
+    {
+        tray.show_balloon(title, body, 5000, 0, None);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let script = format!(
+            "display notification "{}" with title "{}"",
+            body.replace('\"', "'"),
+            title.replace('\"', "'")
+        );
+        let _ = std::process::Command::new("osascript")
+            .args(["-e", &script])
+            .spawn();
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let _ = tray;
+        let _ = std::process::Command::new("notify-send")
+            .args([title, body])
+            .spawn();
+    }
+}
+
 /// Modal text prompt; None when cancelled.
 /// Speak/braille a configured announcement for an event
 /// (PARITY 7.4). Config is re-read per event so Settings changes
@@ -331,6 +635,11 @@ struct State {
     /// True while the search text box has keyboard focus; the
     /// Backspace toggle-read shortcut must not eat its editing.
     search_focused: bool,
+    /// Per-feed new-article counts for the running refresh
+    /// (sounds/notifications at AllDone consume them).
+    refresh_new: Vec<(String, String, usize)>,
+    /// Any feed failed in the running refresh (error sound).
+    refresh_failed: bool,
     /// Article stub for an in-flight queue playback resolve (the
     /// article may not be in the current list).
     pending_play: Option<Article>,
@@ -365,6 +674,8 @@ enum RefreshMsg {
     UpdateChecked(Result<(String, Option<String>), String>),
     /// Open-article-by-URL result: (page title, plain text).
     OpenedArticle(Result<(String, String), String>),
+    /// A downloaded + verified update awaiting a restart.
+    UpdateStaged(Result<String, String>),
 }
 
 const ID_OK: i32 = 5100;
@@ -860,6 +1171,9 @@ fn main() {
         config_path().display()
     ));
     let _ = wxdragon::main(|_| {
+        apply_pending_update();
+        apply_http_config();
+        startup_maintenance();
         let language = ui_language();
         let catalog = blindrss_core::i18n::Catalog::load(&locale_root(), &language);
         let refresh_label = catalog.get("Refresh All Feeds").to_string();
@@ -870,9 +1184,14 @@ fn main() {
         frame.create_status_bar(1, 0, -1, "status");
 
         // Tray icon (orange square placeholder artwork; the real
-        // app icon ships with the release packaging).
+        // app icon ships with the release packaging) with the
+        // tray behaviours: popup menu (Show / Refresh All /
+        // Exit), double-click restores, close_to_tray vetoes the
+        // window close into a hide, start_in_system_tray starts
+        // hidden. The handle is shared with the refresh drain
+        // for Windows balloon notifications.
+        let tray = TaskBarIcon::builder().build();
         {
-            let tray = TaskBarIcon::builder().build();
             let mut rgba = Vec::with_capacity(32 * 32 * 4);
             for _ in 0..32 * 32 {
                 rgba.extend_from_slice(&[240, 130, 20, 255]);
@@ -880,8 +1199,65 @@ fn main() {
             if let Some(bmp) = Bitmap::from_rgba(&rgba, 32, 32) {
                 tray.set_icon(&bmp, "BlindRSS");
             }
-            Box::leak(Box::new(tray));
         }
+        const TRAY_SHOW: i32 = 2301;
+        const TRAY_REFRESH: i32 = 2302;
+        const TRAY_EXIT: i32 = 2303;
+        let mut tray_menu = Menu::builder()
+            .append_item(TRAY_SHOW, "Show BlindRSS", "")
+            .append_item(TRAY_REFRESH, "Refresh All", "")
+            .append_separator()
+            .append_item(TRAY_EXIT, "Exit", "")
+            .build();
+        tray.set_popup_menu(&mut tray_menu);
+        // Set once the real actions exist (below); the tray menu
+        // and close handler consult these slots.
+        type ActionSlot = Rc<RefCell<Option<Rc<dyn Fn()>>>>;
+        let tray_refresh_slot: ActionSlot = Rc::new(RefCell::new(None));
+        let quit_flag = Rc::new(std::cell::Cell::new(false));
+        {
+            let frame_tray = frame;
+            tray.on_left_double_click(move |_| {
+                frame_tray.show(true);
+                frame_tray.raise();
+            });
+        }
+        {
+            let frame_tray = frame;
+            let slot = tray_refresh_slot.clone();
+            let quit = quit_flag.clone();
+            tray.on_menu(move |ev| match ev.get_id() {
+                x if x == TRAY_SHOW => {
+                    frame_tray.show(true);
+                    frame_tray.raise();
+                }
+                x if x == TRAY_REFRESH => {
+                    if let Some(action) = slot.borrow().as_ref() {
+                        action();
+                    }
+                }
+                x if x == TRAY_EXIT => {
+                    quit.set(true);
+                    frame_tray.close(true);
+                }
+                _ => {}
+            });
+        }
+        {
+            // close_to_tray: veto the close and hide instead,
+            // unless the quit flag says this close is a real exit
+            // (tray Exit or File > Exit).
+            let frame_tray = frame;
+            let quit = quit_flag.clone();
+            frame.bind_internal(EventType::CLOSE_WINDOW, move |ev| {
+                let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+                if cfg.get_bool("close_to_tray", false) && !quit.get() {
+                    ev.veto();
+                    frame_tray.show(false);
+                }
+            });
+        }
+        let tray = Rc::new(tray);
 
         let add_btn = Button::builder(&frame).with_label("Add Feed...").build();
         let remove_btn = Button::builder(&frame).with_label("Remove Feed").build();
@@ -985,6 +1361,8 @@ fn main() {
             find_query: String::new(),
             pending_play: None,
             pending_queue: None,
+            refresh_new: Vec::new(),
+            refresh_failed: false,
             search_focused: false,
         }));
 
@@ -1104,23 +1482,100 @@ fn main() {
         // Refresh: worker threads fetch + parse; results return over a
         // channel; a timer drains them on the main thread, which owns
         // the database connection.
+        /// Per-host connection gate (config
+        /// per_host_max_connections): a counting semaphore per
+        /// host so one host never takes more than its share of
+        /// the refresh workers.
+        struct HostGate {
+            state: std::sync::Mutex<usize>,
+            cond: std::sync::Condvar,
+            max: usize,
+        }
+        impl HostGate {
+            fn acquire(&self) {
+                let mut guard = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                while *guard >= self.max {
+                    guard = self.cond.wait(guard).unwrap_or_else(|p| p.into_inner());
+                }
+                *guard += 1;
+            }
+            fn release(&self) {
+                let mut guard = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                *guard = guard.saturating_sub(1);
+                self.cond.notify_one();
+            }
+        }
+
         fn spawn_refresh(
             feeds: Vec<Feed>,
             tx: Sender<RefreshMsg>,
             cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
             stopped: std::sync::Arc<std::sync::atomic::AtomicBool>,
         ) {
-            std::thread::spawn(move || {
-                for feed in feeds {
-                    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-                        stopped.store(true, std::sync::atomic::Ordering::Relaxed);
-                        break;
-                    }
-                    let result = fetch_and_parse(&feed.url);
-                    let _ = tx.send(RefreshMsg::FeedDone(feed, result));
-                }
+            // Refresh engine knobs (Audit 3): worker pool size,
+            // per-host cap, retry attempts — read once per run.
+            let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+            let workers = cfg.get_i64("max_concurrent_refreshes", 16).clamp(1, 64) as usize;
+            let per_host = cfg.get_i64("per_host_max_connections", 4).clamp(1, 64) as usize;
+            let attempts = cfg.get_i64("feed_retry_attempts", 1).clamp(1, 10) as u32;
+            let total = feeds.len();
+            if total == 0 {
                 let _ = tx.send(RefreshMsg::AllDone);
-            });
+                return;
+            }
+            let queue = std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::VecDeque::from(feeds),
+            ));
+            let gates = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
+                String,
+                std::sync::Arc<HostGate>,
+            >::new()));
+            let workers_left =
+                std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(workers.min(total)));
+            for _ in 0..workers.min(total) {
+                let queue = queue.clone();
+                let gates = gates.clone();
+                let tx = tx.clone();
+                let cancel = cancel.clone();
+                let stopped = stopped.clone();
+                let workers_left = workers_left.clone();
+                std::thread::spawn(move || {
+                    loop {
+                        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                            stopped.store(true, std::sync::atomic::Ordering::Relaxed);
+                            break;
+                        }
+                        let feed = queue.lock().unwrap_or_else(|p| p.into_inner()).pop_front();
+                        let Some(feed) = feed else { break };
+                        let host = feed.url.split('/').nth(2).unwrap_or("").to_string();
+                        let gate = gates
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .entry(host)
+                            .or_insert_with(|| {
+                                std::sync::Arc::new(HostGate {
+                                    state: std::sync::Mutex::new(0),
+                                    cond: std::sync::Condvar::new(),
+                                    max: per_host,
+                                })
+                            })
+                            .clone();
+                        gate.acquire();
+                        let mut result = fetch_and_parse(&feed.url);
+                        for _ in 1..attempts {
+                            if result.is_ok() {
+                                break;
+                            }
+                            result = fetch_and_parse(&feed.url);
+                        }
+                        gate.release();
+                        let _ = tx.send(RefreshMsg::FeedDone(feed, result));
+                    }
+                    if workers_left.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+                        let _ = tx.send(RefreshMsg::AllDone);
+                    }
+                });
+            }
         }
         let (tx, rx): (Sender<RefreshMsg>, Receiver<RefreshMsg>) = channel();
         let rx = Rc::new(RefCell::new(rx));
@@ -1134,6 +1589,8 @@ fn main() {
                     return;
                 }
                 st.refreshing = true;
+                st.refresh_new.clear();
+                st.refresh_failed = false;
                 st.cancel_refresh
                     .store(false, std::sync::atomic::Ordering::Relaxed);
                 st.refresh_stopped
@@ -1152,6 +1609,7 @@ fn main() {
             let a = act_refresh.clone();
             refresh_btn.on_click(move |_| a());
         }
+        *tray_refresh_slot.borrow_mut() = Some(act_refresh.clone());
 
         // Refresh Feed (menu/context only): fetch just the feed
         // selected in the tree, reusing the same worker + channel +
@@ -1198,16 +1656,59 @@ fn main() {
         let state_del = state.clone();
         let frame_del = frame;
         let act_delete: Rc<dyn Fn()> = Rc::new(move || {
+            let a = {
+                let st = state_del.borrow();
+                let Some(idx) = st.selected_article else {
+                    frame_del.set_status_text("Select an article first", 0);
+                    return;
+                };
+                let Some(a) = st.articles.get(idx).cloned() else {
+                    return;
+                };
+                a
+            };
+            let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+            // Delete behaviour: the feed's override wins over the
+            // global setting ("deleted" tombstone, "purge", or
+            // "category:<path>" move-instead-of-delete).
+            let behavior = {
+                let st = state_del.borrow();
+                st.db
+                    .as_ref()
+                    .and_then(|db| db.feed_delete_behavior(&a.feed_id).ok().flatten())
+                    .unwrap_or_else(|| cfg.get_str("delete_behavior", "deleted").to_string())
+            };
+            if let Some(path) = behavior.strip_prefix("category:") {
+                let mut st = state_del.borrow_mut();
+                if let Some(db) = st.db.as_ref() {
+                    let _ = db.set_article_category_override(&a.id, Some(path));
+                }
+                refill_articles(&mut st, &list);
+                frame_del.set_status_text(&format!("Moved {} to {path}", a.title), 0);
+                return;
+            }
+            if cfg.get_bool("confirm_article_delete", true) {
+                let md = MessageDialog::builder(
+                    &frame_del,
+                    &format!("Delete '{}'?", a.title),
+                    "Delete Article",
+                )
+                .with_style(MessageDialogStyle::YesNo | MessageDialogStyle::IconQuestion)
+                .build();
+                let answer = md.show_modal();
+                md.destroy();
+                if answer != ID_YES {
+                    restore_focus(&state_del.borrow(), &tree, &list);
+                    return;
+                }
+            }
             let mut st = state_del.borrow_mut();
-            let Some(idx) = st.selected_article else {
-                frame_del.set_status_text("Select an article first", 0);
-                return;
-            };
-            let Some(a) = st.articles.get(idx).cloned() else {
-                return;
-            };
             if let Some(db) = st.db.as_ref() {
-                let _ = db.delete_article(&a.id);
+                if behavior == "purge" {
+                    let _ = db.purge_article(&a.id);
+                } else {
+                    let _ = db.delete_article(&a.id);
+                }
             }
             st.selected_article = None;
             refill_articles(&mut st, &list);
@@ -1291,7 +1792,10 @@ fn main() {
                 return;
             }
             let Some(db) = st.db.as_ref() else { return };
-            match db.search_articles(query.trim(), 300) {
+            let title_only = blindrss_core::config::Config::load(&config_path())
+                .map(|c| c.get_str("search_mode", "title_content") == "title_only")
+                .unwrap_or(false);
+            match db.search_articles_mode(query.trim(), 300, title_only) {
                 Ok(results) => {
                     list.clear_all();
                     list.insert_column(0, "Title", ListColumnFormat::Left, 420);
@@ -2288,6 +2792,13 @@ fn main() {
                 return;
             };
             let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+            // downloads_enabled gates the feature (Python default
+            // is off; the Settings Downloads section turns it on).
+            if !cfg.get_bool("downloads_enabled", false) {
+                frame_dl.set_status_text("Downloads are disabled — enable them in Settings", 0);
+                return;
+            }
+            let dl_format = cfg.get_str("download_format", "video_best").to_string();
             let dir = cfg
                 .raw()
                 .get("download_path")
@@ -2324,7 +2835,7 @@ fn main() {
                         Ok(r) if r.via_ytdlp => blindrss_core::download::download_with_ytdlp(
                             &article.url,
                             &dir,
-                            blindrss_core::download::DownloadPreset::Best,
+                            &dl_format,
                         )
                         .map(|d| format!("Downloaded to {}", d.display())),
                         Ok(r) => {
@@ -2544,8 +3055,15 @@ fn main() {
         let frame_pr = frame;
         let list_pr = list;
         let act_prune: Rc<dyn Fn()> = Rc::new(move || {
+            let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+            let Some(days) = blindrss_core::retention::retention_days(
+                cfg.get_str("article_retention", "unlimited"),
+            ) else {
+                frame_pr.set_status_text("Article retention is unlimited — nothing to prune", 0);
+                return;
+            };
             let mut st = state_pr.borrow_mut();
-            match st.db.as_ref().map(|db| db.prune_old_articles(30)) {
+            match st.db.as_ref().map(|db| db.prune_old_articles(days)) {
                 Some(Ok(n)) => {
                     refill_articles(&mut st, &list_pr);
                     frame_pr.set_status_text(&format!("Pruned {n} old article(s)"), 0);
@@ -2587,6 +3105,7 @@ fn main() {
         ];
         let act_settings: Rc<dyn Fn()> = Rc::new(move || {
             let intent = settings::show_settings(&frame_set, &config_path());
+            apply_http_config();
             restore_focus(&state_set.borrow(), &tree_set, &list_set);
             if let Some(intent) = intent
                 && let Some((_, action)) = dispatch.iter().find(|(name, _)| *name == intent)
@@ -3581,9 +4100,11 @@ fn main() {
             (M_COPY_FEED_URL, act_copy_feed_url.clone()),
         ];
         let frame_menu = frame;
+        let quit_menu = quit_flag.clone();
         frame.on_menu(move |ev| {
             let id = ev.get_id();
             if id == M_EXIT {
+                quit_menu.set(true);
                 frame_menu.close(true);
                 return;
             }
@@ -3865,11 +4386,13 @@ fn main() {
                 let msg = rx_tick.borrow().try_recv();
                 match msg {
                     Ok(RefreshMsg::FeedDone(feed, Ok(parsed))) => {
-                        let st = state_tick.borrow();
+                        let mut st = state_tick.borrow_mut();
+                        let mut stored_new = 0usize;
                         if let Some(db) = st.db.as_ref() {
                             match store_parsed(db, &feed, &parsed) {
                                 Ok(n) => {
                                     new_total += n;
+                                    stored_new = n;
                                     let _ = db.clear_feed_error(&feed.id);
                                 }
                                 Err(e) => frame_tick.set_status_text(
@@ -3878,9 +4401,14 @@ fn main() {
                                 ),
                             }
                         }
+                        if stored_new > 0 {
+                            st.refresh_new
+                                .push((feed.id.clone(), feed.title.clone(), stored_new));
+                        }
                     }
                     Ok(RefreshMsg::FeedDone(feed, Err(e))) => {
-                        let st = state_tick.borrow();
+                        let mut st = state_tick.borrow_mut();
+                        st.refresh_failed = true;
                         if let Some(db) = st.db.as_ref() {
                             let _ = db.record_feed_error(&feed.id, &e);
                         }
@@ -4054,6 +4582,13 @@ fn main() {
                         Ok(msg) => frame_tick.set_status_text(&msg, 0),
                         Err(e) => frame_tick.set_status_text(&format!("Cast: {e}"), 0),
                     },
+                    Ok(RefreshMsg::UpdateStaged(result)) => match result {
+                        Ok(tag) => frame_tick.set_status_text(
+                            &format!("Update {tag} downloaded — restart BlindRSS to apply it"),
+                            0,
+                        ),
+                        Err(e) => frame_tick.set_status_text(&format!("Update download: {e}"), 0),
+                    },
                     Ok(RefreshMsg::OpenedArticle(result)) => match result {
                         Ok((title, text)) => {
                             dialogs::show_article_window(&title, &text);
@@ -4067,6 +4602,22 @@ fn main() {
                                 frame_tick.set_status_text("BlindRSS is up to date", 0);
                             } else {
                                 frame_tick.set_status_text(&format!("Update available: {tag}"), 0);
+                                let cfg = blindrss_core::config::Config::load(&config_path())
+                                    .unwrap_or_default();
+                                if cfg.get_bool("install_updates_automatically", false) {
+                                    frame_tick.set_status_text(
+                                        &format!("Downloading update {tag}..."),
+                                        0,
+                                    );
+                                    let tx_stage = tx.clone();
+                                    std::thread::spawn(move || {
+                                        let result =
+                                            blindrss_core::maintenance::download_and_stage_update(
+                                                &data_dir(),
+                                            );
+                                        let _ = tx_stage.send(RefreshMsg::UpdateStaged(result));
+                                    });
+                                }
                             }
                         }
                         Err(e) => frame_tick.set_status_text(&format!("Updates: {e}"), 0),
@@ -4102,6 +4653,10 @@ fn main() {
                         &format!("Refresh complete: {new_total} new articles"),
                     );
                 }
+                let new_by_feed = std::mem::take(&mut st.refresh_new);
+                let failed = std::mem::take(&mut st.refresh_failed);
+                drop(st);
+                refresh_side_effects(&tray, &new_by_feed, failed);
             }
         });
         timer.start(150, false);
@@ -4146,7 +4701,10 @@ fn main() {
             }
         }
         frame.centre();
-        frame.show(true);
+        {
+            let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+            frame.show(!cfg.get_bool("start_in_system_tray", false));
+        }
         // Python `_focus_default_control`, ported faithfully: Python
         // schedules it with wx.CallAfter from __init__ (the frame is
         // shown later by main.py) and the handler checks IsShown
@@ -4175,6 +4733,17 @@ fn main() {
                     refresh_start();
                 });
                 startup_timer.start(1200, true);
+            }
+            // Startup update check (auto_check_updates, default
+            // on): the UpdateChecked drain reports, and stages
+            // the download when install_updates_automatically.
+            if cfg.get_bool("auto_check_updates", true) {
+                let update_timer = Box::leak(Box::new(Timer::new(&frame)));
+                let update_start = act_update.clone();
+                update_timer.on_tick(move |_| {
+                    update_start();
+                });
+                update_timer.start(4000, true);
             }
         }
     });

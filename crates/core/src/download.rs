@@ -49,49 +49,127 @@ pub fn download_direct(url: &str, dir: &std::path::Path, title: &str) -> Result<
     Ok(path)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum DownloadPreset {
-    /// Audio only, mp3 (Python "mp3" format).
-    AudioMp3,
-    /// Best single file (Python default).
-    Best,
-    /// Best video+audio merged to mp4, capped at 720p.
-    VideoMp4,
+/// Named download formats (Python `core/download_formats.py`).
+/// Config stores the stable identifier ("video_best",
+/// "audio_mp3_192"); logic only ever sees identifiers.
+pub const DOWNLOAD_FORMAT_IDS: [&str; 8] = [
+    "video_best",
+    "video_max",
+    "video_720",
+    "video_480",
+    "audio_mp3_320",
+    "audio_mp3_192",
+    "audio_mp3_128",
+    "audio_best",
+];
+
+pub const DOWNLOAD_FORMAT_DEFAULT: &str = "video_best";
+
+/// Display label for a format identifier.
+pub fn download_format_label(id: &str) -> &'static str {
+    match normalize_download_format(id) {
+        "video_max" => "Video (maximum quality)",
+        "video_720" => "Video (up to 720p)",
+        "video_480" => "Video (up to 480p)",
+        "audio_mp3_320" => "Audio (MP3, 320 kbps)",
+        "audio_mp3_192" => "Audio (MP3, 192 kbps)",
+        "audio_mp3_128" => "Audio (MP3, 128 kbps)",
+        "audio_best" => "Audio (best quality)",
+        _ => "Video (best quality, MP4)",
+    }
 }
 
-/// Download a page URL with yt-dlp into `dir`. Returns the
-/// directory (yt-dlp names the file itself from the title).
+/// Normalize a stored value to a known format identifier.
+pub fn normalize_download_format(value: &str) -> &'static str {
+    match value.trim() {
+        "video_max" => "video_max",
+        "video_720" => "video_720",
+        "video_480" => "video_480",
+        "audio_mp3_320" => "audio_mp3_320",
+        "audio_mp3_192" => "audio_mp3_192",
+        "audio_mp3_128" => "audio_mp3_128",
+        "audio_best" => "audio_best",
+        _ => DOWNLOAD_FORMAT_DEFAULT,
+    }
+}
+
+fn video_selector(max_height: Option<u32>) -> String {
+    let cap = max_height
+        .map(|h| format!("[height<=?{h}]"))
+        .unwrap_or_default();
+    let mut alternatives = vec![
+        format!("bv*[vcodec^=avc1]{cap}+ba[acodec^=mp4a]"),
+        format!("bv*{cap}+ba"),
+        format!("b{cap}"),
+        "b".to_string(),
+    ];
+    alternatives.dedup();
+    alternatives.join("/")
+}
+
+/// (selector, mp3 bitrate) for an identifier — Python `_SPECS`.
+fn format_spec(id: &str) -> (String, Option<u32>) {
+    match normalize_download_format(id) {
+        "video_max" => ("bv*+ba/b".to_string(), None),
+        "video_720" => (video_selector(Some(720)), None),
+        "video_480" => (video_selector(Some(480)), None),
+        "audio_mp3_320" => ("ba/b".to_string(), Some(320)),
+        "audio_mp3_192" => ("ba/b".to_string(), Some(192)),
+        "audio_mp3_128" => ("ba/b".to_string(), Some(128)),
+        "audio_best" => ("ba/b".to_string(), None),
+        _ => (video_selector(None), None),
+    }
+}
+
+fn is_audio_only(id: &str) -> bool {
+    normalize_download_format(id).starts_with("audio_")
+}
+
+/// The yt-dlp argument list for a format identifier (Python
+/// `ytdlp_args`): format selection + output kind.
+pub fn ytdlp_format_args(id: &str) -> Vec<String> {
+    let ident = normalize_download_format(id);
+    let (selector, bitrate) = format_spec(ident);
+    let mut args = vec!["-f".to_string(), selector];
+    if is_audio_only(ident) {
+        args.push("-x".to_string());
+        match bitrate {
+            None => {
+                args.extend(["--audio-format".to_string(), "best".to_string()]);
+            }
+            Some(b) => {
+                args.extend([
+                    "--audio-format".to_string(),
+                    "mp3".to_string(),
+                    "--audio-quality".to_string(),
+                    format!("{b}K"),
+                ]);
+            }
+        }
+    } else {
+        args.extend(["--merge-output-format".to_string(), "mp4".to_string()]);
+    }
+    args
+}
+
+/// Download a page URL with yt-dlp into `dir`, using the named
+/// format from config `download_format`. Returns the directory
+/// (yt-dlp names the file itself from the title).
 pub fn download_with_ytdlp(
     url: &str,
     dir: &std::path::Path,
-    preset: DownloadPreset,
+    format_id: &str,
 ) -> Result<PathBuf, String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("download dir: {e}"))?;
     let exe = crate::media::find_ytdlp().ok_or("yt-dlp not found")?;
     let template = dir.join("%(title)s.%(ext)s");
     let template = template.to_string_lossy().to_string();
+    let format_args = ytdlp_format_args(format_id);
+    let cookies = ytdlp_cookies_file();
     let mut args: Vec<&str> = vec!["--no-warnings", "--no-playlist", "-o", &template];
-    match preset {
-        DownloadPreset::AudioMp3 => {
-            args.extend([
-                "-f",
-                "bestaudio/best",
-                "--extract-audio",
-                "--audio-format",
-                "mp3",
-            ]);
-        }
-        DownloadPreset::Best => {
-            args.extend(["-f", "best"]);
-        }
-        DownloadPreset::VideoMp4 => {
-            args.extend([
-                "-f",
-                "bestvideo[height<=720]+bestaudio/best[height<=720]",
-                "--merge-output-format",
-                "mp4",
-            ]);
-        }
+    args.extend(format_args.iter().map(|a| a.as_str()));
+    if let Some(cookies) = &cookies {
+        args.extend(["--cookies", cookies.as_str()]);
     }
     args.push(url);
     let out = std::process::Command::new(&exe)
@@ -104,6 +182,18 @@ pub fn download_with_ytdlp(
         return Err(format!("yt-dlp download: {first}"));
     }
     Ok(dir.to_path_buf())
+}
+
+/// The configured yt-dlp cookies file (config
+/// `ytdlp_cookies_file`), when set and non-empty. Read through
+/// the shared config-next-to-database convention: the app sets
+/// it via the environment for worker processes — here it is
+/// simply the BLINDRSS_YTDLP_COOKIES override or None; the app
+/// passes the config value through `media` invocations too.
+fn ytdlp_cookies_file() -> Option<String> {
+    std::env::var("BLINDRSS_YTDLP_COOKIES")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
 }
 
 /// Convert a WebVTT subtitle file to plain transcript text with

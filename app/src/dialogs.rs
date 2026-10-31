@@ -1130,3 +1130,55 @@ pub fn show_feed_search(frame: &Frame) -> Option<String> {
     dialog.destroy();
     picked
 }
+
+/// Exclude-notification-feeds picker (Python's
+/// ExcludeNotificationFeedsDialog): every feed with a
+/// checkbox; checked feeds are stored by ID in
+/// windows_notifications_excluded_feeds and get no refresh
+/// notifications.
+pub fn show_exclude_feeds(frame: &impl WxWidget, config_path: &Path) {
+    let Ok(db) = Db::open(&crate::db_path()) else {
+        return;
+    };
+    let feeds = db.feeds().unwrap_or_default();
+    let cfg = Config::load(config_path).unwrap_or_default();
+    let excluded: Vec<String> = cfg
+        .raw()
+        .get("windows_notifications_excluded_feeds")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let dialog = Dialog::builder(frame, "Exclude Feeds from Notifications").build();
+    let sizer = BoxSizer::builder(Orientation::Vertical).build();
+    let label = StaticText::builder(&dialog)
+        .with_label("Checked feeds will not send notifications:")
+        .build();
+    sizer.add(&label, 0, SizerFlag::All, 4);
+    let list = CheckListBox::builder(&dialog).build();
+    for (i, f) in feeds.iter().enumerate() {
+        list.append(&f.title);
+        if excluded.contains(&f.id) {
+            list.check(i as u32, true);
+        }
+    }
+    sizer.add(&list, 1, SizerFlag::Expand | SizerFlag::All, 4);
+    ok_cancel(&dialog, &sizer);
+    dialog.set_sizer(sizer, true);
+    dialog.set_size(Size::new(520, 480));
+    if dialog.show_modal() == 5100 {
+        let ids: Vec<Value> = feeds
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| list.is_checked(*i as u32))
+            .map(|(_, f)| json!(f.id))
+            .collect();
+        let mut cfg = Config::load(config_path).unwrap_or_default();
+        cfg.set_path("windows_notifications_excluded_feeds", Value::Array(ids));
+        let _ = cfg.save(config_path);
+    }
+    dialog.destroy();
+}

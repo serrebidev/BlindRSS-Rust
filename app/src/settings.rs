@@ -43,6 +43,68 @@ fn add_field(
     ctrl
 }
 
+/// A labeled checkbox row; returns the checkbox.
+fn add_check(dialog: &Dialog, sizer: &BoxSizer, label: &str, value: bool) -> CheckBox {
+    let cb = CheckBox::builder(dialog).with_label(label).build();
+    cb.set_value(value);
+    sizer.add(&cb, 0, SizerFlag::All, 2);
+    cb
+}
+
+/// A labeled choice row; returns the choice control.
+fn add_choice(
+    dialog: &Dialog,
+    sizer: &BoxSizer,
+    label: &str,
+    items: &[&str],
+    selected: usize,
+) -> Choice {
+    let row = BoxSizer::builder(Orientation::Horizontal).build();
+    let text = StaticText::builder(dialog).with_label(label).build();
+    let choice = Choice::builder(dialog).build();
+    for item in items {
+        choice.append(item);
+    }
+    choice.set_selection(selected.min(items.len().saturating_sub(1)) as u32);
+    row.add(&text, 0, SizerFlag::All, 4);
+    row.add(&choice, 0, SizerFlag::All, 4);
+    sizer.add_sizer(&row, 0, SizerFlag::Expand | SizerFlag::All, 2);
+    choice
+}
+
+/// A section heading.
+fn add_heading(dialog: &Dialog, sizer: &BoxSizer, label: &str) {
+    let text = StaticText::builder(dialog).with_label(label).build();
+    sizer.add(&text, 0, SizerFlag::All, 4);
+}
+
+/// Fire a test desktop notification from Settings (platform
+/// commands; the real path uses the tray balloon on Windows).
+fn test_notify() {
+    #[cfg(target_os = "windows")]
+    {
+        let script = "$n = New-Object System.Windows.Forms.NotifyIcon; $n.Icon = [System.Drawing.SystemIcons]::Information; $n.Visible = $true; $n.ShowBalloonTip(4000, 'BlindRSS', 'Test notification', [System.Windows.Forms.ToolTipIcon]::Info)";
+        let _ = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command", script])
+            .spawn();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("osascript")
+            .args([
+                "-e",
+                "display notification \"Test notification\" with title \"BlindRSS\"",
+            ])
+            .spawn();
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let _ = std::process::Command::new("notify-send")
+            .args(["BlindRSS", "Test notification"])
+            .spawn();
+    }
+}
+
 fn open_url(url: &str) {
     #[cfg(target_os = "windows")]
     let _ = std::process::Command::new("rundll32")
@@ -190,6 +252,389 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
         .build();
     sizer.add(&announce_test_btn, 0, SizerFlag::All, 4);
 
+    // Refresh engine (Audit 3 keys).
+    add_heading(&dialog, &sizer, "Refresh Engine");
+    let max_conc_field = add_field(
+        &dialog,
+        &sizer,
+        "Max concurrent refreshes",
+        &cfg.get_i64("max_concurrent_refreshes", 16).to_string(),
+        false,
+    );
+    let timeout_field = add_field(
+        &dialog,
+        &sizer,
+        "Feed timeout (seconds)",
+        &cfg.get_i64("feed_timeout_seconds", 15).to_string(),
+        false,
+    );
+    let retries_field = add_field(
+        &dialog,
+        &sizer,
+        "Feed retry attempts",
+        &cfg.get_i64("feed_retry_attempts", 1).to_string(),
+        false,
+    );
+    let per_host_field = add_field(
+        &dialog,
+        &sizer,
+        "Max connections per host",
+        &cfg.get_i64("per_host_max_connections", 4).to_string(),
+        false,
+    );
+    let ignore_cache_cb = add_check(
+        &dialog,
+        &sizer,
+        "Ignore feed cache",
+        cfg.get_bool("ignore_feed_cache", false),
+    );
+
+    // Reading.
+    add_heading(&dialog, &sizer, "Reading");
+    let search_mode_choice = add_choice(
+        &dialog,
+        &sizer,
+        "Search looks in",
+        &["Titles and content", "Titles only"],
+        if cfg.get_str("search_mode", "title_content") == "title_only" {
+            1
+        } else {
+            0
+        },
+    );
+    let delete_behavior0 = cfg.get_str("delete_behavior", "deleted").to_string();
+    let delete_path0 = delete_behavior0
+        .strip_prefix("category:")
+        .unwrap_or("")
+        .to_string();
+    let delete_choice = add_choice(
+        &dialog,
+        &sizer,
+        "Deleting an article",
+        &[
+            "Moves it to the Deleted view",
+            "Deletes it permanently",
+            "Moves it to a category instead",
+        ],
+        if delete_behavior0 == "purge" {
+            1
+        } else if delete_behavior0.starts_with("category:") {
+            2
+        } else {
+            0
+        },
+    );
+    let delete_path_field = add_field(
+        &dialog,
+        &sizer,
+        "Category path for the move-instead option",
+        &delete_path0,
+        false,
+    );
+    let confirm_delete_cb = add_check(
+        &dialog,
+        &sizer,
+        "Confirm before deleting an article",
+        cfg.get_bool("confirm_article_delete", true),
+    );
+
+    // Downloads.
+    add_heading(&dialog, &sizer, "Downloads");
+    let downloads_enabled_cb = add_check(
+        &dialog,
+        &sizer,
+        "Downloads enabled",
+        cfg.get_bool("downloads_enabled", false),
+    );
+    let format_labels: Vec<&str> = blindrss_core::download::DOWNLOAD_FORMAT_IDS
+        .iter()
+        .map(|id| blindrss_core::download::download_format_label(id))
+        .collect();
+    let format_sel = blindrss_core::download::DOWNLOAD_FORMAT_IDS
+        .iter()
+        .position(|id| *id == cfg.get_str("download_format", "video_best"))
+        .unwrap_or(0);
+    let format_choice = add_choice(
+        &dialog,
+        &sizer,
+        "Download format",
+        &format_labels,
+        format_sel,
+    );
+    let max_dl_field = add_field(
+        &dialog,
+        &sizer,
+        "Max downloads kept in the queue",
+        &cfg.get_i64("max_downloads", 32).to_string(),
+        false,
+    );
+    let retention_labels: Vec<String> = blindrss_core::retention::RETENTION_CHOICES
+        .iter()
+        .map(|(id, _)| blindrss_core::retention::retention_label(id))
+        .collect();
+    let retention_refs: Vec<&str> = retention_labels.iter().map(|s| s.as_str()).collect();
+    let art_ret_sel = blindrss_core::retention::RETENTION_CHOICES
+        .iter()
+        .position(|(id, _)| *id == cfg.get_str("article_retention", "unlimited"))
+        .unwrap_or(11);
+    let art_ret_choice = add_choice(
+        &dialog,
+        &sizer,
+        "Keep articles for",
+        &retention_refs,
+        art_ret_sel,
+    );
+    let dl_ret_sel = blindrss_core::retention::RETENTION_CHOICES
+        .iter()
+        .position(|(id, _)| *id == cfg.get_str("download_retention", "unlimited"))
+        .unwrap_or(11);
+    let dl_ret_choice = add_choice(
+        &dialog,
+        &sizer,
+        "Keep downloads for",
+        &retention_refs,
+        dl_ret_sel,
+    );
+
+    // Player / media.
+    add_heading(&dialog, &sizer, "Player");
+    let show_player_cb = add_check(
+        &dialog,
+        &sizer,
+        "Show player when playback starts",
+        cfg.get_bool("show_player_on_play", true),
+    );
+    let speed_field = add_field(
+        &dialog,
+        &sizer,
+        "Playback speed (1.0 = normal)",
+        &cfg.raw()
+            .get("playback_speed")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(1.0)
+            .to_string(),
+        false,
+    );
+    let seek_back_field = add_field(
+        &dialog,
+        &sizer,
+        "Seek back (milliseconds)",
+        &cfg.get_i64("seek_back_ms", 10_000).to_string(),
+        false,
+    );
+    let seek_fwd_field = add_field(
+        &dialog,
+        &sizer,
+        "Seek forward (milliseconds)",
+        &cfg.get_i64("seek_forward_ms", 10_000).to_string(),
+        false,
+    );
+    let vol_step_field = add_field(
+        &dialog,
+        &sizer,
+        "Volume step (percent)",
+        &cfg.get_i64("volume_step", 5).to_string(),
+        false,
+    );
+    let sponsor_cb = add_check(
+        &dialog,
+        &sizer,
+        "Skip sponsors (SponsorBlock)",
+        cfg.get_bool("sponsorblock_enabled", true),
+    );
+    let sponsor_cats_field = add_field(
+        &dialog,
+        &sizer,
+        "SponsorBlock categories (comma separated)",
+        &cfg.raw()
+            .get("sponsorblock_categories")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_else(|| "sponsor, selfpromo, interaction".to_string()),
+        false,
+    );
+    let silence_cb = add_check(
+        &dialog,
+        &sizer,
+        "Skip silence in playback",
+        cfg.get_bool("skip_silence", true),
+    );
+    let silence_db_field = add_field(
+        &dialog,
+        &sizer,
+        "Silence threshold (dB)",
+        &cfg.raw()
+            .get("silence_skip_threshold_db")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(-38.0)
+            .to_string(),
+        false,
+    );
+    let silence_ms_field = add_field(
+        &dialog,
+        &sizer,
+        "Minimum silence (milliseconds)",
+        &cfg.get_i64("silence_skip_min_ms", 700).to_string(),
+        false,
+    );
+
+    // Notifications + sounds.
+    add_heading(&dialog, &sizer, "Notifications and Sounds");
+    let notif_cb = add_check(
+        &dialog,
+        &sizer,
+        "Desktop notifications for new articles",
+        cfg.get_bool("windows_notifications_enabled", false),
+    );
+    let notif_name_cb = add_check(
+        &dialog,
+        &sizer,
+        "Include the feed name in notifications",
+        cfg.get_bool("windows_notifications_include_feed_name", true),
+    );
+    let notif_max_field = add_field(
+        &dialog,
+        &sizer,
+        "Max notifications per refresh (0 = unlimited)",
+        &cfg.get_i64("windows_notifications_max_per_refresh", 0)
+            .to_string(),
+        false,
+    );
+    let notif_summary_cb = add_check(
+        &dialog,
+        &sizer,
+        "Show one summary when notifications are capped",
+        cfg.get_bool("windows_notifications_show_summary_when_capped", true),
+    );
+    let notif_row = BoxSizer::builder(Orientation::Horizontal).build();
+    let exclude_btn = Button::builder(&dialog)
+        .with_label("Exclude Feeds...")
+        .build();
+    let test_notif_btn = Button::builder(&dialog)
+        .with_label("Test Notification")
+        .build();
+    notif_row.add(&exclude_btn, 0, SizerFlag::All, 4);
+    notif_row.add(&test_notif_btn, 0, SizerFlag::All, 4);
+    sizer.add_sizer(&notif_row, 0, SizerFlag::All, 2);
+    let sounds_cb = add_check(
+        &dialog,
+        &sizer,
+        "Play sounds when a refresh finishes",
+        cfg.get_bool("sounds_enabled", true),
+    );
+
+    // Window / tray / backup / updates / advanced.
+    add_heading(&dialog, &sizer, "Window and Tray");
+    let close_tray_cb = add_check(
+        &dialog,
+        &sizer,
+        "Close button hides to the tray",
+        cfg.get_bool("close_to_tray", false),
+    );
+    let start_tray_cb = add_check(
+        &dialog,
+        &sizer,
+        "Start in the system tray",
+        cfg.get_bool("start_in_system_tray", false),
+    );
+    add_heading(&dialog, &sizer, "Backup");
+    let auto_backup_cb = add_check(
+        &dialog,
+        &sizer,
+        "Back up daily, automatically (keeps 7)",
+        cfg.get_bool("auto_backup_enabled", false),
+    );
+    let auto_backup_dir_field = add_field(
+        &dialog,
+        &sizer,
+        "Auto-backup folder (blank = data folder/backups)",
+        cfg.get_str("auto_backup_dir", ""),
+        false,
+    );
+    add_heading(&dialog, &sizer, "Updates");
+    let auto_check_cb = add_check(
+        &dialog,
+        &sizer,
+        "Check for updates on startup",
+        cfg.get_bool("auto_check_updates", true),
+    );
+    let auto_install_cb = add_check(
+        &dialog,
+        &sizer,
+        "Install updates automatically",
+        cfg.get_bool("install_updates_automatically", false),
+    );
+    add_heading(&dialog, &sizer, "Advanced");
+    let mut ua_items: Vec<&str> = vec!["Automatic (matches this computer)"];
+    ua_items.extend(
+        blindrss_core::user_agents::PRESETS
+            .iter()
+            .map(|(_, l, _)| *l),
+    );
+    ua_items.push("Custom (use the text below)");
+    let ua_mode0 = cfg.get_str("user_agent_mode", "auto").to_string();
+    let ua_sel = if ua_mode0 == "custom" {
+        ua_items.len() - 1
+    } else if ua_mode0 == "auto" || ua_mode0.is_empty() {
+        0
+    } else {
+        blindrss_core::user_agents::PRESETS
+            .iter()
+            .position(|(k, _, _)| *k == ua_mode0)
+            .map(|i| i + 1)
+            .unwrap_or(0)
+    };
+    let ua_choice = add_choice(
+        &dialog,
+        &sizer,
+        "Browser identity (User-Agent)",
+        &ua_items,
+        ua_sel,
+    );
+    let ua_custom_field = add_field(
+        &dialog,
+        &sizer,
+        "Custom User-Agent",
+        cfg.get_str("user_agent_custom", ""),
+        false,
+    );
+    let cookies_file_field = add_field(
+        &dialog,
+        &sizer,
+        "yt-dlp cookies file (optional)",
+        cfg.get_str("ytdlp_cookies_file", ""),
+        false,
+    );
+    let captcha_cb = add_check(
+        &dialog,
+        &sizer,
+        "Captcha solver enabled (last-resort fallback)",
+        cfg.get_bool("captcha_solver_enabled", false),
+    );
+    let captcha_provider_field = add_field(
+        &dialog,
+        &sizer,
+        "Captcha solver provider",
+        cfg.get_str("captcha_solver_provider", ""),
+        false,
+    );
+    let captcha_key_field = add_field(
+        &dialog,
+        &sizer,
+        "Captcha solver API key",
+        cfg.get_str("captcha_solver_api_key", ""),
+        true,
+    );
+    let data_loc = StaticText::builder(&dialog)
+        .with_label(&format!("Data folder: {}", crate::data_dir().display()))
+        .build();
+    sizer.add(&data_loc, 0, SizerFlag::All, 4);
+
     // Maintenance actions (moved off the main window, Brandon
     // 2026-10-30): each saves the fields, closes the dialog, and
     // reports its name back so the caller runs it on the main frame.
@@ -241,7 +686,7 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
     btn_row.add(&cancel_btn, 0, SizerFlag::All, 4);
     sizer.add_sizer(&btn_row, 0, SizerFlag::All, 4);
     dialog.set_sizer(sizer, true);
-    dialog.set_size(Size::new(560, 990));
+    dialog.set_size(Size::new(620, 1180));
 
     let cfg_path_buf = config_path.to_path_buf();
     let cfg_path_connect = config_path.to_path_buf();
@@ -313,6 +758,169 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
                 modes.set_mode(ev.id, blindrss_core::announce::MODE_ORDER[idx.min(3)]);
             }
             cfg.set_path("announcements", modes.to_json());
+            // Batch 5 pages: refresh engine, reading, downloads,
+            // player, notifications/sounds, tray, backup,
+            // updates, advanced.
+            let num = |f: &TextCtrl, key: &str, lo: i64, hi: i64| {
+                if let Ok(v) = f.get_value().trim().parse::<i64>() {
+                    Some((key.to_string(), v.clamp(lo, hi)))
+                } else {
+                    None
+                }
+            };
+            for (key, v) in [
+                num(&max_conc_field, "max_concurrent_refreshes", 1, 64),
+                num(&timeout_field, "feed_timeout_seconds", 1, 300),
+                num(&retries_field, "feed_retry_attempts", 1, 10),
+                num(&per_host_field, "per_host_max_connections", 1, 64),
+                num(&max_dl_field, "max_downloads", 1, 1000),
+                num(&seek_back_field, "seek_back_ms", 0, 600_000),
+                num(&seek_fwd_field, "seek_forward_ms", 0, 600_000),
+                num(&vol_step_field, "volume_step", 1, 50),
+                num(&silence_ms_field, "silence_skip_min_ms", 50, 60_000),
+                num(
+                    &notif_max_field,
+                    "windows_notifications_max_per_refresh",
+                    0,
+                    1000,
+                ),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                cfg.set_path(&key, serde_json::json!(v));
+            }
+            if let Ok(v) = speed_field.get_value().trim().parse::<f64>() {
+                cfg.set_path("playback_speed", serde_json::json!(v.clamp(0.25, 4.0)));
+            }
+            if let Ok(v) = silence_db_field.get_value().trim().parse::<f64>() {
+                cfg.set_path("silence_skip_threshold_db", serde_json::json!(v));
+            }
+            cfg.set_path(
+                "ignore_feed_cache",
+                serde_json::json!(ignore_cache_cb.is_checked()),
+            );
+            cfg.set_path(
+                "search_mode",
+                serde_json::json!(if search_mode_choice.get_selection() == Some(1) {
+                    "title_only"
+                } else {
+                    "title_content"
+                }),
+            );
+            let delete_value = match delete_choice.get_selection() {
+                Some(1) => "purge".to_string(),
+                Some(2) => format!("category:{}", delete_path_field.get_value().trim()),
+                _ => "deleted".to_string(),
+            };
+            cfg.set_path("delete_behavior", serde_json::json!(delete_value));
+            cfg.set_path(
+                "confirm_article_delete",
+                serde_json::json!(confirm_delete_cb.is_checked()),
+            );
+            cfg.set_path(
+                "downloads_enabled",
+                serde_json::json!(downloads_enabled_cb.is_checked()),
+            );
+            if let Some(sel) = format_choice.get_selection()
+                && let Some(id) = blindrss_core::download::DOWNLOAD_FORMAT_IDS.get(sel as usize)
+            {
+                cfg.set_path("download_format", serde_json::json!(id));
+            }
+            if let Some(sel) = art_ret_choice.get_selection()
+                && let Some((id, _)) = blindrss_core::retention::RETENTION_CHOICES.get(sel as usize)
+            {
+                cfg.set_path("article_retention", serde_json::json!(id));
+            }
+            if let Some(sel) = dl_ret_choice.get_selection()
+                && let Some((id, _)) = blindrss_core::retention::RETENTION_CHOICES.get(sel as usize)
+            {
+                cfg.set_path("download_retention", serde_json::json!(id));
+            }
+            cfg.set_path(
+                "show_player_on_play",
+                serde_json::json!(show_player_cb.is_checked()),
+            );
+            cfg.set_path(
+                "sponsorblock_enabled",
+                serde_json::json!(sponsor_cb.is_checked()),
+            );
+            let cats: Vec<String> = sponsor_cats_field
+                .get_value()
+                .split(',')
+                .map(|c| c.trim().to_string())
+                .filter(|c| !c.is_empty())
+                .collect();
+            cfg.set_path("sponsorblock_categories", serde_json::json!(cats));
+            cfg.set_path("skip_silence", serde_json::json!(silence_cb.is_checked()));
+            cfg.set_path(
+                "windows_notifications_enabled",
+                serde_json::json!(notif_cb.is_checked()),
+            );
+            cfg.set_path(
+                "windows_notifications_include_feed_name",
+                serde_json::json!(notif_name_cb.is_checked()),
+            );
+            cfg.set_path(
+                "windows_notifications_show_summary_when_capped",
+                serde_json::json!(notif_summary_cb.is_checked()),
+            );
+            cfg.set_path("sounds_enabled", serde_json::json!(sounds_cb.is_checked()));
+            cfg.set_path(
+                "close_to_tray",
+                serde_json::json!(close_tray_cb.is_checked()),
+            );
+            cfg.set_path(
+                "start_in_system_tray",
+                serde_json::json!(start_tray_cb.is_checked()),
+            );
+            cfg.set_path(
+                "auto_backup_enabled",
+                serde_json::json!(auto_backup_cb.is_checked()),
+            );
+            cfg.set_path(
+                "auto_backup_dir",
+                serde_json::json!(auto_backup_dir_field.get_value()),
+            );
+            cfg.set_path(
+                "auto_check_updates",
+                serde_json::json!(auto_check_cb.is_checked()),
+            );
+            cfg.set_path(
+                "install_updates_automatically",
+                serde_json::json!(auto_install_cb.is_checked()),
+            );
+            let ua_value = match ua_choice.get_selection() {
+                Some(0) | None => "auto".to_string(),
+                Some(sel) if (sel as usize) == blindrss_core::user_agents::PRESETS.len() + 1 => {
+                    "custom".to_string()
+                }
+                Some(sel) => blindrss_core::user_agents::PRESETS
+                    .get((sel - 1) as usize)
+                    .map(|(k, _, _)| k.to_string())
+                    .unwrap_or_else(|| "auto".to_string()),
+            };
+            cfg.set_path("user_agent_mode", serde_json::json!(ua_value));
+            cfg.set_path(
+                "user_agent_custom",
+                serde_json::json!(ua_custom_field.get_value()),
+            );
+            cfg.set_path(
+                "ytdlp_cookies_file",
+                serde_json::json!(cookies_file_field.get_value()),
+            );
+            cfg.set_path(
+                "captcha_solver_enabled",
+                serde_json::json!(captcha_cb.is_checked()),
+            );
+            cfg.set_path(
+                "captcha_solver_provider",
+                serde_json::json!(captcha_provider_field.get_value()),
+            );
+            cfg.set_path(
+                "captcha_solver_api_key",
+                serde_json::json!(captcha_key_field.get_value()),
+            );
             let _ = cfg.save(&path_s);
         })
     };
@@ -332,6 +940,14 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
         .build();
         md.show_modal();
     });
+    {
+        let frame_ex = dialog;
+        let path_ex = config_path.to_path_buf();
+        exclude_btn.on_click(move |_| {
+            crate::dialogs::show_exclude_feeds(&frame_ex, &path_ex);
+        });
+    }
+    test_notif_btn.on_click(move |_| test_notify());
     let dialog_save = dialog;
     let save_for_btn = save_all.clone();
     save_btn.on_click(move |_| {

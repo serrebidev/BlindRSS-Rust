@@ -89,10 +89,34 @@ pub fn find_ytdlp() -> Option<PathBuf> {
     None
 }
 
+/// Extra yt-dlp arguments from the app's environment, set at
+/// startup from config: BLINDRSS_YTDLP_COOKIES
+/// (`ytdlp_cookies_file`) and the shared fetch identity
+/// (BLINDRSS_USER_AGENT, from core::http::user_agent()).
+fn ytdlp_env_args() -> Vec<String> {
+    let mut out = Vec::new();
+    if let Ok(c) = std::env::var("BLINDRSS_YTDLP_COOKIES")
+        && !c.trim().is_empty()
+    {
+        out.push("--cookies".to_string());
+        out.push(c);
+    }
+    if let Ok(ua) = std::env::var("BLINDRSS_USER_AGENT")
+        && !ua.trim().is_empty()
+    {
+        out.push("--user-agent".to_string());
+        out.push(ua);
+    }
+    out
+}
+
 fn run_ytdlp(args: &[&str]) -> Result<String, String> {
     let exe = find_ytdlp().ok_or("yt-dlp not found (install it or set BLINDRSS_YTDLP)")?;
+    let env_args = ytdlp_env_args();
+    let mut full: Vec<&str> = env_args.iter().map(|a| a.as_str()).collect();
+    full.extend(args.iter().copied());
     let out = Command::new(&exe)
-        .args(args)
+        .args(&full)
         .output()
         .map_err(|e| format!("yt-dlp failed to start: {e}"))?;
     if !out.status.success() {

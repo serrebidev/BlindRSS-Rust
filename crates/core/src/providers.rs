@@ -165,7 +165,8 @@ impl GReaderClient {
             ("Passwd", self.password.as_str()),
             ("output", "json"),
         ];
-        let mut resp = ureq::post(&self.login_url)
+        let mut resp = crate::http::agent()
+            .post(&self.login_url)
             .send_form(form)
             .map_err(|e| format!("login failed: {e}"))?;
         let body = resp
@@ -200,7 +201,8 @@ impl GReaderClient {
 
     fn get_json<T: for<'de> Deserialize<'de>>(&self, path: &str) -> Result<T, String> {
         let url = format!("{}{}", self.api_base, path);
-        let mut resp = ureq::get(&url)
+        let mut resp = crate::http::agent()
+            .get(&url)
             .header("Authorization", &self.auth_header()?)
             .call()
             .map_err(|e| format!("GET {path} failed: {e}"))?;
@@ -296,7 +298,8 @@ impl GReaderClient {
     /// Set one item's read state on the server: edit-tag adds the
     /// read state to mark read, removes it to mark unread.
     pub fn set_read_remote(&self, item_id: &str, read: bool) -> Result<(), String> {
-        let mut token_resp = ureq::get(&format!("{}/token", self.api_base))
+        let mut token_resp = crate::http::agent()
+            .get(&format!("{}/token", self.api_base))
             .header("Authorization", &self.auth_header()?)
             .call()
             .map_err(|e| format!("token fetch failed: {e}"))?;
@@ -309,7 +312,8 @@ impl GReaderClient {
         } else {
             ("r", "user/-/state/com.google/read")
         };
-        ureq::post(&format!("{}/edit-tag", self.api_base))
+        crate::http::agent()
+            .post(&format!("{}/edit-tag", self.api_base))
             .header("Authorization", &self.auth_header()?)
             .send_form([("i", item_id), (verb, state), ("T", edit_token.trim())])
             .map_err(|e| format!("edit-tag failed: {e}"))?;
@@ -438,7 +442,8 @@ impl MinifluxClient {
 
     fn get_json<T: for<'de> Deserialize<'de>>(&self, path: &str) -> Result<T, String> {
         let url = format!("{}{}", self.base_url, path);
-        let mut resp = ureq::get(&url)
+        let mut resp = crate::http::agent()
+            .get(&url)
             .header("X-Auth-Token", &self.api_key)
             .call()
             .map_err(|e| format!("GET {path} failed: {e}"))?;
