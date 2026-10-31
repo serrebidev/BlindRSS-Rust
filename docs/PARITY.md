@@ -292,4 +292,41 @@ HTML View menu; Rust reads in the main window only).
 8. Translation (6 providers), announcements + sounds, single
    instance, startup dependency check, context help.
 
+## 6. Audit 3 additions (2026-10-30, depth pass)
+
+Full report: reports/feature-audit-3-2026-10-30.md in the migration
+workspace; raw extraction audit3-features.json. Newly inventoried:
+
+- Settings pages mapped exactly (10 pages, per-page key sets in the
+  report) — the 5F.3 settings build now has a precise target,
+  including refresh knobs (feed_timeout_seconds, feed_retry_attempts,
+  per_host_max_connections, ignore_feed_cache), search_mode,
+  delete_behavior, user_agent_mode/custom, data_location.
+- browser_feed.py/browser_bridge.py: warm-browser fetch fallback
+  (challenge completion) as a first-class API — **missing**.
+- stream_proxy.py: local playback/cast proxy with HLS conversion —
+  **missing**.
+- play_cache.py: playback cache with cap/prune/clear — **missing**.
+- Player depth: PlayerFrame has 167 methods; equalizer.py (band
+  model + user presets), audio_silence.py (PCM silence scan),
+  sponsorblock.py (per-category segment skip) are separate port
+  units — **missing**.
+- metadata_enrich.py: async article enrichment (author/tags/section
+  from the article page) — the source of article tags — **missing**.
+- backup.py semantics: restore is STAGED to restore_pending/ and
+  applied at next start before the DB opens; auto-backup rotates.
+  Rust restore currently swaps rss.db live under the open
+  connection — **correctness fix owed**; auto-backup **missing**.
+- download_formats.py / retention.py: named preset systems (yt-dlp
+  format selectors, retention id -> days) replace Rust's hardcoded
+  download presets and fixed 30-day prune — **partial, generalize**.
+- dependency_check.py: media-tool detect/install + yt-dlp
+  self-update + user tool paths — **missing**.
+- updater.py: manifest-driven download/verify/stage/apply
+  self-update; Rust is notify-only — **partial**.
+- announcements.py: per-event announcement modes (speech/braille/
+  sound/off per event) — richer than a single toggle — **missing**.
+- http_headers.py (per-channel headers for players/casters) and
+  article_lang.py (content-language priority order) — **missing**.
+
 </content>

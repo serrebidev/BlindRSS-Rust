@@ -470,7 +470,6 @@ fn main() {
         let deleted_btn = Button::builder(&frame).with_label("Deleted...").build();
         let search_box = TextCtrl::builder(&frame).build();
         let search_btn = Button::builder(&frame).with_label("Search").build();
-        let sync_btn = Button::builder(&frame).with_label("Sync Providers").build();
         let fulltext_btn = Button::builder(&frame).with_label("Read Full Text").build();
         let toggle_read_btn = Button::builder(&frame).with_label("Toggle Read").build();
         let edit_feed_btn = Button::builder(&frame).with_label("Edit Feed").build();
@@ -488,19 +487,7 @@ fn main() {
             .with_label("Delete Smart Folder")
             .build();
         let download_btn = Button::builder(&frame).with_label("Download").build();
-        let takeout_btn = Button::builder(&frame)
-            .with_label("Import YouTube Takeout")
-            .build();
-        let archive_btn = Button::builder(&frame).with_label("Rescan Archive").build();
         let cast_btn = Button::builder(&frame).with_label("Cast").build();
-        let backup_btn = Button::builder(&frame).with_label("Backup").build();
-        let restore_btn = Button::builder(&frame).with_label("Restore").build();
-        let prune_btn = Button::builder(&frame)
-            .with_label("Prune Old Articles")
-            .build();
-        let update_btn = Button::builder(&frame)
-            .with_label("Check for Updates")
-            .build();
         let settings_btn = Button::builder(&frame).with_label("Settings...").build();
         let refresh_btn = Button::builder(&frame).with_label(&refresh_label).build();
         let help_btn = Button::builder(&frame).with_label("Help").build();
@@ -529,7 +516,6 @@ fn main() {
         btn_row.add(&remove_btn, 0, SizerFlag::All, 4);
         btn_row.add(&import_btn, 0, SizerFlag::All, 4);
         btn_row.add(&export_btn, 0, SizerFlag::All, 4);
-        btn_row.add(&sync_btn, 0, SizerFlag::All, 4);
         btn_row.add(&fulltext_btn, 0, SizerFlag::All, 4);
         btn_row.add(&toggle_read_btn, 0, SizerFlag::All, 4);
         btn_row.add(&edit_feed_btn, 0, SizerFlag::All, 4);
@@ -539,13 +525,7 @@ fn main() {
         btn_row.add(&new_sf_btn, 0, SizerFlag::All, 4);
         btn_row.add(&del_sf_btn, 0, SizerFlag::All, 4);
         btn_row.add(&download_btn, 0, SizerFlag::All, 4);
-        btn_row.add(&takeout_btn, 0, SizerFlag::All, 4);
-        btn_row.add(&archive_btn, 0, SizerFlag::All, 4);
         btn_row.add(&cast_btn, 0, SizerFlag::All, 4);
-        btn_row.add(&backup_btn, 0, SizerFlag::All, 4);
-        btn_row.add(&restore_btn, 0, SizerFlag::All, 4);
-        btn_row.add(&prune_btn, 0, SizerFlag::All, 4);
-        btn_row.add(&update_btn, 0, SizerFlag::All, 4);
         btn_row.add(&settings_btn, 0, SizerFlag::All, 4);
         btn_row.add(&help_btn, 0, SizerFlag::All, 4);
         btn_row.add(&keys_btn, 0, SizerFlag::All, 4);
@@ -964,10 +944,6 @@ fn main() {
                 frame_sync.set_status_text(&format!("Syncing {started} provider(s)..."), 0);
             }
         });
-        {
-            let a = act_sync.clone();
-            sync_btn.on_click(move |_| a());
-        }
 
         // Read Full Text: fetch the selected article's page on a
         // worker thread; extraction runs on the main thread when the
@@ -1428,10 +1404,6 @@ fn main() {
                 Err(e) => frame_to.set_status_text(&format!("Takeout: {e}"), 0),
             }
         });
-        {
-            let a = act_takeout.clone();
-            takeout_btn.on_click(move |_| a());
-        }
 
         // Rescan Archive: live document + newest Wayback snapshot
         // for the selected feed, on a worker thread/connection.
@@ -1458,10 +1430,6 @@ fn main() {
                 let _ = tx.send(RefreshMsg::ArchiveDone(feed.title.clone(), result));
             });
         });
-        {
-            let a = act_archive.clone();
-            archive_btn.on_click(move |_| a());
-        }
 
         // Cast: resolve the article's stream, discover Chromecasts,
         // launch the default receiver and load the media — all on a
@@ -1540,10 +1508,6 @@ fn main() {
                 }
             }
         });
-        {
-            let a = act_backup.clone();
-            backup_btn.on_click(move |_| a());
-        }
         let state_rs = state.clone();
         let frame_rs = frame;
         let tree_rs = tree;
@@ -1582,10 +1546,6 @@ fn main() {
                 }
             }
         });
-        {
-            let a = act_restore.clone();
-            restore_btn.on_click(move |_| a());
-        }
         let state_pr = state.clone();
         let frame_pr = frame;
         let list_pr = list;
@@ -1600,10 +1560,6 @@ fn main() {
                 None => frame_pr.set_status_text("No database", 0),
             }
         });
-        {
-            let a = act_prune.clone();
-            prune_btn.on_click(move |_| a());
-        }
         let frame_up = frame;
         let tx_up = tx.clone();
         let act_update: Rc<dyn Fn()> = Rc::new(move || {
@@ -1615,16 +1571,29 @@ fn main() {
                 ));
             });
         });
-        {
-            let a = act_update.clone();
-            update_btn.on_click(move |_| a());
-        }
 
         // Settings: provider accounts + download folder + Inoreader
-        // OAuth connect, in a modal dialog.
+        // OAuth connect, in a modal dialog. Maintenance actions live
+        // in the dialog now (Brandon, 2026-10-30: the main page was
+        // crowded with them); the dialog reports which one was
+        // chosen and it runs here, after the dialog closes.
         let frame_set = frame;
+        type Action = Rc<dyn Fn()>;
+        let dispatch: Vec<(&'static str, Action)> = vec![
+            ("backup", act_backup.clone()),
+            ("restore", act_restore.clone()),
+            ("takeout", act_takeout.clone()),
+            ("archive", act_archive.clone()),
+            ("sync", act_sync.clone()),
+            ("prune", act_prune.clone()),
+            ("update", act_update.clone()),
+        ];
         let act_settings: Rc<dyn Fn()> = Rc::new(move || {
-            settings::show_settings(&frame_set, &config_path());
+            if let Some(intent) = settings::show_settings(&frame_set, &config_path())
+                && let Some((_, action)) = dispatch.iter().find(|(name, _)| *name == intent)
+            {
+                action();
+            }
         });
         {
             let a = act_settings.clone();

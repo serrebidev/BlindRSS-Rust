@@ -54,8 +54,13 @@ fn open_url(url: &str) {
     let _ = std::process::Command::new("xdg-open").arg(url).spawn();
 }
 
-pub fn show_settings(frame: &Frame, config_path: &Path) {
-    let mut cfg = Config::load(config_path).unwrap_or_default();
+/// Shows the settings dialog. Returns the name of a maintenance
+/// action the user chose inside the dialog ("backup", "restore",
+/// "takeout", "archive", "sync", "prune", "update"), or None. The
+/// caller runs the action after the dialog has closed, so the
+/// action's own dialogs parent cleanly on the main frame.
+pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> {
+    let cfg = Config::load(config_path).unwrap_or_default();
     let dialog = Dialog::builder(frame, "BlindRSS Settings").build();
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
 
@@ -123,6 +128,46 @@ pub fn show_settings(frame: &Frame, config_path: &Path) {
         false,
     );
 
+    // Maintenance actions (moved off the main window, Brandon
+    // 2026-10-30): each saves the fields, closes the dialog, and
+    // reports its name back so the caller runs it on the main frame.
+    let intent: std::rc::Rc<std::cell::RefCell<Option<&'static str>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(None));
+    let maint_label = StaticText::builder(&dialog)
+        .with_label("Maintenance")
+        .build();
+    sizer.add(&maint_label, 0, SizerFlag::All, 4);
+    let maint_row1 = BoxSizer::builder(Orientation::Horizontal).build();
+    let maint_row2 = BoxSizer::builder(Orientation::Horizontal).build();
+    let backup_btn = Button::builder(&dialog).with_label("Backup Now").build();
+    let restore_btn = Button::builder(&dialog)
+        .with_label("Restore Backup...")
+        .build();
+    let takeout_btn = Button::builder(&dialog)
+        .with_label("Import YouTube Takeout...")
+        .build();
+    let archive_btn = Button::builder(&dialog)
+        .with_label("Rescan Podcast Archive")
+        .build();
+    let sync_btn = Button::builder(&dialog)
+        .with_label("Sync Providers Now")
+        .build();
+    let prune_btn = Button::builder(&dialog)
+        .with_label("Prune Old Articles")
+        .build();
+    let update_btn = Button::builder(&dialog)
+        .with_label("Check for Updates")
+        .build();
+    maint_row1.add(&backup_btn, 0, SizerFlag::All, 4);
+    maint_row1.add(&restore_btn, 0, SizerFlag::All, 4);
+    maint_row1.add(&takeout_btn, 0, SizerFlag::All, 4);
+    maint_row1.add(&archive_btn, 0, SizerFlag::All, 4);
+    maint_row2.add(&sync_btn, 0, SizerFlag::All, 4);
+    maint_row2.add(&prune_btn, 0, SizerFlag::All, 4);
+    maint_row2.add(&update_btn, 0, SizerFlag::All, 4);
+    sizer.add_sizer(&maint_row1, 0, SizerFlag::All, 2);
+    sizer.add_sizer(&maint_row2, 0, SizerFlag::All, 2);
+
     let btn_row = BoxSizer::builder(Orientation::Horizontal).build();
     let connect_btn = Button::builder(&dialog)
         .with_label("Connect Inoreader...")
@@ -134,48 +179,78 @@ pub fn show_settings(frame: &Frame, config_path: &Path) {
     btn_row.add(&cancel_btn, 0, SizerFlag::All, 4);
     sizer.add_sizer(&btn_row, 0, SizerFlag::All, 4);
     dialog.set_sizer(sizer, true);
-    dialog.set_size(Size::new(560, 520));
+    dialog.set_size(Size::new(560, 620));
 
     let cfg_path_buf = config_path.to_path_buf();
     let cfg_path_connect = config_path.to_path_buf();
+    // One save routine shared by Save and the maintenance buttons.
+    let cfg_rc = std::rc::Rc::new(std::cell::RefCell::new(cfg));
+    let save_all: std::rc::Rc<dyn Fn()> = {
+        let cfg_s = cfg_rc.clone();
+        let path_s = cfg_path_buf.clone();
+        std::rc::Rc::new(move || {
+            let mut cfg = cfg_s.borrow_mut();
+            cfg.set_path(
+                "providers.theoldreader.email",
+                serde_json::json!(tor_email.get_value()),
+            );
+            cfg.set_path(
+                "providers.theoldreader.password",
+                serde_json::json!(tor_pass.get_value()),
+            );
+            cfg.set_path(
+                "providers.bazqux.email",
+                serde_json::json!(baz_email.get_value()),
+            );
+            cfg.set_path(
+                "providers.bazqux.password",
+                serde_json::json!(baz_pass.get_value()),
+            );
+            cfg.set_path(
+                "providers.miniflux.url",
+                serde_json::json!(mini_url.get_value()),
+            );
+            cfg.set_path(
+                "providers.miniflux.api_key",
+                serde_json::json!(mini_key.get_value()),
+            );
+            cfg.set_path(
+                "providers.inoreader.app_id",
+                serde_json::json!(ino_id.get_value()),
+            );
+            cfg.set_path(
+                "providers.inoreader.app_key",
+                serde_json::json!(ino_key.get_value()),
+            );
+            cfg.set_path("download_path", serde_json::json!(dl_path.get_value()));
+            let _ = cfg.save(&path_s);
+        })
+    };
     let dialog_save = dialog;
+    let save_for_btn = save_all.clone();
     save_btn.on_click(move |_| {
-        cfg.set_path(
-            "providers.theoldreader.email",
-            serde_json::json!(tor_email.get_value()),
-        );
-        cfg.set_path(
-            "providers.theoldreader.password",
-            serde_json::json!(tor_pass.get_value()),
-        );
-        cfg.set_path(
-            "providers.bazqux.email",
-            serde_json::json!(baz_email.get_value()),
-        );
-        cfg.set_path(
-            "providers.bazqux.password",
-            serde_json::json!(baz_pass.get_value()),
-        );
-        cfg.set_path(
-            "providers.miniflux.url",
-            serde_json::json!(mini_url.get_value()),
-        );
-        cfg.set_path(
-            "providers.miniflux.api_key",
-            serde_json::json!(mini_key.get_value()),
-        );
-        cfg.set_path(
-            "providers.inoreader.app_id",
-            serde_json::json!(ino_id.get_value()),
-        );
-        cfg.set_path(
-            "providers.inoreader.app_key",
-            serde_json::json!(ino_key.get_value()),
-        );
-        cfg.set_path("download_path", serde_json::json!(dl_path.get_value()));
-        let _ = cfg.save(&cfg_path_buf);
+        save_for_btn();
         dialog_save.end_modal(5100);
     });
+    // Maintenance buttons: save, record the intent, close.
+    for (btn, name) in [
+        (backup_btn, "backup"),
+        (restore_btn, "restore"),
+        (takeout_btn, "takeout"),
+        (archive_btn, "archive"),
+        (sync_btn, "sync"),
+        (prune_btn, "prune"),
+        (update_btn, "update"),
+    ] {
+        let save_m = save_all.clone();
+        let intent_m = intent.clone();
+        let dialog_m = dialog;
+        btn.on_click(move |_| {
+            save_m();
+            *intent_m.borrow_mut() = Some(name);
+            dialog_m.end_modal(5100);
+        });
+    }
     let dialog_cancel = dialog;
     cancel_btn.on_click(move |_| {
         dialog_cancel.end_modal(5101);
@@ -276,4 +351,5 @@ pub fn show_settings(frame: &Frame, config_path: &Path) {
 
     dialog.show_modal();
     dialog.destroy();
+    *intent.borrow()
 }
