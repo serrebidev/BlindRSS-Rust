@@ -533,6 +533,12 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
         "Show image alt text",
         cfg.get_bool("show_image_alt", false),
     );
+    let rich_view_cb = add_check(
+        &dialog,
+        &sizer,
+        "Show articles as rich HTML (WebView)",
+        cfg.get_bool("full_text_rich_view", false),
+    );
     // Article opening (Python issue #31): default browser or a
     // custom command template with %1 for the URL.
     let open_method_choice = add_choice(
@@ -1412,6 +1418,10 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
             cfg.set_path(
                 "show_image_alt",
                 serde_json::json!(show_alt_cb.is_checked()),
+            );
+            cfg.set_path(
+                "full_text_rich_view",
+                serde_json::json!(rich_view_cb.is_checked()),
             );
             let open_method = match open_method_choice.get_selection() {
                 Some(1) => "custom",

@@ -710,3 +710,56 @@ start_on_windows_login, applied on Settings save when changed
 (HKCU Run key via raw advapi32 on Windows, LaunchAgent plist
 + launchctl on macOS, disabled elsewhere; failure reverts the
 stored key, like Python).
+
+Batch 26 resolution (v0.1.26): the WebView rich reader and
+categories parity. Rich reader: core/article_html.rs ports
+Python core/article_html.py — main-content pick, social-embed
+conversion, chrome/boilerplate/byline drops, the
+trafilatura-prune passes, media src normalization (YouTube
+and Vimeo embeds rewritten to watch pages, as Python does),
+paywall rebuild, and the feed-arbitration render
+(render_rich_article + rich_article_from_feed) — with ammonia
+as the sanitizer (Audit 4 item 13; Python's nh3-equivalent
+allowlist configuration, base-URL rewriting for relative
+URLs). One deliberate divergence: ammonia drops data: URLs
+where Python passes them through. The app shows the rich
+document in a wxDragon WebView (feature webview) on all three
+OSes when the new full_text_rich_view setting is on (default
+off; the native text reader stays the default and the
+fallback when no backend exists, as in Python). Route note:
+the original plan was a Windows-only blckngm/webview2 path
+with a shipped loader DLL; wxdragon 0.9.24's WebView covers
+every platform and wxdragon-sys links WebView2LoaderStatic
+on Windows, so no DLL ships and one code path serves all
+OSes. Link diversion ports gui/rich_view_links.py (issue
+#102): embed-shaped iframes (Twitter, Bluesky, Facebook,
+TikTok, Instagram, Threads) navigate inline; other external
+links are vetoed and opened through the article-open path.
+wxDragon exposes no IsTargetMainFrame / GetNavigationAction,
+so the set_page loading window, named-target check, and
+embed-shape check substitute for Python's discriminators.
+Not ported (residuals): multi-page following (Python follows
+rel=next up to 6 pages; the Rust text cascade is single-page
+too, so both paths share the gap), the YouTube
+structured-text special case, the ID3 show-notes path, the
+Google News Jina-proxy path, the metered-preview notice,
+Sky/GSMArena HTML expansions, and rich mode in the article
+window dialog. Categories: Db::articles_for_category ports
+providers/local.py::_category_membership_clause — a category
+view now contains subtree-feed articles that were not moved
+away, plus articles moved (category_override) or labeled
+(article_labels) into the subtree; the filter rules already
+wrote those columns on refresh, so moved/labeled articles
+were previously invisible in the very views they belong to.
+Uncategorized is a real tree node, as in Python's local
+provider: uncategorized feeds (NULL, blank, or the sentinel)
+group under it with a recursive unread count, selecting it
+lists only their articles, Refresh Category covers it, New
+Category created "under" it lands at the root, and it is
+protected from rename and both delete actions. Expansion
+memory ports Python issue #33: the tree records explicit
+expand/collapse per category and re-applies it across
+rebuilds, with category_tree_default_expanded as the default
+for untouched nodes (previously every rebuild reset all
+categories to the default). Tests: batch26_slice (sanitizer
+and cleaner) and batch27_slice (membership clause).

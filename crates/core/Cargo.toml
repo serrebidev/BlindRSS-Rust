@@ -1,6 +1,6 @@
 [package]
 name = "blindrss-core"
-version = "0.1.25"
+version = "0.1.26"
 edition.workspace = true
 license.workspace = true
 
@@ -27,6 +27,8 @@ sha1 = "0.10"
 ring = "0.17"
 alac-encoder = "0.3"
 rsa = { version = "0.9", default-features = false, features = ["std", "getrandom"] }
+ammonia = "4.2.4"
+url = "2.5.8"
 
 [dev-dependencies]
 rusqlite = { version = "0.40", features = ["bundled"] }

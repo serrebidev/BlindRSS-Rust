@@ -8,6 +8,7 @@
 pub mod announce;
 pub mod archive;
 pub mod article_columns;
+pub mod article_html;
 pub mod article_lang;
 pub mod captcha;
 pub mod cast;

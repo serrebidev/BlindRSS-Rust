@@ -1091,6 +1091,99 @@ impl Db {
         rows.collect()
     }
 
+    /// Articles belonging to a category view (Python
+    /// `providers/local.py::_category_membership_clause`): the
+    /// category's whole subtree counts, and membership is
+    /// (feed in subtree AND not moved away) OR (moved here via
+    /// category_override) OR (labeled with a category in the
+    /// subtree). "Uncategorized" is the bucket of feeds with no /
+    /// empty / sentinel category.
+    pub fn articles_for_category(
+        &self,
+        path: &str,
+        limit: usize,
+    ) -> rusqlite::Result<Vec<Article>> {
+        // The subtree name set: the path plus every descendant path
+        // known to the categories table or carried by a feed.
+        let mut names: Vec<String> = vec![path.to_string()];
+        let prefix = format!("{path}/");
+        let mut push_name = |n: &str| {
+            if (n == path || n.starts_with(&prefix)) && !names.iter().any(|x| x == n) {
+                names.push(n.to_string());
+            }
+        };
+        for c in self.categories()? {
+            push_name(&c.title);
+        }
+        {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT DISTINCT category FROM feeds WHERE category IS NOT NULL")?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            for n in rows {
+                push_name(&n?);
+            }
+        }
+        let marks = names.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let uncat = path.trim().is_empty() || path.trim().eq_ignore_ascii_case("uncategorized");
+        let (feed_match, override_match, label_match) = if uncat {
+            (
+                "(f.category IS NULL OR TRIM(f.category) = '' \
+                  OR LOWER(TRIM(f.category)) = 'uncategorized')"
+                    .to_string(),
+                "LOWER(TRIM(a.category_override)) = 'uncategorized'".to_string(),
+                "a.id IN (SELECT article_id FROM article_labels \
+                 WHERE LOWER(TRIM(category)) = 'uncategorized')"
+                    .to_string(),
+            )
+        } else {
+            (
+                format!("f.category IN ({marks})"),
+                format!("a.category_override IN ({marks})"),
+                format!(
+                    "a.id IN (SELECT article_id FROM article_labels WHERE category IN ({marks}))"
+                ),
+            )
+        };
+        let sql = format!(
+            "SELECT a.id, a.feed_id, a.title, a.url, a.content, a.description, a.date, \
+             a.author, a.is_read, a.is_favorite, a.media_url, a.media_type \
+             FROM articles a JOIN feeds f ON f.id = a.feed_id \
+             WHERE ((a.category_override IS NULL AND {feed_match}) \
+             OR {override_match} OR {label_match}) \
+             ORDER BY COALESCE(a.date, '') DESC LIMIT ?"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut params: Vec<&dyn rusqlite::ToSql> = Vec::new();
+        if !uncat {
+            // The name set is bound three times (feed, override, labels).
+            for _ in 0..3 {
+                for n in &names {
+                    params.push(n as &dyn rusqlite::ToSql);
+                }
+            }
+        }
+        let limit_i = limit as i64;
+        params.push(&limit_i);
+        let rows = stmt.query_map(params.as_slice(), |r| {
+            Ok(Article {
+                id: r.get(0)?,
+                feed_id: r.get(1)?,
+                title: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                url: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                content: r.get(4)?,
+                description: r.get(5)?,
+                date: r.get(6)?,
+                author: r.get(7)?,
+                is_read: r.get::<_, i64>(8)? != 0,
+                is_favorite: r.get::<_, i64>(9)? != 0,
+                media_url: r.get(10)?,
+                media_type: r.get(11)?,
+            })
+        })?;
+        rows.collect()
+    }
+
     pub fn remove_category(&self, category_id: &str) -> rusqlite::Result<()> {
         self.conn
             .execute("DELETE FROM categories WHERE id = ?1", params![category_id])?;

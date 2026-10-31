@@ -19,7 +19,9 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::mpsc::{Receiver, Sender, channel};
+use wxdragon::event::webview_events::WebViewEvents;
 use wxdragon::prelude::*;
+use wxdragon::widgets::webview::{WebView, WebViewBackend};
 
 fn home_dir() -> PathBuf {
     std::env::var("HOME")
@@ -841,6 +843,103 @@ fn open_in_browser(url: &str) {
 /// the user's command template (%1 = URL); on any failure, warn
 /// and fall back to the default browser so the user still gets
 /// their article.
+/// The rich reader's document skeleton: the WebView owns the
+/// document (Python's design), the cleaned fragment drops into the
+/// body, and the fragment's `<article lang="...">` carries the
+/// content language for assistive tech.
+fn rich_document(fragment: &str) -> String {
+    format!(
+        "<!DOCTYPE html><html><head><meta charset=\"utf-8\">\
+         <style>body {{ font-family: sans-serif; line-height: 1.5; margin: 1em; }} \
+         img, iframe, video {{ max-width: 100%; }}</style></head>\
+         <body>{fragment}</body></html>"
+    )
+}
+
+/// Python rich_view_links.external_url: a plain HTTP(S) URL safe to
+/// hand to the OS (host present, no credentials, no whitespace,
+/// control characters, or backslashes).
+fn rich_external_url(href: &str) -> Option<String> {
+    if href.is_empty() || href.contains('\\') {
+        return None;
+    }
+    if href
+        .chars()
+        .any(|c| c.is_whitespace() || (c as u32) < 32 || (127..=159).contains(&(c as u32)))
+    {
+        return None;
+    }
+    let lower = href.to_lowercase();
+    let rest = lower
+        .strip_prefix("http://")
+        .or_else(|| lower.strip_prefix("https://"))?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty() || authority.contains('@') {
+        return None;
+    }
+    let host = authority.split(':').next().unwrap_or("");
+    if host.is_empty() {
+        return None;
+    }
+    Some(href.to_string())
+}
+
+/// True for social/player embed URLs, which only ever appear as
+/// iframe sources and must load inside the WebView (Python issue
+/// #102). YouTube/Vimeo iframe sources are normalized to watch pages
+/// by the cleaner, so they are absent here on purpose: if one ever
+/// navigates, the browser is the right home for it.
+fn rich_embed_url(url: &str) -> bool {
+    let low = url.to_lowercase();
+    low.contains("platform.twitter.com/embed/")
+        || low.contains("embed.bsky.app/embed/")
+        || low.contains("facebook.com/plugins/")
+        || low.contains("tiktok.com/embed/")
+        || (low.contains("instagram.com/") && low.contains("/embed"))
+        || ((low.contains("threads.net/") || low.contains("threads.com/"))
+            && low.contains("/embed"))
+}
+
+/// Fetch + render the full rich article on a worker (the rich
+/// counterpart of the full-text fetch).
+fn spawn_rich_fetch(tx: &Sender<RefreshMsg>, article: &blindrss_core::db::Article) {
+    let tx = tx.clone();
+    let id = article.id.clone();
+    let url = article.url.clone();
+    let fallback = article
+        .content
+        .clone()
+        .filter(|c| !c.trim().is_empty())
+        .or_else(|| article.description.clone())
+        .unwrap_or_default();
+    let title = article.title.clone();
+    let author = article.author.clone().unwrap_or_default();
+    let date = article
+        .date
+        .clone()
+        .unwrap_or_default()
+        .split('T')
+        .next()
+        .unwrap_or("")
+        .to_string();
+    std::thread::spawn(move || {
+        let jar = blindrss_core::cookies::load_jar_beside(&config_path());
+        let header = blindrss_core::cookies::cookie_header_for(&jar, &url);
+        let frag = blindrss_core::article_html::render_rich_article(
+            &url,
+            &fallback,
+            &title,
+            &author,
+            &date,
+            &header,
+            "",
+            "",
+            &ui_language(),
+        );
+        let _ = tx.send(RefreshMsg::RichHtml(id, frag));
+    });
+}
+
 fn open_article_link(frame: &Frame, url: &str) {
     let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
     if cfg
@@ -1026,6 +1125,11 @@ struct State {
     /// True while the search text box has keyboard focus; the
     /// Backspace toggle-read shortcut must not eat its editing.
     search_focused: bool,
+    /// Category tree expansion memory (Python issue #33): the
+    /// user's explicit expand/collapse choices, re-applied across
+    /// rebuilds; category_tree_default_expanded covers the rest.
+    expanded_cats: std::collections::HashSet<String>,
+    collapsed_cats: std::collections::HashSet<String>,
     /// Per-feed new-article counts for the running refresh
     /// (sounds/notifications at AllDone consume them).
     refresh_new: Vec<(String, String, usize)>,
@@ -1052,6 +1156,8 @@ enum RefreshMsg {
         blindrss_core::extract::ExtractOutcome,
         Option<String>,
     ),
+    /// Rich (WebView) full article: (article id, fragment if any).
+    RichHtml(String, Option<String>),
     /// yt-dlp resolution for playback: (stream URL, info if fetched).
     MediaReady(
         String,
@@ -1204,6 +1310,13 @@ fn fmt_ts(ts: Option<f64>) -> String {
     format!("{yr:04}-{mo:02}-{d:02} {h:02}:{m:02}")
 }
 
+/// Python core.categories.is_uncategorized: no category, blank,
+/// or the "Uncategorized" sentinel (any case).
+fn is_uncategorized_cat(category: Option<&str>) -> bool {
+    let c = category.unwrap_or("").trim();
+    c.is_empty() || c.eq_ignore_ascii_case("uncategorized")
+}
+
 /// The category path of the current tree selection, if any.
 fn selected_category(st: &State) -> Option<String> {
     st.selected_feed
@@ -1214,6 +1327,13 @@ fn selected_category(st: &State) -> Option<String> {
 
 /// Feeds inside a category path, subcategories included.
 fn feeds_in_category(feeds: &[Feed], path: &str) -> Vec<Feed> {
+    if is_uncategorized_cat(Some(path)) {
+        return feeds
+            .iter()
+            .filter(|f| is_uncategorized_cat(f.category.as_deref()))
+            .cloned()
+            .collect();
+    }
     let prefix = format!("{path}/");
     feeds
         .iter()
@@ -1342,10 +1462,12 @@ fn rebuild_tree(state: &mut State, tree: &TreeCtrl) {
         .unwrap_or_default()
         .into_iter()
         .map(|c| c.title)
+        .filter(|t| !is_uncategorized_cat(Some(t)))
         .collect();
     for f in &feeds {
         if let Some(cat) = &f.category
             && !cat.trim().is_empty()
+            && !is_uncategorized_cat(Some(cat))
             && !paths.contains(cat)
         {
             paths.push(cat.clone());
@@ -1354,6 +1476,29 @@ fn rebuild_tree(state: &mut State, tree: &TreeCtrl) {
     paths.sort();
     let mut cat_items: std::collections::HashMap<String, TreeItemId> =
         std::collections::HashMap::new();
+    // Uncategorized is a real node (Python's local provider):
+    // feeds with no category — or carrying the sentinel — group
+    // under it, and selecting it lists only their articles.
+    let uncat_feeds: Vec<&Feed> = feeds
+        .iter()
+        .filter(|f| is_uncategorized_cat(f.category.as_deref()))
+        .collect();
+    if !uncat_feeds.is_empty() {
+        let unread: i64 = uncat_feeds
+            .iter()
+            .map(|f| db.unread_count(Some(&f.id)).unwrap_or(0))
+            .sum();
+        let label = if unread > 0 {
+            format!("Uncategorized ({unread})")
+        } else {
+            "Uncategorized".to_string()
+        };
+        if let Some(item) =
+            tree.append_item_with_data(&root, &label, "cat:Uncategorized".to_string(), None, None)
+        {
+            cat_items.insert("Uncategorized".to_string(), item);
+        }
+    }
     for path in &paths {
         let mut cur = String::new();
         for seg in path.split('/').filter(|s| !s.trim().is_empty()) {
@@ -1395,17 +1540,31 @@ fn rebuild_tree(state: &mut State, tree: &TreeCtrl) {
     }
     for f in &feeds {
         let label = feed_label(db, f);
-        let parent = f
-            .category
-            .as_ref()
-            .filter(|c| !c.trim().is_empty())
-            .and_then(|c| cat_items.get(c))
-            .cloned()
-            .unwrap_or_else(|| root.clone());
+        let parent = if is_uncategorized_cat(f.category.as_deref()) {
+            cat_items
+                .get("Uncategorized")
+                .cloned()
+                .unwrap_or_else(|| root.clone())
+        } else {
+            f.category
+                .as_ref()
+                .and_then(|c| cat_items.get(c))
+                .cloned()
+                .unwrap_or_else(|| root.clone())
+        };
         tree.append_item_with_data(&parent, &label, f.id.clone(), None, None);
     }
-    if expand_cats {
-        for item in cat_items.values() {
+    // Expansion (Python issue #33): the user's explicit choices
+    // survive rebuilds; the configured default covers the rest.
+    for (path, item) in &cat_items {
+        let expanded = if state.collapsed_cats.contains(path) {
+            false
+        } else if state.expanded_cats.contains(path) {
+            true
+        } else {
+            expand_cats
+        };
+        if expanded {
             tree.expand(item);
         }
     }
@@ -1559,14 +1718,11 @@ fn refill_articles(state: &mut State, list: &ListCtrl) {
         let loaded = db.recommendations(&account).unwrap_or_default();
         return finish_refill(state, list, loaded);
     }
-    // Category selection: articles across every feed in the
-    // category, subcategories included.
+    // Category selection: Python's membership clause — subtree
+    // feeds, minus articles moved elsewhere, plus articles moved
+    // or labeled into the subtree.
     if let Some(path) = filter.and_then(|f| f.strip_prefix("cat:")) {
-        let ids: Vec<String> = feeds_in_category(&state.feeds, path)
-            .iter()
-            .map(|f| f.id.clone())
-            .collect();
-        let loaded = db.articles_for_feeds(&ids, 500).unwrap_or_default();
+        let loaded = db.articles_for_category(path, 500).unwrap_or_default();
         return finish_refill(state, list, loaded);
     }
     let loaded = db.articles(filter, 300).unwrap_or_default();
@@ -1940,6 +2096,7 @@ fn main() {
         let help_btn = Button::builder(&frame).with_label("Help").build();
         let keys_btn = Button::builder(&frame).with_label("Shortcuts...").build();
 
+        let (tx, rx): (Sender<RefreshMsg>, Receiver<RefreshMsg>) = channel();
         let splitter = SplitterWindow::builder(&frame).build();
         let tree = TreeCtrl::builder(&splitter).build();
         let right = Panel::builder(&splitter).build();
@@ -1950,9 +2107,62 @@ fn main() {
             .with_style(TextCtrlStyle::MultiLine | TextCtrlStyle::ReadOnly)
             .build();
 
+        // Rich reader WebView (opt-in, config full_text_rich_view).
+        // Created whenever a backend exists but only shown in rich
+        // mode. wxdragon PANICS when creation fails, so the backend
+        // check is the gate: no WebView2 runtime / WebKit backend
+        // keeps the plain-text reader as the only reader (Python's
+        // fallback). Link handling mirrors Python's
+        // gui/rich_view_links.py (issue #102): main-frame link clicks
+        // go to the system browser; embeds load in view. wxDragon
+        // exposes neither IsTargetMainFrame nor the navigation
+        // action, so the load window (set_page -> Loaded), named
+        // sub-frames, and embed-shaped URLs are the discriminators.
+        let rich_view: std::rc::Rc<Option<WebView>> =
+            std::rc::Rc::new(if WebView::is_backend_available(WebViewBackend::Default) {
+                Some(WebView::builder(&right).build())
+            } else {
+                None
+            });
+        let rich_loading = std::rc::Rc::new(std::cell::Cell::new(false));
+        if let Some(wv) = rich_view.as_ref() {
+            wv.show(false);
+            let loading = rich_loading.clone();
+            wv.on_loaded(move |_| loading.set(false));
+            let frame_nav = frame;
+            let loading_nav = rich_loading.clone();
+            wv.on_navigating(move |data| {
+                if loading_nav.get() {
+                    return;
+                }
+                let Some(url) = data.get_url() else { return };
+                if !data.get_target().unwrap_or_default().is_empty() {
+                    return; // named sub-frame: let it load
+                }
+                if rich_embed_url(&url) {
+                    return; // social/player embeds render in view
+                }
+                if let Some(safe) = rich_external_url(&url) {
+                    data.event.event.veto();
+                    open_article_link(&frame_nav, &safe);
+                }
+            });
+            let frame_win = frame;
+            wv.on_new_window(move |data| {
+                if let Some(url) = data.get_url()
+                    && let Some(safe) = rich_external_url(&url)
+                {
+                    open_article_link(&frame_win, &safe);
+                }
+            });
+        }
+
         let right_sizer = BoxSizer::builder(Orientation::Vertical).build();
         right_sizer.add(&list, 1, SizerFlag::Expand | SizerFlag::All, 2);
         right_sizer.add(&reader, 2, SizerFlag::Expand | SizerFlag::All, 2);
+        if let Some(wv) = rich_view.as_ref() {
+            right_sizer.add(wv, 2, SizerFlag::Expand | SizerFlag::All, 2);
+        }
         right.set_sizer(right_sizer, true);
         splitter.split_vertically(&tree, &right, 280);
 
@@ -2018,6 +2228,8 @@ fn main() {
             refresh_new: Vec::new(),
             refresh_failed: false,
             search_focused: false,
+            expanded_cats: std::collections::HashSet::new(),
+            collapsed_cats: std::collections::HashSet::new(),
         }));
 
         // A staged restore (Python backup.py semantics) applies
@@ -2098,10 +2310,43 @@ fn main() {
             refill_articles(&mut st, &list);
         });
 
+        // Category expansion memory (Python issue #33): record the
+        // user's explicit expand/collapse so rebuilds re-apply it
+        // instead of resetting to the configured default.
+        let state_exp = state.clone();
+        tree.on_item_expanded(move |ev| {
+            let Some(item) = ev.get_item() else { return };
+            if let Some(path) = tree
+                .get_custom_data_direct(&item)
+                .and_then(|d| d.downcast_ref::<String>().cloned())
+                .and_then(|d| d.strip_prefix("cat:").map(|s| s.to_string()))
+            {
+                let mut st = state_exp.borrow_mut();
+                st.collapsed_cats.remove(&path);
+                st.expanded_cats.insert(path);
+            }
+        });
+        let state_col = state.clone();
+        tree.on_item_collapsed(move |ev| {
+            let Some(item) = ev.get_item() else { return };
+            if let Some(path) = tree
+                .get_custom_data_direct(&item)
+                .and_then(|d| d.downcast_ref::<String>().cloned())
+                .and_then(|d| d.strip_prefix("cat:").map(|s| s.to_string()))
+            {
+                let mut st = state_col.borrow_mut();
+                st.expanded_cats.remove(&path);
+                st.collapsed_cats.insert(path);
+            }
+        });
+
         // Selecting an article shows it and marks it read (Python marks
         // read on open as well).
         let state_list = state.clone();
         let frame_list = frame;
+        let rich_view_sel = rich_view.clone();
+        let rich_loading_sel = rich_loading.clone();
+        let tx_sel = tx.clone();
         list.on_item_selected(move |ev| {
             let idx = ev.get_item_index();
             if idx < 0 {
@@ -2122,6 +2367,7 @@ fn main() {
                 .filter(|c| !c.trim().is_empty())
                 .or_else(|| a.description.clone())
                 .unwrap_or_else(|| "(no stored text)".to_string());
+            let raw_body = body.clone();
             // Stored bodies are HTML; the reader shows clean text.
             // Image alt markers follow the per-feed / global
             // show_image_alt setting.
@@ -2131,6 +2377,49 @@ fn main() {
             };
             let body = blindrss_core::extract::html_to_text_opts(&body, keep_alt);
             reader.set_value(&format!("{}\n\n{}", a.title, body));
+            // Rich reader (opt-in, full_text_rich_view): the WebView
+            // shows the cleaned feed body now; the full rich article
+            // replaces it when the worker returns (RichHtml in the
+            // drain). Any failure keeps the plain-text reader.
+            let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+            if cfg.get_bool("full_text_rich_view", false) {
+                if let Some(wv) = rich_view_sel.as_ref() {
+                    let frag = blindrss_core::article_html::rich_article_from_feed(
+                        &a.url,
+                        &raw_body,
+                        &a.title,
+                        a.author.as_deref().unwrap_or(""),
+                        a.date
+                            .as_deref()
+                            .unwrap_or("")
+                            .split('T')
+                            .next()
+                            .unwrap_or(""),
+                        "",
+                        "",
+                        &ui_language(),
+                    );
+                    match frag {
+                        Some(frag) => {
+                            rich_loading_sel.set(true);
+                            wv.set_page(&rich_document(&frag), &a.url);
+                            wv.show(true);
+                            reader.show(false);
+                            frame_list.layout();
+                            spawn_rich_fetch(&tx_sel, &a);
+                        }
+                        None => {
+                            wv.show(false);
+                            reader.show(true);
+                        }
+                    }
+                }
+            } else {
+                if let Some(wv) = rich_view_sel.as_ref() {
+                    wv.show(false);
+                }
+                reader.show(true);
+            }
             if !a.is_read {
                 if let Some(db) = st.db.as_ref() {
                     mark_article_read(db, &a, true);
@@ -2240,7 +2529,6 @@ fn main() {
                 });
             }
         }
-        let (tx, rx): (Sender<RefreshMsg>, Receiver<RefreshMsg>) = channel();
         // Single-instance listener: a second copy's activation
         // request raises this window (via the drain).
         {
@@ -2879,6 +3167,7 @@ fn main() {
         let state_ft = state.clone();
         let frame_ft = frame;
         let tx_ft = tx.clone();
+        let rich_view_ft = rich_view.clone();
         let act_fulltext: Rc<dyn Fn()> = Rc::new(move || {
             let st = state_ft.borrow();
             let Some(article) = st
@@ -2939,6 +3228,13 @@ fn main() {
                     let _ = tx.send(RefreshMsg::FullText(id, outcome, first_html));
                 }
             });
+            // Rich mode: the WebView gets its own full article. The
+            // text result above still lands in the hidden text
+            // reader, so toggling modes stays truthful.
+            let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+            if cfg.get_bool("full_text_rich_view", false) && rich_view_ft.as_ref().is_some() {
+                spawn_rich_fetch(&tx_ft, &article);
+            }
         });
         {
             let a = act_fulltext.clone();
@@ -3139,6 +3435,10 @@ fn main() {
                 frame_rc.set_status_text("Selected feed has no category", 0);
                 return;
             };
+            if is_uncategorized_cat(Some(&category)) {
+                frame_rc.set_status_text("The Uncategorized folder cannot be renamed.", 0);
+                return;
+            }
             if !db_ok {
                 return;
             }
@@ -4675,7 +4975,10 @@ fn main() {
             let state_ac = state.clone();
             let frame_ac = frame;
             Rc::new(move || {
-                let parent = selected_category(&state_ac.borrow());
+                // Uncategorized is not a parent: a category created
+                // "under" it lands at the root, as in Python.
+                let parent = selected_category(&state_ac.borrow())
+                    .filter(|p| !is_uncategorized_cat(Some(p)));
                 let name = prompt_focus(
                     &frame_ac,
                     "Category name:",
@@ -4714,6 +5017,10 @@ fn main() {
                     frame_dc.set_status_text("Select a category in the tree first", 0);
                     return;
                 };
+                if is_uncategorized_cat(Some(&path)) {
+                    frame_dc.set_status_text("The Uncategorized folder cannot be removed.", 0);
+                    return;
+                }
                 let dlg = MessageDialog::builder(
                     &frame_dc,
                     &format!(
@@ -4825,6 +5132,10 @@ fn main() {
                     frame_df.set_status_text("Select a category in the tree first", 0);
                     return;
                 };
+                if is_uncategorized_cat(Some(&path)) {
+                    frame_df.set_status_text("The Uncategorized folder cannot be removed.", 0);
+                    return;
+                }
                 let (feeds, subcats) = {
                     let st = state_df.borrow();
                     let feeds = st
@@ -6014,6 +6325,8 @@ fn main() {
         let timer = Box::leak(Box::new(Timer::new(&frame)));
         let state_tick = state.clone();
         let frame_tick = frame;
+        let rich_view_tick = rich_view.clone();
+        let rich_loading_tick = rich_loading.clone();
         let rx_tick = rx.clone();
         let tx_tick = tx.clone();
         timer.on_tick(move |_| {
@@ -6261,6 +6574,33 @@ fn main() {
                                     .set_status_text("Full text unavailable: nothing extracted", 0);
                             }
                             _ => {}
+                        }
+                    }
+                    Ok(RefreshMsg::RichHtml(id, fragment)) => {
+                        let st = state_tick.borrow();
+                        let current = st
+                            .selected_article
+                            .and_then(|i| st.articles.get(i))
+                            .map(|a| a.id.clone());
+                        if current.as_deref() == Some(id.as_str())
+                            && let (Some(wv), Some(article)) = (
+                                rich_view_tick.as_ref(),
+                                st.articles.iter().find(|a| a.id == id),
+                            )
+                        {
+                            match fragment {
+                                Some(frag) => {
+                                    rich_loading_tick.set(true);
+                                    wv.set_page(&rich_document(&frag), &article.url);
+                                    frame_tick.set_status_text("Full text (rich view)", 0);
+                                }
+                                None => {
+                                    frame_tick.set_status_text(
+                                        "Rich full text unavailable; showing feed content",
+                                        0,
+                                    );
+                                }
+                            }
                         }
                     }
                     Ok(RefreshMsg::MediaReady(id, result)) => {

@@ -122,7 +122,7 @@ pub enum ExtractOutcome {
     Empty,
 }
 
-fn char_count(s: &str) -> usize {
+pub(crate) fn char_count(s: &str) -> usize {
     s.chars().count()
 }
 
@@ -315,7 +315,7 @@ fn axios_text(html: &str) -> String {
     String::new()
 }
 
-fn host_of(url: &str) -> String {
+pub(crate) fn host_of(url: &str) -> String {
     url.split("://")
         .nth(1)
         .unwrap_or(url)
@@ -332,17 +332,17 @@ fn host_of(url: &str) -> String {
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
-struct TagTok {
-    start: usize,
-    end: usize,
-    name: String,
-    close: bool,
-    self_closing: bool,
+pub(crate) struct TagTok {
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+    pub(crate) name: String,
+    pub(crate) close: bool,
+    pub(crate) self_closing: bool,
 }
 
 /// Tokenize a document's tags (quote-aware `>` scan). Tag names
 /// are lowercased; attribute text stays in the source slices.
-fn tag_tokens(html: &str) -> Vec<TagTok> {
+pub(crate) fn tag_tokens(html: &str) -> Vec<TagTok> {
     let bytes = html.as_bytes();
     let mut out = Vec::new();
     let mut i = 0usize;
@@ -394,7 +394,7 @@ fn tag_tokens(html: &str) -> Vec<TagTok> {
 }
 
 /// The value of attribute `name` in an open tag's source, if any.
-fn attr_value(open_tag: &str, name: &str) -> Option<String> {
+pub(crate) fn attr_value(open_tag: &str, name: &str) -> Option<String> {
     let lower = open_tag.to_lowercase();
     let mut idx = 0usize;
     while let Some(pos) = lower[idx..].find(name) {
@@ -421,23 +421,27 @@ fn attr_value(open_tag: &str, name: &str) -> Option<String> {
 
 /// True when the open tag's class list contains `token` as a whole
 /// class name (CSS class-selector semantics).
-fn has_class(open_tag: &str, token: &str) -> bool {
+pub(crate) fn has_class(open_tag: &str, token: &str) -> bool {
     attr_value(open_tag, "class")
         .map(|v| v.split_whitespace().any(|t| t == token))
         .unwrap_or(false)
 }
 
 #[derive(Clone)]
-struct ElemSpan {
-    start: usize,
-    end: usize,
-    inner_start: usize,
-    inner_end: usize,
+pub(crate) struct ElemSpan {
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+    pub(crate) inner_start: usize,
+    pub(crate) inner_end: usize,
 }
 
 /// Top-level elements whose open tag satisfies `pred` (optionally
 /// restricted to one tag name), with balanced same-tag nesting.
-fn find_elements(html: &str, tag: Option<&str>, pred: &dyn Fn(&str) -> bool) -> Vec<ElemSpan> {
+pub(crate) fn find_elements(
+    html: &str,
+    tag: Option<&str>,
+    pred: &dyn Fn(&str) -> bool,
+) -> Vec<ElemSpan> {
     let toks = tag_tokens(html);
     let mut out = Vec::new();
     let mut i = 0usize;
@@ -504,7 +508,7 @@ const VOID_TAGS: &[&str] = &[
 /// Remove every element whose (tag name, open tag) satisfies
 /// `pred`, subtrees included. Returns the new text and whether
 /// anything was removed.
-fn remove_elements(html: &str, pred: &dyn Fn(&str, &str) -> bool) -> (String, bool) {
+pub(crate) fn remove_elements(html: &str, pred: &dyn Fn(&str, &str) -> bool) -> (String, bool) {
     let toks = tag_tokens(html);
     let mut removals: Vec<(usize, usize)> = Vec::new();
     let mut cursor = 0usize;
@@ -590,7 +594,7 @@ fn remove_selector(html: &str, selector: &str) -> (String, bool) {
 
 /// Collapse an HTML fragment's text the way BeautifulSoup's
 /// `get_text(" ", strip=True)` does: single spaces, trimmed.
-fn leaf_text(fragment: &str) -> String {
+pub(crate) fn leaf_text(fragment: &str) -> String {
     fragment_to_text(fragment)
         .split_whitespace()
         .collect::<Vec<_>>()
@@ -938,7 +942,7 @@ fn looks_like_link_list(text: &str) -> bool {
 
 /// Remove zero-width characters (Reuters anti-scraping injection;
 /// they corrupt word matching and trip screen readers).
-fn strip_zero_width(s: &str) -> String {
+pub(crate) fn strip_zero_width(s: &str) -> String {
     s.chars()
         .filter(|c| {
             !matches!(
@@ -1177,7 +1181,10 @@ fn strip_tags(html: &str) -> String {
 }
 
 /// One rust-trafilatura pass with an explicit focus.
-fn extract_focus(html: &str, focus: rust_trafilatura::ExtractionFocus) -> (String, String) {
+pub(crate) fn extract_focus(
+    html: &str,
+    focus: rust_trafilatura::ExtractionFocus,
+) -> (String, String) {
     let opts = rust_trafilatura::Options {
         focus,
         ..Default::default()
