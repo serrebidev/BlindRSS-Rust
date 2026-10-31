@@ -19,6 +19,12 @@ pub fn help_dir() -> Option<PathBuf> {
 }
 
 pub fn show_help(frame: &Frame, locale: &str) {
+    show_help_topic(frame, locale, None);
+}
+
+/// Help opened at a specific guide section (F1 context help);
+/// unknown ids land on the first topic.
+pub fn show_help_topic(frame: &Frame, locale: &str, topic_id: Option<&str>) {
     let Some(dir) = help_dir() else {
         let md = MessageDialog::builder(frame, "Help files were not found.", "Help")
             .with_style(MessageDialogStyle::OK | MessageDialogStyle::IconWarning)
@@ -38,9 +44,12 @@ pub fn show_help(frame: &Frame, locale: &str) {
     let reader = TextCtrl::builder(&dialog)
         .with_style(TextCtrlStyle::MultiLine | TextCtrlStyle::ReadOnly)
         .build();
-    if let Some(first) = topics.first() {
-        reader.set_value(&blindrss_core::help::to_plain_text(&first.body));
-        list.set_selection(0, true);
+    let start = topic_id
+        .and_then(|id| topics.iter().position(|t| t.id == id))
+        .unwrap_or(0);
+    if let Some(topic) = topics.get(start) {
+        reader.set_value(&blindrss_core::help::to_plain_text(&topic.body));
+        list.set_selection(start as u32, true);
     }
     row.add(&list, 1, SizerFlag::Expand | SizerFlag::All, 4);
     row.add(&reader, 2, SizerFlag::Expand | SizerFlag::All, 4);

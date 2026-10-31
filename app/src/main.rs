@@ -7,6 +7,7 @@
 
 mod dialogs;
 mod help;
+mod hotkey;
 mod keys;
 mod player;
 mod settings;
@@ -825,6 +826,9 @@ enum RefreshMsg {
     Translated(String, Result<String, String>),
     /// A second copy asked this one to come to the front.
     ActivateWindow,
+    /// The Windows global show/hide hotkey fired.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    ToggleWindow,
     /// Startup dependency check found missing tools (names).
     DepsMissing(Vec<String>),
     /// Managed yt-dlp download finished.
@@ -886,7 +890,8 @@ const M_FEED_PROPS: i32 = 2192;
 const M_OPEN_ARTICLE: i32 = 2193;
 const M_OPEN_MEDIA: i32 = 2194;
 const M_VIDEO_SEARCH: i32 = 2195;
-const M_PERSISTENT: i32 = 2195;
+const M_PERSISTENT: i32 = 2205;
+const M_IMPORT_COOKIES: i32 = 2206;
 const M_ABOUT: i32 = 2196;
 const M_ARTICLE_WINDOW: i32 = 2197;
 const M_PODCAST_ARCHIVE: i32 = 2198;
@@ -1334,6 +1339,33 @@ fn finish_refill(state: &mut State, list: &ListCtrl, mut loaded: Vec<Article>) {
 
 /// UI language: config `language` ("auto"/missing = OS locale),
 /// normalised to a primary tag ("de_DE.UTF-8" -> "de").
+/// Translation catalog for the UI, loaded once from the locale
+/// tree (exe_dir/locale in releases, the repo's locale/ in dev)
+/// for the configured language. Strings without a catalog entry
+/// fall back to English (Python's gettext behaviour).
+static I18N: std::sync::OnceLock<blindrss_core::i18n::Catalog> = std::sync::OnceLock::new();
+
+pub fn tr(text: &str) -> String {
+    let catalog = I18N.get_or_init(|| {
+        let lang = ui_language();
+        let mut roots =
+            vec![std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../locale")];
+        if let Ok(exe) = std::env::current_exe()
+            && let Some(dir) = exe.parent()
+        {
+            roots.insert(0, dir.join("locale"));
+        }
+        for root in roots {
+            let cat = blindrss_core::i18n::Catalog::load(&root, &lang);
+            if !cat.is_empty() {
+                return cat;
+            }
+        }
+        blindrss_core::i18n::Catalog::default()
+    });
+    catalog.get(text).to_string()
+}
+
 fn ui_language() -> String {
     let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
     let chosen = cfg.get_str("language", "auto").to_string();
@@ -1819,6 +1851,20 @@ fn main() {
             blindrss_core::single_instance::serve(move || {
                 let _ = tx_act.send(RefreshMsg::ActivateWindow);
             });
+        }
+        // Global show/hide hotkey (Windows only): subclass the
+        // frame for WM_HOTKEY and register the configured combo.
+        // A startup failure (combo taken) leaves config alone —
+        // whoever holds it may release it later (Python semantics).
+        #[cfg(target_os = "windows")]
+        {
+            let hwnd = frame.get_handle() as isize;
+            hotkey::install(hwnd, tx.clone());
+            let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+            let accel = cfg
+                .get_str("global_show_hide_hotkey", "Ctrl+Alt+B")
+                .to_string();
+            let _ = hotkey::apply(hwnd, &accel);
         }
         // Startup dependency check (Python mainframe parity):
         // off the UI thread because detection shells out to
@@ -3307,6 +3353,17 @@ fn main() {
             });
         });
 
+        // Import Site Cookies (Tools): Chromium profile cookies
+        // merged into the jar beside the config.
+        let state_ic = state.clone();
+        let frame_ic = frame;
+        let tree_ic = tree;
+        let list_ic = list;
+        let act_import_cookies: Rc<dyn Fn()> = Rc::new(move || {
+            dialogs::show_import_cookies(&frame_ic, &config_path());
+            restore_focus(&state_ic.borrow(), &tree_ic, &list_ic);
+        });
+
         // Delete Smart Folder: deletes the smart folder selected in
         // the tree.
         let state_dsf = state.clone();
@@ -3702,8 +3759,60 @@ fn main() {
             ("columns", act_columns.clone()),
         ];
         let act_settings: Rc<dyn Fn()> = Rc::new(move || {
+            #[cfg(target_os = "windows")]
+            let prior_accel = blindrss_core::config::Config::load(&config_path())
+                .map(|c| {
+                    c.get_str("global_show_hide_hotkey", "Ctrl+Alt+B")
+                        .to_string()
+                })
+                .unwrap_or_else(|_| "Ctrl+Alt+B".to_string());
             let intent = settings::show_settings(&frame_set, &config_path());
             apply_http_config();
+            // Global hotkey change (Windows): register the new
+            // combo; a rejected one reverts in config too, or the
+            // bad value would be all that is left next launch
+            // (Python's from_settings semantics).
+            #[cfg(target_os = "windows")]
+            {
+                let mut cfg =
+                    blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+                let new_accel = cfg
+                    .get_str("global_show_hide_hotkey", "Ctrl+Alt+B")
+                    .to_string();
+                if new_accel != prior_accel {
+                    let hwnd = frame_set.get_handle() as isize;
+                    match hotkey::apply(hwnd, &new_accel) {
+                        Ok(_) => {}
+                        Err(e) => {
+                            let prior = prior_accel.clone();
+                            cfg.set_path("global_show_hide_hotkey", serde_json::json!(prior));
+                            let _ = cfg.save(&config_path());
+                            if matches!(e, hotkey::ApplyError::Taken) {
+                                let msg = if prior.is_empty() {
+                                    format!(
+                                        "Another program is already using {new_accel}, so it cannot show or hide BlindRSS. The hotkey stays off."
+                                    )
+                                } else {
+                                    format!(
+                                        "Another program is already using {new_accel}, so it cannot show or hide BlindRSS. The hotkey stays {prior}."
+                                    )
+                                };
+                                let md = MessageDialog::builder(&frame_set, &msg, "BlindRSS")
+                                    .with_style(
+                                        MessageDialogStyle::OK | MessageDialogStyle::IconWarning,
+                                    )
+                                    .build();
+                                md.show_modal();
+                            } else {
+                                frame_set.set_status_text(
+                                    "That hotkey combination is not usable; keeping the current one",
+                                    0,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
             restore_focus(&state_set.borrow(), &tree_set, &list_set);
             if let Some(intent) = intent
                 && let Some((_, action)) = dispatch.iter().find(|(name, _)| *name == intent)
@@ -4661,6 +4770,11 @@ fn main() {
                 "&Find Feeds...",
                 "Search a site for feeds to subscribe to",
             )
+            .append_item(
+                M_IMPORT_COOKIES,
+                "Import Site &Cookies...",
+                "Import browser cookies so challenge-protected sites can be read",
+            )
             .build();
         let help_menu = Menu::builder()
             .append_item(M_HELP, "&User Guide", "Open the BlindRSS user guide")
@@ -4734,6 +4848,7 @@ fn main() {
             (M_OPEN_ARTICLE, act_open_article.clone()),
             (M_OPEN_MEDIA, act_open_media.clone()),
             (M_VIDEO_SEARCH, act_video_search.clone()),
+            (M_IMPORT_COOKIES, act_import_cookies.clone()),
             (M_PERSISTENT, act_persistent.clone()),
             (M_ABOUT, act_about.clone()),
             (M_ARTICLE_WINDOW, act_article_window.clone()),
@@ -4847,6 +4962,7 @@ fn main() {
             let h_refresh_feed = act_refresh_feed.clone();
             let h_add = act_add.clone();
             let h_video_search = act_video_search.clone();
+            let h_import_cookies = act_import_cookies.clone();
             let h_errors = act_feed_errors.clone();
             let h_toggle_read = act_toggle_read.clone();
             let h_fav = act_fav.clone();
@@ -4868,12 +4984,42 @@ fn main() {
             let h_s_dir = act_sort_dir.clone();
             let h_find = act_find.clone();
             let h_find_next = act_find_next.clone();
+            let f1_frame = frame;
+            let f1_language = language.clone();
+            let f1_tree = tree.get_handle() as usize;
+            let f1_list = list.get_handle() as usize;
+            let f1_reader = reader.get_handle() as usize;
+            let f1_search = search_box.get_handle() as usize;
             frame.bind_internal(EventType::CHAR_HOOK, move |ev| {
                 let code = ev.get_key_code().unwrap_or(0);
                 let ctrl = ev.control_down() || ev.cmd_down();
                 let shift = ev.shift_down();
                 if ev.alt_down() {
                     ev.skip(true);
+                    return;
+                }
+                // F1: context help for the control that has focus
+                // (Python's help_topics resolution, main-window
+                // subset: the registry's dialog/menu/command maps
+                // ride along in core for the dialogs' own F1 keys).
+                if code == 340 && !ctrl && !shift {
+                    let focused = ev
+                        .get_event_object()
+                        .map(|w| w.get_handle() as usize)
+                        .unwrap_or(0);
+                    let topic = if focused == f1_tree {
+                        "feed-tree"
+                    } else if focused == f1_list {
+                        "article-list"
+                    } else if focused == f1_reader {
+                        "reading-pane"
+                    } else if focused == f1_search {
+                        "search-field"
+                    } else {
+                        "main-window"
+                    };
+                    help::show_help_topic(&f1_frame, &f1_language, Some(topic));
+                    ev.skip(false);
                     return;
                 }
                 // Plain Backspace in the article list toggles
@@ -4950,6 +5096,10 @@ fn main() {
                     }
                     Some("feeds.video_search") => {
                         h_video_search();
+                        true
+                    }
+                    Some("tools.import_site_cookies") => {
+                        h_import_cookies();
                         true
                     }
                     Some("article.toggle_favorite") => {
@@ -5098,6 +5248,29 @@ fn main() {
                     Ok(RefreshMsg::ActivateWindow) => {
                         frame_tick.show(true);
                         frame_tick.raise();
+                    }
+                    Ok(RefreshMsg::ToggleWindow) => {
+                        // Global show/hide hotkey (Windows): hide
+                        // to the tray when this window is in front,
+                        // otherwise bring it forward and take the
+                        // foreground the hotkey press grants.
+                        #[cfg(target_os = "windows")]
+                        {
+                            let hwnd = frame_tick.get_handle() as isize;
+                            if frame_tick.is_shown()
+                                && !frame_tick.is_iconized()
+                                && hotkey::foreground_is(hwnd)
+                            {
+                                frame_tick.show(false);
+                            } else {
+                                if frame_tick.is_iconized() {
+                                    frame_tick.iconize(false);
+                                }
+                                frame_tick.show(true);
+                                frame_tick.raise();
+                                hotkey::set_foreground(hwnd);
+                            }
+                        }
                     }
                     Ok(RefreshMsg::DepsMissing(missing)) => {
                         let mut msg = "Missing recommended tools:\n".to_string();

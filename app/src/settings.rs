@@ -199,7 +199,7 @@ fn inoreader_listener_connect(frame: &Dialog, config_path: &Path, app_id: String
     let dialog2 = Dialog::builder(frame, "Inoreader Sign-in").build();
     let sizer2 = BoxSizer::builder(Orientation::Vertical).build();
     let label = StaticText::builder(&dialog2)
-        .with_label("Waiting for the browser sign-in to complete...")
+        .with_label(&crate::tr("Waiting for the browser sign-in to complete..."))
         .build();
     sizer2.add(&label, 0, SizerFlag::All, 8);
     dialog2.set_sizer(sizer2, true);
@@ -275,6 +275,7 @@ fn inoreader_listener_connect(frame: &Dialog, config_path: &Path, app_id: String
 pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> {
     let cfg = Config::load(config_path).unwrap_or_default();
     let dialog = Dialog::builder(frame, "BlindRSS Settings").build();
+    crate::dialogs::bind_f1(frame, &dialog, "SettingsDialog");
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
 
     // Active provider (Python's Provider page + factory.py):
@@ -357,30 +358,41 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
     );
 
     // Startup state (Python parity keys).
-    let startup_label = StaticText::builder(&dialog).with_label("Startup").build();
+    let startup_label = StaticText::builder(&dialog)
+        .with_label(&crate::tr("Startup"))
+        .build();
     sizer.add(&startup_label, 0, SizerFlag::All, 4);
     let remember_cb = CheckBox::builder(&dialog)
-        .with_label("Remember last feed")
+        .with_label(&crate::tr("Remember last feed"))
         .build();
     remember_cb.set_value(cfg.get_bool("remember_last_feed", false));
     sizer.add(&remember_cb, 0, SizerFlag::All, 4);
     let maximized_cb = CheckBox::builder(&dialog)
-        .with_label("Start maximized")
+        .with_label(&crate::tr("Start maximized"))
         .build();
     maximized_cb.set_value(cfg.get_bool("start_maximized", false));
     sizer.add(&maximized_cb, 0, SizerFlag::All, 4);
     let expand_cb = CheckBox::builder(&dialog)
-        .with_label("Expand categories by default")
+        .with_label(&crate::tr("Expand categories by default"))
         .build();
     expand_cb.set_value(cfg.get_bool("category_tree_default_expanded", true));
     sizer.add(&expand_cb, 0, SizerFlag::All, 4);
+    let hotkey_field = add_field(
+        &dialog,
+        &sizer,
+        "Global show/hide hotkey (Windows, blank = off)",
+        cfg.get_str("global_show_hide_hotkey", "Ctrl+Alt+B"),
+        false,
+    );
 
     // Refresh scheduling (Python keys: refresh_on_startup defaults
     // on, refresh_interval is in seconds, 300 default, 0 = off).
-    let refresh_label = StaticText::builder(&dialog).with_label("Refresh").build();
+    let refresh_label = StaticText::builder(&dialog)
+        .with_label(&crate::tr("Refresh"))
+        .build();
     sizer.add(&refresh_label, 0, SizerFlag::All, 4);
     let refresh_startup_cb = CheckBox::builder(&dialog)
-        .with_label("Refresh feeds on startup")
+        .with_label(&crate::tr("Refresh feeds on startup"))
         .build();
     refresh_startup_cb.set_value(cfg.get_bool("refresh_on_startup", true));
     sizer.add(&refresh_startup_cb, 0, SizerFlag::All, 4);
@@ -395,7 +407,7 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
     // Announcements (PARITY 7.4): per-event speech/Braille mode,
     // mirroring Python's Settings > Announcements page.
     let announce_label = StaticText::builder(&dialog)
-        .with_label("Announcements")
+        .with_label(&crate::tr("Announcements"))
         .build();
     sizer.add(&announce_label, 0, SizerFlag::All, 4);
     let current_modes = blindrss_core::announce::Announcements::from_config(&cfg);
@@ -414,7 +426,7 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
         announce_choices.push(choice);
     }
     let announce_test_btn = Button::builder(&dialog)
-        .with_label("Test Announcement")
+        .with_label(&crate::tr("Test Announcement"))
         .build();
     sizer.add(&announce_test_btn, 0, SizerFlag::All, 4);
 
@@ -679,10 +691,10 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
     );
     let notif_row = BoxSizer::builder(Orientation::Horizontal).build();
     let exclude_btn = Button::builder(&dialog)
-        .with_label("Exclude Feeds...")
+        .with_label(&crate::tr("Exclude Feeds..."))
         .build();
     let test_notif_btn = Button::builder(&dialog)
-        .with_label("Test Notification")
+        .with_label(&crate::tr("Test Notification"))
         .build();
     notif_row.add(&exclude_btn, 0, SizerFlag::All, 4);
     notif_row.add(&test_notif_btn, 0, SizerFlag::All, 4);
@@ -861,32 +873,34 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
     let intent: std::rc::Rc<std::cell::RefCell<Option<&'static str>>> =
         std::rc::Rc::new(std::cell::RefCell::new(None));
     let maint_label = StaticText::builder(&dialog)
-        .with_label("Maintenance")
+        .with_label(&crate::tr("Maintenance"))
         .build();
     sizer.add(&maint_label, 0, SizerFlag::All, 4);
     let maint_row1 = BoxSizer::builder(Orientation::Horizontal).build();
     let maint_row2 = BoxSizer::builder(Orientation::Horizontal).build();
-    let backup_btn = Button::builder(&dialog).with_label("Backup Now").build();
+    let backup_btn = Button::builder(&dialog)
+        .with_label(&crate::tr("Backup Now"))
+        .build();
     let restore_btn = Button::builder(&dialog)
-        .with_label("Restore Backup...")
+        .with_label(&crate::tr("Restore Backup..."))
         .build();
     let takeout_btn = Button::builder(&dialog)
-        .with_label("Import YouTube Takeout...")
+        .with_label(&crate::tr("Import YouTube Takeout..."))
         .build();
     let archive_btn = Button::builder(&dialog)
-        .with_label("Rescan Podcast Archive")
+        .with_label(&crate::tr("Rescan Podcast Archive"))
         .build();
     let sync_btn = Button::builder(&dialog)
-        .with_label("Sync Providers Now")
+        .with_label(&crate::tr("Sync Providers Now"))
         .build();
     let prune_btn = Button::builder(&dialog)
-        .with_label("Prune Old Articles")
+        .with_label(&crate::tr("Prune Old Articles"))
         .build();
     let update_btn = Button::builder(&dialog)
-        .with_label("Check for Updates")
+        .with_label(&crate::tr("Check for Updates"))
         .build();
     let columns_btn = Button::builder(&dialog)
-        .with_label("Article Columns...")
+        .with_label(&crate::tr("Article Columns..."))
         .build();
     maint_row1.add(&backup_btn, 0, SizerFlag::All, 4);
     maint_row1.add(&restore_btn, 0, SizerFlag::All, 4);
@@ -901,13 +915,13 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
 
     let btn_row2 = BoxSizer::builder(Orientation::Horizontal).build();
     let connect_listener_btn = Button::builder(&dialog)
-        .with_label("Connect Inoreader (browser sign-in)...")
+        .with_label(&crate::tr("Connect Inoreader (browser sign-in)..."))
         .build();
     let test_miniflux_btn = Button::builder(&dialog)
-        .with_label("Test Miniflux Connection")
+        .with_label(&crate::tr("Test Miniflux Connection"))
         .build();
     let youtube_btn = Button::builder(&dialog)
-        .with_label("Connect YouTube Account...")
+        .with_label(&crate::tr("Connect YouTube Account..."))
         .build();
     btn_row2.add(&connect_listener_btn, 0, SizerFlag::All, 4);
     btn_row2.add(&test_miniflux_btn, 0, SizerFlag::All, 4);
@@ -916,10 +930,14 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
 
     let btn_row = BoxSizer::builder(Orientation::Horizontal).build();
     let connect_btn = Button::builder(&dialog)
-        .with_label("Connect Inoreader...")
+        .with_label(&crate::tr("Connect Inoreader..."))
         .build();
-    let save_btn = Button::builder(&dialog).with_label("Save").build();
-    let cancel_btn = Button::builder(&dialog).with_label("Cancel").build();
+    let save_btn = Button::builder(&dialog)
+        .with_label(&crate::tr("Save"))
+        .build();
+    let cancel_btn = Button::builder(&dialog)
+        .with_label(&crate::tr("Cancel"))
+        .build();
     btn_row.add(&connect_btn, 0, SizerFlag::All, 4);
     btn_row.add(&save_btn, 0, SizerFlag::All, 4);
     btn_row.add(&cancel_btn, 0, SizerFlag::All, 4);
@@ -974,6 +992,10 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
                 serde_json::json!(ino_key.get_value()),
             );
             cfg.set_path("download_path", serde_json::json!(dl_path.get_value()));
+            cfg.set_path(
+                "global_show_hide_hotkey",
+                serde_json::json!(hotkey_field.get_value().trim()),
+            );
             cfg.set_path(
                 "remember_last_feed",
                 serde_json::json!(remember_cb.is_checked()),

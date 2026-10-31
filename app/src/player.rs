@@ -259,24 +259,38 @@ fn open_player_impl(
         .with_size(Size::new(560, 460))
         .build();
     let media = MediaCtrl::builder(&frame).build();
-    let play_btn = Button::builder(&frame).with_label("Play/Pause").build();
-    let stop_btn = Button::builder(&frame).with_label("Stop").build();
+    let play_btn = Button::builder(&frame)
+        .with_label(&crate::tr("Play/Pause"))
+        .build();
+    let stop_btn = Button::builder(&frame)
+        .with_label(&crate::tr("Stop"))
+        .build();
     let back_btn = Button::builder(&frame)
         .with_label(&format!("Back {}s", seek_back_ms / 1000))
         .build();
     let fwd_btn = Button::builder(&frame)
         .with_label(&format!("Forward {}s", seek_fwd_ms / 1000))
         .build();
-    let vdown_btn = Button::builder(&frame).with_label("Volume Down").build();
-    let vup_btn = Button::builder(&frame).with_label("Volume Up").build();
-    let slower_btn = Button::builder(&frame).with_label("Slower").build();
-    let faster_btn = Button::builder(&frame).with_label("Faster").build();
-    let prev_ch_btn = Button::builder(&frame)
-        .with_label("Previous Chapter")
+    let vdown_btn = Button::builder(&frame)
+        .with_label(&crate::tr("Volume Down"))
         .build();
-    let next_ch_btn = Button::builder(&frame).with_label("Next Chapter").build();
+    let vup_btn = Button::builder(&frame)
+        .with_label(&crate::tr("Volume Up"))
+        .build();
+    let slower_btn = Button::builder(&frame)
+        .with_label(&crate::tr("Slower"))
+        .build();
+    let faster_btn = Button::builder(&frame)
+        .with_label(&crate::tr("Faster"))
+        .build();
+    let prev_ch_btn = Button::builder(&frame)
+        .with_label(&crate::tr("Previous Chapter"))
+        .build();
+    let next_ch_btn = Button::builder(&frame)
+        .with_label(&crate::tr("Next Chapter"))
+        .build();
     let pos_label = StaticText::builder(&frame)
-        .with_label("0:00:00 / 0:00:00")
+        .with_label(&crate::tr("0:00:00 / 0:00:00"))
         .build();
     let seek_slider = Slider::builder(&frame).build();
     seek_slider.set_range(0, 1000);

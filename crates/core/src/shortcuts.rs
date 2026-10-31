@@ -113,6 +113,46 @@ pub fn normalize_accelerator(accel: &str) -> String {
     out
 }
 
+/// Win32 RegisterHotKey spec for a system-wide hotkey
+/// (Python's global_hotkey_spec): (modifier flags, virtual key).
+/// Only ASCII letters/digits and F1-F24 (not F12, reserved for
+/// debuggers); a letter/digit needs Ctrl, Alt or Win — a bare or
+/// Shift-only key would swallow ordinary typing everywhere else.
+pub fn global_hotkey_spec(accel: &str) -> Option<(u32, u32)> {
+    let normalized = normalize_accelerator(accel);
+    if normalized.is_empty() {
+        return None;
+    }
+    let parts: Vec<&str> = normalized.split('+').collect();
+    let (mods, key) = parts.split_at(parts.len() - 1);
+    let mut flags: u32 = 0;
+    for m in mods {
+        flags |= match *m {
+            "Alt" => 0x1,
+            "Ctrl" => 0x2,
+            "Shift" => 0x4,
+            "Cmd" => 0x8,
+            _ => return None,
+        };
+    }
+    let key = key[0];
+    let bytes = key.as_bytes();
+    if bytes.len() == 1 && bytes[0].is_ascii_alphanumeric() {
+        if flags & !0x4 == 0 {
+            return None;
+        }
+        return Some((flags, bytes[0].to_ascii_uppercase() as u32));
+    }
+    if let Some(num) = key.strip_prefix('F')
+        && let Ok(n) = num.parse::<u32>()
+        && (1..=24).contains(&n)
+        && n != 12
+    {
+        return Some((flags, 0x6F + n));
+    }
+    None
+}
+
 /// Effective accelerators: id -> canonical accelerator (only
 /// bound commands included).
 pub fn effective(overrides: &HashMap<String, String>) -> HashMap<String, String> {

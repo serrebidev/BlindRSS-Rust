@@ -6,8 +6,27 @@
 //! locale (falling back to English) and splits it into topics.
 
 pub struct HelpTopic {
+    /// The section anchor (`{#main-window}` -> "main-window");
+    /// empty for the pre-guide Introduction topic.
+    pub id: String,
     pub title: String,
     pub body: String,
+}
+
+/// Split a guide heading into (title, anchor id): headings are
+/// `## Title {#topic-id}` in every shipped locale.
+fn split_heading(rest: &str) -> (String, String) {
+    let rest = rest.trim();
+    if let Some(open) = rest.rfind("{#")
+        && let Some(close) = rest.rfind('}')
+        && close > open
+    {
+        return (
+            rest[..open].trim().to_string(),
+            rest[open + 2..close].trim().to_string(),
+        );
+    }
+    (rest.to_string(), String::new())
 }
 
 /// Load the guide text for `locale` from a help directory,
@@ -27,17 +46,21 @@ pub fn load_guide(help_dir: &std::path::Path, locale: &str) -> Option<String> {
 pub fn topics(guide: &str) -> Vec<HelpTopic> {
     let mut out: Vec<HelpTopic> = Vec::new();
     let mut title = "Introduction".to_string();
+    let mut id = String::new();
     let mut body = String::new();
     for line in guide.lines() {
         if let Some(rest) = line.strip_prefix("## ") {
             let body_trim = body.trim().to_string();
             if !body_trim.is_empty() || !out.is_empty() {
                 out.push(HelpTopic {
+                    id: id.clone(),
                     title: title.clone(),
                     body: body_trim,
                 });
             }
-            title = rest.trim().to_string();
+            let (new_title, new_id) = split_heading(rest);
+            title = new_title;
+            id = new_id;
             body = String::new();
         } else if line.starts_with("# ") && out.is_empty() && body.trim().is_empty() {
             // Skip the document title line.
@@ -50,6 +73,7 @@ pub fn topics(guide: &str) -> Vec<HelpTopic> {
     let body_trim = body.trim().to_string();
     if !body_trim.is_empty() || out.is_empty() {
         out.push(HelpTopic {
+            id,
             title,
             body: body_trim,
         });

@@ -216,6 +216,14 @@ pub fn announce_test(message: &str) -> bool {
     emit(text, true, true)
 }
 
+/// Process names that mean JAWS/Fusion is the running screen
+/// reader (Python's gate in _speak_jaws: a registered COM server on
+/// disk is not enough — the process must be alive).
+pub fn is_jaws_process_name(exe_name: &str) -> bool {
+    let lower = exe_name.to_ascii_lowercase();
+    matches!(lower.as_str(), "jfw.exe" | "jaws.exe" | "fusion.exe")
+}
+
 fn emit(text: &str, speech: bool, braille: bool) -> bool {
     let mut handled = false;
     if speech && backend::speak(text) {
@@ -292,18 +300,24 @@ mod backend {
     }
 
     pub fn speak(text: &str) -> bool {
-        let Some(m) = load() else { return false };
-        if !running(m) {
-            return false;
-        }
-        unsafe {
-            if let Some(cancel) = proc::<CancelSpeech>(m, "nvdaController_cancelSpeech") {
-                let _ = cancel();
+        if let Some(m) = load()
+            && running(m)
+        {
+            let ok = unsafe {
+                if let Some(cancel) = proc::<CancelSpeech>(m, "nvdaController_cancelSpeech") {
+                    let _ = cancel();
+                }
+                proc::<SpeakText>(m, "nvdaController_speakText")
+                    .map(|f| f(wide(text).as_ptr()) == 0)
+                    .unwrap_or(false)
+            };
+            if ok {
+                return true;
             }
-            proc::<SpeakText>(m, "nvdaController_speakText")
-                .map(|f| f(wide(text).as_ptr()) == 0)
-                .unwrap_or(false)
         }
+        // Python's order: NVDA first, JAWS second (speech only —
+        // JAWS has no comparable simple Braille entry point).
+        jaws::speak(text)
     }
 
     pub fn braille(text: &str) -> bool {
@@ -315,6 +329,291 @@ mod backend {
             return false;
         };
         (unsafe { f(wide(text).as_ptr()) }) == 0
+    }
+
+    /// JAWS speech through the FreedomSci.JawsApi COM object
+    /// (Python's _speak_jaws): gated on a live jfw/jaws/fusion
+    /// process, then IDispatch::Invoke("SayString", text, True).
+    /// Hand-rolled COM via ole32 proc addresses — no COM crate.
+    mod jaws {
+        use std::ffi::c_void;
+        use std::sync::OnceLock;
+
+        unsafe extern "system" {
+            fn LoadLibraryW(name: *const u16) -> usize;
+            fn GetProcAddress(module: usize, name: *const u8) -> usize;
+            fn CreateToolhelp32Snapshot(flags: u32, pid: u32) -> isize;
+            fn Process32FirstW(snap: isize, entry: *mut ProcessEntry32) -> i32;
+            fn Process32NextW(snap: isize, entry: *mut ProcessEntry32) -> i32;
+            fn CloseHandle(h: isize) -> i32;
+        }
+
+        #[repr(C)]
+        struct ProcessEntry32 {
+            size: u32,
+            cnt_usage: u32,
+            process_id: u32,
+            default_heap_id: usize,
+            module_id: u32,
+            cnt_threads: u32,
+            parent_process_id: u32,
+            pri_class_base: i32,
+            flags: u32,
+            exe_file: [u16; 260],
+        }
+
+        fn wide(s: &str) -> Vec<u16> {
+            s.encode_utf16().chain(std::iter::once(0)).collect()
+        }
+
+        fn jaws_running() -> bool {
+            unsafe {
+                let snap = CreateToolhelp32Snapshot(0x0000_0002, 0);
+                if snap == -1 {
+                    return false;
+                }
+                let mut entry: ProcessEntry32 = std::mem::zeroed();
+                entry.size = std::mem::size_of::<ProcessEntry32>() as u32;
+                let mut found = false;
+                if Process32FirstW(snap, &mut entry) != 0 {
+                    loop {
+                        let len = entry
+                            .exe_file
+                            .iter()
+                            .position(|c| *c == 0)
+                            .unwrap_or(entry.exe_file.len());
+                        let name = String::from_utf16_lossy(&entry.exe_file[..len]);
+                        if super::super::is_jaws_process_name(&name) {
+                            found = true;
+                            break;
+                        }
+                        if Process32NextW(snap, &mut entry) == 0 {
+                            break;
+                        }
+                    }
+                }
+                CloseHandle(snap);
+                found
+            }
+        }
+
+        type CoInitializeEx = unsafe extern "system" fn(*const c_void, u32) -> i32;
+        type CoUninitialize = unsafe extern "system" fn();
+        type ClsidFromProgId = unsafe extern "system" fn(*const u16, *mut Guid) -> i32;
+        type CoCreateInstance = unsafe extern "system" fn(
+            *const Guid,
+            *const c_void,
+            u32,
+            *const Guid,
+            *mut *mut c_void,
+        ) -> i32;
+        type SysAllocString = unsafe extern "system" fn(*const u16) -> *mut u16;
+        type SysFreeString = unsafe extern "system" fn(*mut u16);
+
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct Guid {
+            a: u32,
+            b: u16,
+            c: u16,
+            d: [u8; 8],
+        }
+
+        const IID_NULL: Guid = Guid {
+            a: 0,
+            b: 0,
+            c: 0,
+            d: [0; 8],
+        };
+        const IID_IDISPATCH: Guid = Guid {
+            a: 0x0002_0400,
+            b: 0,
+            c: 0,
+            d: [0xC0, 0, 0, 0, 0, 0, 0, 0x46],
+        };
+
+        #[repr(C)]
+        struct Variant {
+            vt: u16,
+            r1: u16,
+            r2: u16,
+            r3: u16,
+            data: usize,
+            extra: usize,
+        }
+
+        #[repr(C)]
+        struct DispParams {
+            args: *const Variant,
+            named_args: *const i32,
+            arg_count: u32,
+            named_count: u32,
+        }
+
+        type GetIdsOfNames = unsafe extern "system" fn(
+            *mut c_void,
+            *const Guid,
+            *const *const u16,
+            u32,
+            u32,
+            *mut i32,
+        ) -> i32;
+        type Invoke = unsafe extern "system" fn(
+            *mut c_void,
+            i32,
+            *const Guid,
+            u32,
+            u16,
+            *const DispParams,
+            *mut Variant,
+            *const c_void,
+            *const c_void,
+        ) -> i32;
+        type Release = unsafe extern "system" fn(*mut c_void) -> u32;
+
+        fn ole_proc<T>(name: &str) -> Option<T> {
+            static OLE32: OnceLock<usize> = OnceLock::new();
+            let module = *OLE32.get_or_init(|| unsafe { LoadLibraryW(wide("ole32.dll").as_ptr()) });
+            if module == 0 {
+                return None;
+            }
+            let mut buf = name.as_bytes().to_vec();
+            buf.push(0);
+            let addr = unsafe { GetProcAddress(module, buf.as_ptr()) };
+            if addr == 0 {
+                None
+            } else {
+                Some(unsafe { std::mem::transmute_copy(&addr) })
+            }
+        }
+
+        pub fn speak(text: &str) -> bool {
+            if !jaws_running() {
+                return false;
+            }
+            unsafe {
+                let Some(co_init) = ole_proc::<CoInitializeEx>("CoInitializeEx") else {
+                    return false;
+                };
+                // COINIT_APARTMENTTHREADED; RPC_E_CHANGED_MODE (-2)
+                // means COM is already up in another mode — proceed.
+                let hr = co_init(std::ptr::null(), 2);
+                let initialized = hr >= 0;
+                let ok = speak_inner(text);
+                if initialized && let Some(co_uninit) = ole_proc::<CoUninitialize>("CoUninitialize")
+                {
+                    co_uninit();
+                }
+                ok
+            }
+        }
+
+        unsafe fn speak_inner(text: &str) -> bool {
+            unsafe {
+                let Some(clsid_from) = ole_proc::<ClsidFromProgId>("CLSIDFromProgID") else {
+                    return false;
+                };
+                let Some(create) = ole_proc::<CoCreateInstance>("CoCreateInstance") else {
+                    return false;
+                };
+                let mut clsid = IID_NULL;
+                if clsid_from(wide("FreedomSci.JawsApi").as_ptr(), &mut clsid) < 0 {
+                    return false;
+                }
+                let mut obj: *mut c_void = std::ptr::null_mut();
+                // CLSCTX_ALL = 0x17.
+                if create(&clsid, std::ptr::null(), 0x17, &IID_IDISPATCH, &mut obj) < 0
+                    || obj.is_null()
+                {
+                    return false;
+                }
+                let vtable = *(obj as *const *const usize);
+                let get_ids: GetIdsOfNames = std::mem::transmute_copy(&*vtable.add(5));
+                let invoke: Invoke = std::mem::transmute_copy(&*vtable.add(6));
+                let release: Release = std::mem::transmute_copy(&*vtable.add(2));
+                let mut dispid = 0i32;
+                let name = wide("SayString");
+                let names = [name.as_ptr()];
+                let hr = get_ids(obj, &IID_NULL, names.as_ptr(), 1, 0x0400, &mut dispid);
+                let mut result = false;
+                if hr >= 0 {
+                    result = invoke_say(obj, invoke, dispid, text);
+                }
+                release(obj);
+                result
+            }
+        }
+
+        unsafe fn invoke_say(obj: *mut c_void, invoke: Invoke, dispid: i32, text: &str) -> bool {
+            unsafe {
+                static AUT32: OnceLock<usize> = OnceLock::new();
+                let module = *AUT32.get_or_init(|| LoadLibraryW(wide("oleaut32.dll").as_ptr()));
+                if module == 0 {
+                    return false;
+                }
+                let mut buf = b"SysAllocString\0".to_vec();
+                let alloc_addr = GetProcAddress(module, buf.as_mut_ptr());
+                buf = b"SysFreeString\0".to_vec();
+                let free_addr = GetProcAddress(module, buf.as_mut_ptr());
+                if alloc_addr == 0 || free_addr == 0 {
+                    return false;
+                }
+                let alloc: SysAllocString = std::mem::transmute_copy(&alloc_addr);
+                let free_str: SysFreeString = std::mem::transmute_copy(&free_addr);
+                let bstr = alloc(wide(text).as_ptr());
+                if bstr.is_null() {
+                    return false;
+                }
+                // IDispatch arguments are passed in reverse order:
+                // SayString(text, interrupt) -> [interrupt, text].
+                let args = [
+                    Variant {
+                        vt: 11, // VT_BOOL
+                        r1: 0,
+                        r2: 0,
+                        r3: 0,
+                        data: 0xFFFF, // VARIANT_TRUE
+                        extra: 0,
+                    },
+                    Variant {
+                        vt: 8, // VT_BSTR
+                        r1: 0,
+                        r2: 0,
+                        r3: 0,
+                        data: bstr as usize,
+                        extra: 0,
+                    },
+                ];
+                let params = DispParams {
+                    args: args.as_ptr(),
+                    named_args: std::ptr::null(),
+                    arg_count: 2,
+                    named_count: 0,
+                };
+                let mut out = Variant {
+                    vt: 0,
+                    r1: 0,
+                    r2: 0,
+                    r3: 0,
+                    data: 0,
+                    extra: 0,
+                };
+                // DISPATCH_METHOD = 1, LOCALE_USER_DEFAULT = 0x0400.
+                let hr = invoke(
+                    obj,
+                    dispid,
+                    &IID_NULL,
+                    0x0400,
+                    1,
+                    &params,
+                    &mut out,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                );
+                free_str(bstr);
+                hr >= 0 && out.vt == 11 && (out.data as u16) != 0
+            }
+        }
     }
 }
 

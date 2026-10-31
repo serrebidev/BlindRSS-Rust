@@ -90,7 +90,7 @@ impl CondBlock {
     fn build(dialog: &Dialog, sizer: &BoxSizer, rule0: &Value) -> CondBlock {
         let match_row = BoxSizer::builder(Orientation::Horizontal).build();
         let match_label = StaticText::builder(dialog)
-            .with_label("Show articles that match")
+            .with_label(&crate::tr("Show articles that match"))
             .build();
         let match_choice = Choice::builder(dialog).build();
         match_choice.append("All conditions (AND)");
@@ -130,9 +130,11 @@ impl CondBlock {
         }
         op_choice.set_selection(0);
         let value_ctrl = TextCtrl::builder(dialog).build();
-        let add_btn = Button::builder(dialog).with_label("Add Condition").build();
+        let add_btn = Button::builder(dialog)
+            .with_label(&crate::tr("Add Condition"))
+            .build();
         let remove_btn = Button::builder(dialog)
-            .with_label("Remove Condition")
+            .with_label(&crate::tr("Remove Condition"))
             .build();
         row.add(&field_choice, 0, SizerFlag::All, 4);
         row.add(&op_choice, 0, SizerFlag::All, 4);
@@ -221,8 +223,10 @@ fn name_row(dialog: &Dialog, sizer: &BoxSizer, label: &str, value: &str) -> Text
 /// standard modal codes (5100 = OK, like TextEntryDialog).
 fn ok_cancel(dialog: &Dialog, sizer: &BoxSizer) {
     let row = BoxSizer::builder(Orientation::Horizontal).build();
-    let ok_btn = Button::builder(dialog).with_label("OK").build();
-    let cancel_btn = Button::builder(dialog).with_label("Cancel").build();
+    let ok_btn = Button::builder(dialog).with_label(&crate::tr("OK")).build();
+    let cancel_btn = Button::builder(dialog)
+        .with_label(&crate::tr("Cancel"))
+        .build();
     row.add(&ok_btn, 0, SizerFlag::All, 4);
     row.add(&cancel_btn, 0, SizerFlag::All, 4);
     sizer.add_sizer(&row, 0, SizerFlag::All, 2);
@@ -298,7 +302,7 @@ pub fn edit_filter_rule(
     let block = CondBlock::build(&dialog, &sizer, &rule0);
 
     let act_label = StaticText::builder(&dialog)
-        .with_label("When an article matches:")
+        .with_label(&crate::tr("When an article matches:"))
         .build();
     sizer.add(&act_label, 0, SizerFlag::All, 4);
     let flag = |key: &str| actions0.get(key).and_then(|v| v.as_bool()).unwrap_or(false);
@@ -366,8 +370,33 @@ pub fn edit_filter_rule(
 /// list, New / Edit / Delete, Move Up / Down (the pipeline
 /// order), and Apply to Existing Articles. Works directly on
 /// the database; modal and self-contained.
+/// F1 inside a dialog opens the guide at the section documenting
+/// that dialog (Python's DIALOG_TOPICS; the kind strings are the
+/// Python class names, reused verbatim).
+pub fn bind_f1(frame: &Frame, dialog: &Dialog, kind: &'static str) {
+    let parent = *frame;
+    dialog.bind_internal(EventType::CHAR_HOOK, move |ev| {
+        if ev.get_key_code() == Some(340) {
+            // Kind is a Python dialog class name when DIALOG_TOPICS
+            // has it, else a guide topic id used directly.
+            let topic = blindrss_core::help_topics::topic_for_dialog(kind).unwrap_or_else(|| {
+                blindrss_core::help_topics::TOPICS
+                    .iter()
+                    .find(|(id, _)| *id == kind)
+                    .map(|(id, _)| *id)
+                    .unwrap_or(blindrss_core::help_topics::DEFAULT_TOPIC)
+            });
+            crate::help::show_help_topic(&parent, &crate::ui_language(), Some(topic));
+            ev.skip(false);
+        } else {
+            ev.skip(true);
+        }
+    });
+}
+
 pub fn show_filter_rules(frame: &Frame, db: &Db) {
     let dialog = Dialog::builder(frame, "Filter Rules").build();
+    bind_f1(frame, &dialog, "FilterRulesDialog");
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let list = ListCtrl::builder(&dialog)
         .with_style(ListCtrlStyle::Report | ListCtrlStyle::SingleSel)
@@ -543,6 +572,7 @@ pub fn show_filter_rules(frame: &Frame, db: &Db) {
 /// title, feed URL, and category. Returns true when changed.
 pub fn show_feed_properties(frame: &Frame, db: &Db, feed: &blindrss_core::Feed) -> bool {
     let dialog = Dialog::builder(frame, "Feed Properties").build();
+    bind_f1(frame, &dialog, "FeedPropertiesDialog");
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let title_ctrl = name_row(&dialog, &sizer, "Title:", &feed.title);
     let url_ctrl = name_row(&dialog, &sizer, "Feed URL:", &feed.url);
@@ -567,7 +597,7 @@ pub fn show_feed_properties(frame: &Frame, db: &Db, feed: &blindrss_core::Feed) 
         &encoding0,
     );
     let reset_btn = Button::builder(&dialog)
-        .with_label("Reset Title to Feed's Own")
+        .with_label(&crate::tr("Reset Title to Feed's Own"))
         .build();
     sizer.add(&reset_btn, 0, SizerFlag::All, 4);
     ok_cancel(&dialog, &sizer);
@@ -643,7 +673,9 @@ pub fn show_about(frame: &Frame) {
         let t = StaticText::builder(&dialog).with_label(line).build();
         sizer.add(&t, 0, SizerFlag::All, 4);
     }
-    let ok_btn = Button::builder(&dialog).with_label("OK").build();
+    let ok_btn = Button::builder(&dialog)
+        .with_label(&crate::tr("OK"))
+        .build();
     sizer.add(&ok_btn, 0, SizerFlag::All, 4);
     let d = dialog;
     ok_btn.on_click(move |_| d.end_modal(5100));
@@ -690,6 +722,7 @@ pub fn show_article_history(frame: &Frame, db: &Db, article: &blindrss_core::Art
     }
     let total = versions.len();
     let dialog = Dialog::builder(frame, "Article History").build();
+    bind_f1(frame, &dialog, "ArticleHistoryDialog");
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let heading = StaticText::builder(&dialog)
         .with_label(&format!("{total} versions of: {}", article.title))
@@ -717,7 +750,9 @@ pub fn show_article_history(frame: &Frame, db: &Db, article: &blindrss_core::Art
         .build();
     row.add(&text, 2, SizerFlag::Expand | SizerFlag::All, 4);
     sizer.add_sizer(&row, 1, SizerFlag::Expand | SizerFlag::All, 2);
-    let close_btn = Button::builder(&dialog).with_label("Close").build();
+    let close_btn = Button::builder(&dialog)
+        .with_label(&crate::tr("Close"))
+        .build();
     sizer.add(&close_btn, 0, SizerFlag::All, 4);
     let versions = Rc::new(versions);
     let show_version: Rc<dyn Fn(usize)> = {
@@ -757,25 +792,38 @@ pub fn show_article_columns(frame: &Frame, config_path: &Path) {
     let cfg = Config::load(config_path).unwrap_or_default();
     let state: Rc<RefCell<Vec<ColumnLayout>>> = Rc::new(RefCell::new(layout_from_config(&cfg)));
     let dialog = Dialog::builder(frame, "Article Columns").build();
+    bind_f1(frame, &dialog, "list-headers");
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let help = StaticText::builder(&dialog)
-        .with_label("Columns (checked = shown). Use Move Up / Move Down to reorder:")
+        .with_label(&crate::tr(
+            "Columns (checked = shown). Use Move Up / Move Down to reorder:",
+        ))
         .build();
     sizer.add(&help, 0, SizerFlag::All, 4);
     let list = CheckListBox::builder(&dialog).build();
     sizer.add(&list, 1, SizerFlag::Expand | SizerFlag::All, 4);
     let note = StaticText::builder(&dialog)
-        .with_label("Title is always the first column and cannot be hidden.")
+        .with_label(&crate::tr(
+            "Title is always the first column and cannot be hidden.",
+        ))
         .build();
     sizer.add(&note, 0, SizerFlag::All, 4);
     let row = BoxSizer::builder(Orientation::Horizontal).build();
-    let up_btn = Button::builder(&dialog).with_label("Move Up").build();
-    let down_btn = Button::builder(&dialog).with_label("Move Down").build();
-    let reset_btn = Button::builder(&dialog)
-        .with_label("Reset All to Defaults")
+    let up_btn = Button::builder(&dialog)
+        .with_label(&crate::tr("Move Up"))
         .build();
-    let ok_btn = Button::builder(&dialog).with_label("OK").build();
-    let cancel_btn = Button::builder(&dialog).with_label("Cancel").build();
+    let down_btn = Button::builder(&dialog)
+        .with_label(&crate::tr("Move Down"))
+        .build();
+    let reset_btn = Button::builder(&dialog)
+        .with_label(&crate::tr("Reset All to Defaults"))
+        .build();
+    let ok_btn = Button::builder(&dialog)
+        .with_label(&crate::tr("OK"))
+        .build();
+    let cancel_btn = Button::builder(&dialog)
+        .with_label(&crate::tr("Cancel"))
+        .build();
     row.add(&up_btn, 0, SizerFlag::All, 4);
     row.add(&down_btn, 0, SizerFlag::All, 4);
     row.add(&reset_btn, 0, SizerFlag::All, 4);
@@ -910,11 +958,12 @@ pub fn show_video_search(
     let cfg = Config::load(config_path).unwrap_or_default();
     let sites = searchable_sites(cfg.get_bool("enable_adult_search", false));
     let dialog = Dialog::builder(frame, "Video Search").build();
+    bind_f1(frame, &dialog, "YtdlpGlobalSearchDialog");
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let query_ctrl = name_row(&dialog, &sizer, "Search:", "");
     let opt_row = BoxSizer::builder(Orientation::Horizontal).build();
     let scope_label = StaticText::builder(&dialog)
-        .with_label("Search Sites:")
+        .with_label(&crate::tr("Search Sites:"))
         .build();
     opt_row.add(&scope_label, 0, SizerFlag::All, 4);
     let mut scope_items: Vec<&str> = vec!["All sites"];
@@ -925,7 +974,9 @@ pub fn show_video_search(
     }
     scope_choice.set_selection(0);
     opt_row.add(&scope_choice, 1, SizerFlag::All, 4);
-    let sort_label = StaticText::builder(&dialog).with_label("Sort by:").build();
+    let sort_label = StaticText::builder(&dialog)
+        .with_label(&crate::tr("Sort by:"))
+        .build();
     opt_row.add(&sort_label, 0, SizerFlag::All, 4);
     let sort_choice = Choice::builder(&dialog).build();
     for item in ["Relevance", "Title", "Site", "Plays"] {
@@ -943,7 +994,9 @@ pub fn show_video_search(
     list.insert_column(3, "Duration", ListColumnFormat::Left, 80);
     list.insert_column(4, "Uploader", ListColumnFormat::Left, 160);
     sizer.add(&list, 1, SizerFlag::Expand | SizerFlag::All, 4);
-    let status = StaticText::builder(&dialog).with_label("Ready.").build();
+    let status = StaticText::builder(&dialog)
+        .with_label(&crate::tr("Ready."))
+        .build();
     sizer.add(&status, 0, SizerFlag::All, 4);
     let row = BoxSizer::builder(Orientation::Horizontal).build();
     let mk = |label: &str| {
@@ -1181,6 +1234,7 @@ pub fn show_persistent_searches(frame: &Frame, config_path: &Path) -> Option<Str
         .unwrap_or_default();
     let searches = Rc::new(RefCell::new(searches));
     let dialog = Dialog::builder(frame, "Persistent Search").build();
+    bind_f1(frame, &dialog, "PersistentSearchDialog");
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let list = ListBox::builder(&dialog).build();
     sizer.add(&list, 1, SizerFlag::Expand | SizerFlag::All, 4);
@@ -1310,6 +1364,7 @@ pub fn show_podcast_archive(frame: &Frame, db: &Db) -> Option<blindrss_core::Fee
         return None;
     }
     let dialog = Dialog::builder(frame, "Podcast Archive").build();
+    bind_f1(frame, &dialog, "PodcastArchiveDialog");
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let list = ListBox::builder(&dialog).build();
     for f in &podcasts {
@@ -1323,9 +1378,11 @@ pub fn show_podcast_archive(frame: &Frame, db: &Db) -> Option<blindrss_core::Fee
     sizer.add(&list, 1, SizerFlag::Expand | SizerFlag::All, 4);
     let row = BoxSizer::builder(Orientation::Horizontal).build();
     let rescan_btn = Button::builder(&dialog)
-        .with_label("Rescan Archive")
+        .with_label(&crate::tr("Rescan Archive"))
         .build();
-    let close_btn = Button::builder(&dialog).with_label("Close").build();
+    let close_btn = Button::builder(&dialog)
+        .with_label(&crate::tr("Close"))
+        .build();
     row.add(&rescan_btn, 0, SizerFlag::All, 4);
     row.add(&close_btn, 0, SizerFlag::All, 4);
     sizer.add_sizer(&row, 0, SizerFlag::Expand | SizerFlag::All, 2);
@@ -1384,6 +1441,7 @@ pub fn save_queue(config_path: &Path, entries: &[Value]) {
 pub fn show_queue(frame: &Frame, config_path: &Path) -> Option<usize> {
     let entries = Rc::new(RefCell::new(load_queue(config_path)));
     let dialog = Dialog::builder(frame, "Play Queue").build();
+    bind_f1(frame, &dialog, "play-queue");
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let list = ListBox::builder(&dialog).build();
     sizer.add(&list, 1, SizerFlag::Expand | SizerFlag::All, 4);
@@ -1515,7 +1573,7 @@ pub fn select_takeout_feeds(
     let dialog = Dialog::builder(frame, "Import YouTube Takeout").build();
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let label = StaticText::builder(&dialog)
-        .with_label("Choose the subscriptions to import:")
+        .with_label(&crate::tr("Choose the subscriptions to import:"))
         .build();
     sizer.add(&label, 0, SizerFlag::All, 4);
     let list = CheckListBox::builder(&dialog).build();
@@ -1549,6 +1607,7 @@ pub fn select_takeout_feeds(
 /// and subscribes the chosen one.
 pub fn show_feed_search(frame: &Frame) -> Option<String> {
     let dialog = Dialog::builder(frame, "Find Feeds").build();
+    bind_f1(frame, &dialog, "FeedSearchDialog");
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let url_ctrl = name_row(&dialog, &sizer, "Site or feed URL:", "");
     let list = ListBox::builder(&dialog).build();
@@ -1667,7 +1726,7 @@ pub fn show_exclude_feeds(frame: &impl WxWidget, config_path: &Path) {
     let dialog = Dialog::builder(frame, "Exclude Feeds from Notifications").build();
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let label = StaticText::builder(&dialog)
-        .with_label("Checked feeds will not send notifications:")
+        .with_label(&crate::tr("Checked feeds will not send notifications:"))
         .build();
     sizer.add(&label, 0, SizerFlag::All, 4);
     let list = CheckListBox::builder(&dialog).build();
@@ -1713,12 +1772,14 @@ pub fn show_youtube_signin(frame: &impl WxWidget, config_path: &Path) {
     let dialog = Dialog::builder(frame, "Connect YouTube Account").build();
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let status = StaticText::builder(&dialog)
-        .with_label("Contacting Google...")
+        .with_label(&crate::tr("Contacting Google..."))
         .build();
     sizer.add(&status, 0, SizerFlag::All, 8);
     let code_label = StaticText::builder(&dialog).with_label("").build();
     sizer.add(&code_label, 0, SizerFlag::All, 8);
-    let close_btn = Button::builder(&dialog).with_label("Cancel").build();
+    let close_btn = Button::builder(&dialog)
+        .with_label(&crate::tr("Cancel"))
+        .build();
     sizer.add(&close_btn, 0, SizerFlag::All, 4);
     let (tx, rx) = std::sync::mpsc::channel::<Result<String, String>>();
     let rx = Rc::new(rx);
@@ -1841,4 +1902,118 @@ pub fn show_cast_picker(
     };
     dialog.destroy();
     picked
+}
+
+/// Import Site Cookies (Python's ImportSiteCookiesDialog, issue
+/// #79): pick Chromium-family profiles; their decrypted v10
+/// cookies merge into site_cookies.txt beside the config, so
+/// challenge-protected sites can be read. v20 app-bound rows are
+/// counted as skipped (no elevation machinery in the Rust app).
+pub fn show_import_cookies(frame: &Frame, config_path: &Path) {
+    use blindrss_core::chromium;
+    let dialog = Dialog::builder(frame, "Import Site Cookies").build();
+    bind_f1(frame, &dialog, "site-cookies");
+    let sizer = BoxSizer::builder(Orientation::Vertical).build();
+    let label = StaticText::builder(&dialog)
+        .with_label(&crate::tr(
+            "Choose the browser profiles to import cookies from:",
+        ))
+        .build();
+    sizer.add(&label, 0, SizerFlag::All, 4);
+    let profiles = chromium::list_profiles();
+    let list = CheckListBox::builder(&dialog).build();
+    for (i, p) in profiles.iter().enumerate() {
+        list.append(&format!(
+            "{} — {} ({})",
+            p.browser,
+            p.profile,
+            crate::fmt_ts(Some(p.mtime))
+        ));
+        list.check(i as u32, true);
+    }
+    sizer.add(&list, 1, SizerFlag::Expand | SizerFlag::All, 4);
+    let status = StaticText::builder(&dialog)
+        .with_label(if profiles.is_empty() {
+            "No Chromium-family browser profiles found."
+        } else {
+            ""
+        })
+        .build();
+    sizer.add(&status, 0, SizerFlag::All, 4);
+    let row = BoxSizer::builder(Orientation::Horizontal).build();
+    let import_btn = Button::builder(&dialog)
+        .with_label(&crate::tr("Import"))
+        .build();
+    row.add(&import_btn, 0, SizerFlag::All, 4);
+    let close_btn = Button::builder(&dialog)
+        .with_label(&crate::tr("Close"))
+        .build();
+    row.add(&close_btn, 0, SizerFlag::All, 4);
+    sizer.add_sizer(&row, 0, SizerFlag::All, 2);
+    dialog.set_sizer(sizer, true);
+    dialog.set_size(Size::new(620, 440));
+
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let profiles = Rc::new(profiles);
+    {
+        let profiles = profiles.clone();
+        let cfg_path = config_path.to_path_buf();
+        import_btn.on_click(move |_| {
+            let chosen: Vec<chromium::ChromiumProfile> = profiles
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| list.is_checked(*i as u32))
+                .map(|(_, p)| p.clone())
+                .collect();
+            if chosen.is_empty() {
+                status.set_label("No profiles selected.");
+                return;
+            }
+            status.set_label("Importing...");
+            let tx = tx.clone();
+            let jar_path = cfg_path
+                .parent()
+                .map(|d| d.join("site_cookies.txt"))
+                .unwrap_or_default();
+            std::thread::spawn(move || {
+                let mut records = Vec::new();
+                let mut skipped = 0usize;
+                for p in &chosen {
+                    let outcome = chromium::read_profile_cookies(p);
+                    skipped += outcome.skipped;
+                    records.extend(outcome.records);
+                }
+                let existing = std::fs::read_to_string(&jar_path).unwrap_or_default();
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                let merged = chromium::merge_into_jar(&existing, &records, now);
+                let imported = records.len();
+                let msg = match std::fs::write(&jar_path, merged) {
+                    Ok(()) => format!(
+                        "Imported {imported} cookies from {} profiles; {skipped} skipped (could not be decrypted).",
+                        chosen.len()
+                    ),
+                    Err(e) => format!("Could not write the cookie jar: {e}"),
+                };
+                let _ = tx.send(msg);
+            });
+        });
+    }
+    {
+        let d = dialog;
+        close_btn.on_click(move |_| {
+            d.end_modal(5100);
+        });
+    }
+    let timer = Box::leak(Box::new(Timer::new(&dialog)));
+    timer.start(200, false);
+    timer.on_tick(move |_| {
+        if let Ok(msg) = rx.try_recv() {
+            status.set_label(&msg);
+        }
+    });
+    dialog.show_modal();
+    dialog.destroy();
 }
