@@ -26,6 +26,7 @@ use serde_json::Value;
 pub fn thread_text(url: &str) -> Option<(String, String)> {
     lemmy_thread(url)
         .or_else(|| github_thread(url))
+        .or_else(|| github_page_text(url))
         .or_else(|| reddit_thread(url))
         .or_else(|| discourse_thread(url))
 }
@@ -195,6 +196,363 @@ pub fn github_thread(url: &str) -> Option<(String, String)> {
     }
     let _ = kind;
     Some((title, out.join("\n\n")))
+}
+
+// ---------------------------------------------------------------------------
+// GitHub page documents (Batch 35b): commit, release and discussion
+// pages rebuilt from the REST API, porting the remaining
+// core/github_source.py renderers (issue/PR live in github_thread
+// above). Org discussions have no REST endpoint and are rebuilt
+// from the server-rendered page, as in Python.
+// ---------------------------------------------------------------------------
+
+const GITHUB_RESERVED_OWNERS: [&str; 12] = [
+    "settings",
+    "login",
+    "join",
+    "explore",
+    "marketplace",
+    "notifications",
+    "search",
+    "topics",
+    "collections",
+    "sponsors",
+    "orgs",
+    "new",
+];
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum GithubPage {
+    Commit(String, String, String),
+    Release(String, String, String),
+    Discussion(String, String, String),
+    OrgDiscussion(String, String),
+}
+
+pub fn github_page_parts(url: &str) -> Option<GithubPage> {
+    let rest = url.strip_prefix("https://github.com/")?;
+    let clean = rest.split(['?', '#']).next().unwrap_or(rest);
+    let parts: Vec<&str> = clean.split('/').filter(|p| !p.is_empty()).collect();
+    if parts.len() == 4 && parts[0] == "orgs" && parts[2] == "discussions" {
+        if parts[3].chars().all(|c| c.is_ascii_digit()) && !parts[3].is_empty() {
+            return Some(GithubPage::OrgDiscussion(
+                parts[1].to_string(),
+                parts[3].to_string(),
+            ));
+        }
+        return None;
+    }
+    if parts.len() < 4 {
+        return None;
+    }
+    let (owner, repo) = (parts[0], parts[1]);
+    if GITHUB_RESERVED_OWNERS.contains(&owner.to_lowercase().as_str()) {
+        return None;
+    }
+    match parts[2] {
+        "commit" if parts.len() == 4 => {
+            let sha = parts[3];
+            if sha.len() >= 7 && sha.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Some(GithubPage::Commit(
+                    owner.to_string(),
+                    repo.to_string(),
+                    sha.to_string(),
+                ));
+            }
+            None
+        }
+        "releases" if parts.len() >= 5 && parts[3] == "tag" => Some(GithubPage::Release(
+            owner.to_string(),
+            repo.to_string(),
+            parts[4..].join("/"),
+        )),
+        "discussions" if parts.len() == 4 => {
+            if parts[3].chars().all(|c| c.is_ascii_digit()) && !parts[3].is_empty() {
+                return Some(GithubPage::Discussion(
+                    owner.to_string(),
+                    repo.to_string(),
+                    parts[3].to_string(),
+                ));
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn login_of(v: &Value) -> String {
+    v.get("user")
+        .map(|u| str_field(u, "login"))
+        .unwrap_or_default()
+}
+
+pub fn github_page_text(url: &str) -> Option<(String, String)> {
+    match github_page_parts(url)? {
+        GithubPage::Commit(owner, repo, sha) => github_commit_text(&owner, &repo, &sha),
+        GithubPage::Release(owner, repo, tag) => github_release_text(&owner, &repo, &tag),
+        GithubPage::Discussion(owner, repo, num) => github_discussion_text(&owner, &repo, &num)
+            // Python `_discussion_document`: anything the REST API
+            // cannot serve falls through to the rendered page.
+            .or_else(|| github_org_discussion_text(&owner, &num, url)),
+        GithubPage::OrgDiscussion(owner, num) => github_org_discussion_text(&owner, &num, url),
+    }
+}
+
+fn github_commit_text(owner: &str, repo: &str, sha: &str) -> Option<(String, String)> {
+    let base = format!("https://api.github.com/repos/{owner}/{repo}");
+    let commit = get_json(&format!("{base}/commits/{sha}"))?;
+    let full_sha = str_field(&commit, "sha");
+    if full_sha.is_empty() {
+        return None;
+    }
+    let info = commit.get("commit").cloned().unwrap_or(Value::Null);
+    let author_info = info.get("author").cloned().unwrap_or(Value::Null);
+    let mut author = login_of(&commit);
+    if author.is_empty() || author == "ghost" {
+        author = str_field(&author_info, "name");
+        if author.is_empty() {
+            author = "unknown".to_string();
+        }
+    }
+    let when = str_field(&author_info, "date");
+    let message = str_field(&info, "message");
+    let subject = message
+        .lines()
+        .next()
+        .unwrap_or("(no commit message)")
+        .trim()
+        .to_string();
+    let slug = format!("{owner}/{repo}");
+    let mut out: Vec<String> = Vec::new();
+    let mut heading = format!("Commit by {author}");
+    if !when.is_empty() {
+        heading += &format!(" - {when}");
+    }
+    out.push(heading);
+    let mut bullets = vec![format!("Commit: {}", &full_sha[..full_sha.len().min(12)])];
+    if let Some(stats) = commit.get("stats") {
+        let add = stats.get("additions").and_then(|v| v.as_i64()).unwrap_or(0);
+        let del = stats.get("deletions").and_then(|v| v.as_i64()).unwrap_or(0);
+        bullets.push(format!("{add} additions, {del} deletions"));
+    }
+    if let Some(parents) = commit.get("parents").and_then(|v| v.as_array())
+        && !parents.is_empty()
+    {
+        let short: Vec<String> = parents
+            .iter()
+            .map(|p| {
+                let s = str_field(p, "sha");
+                s[..s.len().min(7)].to_string()
+            })
+            .collect();
+        bullets.push(format!("Parents: {}", short.join(", ")));
+    }
+    bullets.push(format!("Repository: {slug}"));
+    out.push(bullets.join("\n"));
+    if !message.trim().is_empty() {
+        out.push(message.trim().to_string());
+    }
+    // Commit comments.
+    if let Some(comments) = get_json(&format!("{base}/commits/{sha}/comments?per_page=100"))
+        && let Some(items) = comments.as_array()
+    {
+        for c in items {
+            let body = str_field(c, "body");
+            if body.trim().is_empty() {
+                continue;
+            }
+            out.push(format!(
+                "Comment by {} - {}",
+                login_of(c),
+                str_field(c, "created_at")
+            ));
+            out.push(body.trim().to_string());
+        }
+    }
+    // Changed files with patches (Python caps: 60 files with patch,
+    // 400 diff lines per file, 4000 total).
+    if let Some(files) = commit.get("files").and_then(|v| v.as_array())
+        && !files.is_empty()
+    {
+        out.push(format!("Changed files ({})", files.len()));
+        let mut diff_lines_total = 0usize;
+        for (i, f) in files.iter().enumerate() {
+            let name = str_field(f, "filename");
+            let status = str_field(f, "status");
+            let add = f.get("additions").and_then(|v| v.as_i64()).unwrap_or(0);
+            let del = f.get("deletions").and_then(|v| v.as_i64()).unwrap_or(0);
+            out.push(format!("{name} ({status}, +{add} -{del})"));
+            if i < 60 && diff_lines_total < 4000 {
+                let patch = str_field(f, "patch");
+                if !patch.is_empty() {
+                    let lines: Vec<&str> = patch.lines().take(400).collect();
+                    diff_lines_total += lines.len();
+                    out.push(lines.join("\n"));
+                }
+            }
+        }
+    }
+    Some((format!("{subject} ({slug})"), out.join("\n\n")))
+}
+
+fn github_release_text(owner: &str, repo: &str, tag: &str) -> Option<(String, String)> {
+    let base = format!("https://api.github.com/repos/{owner}/{repo}");
+    let release = get_json(&format!("{base}/releases/tags/{tag}"))?;
+    let tag_name = str_field(&release, "tag_name");
+    if tag_name.is_empty() {
+        return None;
+    }
+    let slug = format!("{owner}/{repo}");
+    let author = login_of(&release);
+    let mut title = str_field(&release, "name");
+    if title.is_empty() {
+        title = tag_name.clone();
+    }
+    let published = {
+        let p = str_field(&release, "published_at");
+        if p.is_empty() {
+            str_field(&release, "created_at")
+        } else {
+            p
+        }
+    };
+    let mut out: Vec<String> = Vec::new();
+    let mut heading = format!("Release published by {author}");
+    if !published.is_empty() {
+        heading += &format!(" - {published}");
+    }
+    out.push(heading);
+    let mut bullets = vec![format!("Tag: {tag_name}")];
+    if release.get("prerelease").and_then(|v| v.as_bool()) == Some(true) {
+        bullets.push("Pre-release".to_string());
+    }
+    if release.get("draft").and_then(|v| v.as_bool()) == Some(true) {
+        bullets.push("Draft".to_string());
+    }
+    bullets.push(format!("Repository: {slug}"));
+    out.push(bullets.join("\n"));
+    let body = str_field(&release, "body");
+    if !body.trim().is_empty() {
+        out.push(body.trim().to_string());
+    }
+    if let Some(assets) = release.get("assets").and_then(|v| v.as_array())
+        && !assets.is_empty()
+    {
+        out.push(format!("Assets ({})", assets.len()));
+        let rows: Vec<String> = assets
+            .iter()
+            .map(|a| {
+                let name = str_field(a, "name");
+                let name = if name.is_empty() { "asset" } else { &name };
+                match a.get("download_count").and_then(|v| v.as_i64()) {
+                    Some(d) => format!("{name} ({d} downloads)"),
+                    None => name.to_string(),
+                }
+            })
+            .collect();
+        out.push(rows.join("\n"));
+    }
+    Some((format!("{title} ({slug})"), out.join("\n\n")))
+}
+
+fn github_discussion_text(owner: &str, repo: &str, num: &str) -> Option<(String, String)> {
+    let base = format!("https://api.github.com/repos/{owner}/{repo}");
+    let disc = get_json(&format!("{base}/discussions/{num}"))?;
+    let title = str_field(&disc, "title");
+    if title.is_empty() {
+        return None;
+    }
+    let slug = format!("{owner}/{repo}");
+    let mut out: Vec<String> = Vec::new();
+    out.push(format!(
+        "Discussion opened by {} - {}",
+        login_of(&disc),
+        str_field(&disc, "created_at")
+    ));
+    let body = str_field(&disc, "body");
+    if !body.trim().is_empty() {
+        out.push(body.trim().to_string());
+    }
+    if let Some(comments) = get_json(&format!("{base}/discussions/{num}/comments?per_page=100"))
+        && let Some(items) = comments.as_array()
+    {
+        let mut sorted: Vec<&Value> = items.iter().collect();
+        sorted.sort_by_key(|c| str_field(c, "created_at"));
+        for c in sorted {
+            let body = str_field(c, "body");
+            if body.trim().is_empty() {
+                continue;
+            }
+            let is_reply = c.get("parent_id").map(|v| !v.is_null()).unwrap_or(false);
+            let label = if is_reply { "Reply" } else { "Comment" };
+            out.push(format!(
+                "{label} by {} - {}",
+                login_of(c),
+                str_field(c, "created_at")
+            ));
+            out.push(body.trim().to_string());
+        }
+    }
+    Some((format!("{title} ({slug}#{num})"), out.join("\n\n")))
+}
+
+fn github_org_discussion_text(owner: &str, num: &str, url: &str) -> Option<(String, String)> {
+    // No REST endpoint: rebuild from the server-rendered page's
+    // timeline comment groups (Python's page-scrape fallback).
+    let (bytes, _final) = crate::extract::fetch_page_bytes(url, "").ok()?;
+    let html = String::from_utf8_lossy(&bytes).to_string();
+    let mut title = String::new();
+    for sp in crate::extract::find_elements(&html, Some("title"), &|_| true) {
+        title = crate::extract::leaf_text(&html[sp.inner_start..sp.inner_end]);
+        if !title.is_empty() {
+            break;
+        }
+    }
+    title = title.split(" · ").next().unwrap_or("").trim().to_string();
+    if title.is_empty() {
+        title = format!("Discussion #{num}");
+    }
+    let groups = crate::extract::find_elements(&html, Some("div"), &|open: &str| {
+        crate::extract::has_class(open, "timeline-comment-group")
+    });
+    let mut out: Vec<String> = Vec::new();
+    let mut author = String::new();
+    for (i, g) in groups.iter().enumerate() {
+        let frag = &html[g.inner_start..g.inner_end];
+        let bodies = crate::extract::find_elements(frag, None, &|open: &str| {
+            crate::extract::has_class(open, "comment-body")
+                || crate::extract::has_class(open, "markdown-body")
+        });
+        let Some(first) = bodies.first() else {
+            continue;
+        };
+        let body_html = &frag[first.start..first.end];
+        let text = crate::extract::html_to_text(body_html);
+        if text.trim().is_empty() {
+            continue;
+        }
+        let who = crate::extract::find_elements(frag, None, &|open: &str| {
+            crate::extract::has_class(open, "author")
+        })
+        .first()
+        .map(|sp| crate::extract::leaf_text(&frag[sp.inner_start..sp.inner_end]))
+        .unwrap_or_default();
+        if author.is_empty() {
+            author = who.clone();
+        }
+        let label = if i == 0 {
+            "Discussion opened by"
+        } else {
+            "Comment by"
+        };
+        out.push(format!("{label} {who}"));
+        out.push(text.trim().to_string());
+    }
+    if out.is_empty() {
+        return None;
+    }
+    let _ = author;
+    Some((format!("{title} ({owner}#{num})"), out.join("\n\n")))
 }
 
 // ---------------------------------------------------------------------------

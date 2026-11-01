@@ -138,10 +138,22 @@ Python `core/casting.py`, in that order.
   links and podcast enclosures are the normal case. When an entry has
   no stable ID/link, generate the deterministic feed-scoped ID the
   Python parser generates.
+- `sources.rs`: the source-feed family — subscriptions with no native
+  RSS (Odysee, Rumble, YouTube search, SoundCloud, Mixcloud, Google
+  Groups, Groups.io search) enumerated at refresh in the branch order
+  of Python's `providers/local.py::_refresh_single_feed`, plus the
+  YouTube channel uploads fallback/history backfill and the NPR/Sky
+  audio attach. Rumble/Odysee feed URLs are normalized and persisted
+  back to the feeds row at refresh, as Python does.
 - `extract.rs` + `postprocess.rs` + `article_html.rs`: full-text
   extraction. The cascade is fixed: rust-trafilatura base, dom_smoothie
   (Readability) second opinion, and the ported BlindRSS gate/site layer
-  owns every final call.
+  owns every final call. `ytfull.rs` reconstructs YouTube watch pages
+  through yt-dlp (Description / Chapters / Subtitles / comment trees);
+  `threads.rs` rebuilds Lemmy/GitHub/Reddit/Discourse threads and
+  GitHub commit/release/discussion pages. Both readers follow
+  multi-page articles (`_find_next_page` rules) and merge with
+  `_merge_texts` semantics; direct MP3 URLs resolve ID3 show notes.
   - Never replace fuller feed/article text with a shorter scrape, a
     translation failure, or a bot-interstitial page. When web
     extraction returns less than the feed already has, the feed wins.

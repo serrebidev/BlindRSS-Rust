@@ -16,6 +16,9 @@
 //!   page but absent from the extraction is appended, so tables are not
 //!   silently dropped (the Heise case Python itself fails today).
 
+use regex::Regex;
+use std::sync::OnceLock;
+
 /// Block markers, ported in full from Python
 /// `core/article_extractor.py::_BOT_INTERSTITIAL_MARKERS`.
 const GATE_MARKERS: &[&str] = &[
@@ -380,7 +383,13 @@ pub(crate) fn tag_tokens(html: &str) -> Vec<TagTok> {
         if k >= bytes.len() {
             break;
         }
-        let self_closing = !close && k > j && bytes[k - 1] == b'/';
+        // Void elements (link, meta, img, hr, ...) never have a
+        // close tag in HTML, with or without the XHTML slash:
+        // treating one as an open tag makes the balanced scanner
+        // hunt for a close that does not exist and give up on the
+        // rest of the document.
+        let self_closing =
+            !close && ((k > j && bytes[k - 1] == b'/') || VOID_TAGS.contains(&name.as_str()));
         out.push(TagTok {
             start: i,
             end: k + 1,
@@ -2006,6 +2015,582 @@ pub fn fetch_via_sky_translate(url: &str) -> Option<String> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Batch 35b: multi-page following, the metered-preview notice, the
+// NPR text edition, Sky Flourish table expansion, ID3 show notes,
+// and the Google News proxy path — the remaining pieces of Python's
+// extract_full_article main loop.
+// ---------------------------------------------------------------------------
+
+const MEDIA_EXTS: [&str; 20] = [
+    ".mp3", ".m4a", ".aac", ".wav", ".flac", ".ogg", ".opus", ".mp4", ".mkv", ".webm", ".mov",
+    ".m4v", ".avi", ".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".pdf",
+];
+
+fn url_path_lower(url: &str) -> String {
+    let after = url.split("://").nth(1).unwrap_or(url);
+    let path = after
+        .split(['?', '#'])
+        .next()
+        .unwrap_or("")
+        .split_once('/')
+        .map(|(_, p)| format!("/{p}"))
+        .unwrap_or_default();
+    path.to_lowercase()
+}
+
+/// Python `_looks_like_media_url`: the URL path ends in a media
+/// extension (a direct enclosure, not a webpage).
+pub fn looks_like_media_url(url: &str) -> bool {
+    let path = url_path_lower(url);
+    MEDIA_EXTS.iter().any(|ext| path.ends_with(ext))
+}
+
+/// Python `_looks_like_id3_media_url`: an MP3 whose leading ID3 tag
+/// can carry readable show notes.
+pub fn looks_like_id3_media_url(url: &str) -> bool {
+    url_path_lower(url).ends_with(".mp3")
+}
+
+// --- ID3v2 (bounded prefix read, Python utils.embedded_id3_metadata) ---
+
+fn fetch_prefix_bytes(url: &str, range: &str, max: usize) -> Option<Vec<u8>> {
+    // Local files read directly; remote media via a Range request.
+    if !url.contains("://") || url.starts_with("file://") {
+        let path = url.strip_prefix("file://").unwrap_or(url);
+        let data = std::fs::read(path).ok()?;
+        return Some(data.into_iter().take(max).collect());
+    }
+    let mut resp = crate::http::agent()
+        .get(url)
+        .header("Range", range)
+        .call()
+        .ok()?;
+    let body = resp.body_mut().read_to_vec().ok()?;
+    Some(body.into_iter().take(max).collect())
+}
+
+fn id3_decode_text(enc: u8, bytes: &[u8]) -> String {
+    match enc {
+        3 => String::from_utf8_lossy(bytes).to_string(),
+        1 | 2 => {
+            // UTF-16: BOM decides endianness for enc 1; enc 2 is BE.
+            let (little, skip) = if enc == 1 && bytes.len() >= 2 {
+                if bytes[0] == 0xFF && bytes[1] == 0xFE {
+                    (true, 2)
+                } else if bytes[0] == 0xFE && bytes[1] == 0xFF {
+                    (false, 2)
+                } else {
+                    (false, 0)
+                }
+            } else {
+                (false, 0)
+            };
+            let units: Vec<u16> = bytes[skip..]
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| {
+                    if little {
+                        u16::from_le_bytes([c[0], c[1]])
+                    } else {
+                        u16::from_be_bytes([c[0], c[1]])
+                    }
+                })
+                .collect();
+            String::from_utf16_lossy(&units)
+        }
+        _ => bytes.iter().map(|b| *b as char).collect(),
+    }
+}
+
+/// Split a text-frame payload on its encoding's terminator.
+fn id3_split_descriptor(enc: u8, bytes: &[u8]) -> Option<(String, &[u8])> {
+    if enc == 1 || enc == 2 {
+        let mut i = 0;
+        while i + 1 < bytes.len() {
+            if bytes[i] == 0 && bytes[i + 1] == 0 {
+                return Some((id3_decode_text(enc, &bytes[..i]), &bytes[i + 2..]));
+            }
+            i += 2;
+        }
+        None
+    } else {
+        let pos = bytes.iter().position(|b| *b == 0)?;
+        Some((id3_decode_text(enc, &bytes[..pos]), &bytes[pos + 1..]))
+    }
+}
+
+/// (title, author, content) from an MP3's embedded ID3 tag, or None
+/// when the tag carries no show-note text. Content candidates are
+/// USLT and COMM frames plus TXXX frames described as description /
+/// summary / show notes / transcript; the longest wins (Python).
+pub fn id3_metadata(url: &str) -> Option<(String, String, String)> {
+    let hdr = fetch_prefix_bytes(url, "bytes=0-9", 10)?;
+    if hdr.len() < 10 || &hdr[0..3] != b"ID3" {
+        return None;
+    }
+    let version = hdr[3];
+    let flags = hdr[5];
+    let ss = &hdr[6..10];
+    let tag_size = (((ss[0] & 0x7F) as usize) << 21)
+        | (((ss[1] & 0x7F) as usize) << 14)
+        | (((ss[2] & 0x7F) as usize) << 7)
+        | ((ss[3] & 0x7F) as usize);
+    let total = tag_size + 10 + if flags & 0x10 != 0 { 10 } else { 0 };
+    if total <= 10 || total > 1_000_000 {
+        return None;
+    }
+    let tag = fetch_prefix_bytes(url, &format!("bytes=0-{}", total - 1), total)?;
+    if tag.len() < total || &tag[0..3] != b"ID3" {
+        return None;
+    }
+    let mut title = String::new();
+    let mut author = String::new();
+    let mut author2 = String::new();
+    let mut candidates: Vec<String> = Vec::new();
+    let mut pos = 10usize;
+    while pos + 10 <= tag.len() {
+        let id = &tag[pos..pos + 4];
+        if id.iter().all(|b| *b == 0) {
+            break; // padding
+        }
+        if !id.iter().all(|b| b.is_ascii_alphanumeric()) {
+            break;
+        }
+        let id_str = std::str::from_utf8(id).unwrap_or("").to_string();
+        let size = if version == 4 {
+            (((tag[pos + 4] & 0x7F) as usize) << 21)
+                | (((tag[pos + 5] & 0x7F) as usize) << 14)
+                | (((tag[pos + 6] & 0x7F) as usize) << 7)
+                | ((tag[pos + 7] & 0x7F) as usize)
+        } else {
+            u32::from_be_bytes([tag[pos + 4], tag[pos + 5], tag[pos + 6], tag[pos + 7]]) as usize
+        };
+        let start = pos + 10;
+        let end = (start + size).min(tag.len());
+        if start >= end {
+            break;
+        }
+        let payload = &tag[start..end];
+        match id_str.as_str() {
+            "TIT2" | "TPE1" | "TPE2" => {
+                if !payload.is_empty() {
+                    let text = id3_decode_text(payload[0], &payload[1..])
+                        .replace('\0', " ")
+                        .trim()
+                        .to_string();
+                    match id_str.as_str() {
+                        "TIT2" if title.is_empty() => title = text,
+                        "TPE1" if author.is_empty() => author = text,
+                        "TPE2" if author2.is_empty() => author2 = text,
+                        _ => {}
+                    }
+                }
+            }
+            "COMM" | "USLT" => {
+                if payload.len() > 4 {
+                    let enc = payload[0];
+                    // Skip the 3-byte language, then the descriptor.
+                    if let Some((_desc, rest)) = id3_split_descriptor(enc, &payload[4..]) {
+                        let text = id3_decode_text(enc, rest).trim().to_string();
+                        if !text.is_empty() && !candidates.contains(&text) {
+                            candidates.push(text);
+                        }
+                    }
+                }
+            }
+            "TXXX" if !payload.is_empty() => {
+                let enc = payload[0];
+                if let Some((desc, rest)) = id3_split_descriptor(enc, &payload[1..])
+                    && [
+                        "description",
+                        "summary",
+                        "show notes",
+                        "shownotes",
+                        "transcript",
+                    ]
+                    .contains(&desc.trim().to_lowercase().as_str())
+                {
+                    let text = id3_decode_text(enc, rest).trim().to_string();
+                    if !text.is_empty() && !candidates.contains(&text) {
+                        candidates.push(text);
+                    }
+                }
+            }
+            _ => {}
+        }
+        pos = end;
+    }
+    let content = candidates.into_iter().max_by_key(|c| c.len())?;
+    if content.trim().is_empty() {
+        return None;
+    }
+    if author.is_empty() {
+        author = author2;
+    }
+    Some((title, author, content))
+}
+
+// --- Metered preview (Python _looks_like_metered_preview) ---
+
+pub fn looks_like_metered_preview(html: &str) -> bool {
+    if html.is_empty() {
+        return false;
+    }
+    let head: String = html.chars().take(400_000).collect();
+    head.to_lowercase()
+        .contains("to read as many articles as you like")
+}
+
+pub fn metered_preview_notice() -> &'static str {
+    "Only the free preview of this article is published on the page — the rest requires a subscription. Open the original link in your browser to read it."
+}
+
+// --- Pagination (Python _find_next_page + _merge_texts) ---
+
+const NO_PAGINATION_FOLLOW_HOSTS: [&str; 6] = [
+    "wired.com",
+    "ning.com",
+    "neowin.net",
+    "bloomberg.com",
+    "slashdot.org",
+    "github.com",
+];
+
+fn absolutize(base: &str, href: &str) -> String {
+    let href = href.trim();
+    if href.starts_with("http://") || href.starts_with("https://") {
+        return href.to_string();
+    }
+    let (scheme, rest) = base.split_once("://").unwrap_or(("https", base));
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if let Some(stripped) = href.strip_prefix("//") {
+        return format!("{scheme}://{stripped}");
+    }
+    if href.starts_with('/') {
+        return format!("{scheme}://{host}{href}");
+    }
+    // Page-relative: resolve against the base's directory.
+    let clean = base.split(['?', '#']).next().unwrap_or(base);
+    match clean.rfind('/') {
+        Some(i) if i > scheme.len() + 2 => format!("{}{href}", &clean[..=i]),
+        _ => format!("{scheme}://{host}/{href}"),
+    }
+}
+
+/// The next-page URL of a paginated article, or None (Python
+/// `_find_next_page`: link rel=next, then a rel=next, then labelled
+/// pagination anchors — never a "next story" teaser).
+pub fn find_next_page(html: &str, base_url: &str) -> Option<String> {
+    if html.is_empty() {
+        return None;
+    }
+    let host = host_of(base_url);
+    if NO_PAGINATION_FOLLOW_HOSTS
+        .iter()
+        .any(|d| host == *d || host.ends_with(&format!(".{d}")))
+    {
+        return None;
+    }
+    static NEXT_STORY_RE: OnceLock<Regex> = OnceLock::new();
+    let next_story_re = NEXT_STORY_RE.get_or_init(|| {
+        Regex::new(r"next[\s_-]*(?:stor(?:y|ies)|articles?|posts?|read|up)\b").unwrap()
+    });
+    static LABEL_RE: OnceLock<Regex> = OnceLock::new();
+    let label_re = LABEL_RE.get_or_init(|| {
+        Regex::new(r"^(?:next|older)(?:\s+(?:page|pages|entries))?\s*(?:[›»>]+)?$").unwrap()
+    });
+    // 1) <link rel="next">
+    for sp in find_elements(html, Some("link"), &|open: &str| {
+        attr_value(open, "rel")
+            .map(|r| r.to_lowercase().contains("next"))
+            .unwrap_or(false)
+    }) {
+        if let Some(href) = attr_value(&html[sp.start..sp.inner_start], "href")
+            && !href.trim().is_empty()
+        {
+            return Some(absolutize(base_url, &href));
+        }
+    }
+    // 2) <a rel="next">
+    for sp in find_elements(html, Some("a"), &|open: &str| {
+        attr_value(open, "rel")
+            .map(|r| r.to_lowercase().contains("next"))
+            .unwrap_or(false)
+    }) {
+        if let Some(href) = attr_value(&html[sp.start..sp.inner_start], "href")
+            && !href.trim().is_empty()
+        {
+            return Some(absolutize(base_url, &href));
+        }
+    }
+    // 3) Labelled pagination anchors.
+    for sp in find_elements(html, Some("a"), &|_| true) {
+        let open = &html[sp.start..sp.inner_start];
+        let Some(href) = attr_value(open, "href") else {
+            continue;
+        };
+        if href.trim().is_empty() {
+            continue;
+        }
+        let text = leaf_text(&html[sp.inner_start..sp.inner_end]).to_lowercase();
+        let cls = attr_value(open, "class").unwrap_or_default().to_lowercase();
+        let aria = attr_value(open, "aria-label")
+            .unwrap_or_default()
+            .to_lowercase();
+        let data_attrs: String = ["data-track", "data-action", "data-event"]
+            .iter()
+            .filter_map(|name| attr_value(open, name))
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase();
+        let haystack = format!("{text} {cls} {aria} {data_attrs}");
+        if next_story_re.is_match(&haystack) {
+            continue;
+        }
+        if label_re.is_match(text.trim())
+            || [">", ">>", "›", "»"].contains(&text.trim())
+            || cls.contains("next")
+            || aria.starts_with("next")
+        {
+            let abs = absolutize(base_url, &href);
+            let lower = abs.to_lowercase();
+            if [
+                "facebook.com",
+                "twitter.com",
+                "x.com",
+                "linkedin.com",
+                "pinterest.com",
+            ]
+            .iter()
+            .any(|s| lower.contains(s))
+            {
+                continue;
+            }
+            return Some(abs);
+        }
+    }
+    None
+}
+
+/// Merge page texts, de-duplicating repeated paragraphs (Python
+/// `_merge_texts` for HTML-extracted text: short lines always kept
+/// and stay out of the dedupe set; linearized table blocks are kept
+/// or dropped as a unit; table/structure marker lines bypass both
+/// the length floor and dedupe because the fixed markers repeat).
+pub fn merge_texts(texts: &[String]) -> String {
+    static TABLE_MARKER_RE: OnceLock<Regex> = OnceLock::new();
+    let table_re = TABLE_MARKER_RE.get_or_init(|| {
+        Regex::new(r"^(?:Table with \d+ rows? and \d+ columns?[:.]|Row \d+: .*\.|End of table\.)")
+            .unwrap()
+    });
+    static STRUCTURE_MARKER_RE: OnceLock<Regex> = OnceLock::new();
+    let structure_re = STRUCTURE_MARKER_RE.get_or_init(|| {
+        Regex::new(r"^(?:Heading level [1-6]: .+|Quote:$|End of quote\.$|• .+|\d{1,3}\. .+)")
+            .unwrap()
+    });
+    let key_of = |s: &str| -> String {
+        s.split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase()
+    };
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out_texts: Vec<String> = Vec::new();
+    for t in texts {
+        let t = t.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let paras: Vec<&str> = t
+            .lines()
+            .map(|p| p.trim())
+            .filter(|p| !p.is_empty())
+            .collect();
+        let mut merged: Vec<String> = Vec::new();
+        let mut i = 0;
+        while i < paras.len() {
+            let p = paras[i];
+            if p.starts_with("Table with") && table_re.is_match(p) {
+                // A linearized table block: marker lines only, kept
+                // or dropped as a unit on the whole-block key.
+                let mut block = vec![p];
+                let mut j = i + 1;
+                while j < paras.len() && table_re.is_match(paras[j]) {
+                    block.push(paras[j]);
+                    let last = paras[j];
+                    j += 1;
+                    if last == "End of table." {
+                        break;
+                    }
+                }
+                if seen.insert(key_of(&block.join(" "))) {
+                    merged.extend(block.iter().map(|s| s.to_string()));
+                }
+                i = j;
+                continue;
+            }
+            if table_re.is_match(p) || structure_re.is_match(p) {
+                merged.push(p.to_string());
+                i += 1;
+                continue;
+            }
+            let key = key_of(p);
+            // Short lines are always kept and stay out of the
+            // dedupe set (the `||` short-circuit preserves that).
+            if key.chars().count() < 25 || seen.insert(key) {
+                merged.push(p.to_string());
+            }
+            i += 1;
+        }
+        if !merged.is_empty() {
+            out_texts.push(merged.join("\n"));
+        }
+    }
+    normalize_merged_whitespace(&out_texts.join("\n\n"))
+}
+
+/// Python `_normalize_whitespace` (the merge output pass): strip
+/// zero-width marks, unify newlines, drop trailing spaces per line,
+/// collapse 3+ newlines to a blank line, trim.
+fn normalize_merged_whitespace(text: &str) -> String {
+    let text = text
+        .replace(['\u{200b}', '\u{2060}', '\u{feff}'], "")
+        .replace("\r\n", "\n")
+        .replace('\r', "\n");
+    let mut out = String::with_capacity(text.len());
+    for line in text.split('\n') {
+        out.push_str(line.trim_end_matches([' ', '\t']));
+        out.push('\n');
+    }
+    // Collapse runs of 3+ newlines (2+ blank lines) to one blank line.
+    let mut collapsed = String::with_capacity(out.len());
+    let mut newline_run = 0usize;
+    for ch in out.chars() {
+        if ch == '\n' {
+            newline_run += 1;
+            if newline_run <= 2 {
+                collapsed.push(ch);
+            }
+        } else {
+            newline_run = 0;
+            collapsed.push(ch);
+        }
+    }
+    collapsed.trim().to_string()
+}
+
+// --- Sky Flourish tables (Python _expand_sky_flourish_tables) ---
+
+/// Replace Sky's script-hydrated Flourish tables with the semantic
+/// tables from the Flourish embed, so extraction can see the cells.
+pub fn expand_sky_flourish_tables(html: &str, url: &str) -> String {
+    if html.is_empty() || host_of(url) != "news.sky.com" {
+        return html.to_string();
+    }
+    if !html.to_lowercase().contains("flourish-table") {
+        return html.to_string();
+    }
+    static SRC_RE: OnceLock<Regex> = OnceLock::new();
+    let src_re = SRC_RE.get_or_init(|| Regex::new(r"^/?visualisation/(\d+)(?:\?[^#]*)?$").unwrap());
+    let widgets = find_elements(html, Some("div"), &|open: &str| {
+        has_class(open, "flourish-embed") && has_class(open, "flourish-table")
+    });
+    if widgets.is_empty() {
+        return html.to_string();
+    }
+    // Wrapper candidates for the sdc-article-widget replacement.
+    let wrappers = find_elements(html, Some("div"), &|open: &str| {
+        has_class(open, "sdc-article-widget")
+    });
+    let mut replacements: Vec<(usize, usize, String)> = Vec::new();
+    for widget in widgets.iter().take(12) {
+        let open = &html[widget.start..widget.inner_start];
+        let Some(data_src) = attr_value(open, "data-src") else {
+            continue;
+        };
+        let Some(cap) = src_re.captures(&data_src) else {
+            continue;
+        };
+        let embed_url = format!("https://flo.uri.sh/visualisation/{}/embed", &cap[1]);
+        // Python fetches the embed with the article as Referer.
+        let Ok(mut resp) = crate::http::agent()
+            .get(&embed_url)
+            .header("Referer", url)
+            .call()
+        else {
+            continue;
+        };
+        let Ok(bytes) = resp.body_mut().read_to_vec() else {
+            continue;
+        };
+        if bytes.len() > 8_000_000 {
+            continue;
+        }
+        let embed_html = String::from_utf8_lossy(&bytes).to_string();
+        let tables = find_elements(&embed_html, Some("table"), &|_| true);
+        if tables.is_empty() {
+            continue;
+        }
+        let container: String = tables
+            .iter()
+            .map(|t| embed_html[t.start..t.end].to_string())
+            .collect::<Vec<_>>()
+            .join("");
+        // Replace the sdc-article-widget wrapper when the widget
+        // sits inside one (trafilatura discards that wrapper).
+        let target = wrappers
+            .iter()
+            .filter(|w| w.start <= widget.start && widget.end <= w.end)
+            .min_by_key(|w| w.end - w.start)
+            .map(|w| (w.start, w.end))
+            .unwrap_or((widget.start, widget.end));
+        replacements.push((target.0, target.1, container));
+    }
+    if replacements.is_empty() {
+        return html.to_string();
+    }
+    replacements.sort_by_key(|r| r.0);
+    replacements.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
+    let mut out = String::with_capacity(html.len());
+    let mut cursor = 0usize;
+    for (start, end, replacement) in replacements {
+        if start < cursor {
+            continue;
+        }
+        out.push_str(&html[cursor..start]);
+        out.push_str(&replacement);
+        cursor = end;
+    }
+    out.push_str(&html[cursor..]);
+    out
+}
+
+// --- NPR text edition (Python core/npr.py download_text_only_html) ---
+
+/// Fetch NPR's own text-only edition of a story and strip the
+/// content-free "Related Story: NPR" insets it renders.
+pub fn npr_text_edition_html(url: &str) -> Option<String> {
+    let story_id = crate::sources::npr_story_id(url)?;
+    let (bytes, _final) = fetch_page_bytes(&format!("https://text.npr.org/{story_id}"), "").ok()?;
+    let html = String::from_utf8_lossy(&bytes).to_string();
+    static STUB_RE: OnceLock<Regex> = OnceLock::new();
+    let stub_re = STUB_RE.get_or_init(|| {
+        Regex::new(r"(?is)<hr[^>]*>\s*Related Story:\s*<a[^>]*>.*?</a>\s*<hr[^>]*>").unwrap()
+    });
+    Some(stub_re.replace_all(&html, "").to_string())
+}
+
+pub(crate) fn is_google_news_url(url: &str) -> bool {
+    let host = host_of(url);
+    if host != "news.google.com" && host != "www.news.google.com" {
+        return false;
+    }
+    let path = url_path_lower(url);
+    path.starts_with("/articles/") || path.starts_with("/read/")
+}
+
 /// Fetch a page and extract its full text, running Python's
 /// fallback chain when the direct fetch is gated or empty.
 /// Returns the outcome plus the direct-fetch HTML when there
@@ -2044,17 +2629,148 @@ pub fn fetch_full_text_opts(
             None,
         );
     }
+    // Direct media URLs (Batch 35b, Python extract_full_article):
+    // an MP3's show notes live in its ID3 tag; other media has no
+    // webpage text at all, so callers fall back to feed content.
+    if looks_like_media_url(url) {
+        if looks_like_id3_media_url(url)
+            && let Some((title, _author, content)) = id3_metadata(url)
+        {
+            let text = html_to_text(&content);
+            if !text.trim().is_empty() {
+                return (
+                    ExtractOutcome::Article {
+                        title,
+                        text,
+                        source: "id3",
+                    },
+                    None,
+                );
+            }
+        }
+        return (ExtractOutcome::Empty, None);
+    }
+    // YouTube watch pages: the structured reconstruction beats the
+    // progressively-hydrated HTML (Python youtube_fulltext); a
+    // failure is reported, not scraped boilerplate.
+    if crate::ytfull::is_youtube_video_url(url) {
+        return match crate::ytfull::extract_article(url) {
+            Some((title, _author, text)) => (
+                ExtractOutcome::Article {
+                    title,
+                    text,
+                    source: "youtube",
+                },
+                None,
+            ),
+            None => (
+                ExtractOutcome::Gate {
+                    reason: "Could not retrieve YouTube video details.".to_string(),
+                },
+                None,
+            ),
+        };
+    }
+    // Google News links are signed redirects: resolve through the
+    // Jina proxy, which renders the redirect server-side (Python's
+    // local decoder rides the curl_cffi impersonation transport —
+    // a documented non-port).
+    if is_google_news_url(url) {
+        if let Some(text) = fetch_via_jina_text(url)
+            && text.chars().count() >= 200
+        {
+            return (
+                ExtractOutcome::Article {
+                    title: String::new(),
+                    text,
+                    source: "jina",
+                },
+                None,
+            );
+        }
+        return (
+            ExtractOutcome::Gate {
+                reason: "Could not resolve the Google News link to its publisher page.".to_string(),
+            },
+            None,
+        );
+    }
     let mut first_html: Option<String> = None;
+    // NPR stories: NPR's own text edition is the better source and
+    // sits outside the TollBit gate (Python routes fetches to it).
+    if let Some(html) = npr_text_edition_html(url) {
+        let outcome = extract_article_opts(&html, url, feed_text, keep_alt);
+        if matches!(outcome, ExtractOutcome::Article { .. }) {
+            let outcome = match outcome {
+                ExtractOutcome::Article { title, text, .. } => ExtractOutcome::Article {
+                    title,
+                    text,
+                    source: "npr",
+                },
+                other => other,
+            };
+            return (outcome, Some(html));
+        }
+    }
     let direct = fetch_page_bytes(url, cookie_header)
         .map(|(bytes, ct)| decode_bytes(&bytes, &ct, encoding_override));
     let mut direct_outcome: Option<ExtractOutcome> = None;
     let mut gate_seen = false;
     if let Ok(html) = &direct {
         first_html = Some(html.clone());
-        let outcome = extract_article_opts(html, url, feed_text, keep_alt);
+        let expanded = expand_sky_flourish_tables(html, url);
+        let outcome = extract_article_opts(&expanded, url, feed_text, keep_alt);
         gate_seen = matches!(outcome, ExtractOutcome::Gate { .. });
-        if matches!(outcome, ExtractOutcome::Article { .. }) {
-            return (outcome, first_html);
+        if let ExtractOutcome::Article {
+            title,
+            text,
+            source,
+        } = outcome
+        {
+            // Multi-page following + the metered-preview notice
+            // (Python's extract_full_article main loop).
+            let mut texts = vec![text];
+            let mut cur_html = expanded;
+            let mut cur_url = url.to_string();
+            let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+            visited.insert(url.to_string());
+            for _ in 0..5 {
+                let Some(next) = find_next_page(&cur_html, &cur_url) else {
+                    break;
+                };
+                if !visited.insert(next.clone()) {
+                    break;
+                }
+                let Ok((bytes, ct)) = fetch_page_bytes(&next, cookie_header) else {
+                    break;
+                };
+                let page_html = decode_bytes(&bytes, &ct, encoding_override);
+                let page_html = expand_sky_flourish_tables(&page_html, &next);
+                match extract_article_opts(&page_html, &next, None, keep_alt) {
+                    ExtractOutcome::Article { text: t2, .. } if !t2.trim().is_empty() => {
+                        texts.push(t2);
+                        cur_html = page_html;
+                        cur_url = next;
+                    }
+                    _ => break,
+                }
+            }
+            let mut merged = if texts.len() > 1 {
+                merge_texts(&texts)
+            } else {
+                texts.into_iter().next().unwrap_or_default()
+            };
+            if looks_like_metered_preview(html) {
+                merged = format!("{}\n\n{}", merged.trim_end(), metered_preview_notice());
+            }
+            return (
+                ExtractOutcome::Article {
+                    title,
+                    text: merged,
+                    source,
+                },
+                first_html,
+            );
         }
         direct_outcome = Some(outcome);
     }

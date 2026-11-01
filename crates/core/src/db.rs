@@ -17,6 +17,10 @@ pub struct Feed {
     pub icon_url: Option<String>,
 }
 
+/// One hosted-media cache row: (media_url, media_type,
+/// checked_at epoch); NULL media is a recorded miss.
+pub type HostedMediaCache = (Option<String>, Option<String>, i64);
+
 /// One chapter mark (chapters table; start in seconds).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Chapter {
@@ -107,6 +111,12 @@ CREATE TABLE IF NOT EXISTS youtube_recommendations (
     is_favorite INTEGER NOT NULL DEFAULT 0,
     is_deleted INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (account, video_id));
+CREATE TABLE IF NOT EXISTS youtube_history_state (
+    feed_id TEXT PRIMARY KEY, state INTEGER NOT NULL DEFAULT 0,
+    attempted_at INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS hosted_article_media (
+    cache_key TEXT PRIMARY KEY, media_url TEXT, media_type TEXT,
+    checked_at INTEGER NOT NULL DEFAULT 0);
 ";
 
 /// Columns Python added to existing tables by migration; older
@@ -469,6 +479,89 @@ impl Db {
         self.conn.execute(
             "UPDATE articles SET media_url = ?1, media_type = ?2 WHERE id = ?3",
             params![url, media_type, article_id],
+        )?;
+        Ok(())
+    }
+
+    /// Total stored articles for one feed (listing caps split on
+    /// initial vs refresh by whether anything is stored yet).
+    pub fn article_count_for_feed(&self, feed_id: &str) -> rusqlite::Result<i64> {
+        self.conn.query_row(
+            "SELECT COUNT(*) FROM articles WHERE feed_id = ?1",
+            params![feed_id],
+            |row| row.get(0),
+        )
+    }
+
+    /// YouTube channel history-backfill state for a feed:
+    /// (state, attempted_at epoch). State 2 = done (Python
+    /// `db._YOUTUBE_HISTORY_DONE`); 1 = attempted, retry after a day.
+    pub fn youtube_history_state(&self, feed_id: &str) -> rusqlite::Result<(i64, i64)> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT state, attempted_at FROM youtube_history_state WHERE feed_id = ?1")?;
+        let mut rows = stmt.query_map(params![feed_id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        match rows.next() {
+            Some(r) => Ok(r?),
+            None => Ok((0, 0)),
+        }
+    }
+
+    pub fn set_youtube_history_state(
+        &self,
+        feed_id: &str,
+        state: i64,
+        attempted_at: i64,
+    ) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT INTO youtube_history_state (feed_id, state, attempted_at) \
+             VALUES (?1, ?2, ?3) ON CONFLICT(feed_id) DO UPDATE SET \
+             state = excluded.state, attempted_at = excluded.attempted_at",
+            params![feed_id, state, attempted_at],
+        )?;
+        Ok(())
+    }
+
+    /// Hosted-provider media resolved client-side (NPR program
+    /// feeds carry no enclosure; Python's HostedArticleMediaMixin).
+    /// Returns (media_url, media_type, checked_at epoch) when a row
+    /// exists — a row with NULL media is a recorded miss.
+    pub fn hosted_article_media(
+        &self,
+        cache_key: &str,
+    ) -> rusqlite::Result<Option<HostedMediaCache>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT media_url, media_type, checked_at FROM hosted_article_media \
+             WHERE cache_key = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![cache_key], |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+        match rows.next() {
+            Some(r) => Ok(Some(r?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn set_hosted_article_media(
+        &self,
+        cache_key: &str,
+        media_url: Option<&str>,
+        media_type: Option<&str>,
+        checked_at: i64,
+    ) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT INTO hosted_article_media (cache_key, media_url, media_type, checked_at) \
+             VALUES (?1, ?2, ?3, ?4) ON CONFLICT(cache_key) DO UPDATE SET \
+             media_url = excluded.media_url, media_type = excluded.media_type, \
+             checked_at = excluded.checked_at",
+            params![cache_key, media_url, media_type, checked_at],
         )?;
         Ok(())
     }

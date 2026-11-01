@@ -946,3 +946,84 @@ fallback chain; a libVLC engine port (garkimasera/vlc-rs,
 maintained as of 2026-10) behind the same player window is
 the parity endgame and its own batch — it also decides the
 vlc-knob and preferred_soundcard residuals above.
+
+Batch 35 resolution (v0.1.35): the source-feed family is
+ported in `crates/core/src/sources.rs`. Scope correction
+first: Python's `core/github_source.py` is NOT a refresh
+subscription type (nothing in the provider refresh path
+references it) — it is the extractor's GitHub page
+reconstruction, ported under Batch 35b. NPR and Sky are
+likewise media attach inside the generic parse path, not
+listing sources. The listing family in refresh, mirroring
+the branch order of `providers/local.py::_refresh_single_feed`:
+Odysee (yt-dlp info document, listing title from the info,
+caps 150 initial / 60 refresh), Rumble (HTML listing scrape
+over the extractor's balanced scanner, 3/1 pages, feed URL
+normalized and persisted back to the feeds row — Odysee
+normalization persists the same way), YouTube search
+(yt-dlp flat listing, uuid5 article ids), SoundCloud
+(api-v2 with a client_id scraped from SoundCloud's own web
+assets, yt-dlp fallback), Mixcloud (public API with paging),
+Google Groups (row scrape; the permission-denied page
+returns Python's exact sign-in error), and Groups.io search
+(topic scrape with DisplayShortTime nanosecond dates,
+next-page following). YouTube channel feeds gain the
+uploads-playlist fallback (issue #107) and the one-time
+history backfill (issue #109), both under the stable
+`yt:video:<id>` ids Python uses. NPR audio attach (embed
+player first, then story-page candidates) and Sky Podfollow
+audio attach run inside `store_parsed` for new articles and
+through `attach_hosted_npr_media` for hosted providers,
+with the `hosted_article_media` cache table (6-hour miss
+retry, 8 resolutions per call) and the
+`youtube_history_state` table added to the schema.
+Discovery maps all of these subscription shapes to their
+canonical URLs. Regression: batch35_slice (9 tests —
+classifiers, normalization, uuid5 against CPython values,
+listing parses, Db roundtrip).
+
+Batch 35b resolution (v0.1.35): the rich-reader and
+extraction residuals from Audit 4 are ported. Multi-page
+following now runs in both readers: the text cascade
+follows up to 6 pages with Python's `_find_next_page`
+(link rel=next, then anchor rel=next, then labelled
+anchors; the next-story guard, the per-host
+no-pagination-follow list, and social-target skipping all
+ported), merging with a faithful `_merge_texts` (paragraph
+dedupe on the whitespace-collapsed lowercase key, sub-25
+lines kept and outside the dedupe set, linearized table
+blocks moved as units on the real marker regex, structure
+markers bypassing dedupe) and appending the
+metered-preview notice when page 1 carries the marker; the
+rich reader follows the same chain, cleaning each page and
+deduping whole pages by normalized text. YouTube watch
+pages reconstruct through `crates/core/src/ytfull.rs`
+(yt-dlp -J with the comments extractor args): Description,
+Chapters (info chapters, else the description timestamp
+grammar with the 3-line floor), Subtitles (ranked track
+selection, cue text only, speaker chevrons stripped), and
+Comments as parent/reply trees — in the text reader
+directly and in the rich reader as section HTML with
+16,384-char accessible chunks. Direct media URLs resolve
+their ID3v2 show notes (bounded prefix read, v2.3/v2.4
+frame parsing, USLT/COMM/TXXX candidates, longest wins);
+the rich reader keeps the sanitized ID3 HTML. Google News
+article URLs route to the Jina read-proxy before the
+cascade and fail closed when it returns nothing (the local
+signed decoder rides curl_cffi impersonation — the
+documented rquest non-port). GitHub page reconstruction
+gains commit, release, and discussion documents in
+`threads.rs`; a repo discussion the REST API cannot serve
+falls back to the server-rendered page scrape, as Python's
+does. The article window gains Python's rich mode: with
+`full_text_rich_view` on it renders the rich article on a
+worker and offers the "Show in HTML view" switch between
+the WebView and the text reader. One scanner fix rides
+along: `tag_tokens` now treats HTML void elements as
+self-closing — a bare `<link rel="next">` previously made
+the balanced scanner hunt for a close tag that does not
+exist and abandon the document, which is what blocked
+link-based pagination. Regression: batch35b_slice
+(13 tests — pagination forms and guards, merge semantics,
+metered marker, ID3 v2.3/v2.4 fixtures, comment trees,
+GitHub classification).

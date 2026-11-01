@@ -1168,16 +1168,92 @@ fn feed_fallback_html(fallback_html: &str, url: &str) -> String {
         .collect()
 }
 
+/// Split a large text leaf at readable boundaries without losing
+/// bytes (Python `_accessible_text_chunks`, 16,384-char leaves).
+fn accessible_text_chunks(text: &str) -> Vec<String> {
+    const LIMIT: usize = 16_384;
+    let chars: Vec<char> = text.chars().collect();
+    let mut chunks = Vec::new();
+    let mut rest: &[char] = &chars;
+    while rest.len() > LIMIT {
+        // Find the best cut: paragraph break, newline, then space,
+        // at or before the limit and at least halfway in.
+        let window: String = rest[..=LIMIT.min(rest.len() - 1)].iter().collect();
+        let cut = match window.rfind("\n\n") {
+            Some(c) if c >= LIMIT / 2 => c + 2,
+            _ => match window.rfind('\n') {
+                Some(c) if c >= LIMIT / 2 => c + 1,
+                _ => match window.rfind(' ') {
+                    Some(c) if c >= LIMIT / 2 => c + 1,
+                    _ => LIMIT,
+                },
+            },
+        };
+        let cut = cut.min(rest.len());
+        chunks.push(rest[..cut].iter().collect::<String>());
+        rest = &rest[cut..];
+    }
+    if !rest.is_empty() || chunks.is_empty() {
+        chunks.push(rest.iter().collect::<String>());
+    }
+    chunks
+}
+
+/// Turn shared YouTube text into a small, complete rich-reader DOM
+/// (Python `_structured_youtube_text_html`): the four navigable
+/// section headings, content in moderately sized text leaves.
+fn structured_youtube_html(text: &str) -> String {
+    let is_heading = |b: &str| -> bool {
+        b == "Description"
+            || b == "Chapters"
+            || b == "Comments"
+            || b == "Subtitles"
+            || (b.starts_with("Subtitles (") && b.ends_with(')'))
+    };
+    let blocks: Vec<&str> = text
+        .split("\n\n")
+        .map(|b| b.trim())
+        .filter(|b| !b.is_empty())
+        .collect();
+    let mut sections: Vec<(String, Vec<String>)> = Vec::new();
+    let mut heading = String::new();
+    let mut content: Vec<String> = Vec::new();
+    for block in blocks {
+        if is_heading(block) {
+            if !heading.is_empty() {
+                sections.push((heading.clone(), content));
+                content = Vec::new();
+            }
+            heading = block.to_string();
+        } else {
+            content.push(block.to_string());
+        }
+    }
+    if !heading.is_empty() {
+        sections.push((heading, content));
+    }
+    let mut out = String::new();
+    for (section_heading, section_content) in sections {
+        out.push_str(&format!("<h2>{}</h2>", esc_text(&section_heading)));
+        let joined = section_content.join("\n\n");
+        for chunk in accessible_text_chunks(&joined) {
+            out.push_str(&format!(
+                "<div class=\"awv-youtube-section\" style=\"white-space: pre-wrap\">{}</div>",
+                esc_text(&chunk)
+            ));
+        }
+    }
+    out
+}
+
 /// Fetch `url` and return a full rich-reader HTML fragment (header +
 /// body), falling back to cleaned feed content when the page can't be
 /// fetched or yields no usable body. Returns None only when there is
 /// nothing at all to show. The returned `<article>` carries a `lang`
-/// attribute resolved by issue #72's priority order.
-///
-/// Not ported from Python's render (PARITY residuals): the YouTube
-/// structured-text special case, the ID3 show-notes path, the Google
-/// News proxy path, the metered-preview notice, and multi-page
-/// following (the Rust text cascade is single-page too).
+/// attribute resolved by issue #72's priority order. Batch 35b ported
+/// Python's remaining render paths: the YouTube structured-text
+/// special case, the ID3 show-notes path, the Google News proxy
+/// fallback, the metered-preview notice, and multi-page following.
 #[allow(clippy::too_many_arguments)]
 pub fn render_rich_article(
     url: &str,
@@ -1195,12 +1271,43 @@ pub fn render_rich_article(
     let author = fallback_author.to_string();
     let mut body = String::new();
     let mut page_lang: Option<String> = None;
+    let mut metered_preview = false;
 
+    // Direct podcast enclosure (Batch 35b): preserve links from the
+    // bounded embedded ID3 show notes (Python article_html).
     if !url.is_empty()
+        && crate::extract::looks_like_id3_media_url(url)
+        && fallback_html.trim().is_empty()
+        && let Some((t, _a, content)) = crate::extract::id3_metadata(url)
+    {
+        if title.is_empty() {
+            title = t;
+        }
+        body = clean_article_html(&content, url, false);
+    }
+
+    // YouTube watch pages: the same structured reconstruction as
+    // classic full text, wrapped as section HTML (Python
+    // _structured_youtube_text_html).
+    if body.is_empty()
+        && !url.is_empty()
+        && !crate::extract::looks_like_media_url(url)
+        && crate::ytfull::is_youtube_video_url(url)
+        && let Some((t, _a, text)) = crate::ytfull::extract_article(url)
+    {
+        if title.is_empty() {
+            title = t;
+        }
+        body = structured_youtube_html(&text);
+    }
+
+    if body.is_empty()
+        && !url.is_empty()
         && let Ok((bytes, content_type)) = fetch_page_bytes(url, cookie_header)
     {
         let page_html = crate::extract::decode_bytes(&bytes, &content_type, "");
         page_lang = crate::article_lang::lang_from_page_html(&page_html);
+        metered_preview = crate::extract::looks_like_metered_preview(&page_html);
         if title.is_empty() {
             let (t, _) = extract_focus(
                 &page_html,
@@ -1208,7 +1315,60 @@ pub fn render_rich_article(
             );
             title = t;
         }
-        body = clean_article_html(&page_html, url, true);
+        // Sky Flourish + GSMArena expansions, then multi-page
+        // following with whole-page dedupe (Python's page loop).
+        let expanded = crate::extract::expand_sky_flourish_tables(&page_html, url);
+        let expanded = crate::extract::normalize_gsmarena_battery_table_html(&expanded, url);
+        let mut body_parts: Vec<String> = Vec::new();
+        let mut seen_sigs: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let first_body = clean_article_html(&expanded, url, true);
+        if !first_body.is_empty() {
+            seen_sigs.insert(norm(&leaf_text(&first_body)));
+            body_parts.push(first_body);
+        }
+        let mut cur_html = page_html;
+        let mut cur_url = url.to_string();
+        let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+        visited.insert(url.to_string());
+        for _ in 0..5 {
+            let Some(next) = crate::extract::find_next_page(&cur_html, &cur_url) else {
+                break;
+            };
+            if !visited.insert(next.clone()) {
+                break;
+            }
+            let Ok((b2, ct2)) = fetch_page_bytes(&next, cookie_header) else {
+                break;
+            };
+            let h2 = crate::extract::decode_bytes(&b2, &ct2, "");
+            let e2 = crate::extract::expand_sky_flourish_tables(&h2, &next);
+            let e2 = crate::extract::normalize_gsmarena_battery_table_html(&e2, &next);
+            let page_body = clean_article_html(&e2, &next, true);
+            if !page_body.is_empty() {
+                let sig = norm(&leaf_text(&page_body));
+                if !sig.is_empty() && seen_sigs.insert(sig) {
+                    body_parts.push(page_body);
+                }
+            }
+            cur_html = h2;
+            cur_url = next;
+        }
+        body = body_parts.concat();
+    }
+
+    // Blocked/unresolvable Google News: fall back to the read-proxy
+    // rendering (text only) so the article still shows.
+    if body.is_empty()
+        && !url.is_empty()
+        && crate::extract::is_google_news_url(url)
+        && let Some(text) = crate::extract::fetch_via_jina_text(url)
+        && !text.trim().is_empty()
+    {
+        body = text
+            .split("\n\n")
+            .map(|p| format!("<p>{}</p>", esc_text(p.trim())))
+            .collect::<Vec<_>>()
+            .join("");
     }
 
     // Some publishers serve a truncated page but syndicate the complete
@@ -1222,12 +1382,24 @@ pub fn render_rich_article(
             if (feed_len as f64) > body_len as f64 * 1.25 {
                 let embeds = harvest_embeds(&body);
                 body = format!("{feed_body}{embeds}");
+                // The feed carried more than the page did, so the
+                // free-excerpt notice no longer applies.
+                metered_preview = false;
             }
         }
     }
 
     if body.is_empty() {
         body = feed_fallback_html(fallback_html, url);
+        metered_preview = false;
+    }
+    // Metered publishers serve a few paragraphs and withhold the
+    // rest; say so instead of letting the story stop mid-report.
+    if metered_preview && !body.is_empty() {
+        body = format!(
+            "{body}<p class=\"awv-notice\">{}</p>",
+            esc_text(crate::extract::metered_preview_notice())
+        );
     }
     assemble_rich(
         &body,

@@ -50,6 +50,7 @@ pub mod shortcuts;
 pub mod shortcuts_data;
 pub mod silence;
 pub mod single_instance;
+pub mod sources;
 pub mod sponsorblock;
 pub mod takeout;
 pub mod threads;
@@ -58,6 +59,7 @@ pub mod translation_updates;
 pub mod user_agents;
 pub mod videosearch;
 pub mod youtube_account;
+pub mod ytfull;
 
 pub use db::{Article, Category, Chapter, Db, Feed, PlaybackState};
 pub use extract::{ExtractOutcome, extract_article};

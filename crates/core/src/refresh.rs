@@ -61,6 +61,25 @@ pub fn store_parsed(
             .map_err(|e| format!("store failed: {e}"))?
         {
             inserted += 1;
+            // NPR / Sky media attach (Python's generic parse path):
+            // those program feeds ship no enclosure, so resolve the
+            // audio for media-less new articles at store time.
+            if article.media_url.is_none() {
+                let attach = if crate::sources::is_npr_url(&article.url) {
+                    crate::sources::npr_audio(&article.url)
+                } else if crate::sources::is_sky_news_url(&article.url) {
+                    crate::sources::sky_podcast_audio(
+                        &article.url,
+                        &article.title,
+                        &entry.content_text,
+                    )
+                } else {
+                    None
+                };
+                if let Some((mu, mt)) = attach {
+                    let _ = db.update_article_media(&article.id, &mu, Some(&mt));
+                }
+            }
             if !rules.is_empty() {
                 apply_filter_pipeline(db, &rules, &article, &parsed.title);
             }
@@ -103,8 +122,116 @@ fn apply_filter_pipeline(
 
 /// Refresh one feed; returns how many new articles were stored.
 pub fn refresh_feed(db: &Db, feed: &Feed) -> Result<usize, String> {
-    let parsed = fetch_and_parse(&feed.url)?;
-    store_parsed(db, feed, &parsed)
+    // Listing sources (Batch 35): subscriptions with no native RSS
+    // are enumerated by their source fetcher, mirroring the branch
+    // order of Python `providers/local.py::_refresh_single_feed`.
+    if let Some(kind) = crate::sources::classify(&feed.url) {
+        // Python persists a normalized listing URL back into the
+        // feeds row at refresh (the Rumble and Odysee branches of
+        // `_refresh_single_feed` run `UPDATE feeds SET url`).
+        let normalized = match kind {
+            crate::sources::SourceKind::Odysee => {
+                Some(crate::sources::normalize_odysee_url(&feed.url))
+            }
+            crate::sources::SourceKind::Rumble => {
+                Some(crate::sources::normalize_rumble_feed_url(&feed.url))
+            }
+            _ => None,
+        };
+        let mut feed_owned: Option<Feed> = None;
+        if let Some(n) = normalized
+            && n != feed.url
+        {
+            let _ = db.update_feed(&feed.id, None, Some(&n));
+            let mut f = feed.clone();
+            f.url = n;
+            feed_owned = Some(f);
+        }
+        let feed = feed_owned.as_ref().unwrap_or(feed);
+        let existing = db.article_count_for_feed(&feed.id).unwrap_or(0);
+        let (title, items) = crate::sources::fetch_listing(&feed.url, kind, &feed.id, existing)?;
+        let parsed = crate::feeds::ParsedFeed {
+            title,
+            entries: crate::sources::items_to_entries(items),
+        };
+        return store_parsed(db, feed, &parsed);
+    }
+    let parsed = match fetch_and_parse(&feed.url) {
+        Ok(p) => p,
+        Err(e) => {
+            // YouTube channel feeds answer 404/500 at random for
+            // some channels (issue #107): fall back to listing the
+            // uploads playlist through yt-dlp.
+            if let Some(cid) = crate::sources::youtube_channel_id(&feed.url) {
+                let (title, items) =
+                    crate::sources::fetch_youtube_channel_items(&cid, 30).map_err(|_| e.clone())?;
+                let parsed = crate::feeds::ParsedFeed {
+                    title,
+                    entries: crate::sources::items_to_entries(shape_stable_ids(db, feed, items)),
+                };
+                return store_parsed(db, feed, &parsed);
+            }
+            return Err(e);
+        }
+    };
+    let stored = store_parsed(db, feed, &parsed)?;
+    // One-time channel history backfill (issue #109): the RSS feed
+    // carries only the newest 15 uploads, so list the whole uploads
+    // playlist once and store it under the same stable ids.
+    if let Some(cid) = crate::sources::youtube_channel_id(&feed.url) {
+        youtube_history_backfill(db, feed, &cid);
+    }
+    Ok(stored)
+}
+
+/// Shape channel-listing items for storage: an id already owned by
+/// a DIFFERENT feed gets this feed's prefix (Python's rule), so two
+/// subscriptions to one channel never steal each other's rows.
+fn shape_stable_ids(
+    db: &Db,
+    feed: &Feed,
+    items: Vec<crate::sources::SourceItem>,
+) -> Vec<crate::sources::SourceItem> {
+    items
+        .into_iter()
+        .map(|mut it| {
+            if let Ok(Some(existing)) = db.article_by_id(&it.id)
+                && existing.feed_id != feed.id
+            {
+                it.id = format!("{}:{}", feed.id, it.id);
+            }
+            it
+        })
+        .collect()
+}
+
+fn youtube_history_backfill(db: &Db, feed: &Feed, channel_id: &str) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let (state, attempted) = db.youtube_history_state(&feed.id).unwrap_or((0, 0));
+    if state == 2 {
+        return; // done (Python's _YOUTUBE_HISTORY_DONE)
+    }
+    if state == 1 && now - attempted < 86_400 {
+        return; // failed attempt retries after a day
+    }
+    match crate::sources::fetch_youtube_channel_items(channel_id, 500) {
+        Ok((_title, items)) => {
+            let parsed = crate::feeds::ParsedFeed {
+                title: feed.title.clone(),
+                entries: crate::sources::items_to_entries(shape_stable_ids(db, feed, items)),
+            };
+            // History items are stored unread but are NOT new-item
+            // news: the count is deliberately discarded.
+            let _ = store_parsed(db, feed, &parsed);
+            let _ = db.set_youtube_history_state(&feed.id, 2, now);
+        }
+        Err(_) => {
+            let _ = db.set_youtube_history_state(&feed.id, 1, now);
+        }
+    }
 }
 
 /// Refresh every feed, collecting per-feed results. One feed failing

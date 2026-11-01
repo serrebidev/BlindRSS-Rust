@@ -105,6 +105,39 @@ pub fn social_feed_url(url: &str) -> Option<String> {
         return Some(format!("{scheme}://{host}{path_t}/rss"));
     }
 
+    // Source-feed family (Batch 35, Python discovery/local rules):
+    // Google Groups group pages and addresses become the canonical
+    // synthetic subscription; Groups.io group pages become the
+    // group's native RSS (search URLs stay synthetic — they are a
+    // listing source, handled by core::sources at refresh).
+    if let Some(u) = crate::sources::google_group_subscription_url(url) {
+        return Some(u);
+    }
+    if host == "groups.io" || host.ends_with(".groups.io") {
+        if crate::sources::groups_io_search(url).is_some() {
+            return Some(url.trim().to_string());
+        }
+        if let Some(u) = crate::sources::groups_io_feed_url(url) {
+            return Some(u);
+        }
+        return None;
+    }
+    // Rumble channel/search pages normalize to their listing form;
+    // the stored URL stays the listing page (a sources::classify
+    // source at refresh).
+    if host.contains("rumble.com") {
+        return Some(crate::sources::normalize_rumble_feed_url(url));
+    }
+    // Odysee pages subscribe as the listing URL with tracking
+    // parameters stripped.
+    if host.contains("odysee.com") || host.contains("lbry.tv") {
+        return Some(crate::sources::normalize_odysee_url(url));
+    }
+    // YouTube search pages subscribe as-is (a listing source).
+    if host.contains("youtube.com") && crate::sources::youtube_search_query(url).is_some() {
+        return Some(url.trim().to_string());
+    }
+
     // YouTube: /channel/<UC..> and /playlist?list=<id>
     if host.contains("youtube.com") {
         if parts.len() == 2 && parts[0] == "channel" && parts[1].starts_with("UC") {

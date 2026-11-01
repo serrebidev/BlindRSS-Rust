@@ -198,9 +198,12 @@ impl Provider for HostedProvider {
         self.db()?.feeds().map_err(|e| format!("{e}"))
     }
     fn articles(&self, feed_id: Option<&str>, limit: usize) -> Result<Vec<Article>, String> {
-        self.db()?
-            .articles(feed_id, limit)
-            .map_err(|e| format!("{e}"))
+        let db = self.db()?;
+        let mut articles = db.articles(feed_id, limit).map_err(|e| format!("{e}"))?;
+        // Hosted NPR attach: program feeds carry no enclosure, so
+        // resolve the audio client-side (cached in the Db).
+        crate::sources::attach_hosted_npr_media(&db, self.name, &mut articles);
+        Ok(articles)
     }
     fn mark_read(&self, article: &Article, read: bool) -> Result<(), String> {
         self.db()?

@@ -17,6 +17,7 @@ use std::cell::RefCell;
 use std::path::Path;
 use std::rc::Rc;
 use wxdragon::prelude::*;
+use wxdragon::widgets::webview::{WebView, WebViewBackend};
 
 /// (key, label) text fields, Python's TEXT_FIELDS order.
 const TEXT_FIELDS: [(&str, &str); 7] = [
@@ -817,6 +818,57 @@ pub fn show_article_window(title: &str, body: &str) {
     frame.set_sizer(sizer, true);
     frame.show(true);
     reader.set_focus();
+}
+
+/// Article window with a rich (HTML) view (Python's ArticleWindow):
+/// a "Show in HTML view" checkbox switches between the WebView
+/// rendering and the plain-text reader without closing the window.
+/// Falls back to the text-only window when no rich fragment is
+/// available or no WebView backend exists.
+pub fn show_article_window_rich(title: &str, body: &str, url: &str, rich_html: Option<String>) {
+    let rich_html = rich_html.filter(|h| !h.trim().is_empty());
+    if rich_html.is_none() || !WebView::is_backend_available(WebViewBackend::Default) {
+        show_article_window(title, body);
+        return;
+    }
+    let frame = Frame::builder()
+        .with_title(&format!("BlindRSS - {title}"))
+        .with_size(Size::new(760, 560))
+        .build();
+    let sizer = BoxSizer::builder(Orientation::Vertical).build();
+    let toggle = CheckBox::builder(&frame)
+        .with_label(&crate::tr("Show in &HTML view"))
+        .build();
+    toggle.set_name(&crate::tr("HTML view"));
+    toggle.set_value(true);
+    sizer.add(&toggle, 0, SizerFlag::All, 4);
+    let webview = WebView::builder(&frame).build();
+    webview.set_page(
+        &crate::rich_document(rich_html.as_deref().unwrap_or("")),
+        url,
+    );
+    sizer.add(&webview, 1, SizerFlag::Expand | SizerFlag::All, 4);
+    let reader = TextCtrl::builder(&frame)
+        .with_style(TextCtrlStyle::MultiLine | TextCtrlStyle::ReadOnly)
+        .build();
+    reader.set_value(body);
+    reader.show(false);
+    sizer.add(&reader, 1, SizerFlag::Expand | SizerFlag::All, 4);
+    frame.set_sizer(sizer, true);
+    frame.show(true);
+    let frame_t = frame;
+    toggle.on_toggled(move |e| {
+        let rich = e.is_checked();
+        webview.show(rich);
+        reader.show(!rich);
+        frame_t.layout();
+        if rich {
+            webview.set_focus();
+        } else {
+            reader.set_focus();
+        }
+    });
+    webview.set_focus();
 }
 
 /// Article change history (Python's on_view_article_history):

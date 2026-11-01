@@ -603,6 +603,9 @@ fn apply_http_config() {
             cfg.get_str("ytdlp_cookies_file", ""),
         );
         std::env::set_var("BLINDRSS_USER_AGENT", blindrss_core::http::user_agent());
+        // The resolved UI language for core consumers that rank by
+        // it (YouTube subtitle track selection in ytfull).
+        std::env::set_var("BLINDRSS_UI_LANGUAGE", ui_language());
         // Managed yt-dlp (dependency self-update installs into
         // <data_dir>/bin) wins over PATH when present and the
         // user has not pinned their own binary.
@@ -900,7 +903,7 @@ fn open_in_browser(url: &str) {
 /// document (Python's design), the cleaned fragment drops into the
 /// body, and the fragment's `<article lang="...">` carries the
 /// content language for assistive tech.
-fn rich_document(fragment: &str) -> String {
+pub(crate) fn rich_document(fragment: &str) -> String {
     format!(
         "<!DOCTYPE html><html><head><meta charset=\"utf-8\">\
          <style>body {{ font-family: sans-serif; line-height: 1.5; margin: 1em; }} \
@@ -1220,6 +1223,9 @@ enum RefreshMsg {
     ),
     /// Rich (WebView) full article: (article id, fragment if any).
     RichHtml(String, Option<String>),
+    /// Article window content with an optional rich fragment:
+    /// (title, text body, article URL, rich fragment if rendered).
+    ArticleWindowRich(String, String, String, Option<String>),
     /// yt-dlp resolution for playback: (stream URL, info if fetched).
     MediaReady(
         String,
@@ -4061,9 +4067,12 @@ fn main() {
         });
 
         // Article Window (Article menu): the selected article in
-        // its own window.
+        // its own window. With the rich view on, the window gets
+        // the HTML rendering too and offers Python's "Show in HTML
+        // view" switch; the render runs on a worker.
         let state_aw = state.clone();
         let frame_aw = frame;
+        let tx_aw = tx.clone();
         let act_article_window: Rc<dyn Fn()> = Rc::new(move || {
             let st = state_aw.borrow();
             let Some(article) = st
@@ -4084,7 +4093,45 @@ fn main() {
             } else {
                 body
             };
-            dialogs::show_article_window(&article.title, &body);
+            let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+            if cfg.get_bool("full_text_rich_view", false) {
+                let tx = tx_aw.clone();
+                let title = article.title.clone();
+                let url = article.url.clone();
+                let fallback = article
+                    .content
+                    .clone()
+                    .filter(|c| !c.trim().is_empty())
+                    .or_else(|| article.description.clone())
+                    .unwrap_or_default();
+                let author = article.author.clone().unwrap_or_default();
+                let date = article
+                    .date
+                    .clone()
+                    .unwrap_or_default()
+                    .split('T')
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                std::thread::spawn(move || {
+                    let jar = blindrss_core::cookies::load_jar_beside(&config_path());
+                    let header = blindrss_core::cookies::cookie_header_for(&jar, &url);
+                    let frag = blindrss_core::article_html::render_rich_article(
+                        &url,
+                        &fallback,
+                        &title,
+                        &author,
+                        &date,
+                        &header,
+                        "",
+                        "",
+                        &ui_language(),
+                    );
+                    let _ = tx.send(RefreshMsg::ArticleWindowRich(title, body, url, frag));
+                });
+            } else {
+                dialogs::show_article_window(&article.title, &body);
+            }
         });
 
         // Podcast Archive (Tools): pick a podcast feed, rescan
@@ -6799,6 +6846,9 @@ fn main() {
                                 }
                             }
                         }
+                    }
+                    Ok(RefreshMsg::ArticleWindowRich(title, body, url, frag)) => {
+                        dialogs::show_article_window_rich(&title, &body, &url, frag);
                     }
                     Ok(RefreshMsg::MediaReady(id, result)) => {
                         let mut st = state_tick.borrow_mut();
