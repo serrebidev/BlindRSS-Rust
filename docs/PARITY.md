@@ -1081,3 +1081,34 @@ batch36_slice (5 tests — segment math, header parsers,
 gate rules, and an offline end-to-end pass against a local
 origin proving the second read of a range costs no origin
 fetch).
+
+Audit 5 addendum (2026-11-01, after v0.1.36 — full report in
+docs/AUDIT-5-2026-11-01.md): a fresh mechanical + hand audit of
+Python v2.5.5 against this tree found fourteen confirmed items
+in neither this plan nor the code, now part of the plan: (1)
+FeedSearchDialog term search — Python searches 25 directory
+sources by name; the Rust dialog only resolves URLs (the §2
+row's "directory search missing" understates it and was never
+closed); (2) MSAA Direct Annotation control names (Python
+#131 — IAccPropServices names for tree/list/reader/player
+controls; Rust has none); (3) managed yt-dlp preference
+(Python #130 — find_ytdlp never consults the managed copy);
+(4) the empty-extraction 15-minute LRU and the escaped-markup
+unescape branch (Python #133/#134); (5) ytfull's language_match
+simplification vs Python #132 (zh script table, -orig strip,
+rank scale); (6) Miniflux targeted refresh (per-feed calls,
+workers, 5xx cooldown, soft deadline, force-skip + its six
+config keys); (7) the main-window full-text view cache
+(max_cached_views / cache_full_text); (8) article structure
+options (article_structure_* settings shaping reader
+linearization); (9) source listing caps as config keys (Batch
+35 hard-coded Python's defaults); (10) github_token and
+groups_io_api_key conditional paths; (11) per-channel HTTP
+headers for playback/casting (http_headers.py — decide with
+Batch 38); (12) article-window rich-view navigation policy;
+(13) the installed-browser cookie import consent gate
+(installed_browser_cookie_import_enabled); (14)
+installed-browser true-version UA detection. The report also
+warns that this file's §1/§2 tables and §5 lists are stale
+snapshots contradicting the resolution paragraphs in ~15
+places — the resolutions and Audit 5 govern.
