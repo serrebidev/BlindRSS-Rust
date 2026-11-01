@@ -325,7 +325,14 @@ fn eq_wrap(url: &str, cfg: &blindrss_core::config::Config) -> String {
 /// then a live ffmpeg transcode of the URL. Returns which
 /// path loaded: "" direct, "proxy", "ffmpeg", or "failed".
 fn load_with_fallbacks(media: &MediaCtrl, url: &str) -> &'static str {
-    if media.load_uri(url) {
+    // The primary load goes through the range cache when the
+    // Python gate says so (Batch 36): it serves a truthful
+    // Content-Length and real 206 ranges from a disk cache, so
+    // the backend neither clamps seeks to a wrong duration nor
+    // re-streams bytes it already fetched.
+    let cfg = blindrss_core::config::Config::load(&crate::config_path()).unwrap_or_default();
+    let primary = blindrss_core::rangecache::maybe_range_cache_url(url, &[], false, None, &cfg);
+    if media.load_uri(&primary) {
         return "";
     }
     if url.starts_with("http://") || url.starts_with("https://") {

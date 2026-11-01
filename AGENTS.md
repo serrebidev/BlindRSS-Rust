@@ -184,8 +184,19 @@ Python `core/casting.py`, in that order.
 - `proxy.rs`: the local media proxy. `/stream` serves progressively in
   chunks (never buffer a whole file before the first byte); `/play`
   transcodes through ffmpeg to MP3 for backends that refuse podcast
-  CDN URLs. The full range-cache port (Python `range_cache_proxy.py`)
-  is an open residual in PARITY.md.
+  CDN URLs.
+- `rangecache.rs`: the range-cache proxy (Python
+  `core/range_cache_proxy.py`, Batch 36). A second, loopback-only
+  listener serves /media?id=<sid> from an on-disk segment cache whose
+  layout is byte-for-byte Python's (sha256 URL directories,
+  zero-padded chunk files, mappings/), so both apps share one cache
+  directory. Entries probe once (single-flight; handlers wait via
+  await_probe rather than answering without the real total), stream
+  misses from the origin while caching them, re-resolve expired
+  signed URLs and retry once, and a background downloader fills from
+  the play head. `maybe_range_cache_url` is the player gate (Python
+  `_maybe_range_cache_url`): the player's primary load goes through
+  it, the /stream and /play fallbacks stay behind it.
 - `dependency.rs`: external tool resolution and installation
   (yt-dlp, ffmpeg, ffprobe). Detection order: user-chosen path from
   Settings, then the managed runtime copy, then PATH, then known

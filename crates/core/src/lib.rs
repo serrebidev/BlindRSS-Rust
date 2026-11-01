@@ -42,6 +42,7 @@ pub mod postprocess;
 pub mod provider;
 pub mod providers;
 pub mod proxy;
+pub mod rangecache;
 pub mod raop;
 pub mod refresh;
 pub mod retention;

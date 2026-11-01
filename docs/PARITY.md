@@ -1027,3 +1027,57 @@ link-based pagination. Regression: batch35b_slice
 (13 tests — pagination forms and guards, merge semantics,
 metered marker, ID3 v2.3/v2.4 fixtures, comment trees,
 GitHub classification).
+
+Batch 36 resolution (v0.1.36): the general range-cache
+proxy is ported as `crates/core/src/rangecache.rs`
+(Python `core/range_cache_proxy.py`, ~2,000 lines). A
+second loopback-only listener serves /health, /health-split
+and /media?id=<sid>; entries probe the origin once with a
+one-byte range request (single-flight, with Python's
+await_probe waits — 3 s, then up to 20 s more while the
+total is unknown, because answering the player without the
+real total makes it adopt the served window as the whole
+file), learn the total length / range support / final URL,
+and then serve byte ranges from an on-disk segment cache
+whose layout is byte-for-byte Python's (`<sha256(url)>`
+directory, `<start:012>-<end:012>.bin` chunks,
+`mappings/<sid>.json`), so the two apps share a cache
+directory safely. Cache misses stream from the origin
+while being written to disk; partial chunks over 4 KB are
+kept; a background downloader fills from the play head
+(bootstrap burst, seek following with the 2 MB abort
+window, 120 s idle stop); signed URLs that expire
+mid-playback are re-resolved from the original URL and the
+fetch retried once on transport errors and
+401/403/404/410; origins without range support (or an
+unknown total) are passed straight through with their own
+headers. The player gate is a faithful port of
+`_maybe_range_cache_url`: loopback, non-http(s) and .m3u8
+pass through; googlevideo and the podcast tracking hosts
+always proxy; otherwise `range_cache_enabled`,
+`range_cache_apply_all_hosts` and `range_cache_hosts`
+decide; the promodj Referer special case and the
+`can_deliver_body` machine check (via /health-split,
+cached 600 s positive / 120 s negative) are included; the
+primary player load now goes through the cache, with the
+existing /stream and /play fallbacks behind it. Recorded
+simplifications, not silent drops: the server is a
+process-lifetime listener rather than Python's restartable
+object (its port-reuse and restart-while-VLC-connected
+machinery exists to survive restarts this design never
+does); responses close per request like the rest of the
+local proxy; Python's split connect/read timeouts ride the
+dedicated agent's single 60 s timeout; the player's
+`prefetch_bytes` entry field is carried but, as in the
+current Python, read by no fetch path; the player's
+range-proxy retry counters belong to its VLC stall
+recovery and stay with the Batch 38 engine port, where
+the Rust watchdog already covers the same ground;
+playback headers and the pre-redirect original URL are
+accepted by the gate but the current player call site has
+neither to pass (no header plumbing exists in the Rust
+player yet — Batch 38 decides it). Regression:
+batch36_slice (5 tests — segment math, header parsers,
+gate rules, and an offline end-to-end pass against a local
+origin proving the second read of a range costs no origin
+fetch).
