@@ -895,6 +895,32 @@ when its text changes, and the per-second playback-state
 save (a Db::open + upsert on the UI thread every tick) is
 throttled to 5 s of actual position movement.
 
+Batch 33 resolution (v0.1.33, Brandon's order after the
+v0.1.30 verification found it): the feed_settings
+migration was not concurrency-safe. init_schema checked
+PRAGMA table_info and then ran ALTER TABLE outside any
+transaction, so two connections opening a not-yet-migrated
+database at once both saw the column missing and both
+added it — "duplicate column name", seen in the v0.1.30
+tag CI (batch27 test) and a real upgrade-day risk whenever
+the app and a worker open the database together after an
+update. Reproduced locally with 8 threads opening one
+fresh file (3 of 5 runs failed, on three different
+migration columns). Fix: init_schema now runs under
+BEGIN IMMEDIATE with a 5 s busy_timeout, so openers
+serialize and the check happens inside the write lock.
+Regression: batch32_slice (concurrent opens of one fresh
+DB, repeated opens) — 12 consecutive clean runs post-fix.
+Audit addendum: every CREATE TABLE/INDEX in the schema
+already uses IF NOT EXISTS, the migration loop is the only
+ALTER site in the codebase, and a panic-path sweep of both
+crates found no panic!/unreachable! in library or app
+code. This release also carries the previously unreleased
+Batch 31 (RAOP/FFI/update hardening) and Audit 5
+(data-safety: config preservation, staged-restore path,
+HLS/DASH enclosure playability) work — v0.1.31 and v0.1.32
+were tagged but never published, and are not re-tagged.
+
 Open residual (playback engine): Python's player is libVLC
 end to end (7,276-line gui/player.py: VLC caching knobs,
 preferred soundcard, resume_* family, HTTP header control).

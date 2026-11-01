@@ -201,6 +201,32 @@ impl Db {
     }
 
     fn init_schema(&self) -> rusqlite::Result<()> {
+        // Serialize schema init across connections. The
+        // migration loop below checks table_info and then
+        // ALTERs; outside a write transaction two openers of
+        // a not-yet-migrated file both see a column missing
+        // and both add it ("duplicate column name" — the
+        // v0.1.30 tag-CI failure, and a real upgrade-day
+        // crash risk when the app and a worker open the
+        // database together). BEGIN IMMEDIATE takes the write
+        // lock up front; busy_timeout makes the other opener
+        // wait instead of erroring.
+        self.conn.execute_batch("PRAGMA busy_timeout=5000;")?;
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = self.init_schema_locked();
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
+    }
+
+    fn init_schema_locked(&self) -> rusqlite::Result<()> {
         self.conn.execute_batch(SCHEMA)?;
         for (table, column, decl) in MIGRATION_COLUMNS {
             let mut stmt = self.conn.prepare(&format!("PRAGMA table_info({table})"))?;
