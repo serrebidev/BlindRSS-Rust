@@ -157,10 +157,30 @@ pub fn stream_url(url: &str) -> Result<String, String> {
 // ---------------------------------------------------------------------
 
 /// File extensions BlindRSS treats as directly playable media.
-pub const MEDIA_EXTENSIONS: [&str; 13] = [
+/// The stream manifests (HLS/DASH/MPEG-TS) belong here too: plenty
+/// of podcast and video hosts publish the episode as a playlist
+/// (`episode.m3u8`) instead of a plain audio file, and an enclosure
+/// the resolver does not recognise gets replaced by whatever other
+/// media item the feed carries (an episode image, usually).
+pub const MEDIA_EXTENSIONS: [&str; 16] = [
     ".mp3", ".m4a", ".m4b", ".aac", ".ogg", ".opus", ".wav", ".flac", ".mp4", ".m4v", ".webm",
-    ".mkv", ".mov",
+    ".mkv", ".mov", ".m3u8", ".mpd", ".ts",
 ];
+
+/// Stream MIME types that are playable without a media-file
+/// extension (HLS and DASH manifests, raw MPEG-TS).
+fn is_stream_mime(mime: &str) -> bool {
+    matches!(
+        mime,
+        "application/vnd.apple.mpegurl"
+            | "application/x-mpegurl"
+            | "audio/mpegurl"
+            | "audio/x-mpegurl"
+            | "application/dash+xml"
+            | "application/x-mpegts"
+            | "video/mp2t"
+    )
+}
 
 /// True when the URL path ends in a media file extension.
 pub fn is_media_file_url(url: &str) -> bool {
@@ -199,18 +219,25 @@ pub fn media_type_for_url(url: &str) -> Option<String> {
         "video/x-matroska"
     } else if path.ends_with(".mov") {
         "video/quicktime"
+    } else if path.ends_with(".m3u8") {
+        "application/vnd.apple.mpegurl"
+    } else if path.ends_with(".mpd") {
+        "application/dash+xml"
+    } else if path.ends_with(".ts") {
+        "video/mp2t"
     } else {
         return None;
     };
     Some(ty.to_string())
 }
 
-/// Python's direct-media test: an audio/video media type, or a
-/// media file extension on the URL.
+/// Python's direct-media test: an audio/video (or stream) media
+/// type, a media file extension, or a stream manifest extension on
+/// the URL.
 pub fn is_playable_media(url: &str, media_type: Option<&str>) -> bool {
     if let Some(t) = media_type {
         let t = t.trim().to_ascii_lowercase();
-        if t.starts_with("audio/") || t.starts_with("video/") {
+        if t.starts_with("audio/") || t.starts_with("video/") || is_stream_mime(&t) {
             return true;
         }
     }
@@ -453,4 +480,53 @@ pub fn resolve_for_play(
         return Err("No playable media found for this article".to_string());
     }
     Err("Article has no playable media".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hls_and_dash_enclosures_are_playable() {
+        // A podcast episode served as a playlist: no audio MIME, no
+        // familiar audio extension — it must still be playable, or
+        // the feed chooser falls back to the episode image.
+        assert!(is_playable_media(
+            "https://cdn.example.com/ep1.m3u8",
+            Some("application/vnd.apple.mpegurl")
+        ));
+        assert!(is_playable_media(
+            "https://cdn.example.com/ep1",
+            Some("application/x-mpegURL")
+        ));
+        assert!(is_playable_media(
+            "https://cdn.example.com/manifest.mpd",
+            Some("application/dash+xml")
+        ));
+        assert!(is_playable_media("https://cdn.example.com/ep1.m3u8", None));
+        assert!(is_playable_media("https://cdn.example.com/ep1.ts", None));
+        // An image enclosure is still not playable.
+        assert!(!is_playable_media(
+            "https://cdn.example.com/cover.jpg",
+            Some("image/jpeg")
+        ));
+    }
+
+    #[test]
+    fn stream_extensions_get_stream_types() {
+        assert_eq!(
+            media_type_for_url("https://cdn.example.com/ep1.m3u8").as_deref(),
+            Some("application/vnd.apple.mpegurl")
+        );
+        assert_eq!(
+            media_type_for_url("https://cdn.example.com/ep1.mpd?token=1").as_deref(),
+            Some("application/dash+xml")
+        );
+    }
+
+    #[test]
+    fn audio_extension_still_wins_over_query() {
+        assert!(is_media_file_url("https://cdn.example.com/a.mp3?x=1#t=5"));
+        assert!(!is_media_file_url("https://cdn.example.com/a.mp3x"));
+    }
 }

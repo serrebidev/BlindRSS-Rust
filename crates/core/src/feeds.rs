@@ -59,11 +59,10 @@ fn entry_from(e: &Entry) -> ParsedEntry {
             if fallback.is_none() {
                 fallback = Some((url.clone(), ctype.clone()));
             }
-            let playable = ctype
-                .as_deref()
-                .map(|t| t.starts_with("audio/") || t.starts_with("video/"))
-                .unwrap_or(false)
-                || crate::media::is_media_file_url(&url);
+            // One playable test for the feed chooser and the
+            // resolver: audio/video MIME, stream manifests, or a
+            // media extension on the URL.
+            let playable = crate::media::is_playable_media(&url, ctype.as_deref());
             if playable {
                 chosen = Some((url, ctype));
                 break 'scan;

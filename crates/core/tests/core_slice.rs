@@ -12,9 +12,21 @@ fn fixture(name: &str) -> PathBuf {
         .join(name)
 }
 
+/// A private copy of a fixture database. Opening the checked-in file
+/// directly is not read-only — `Db::open` runs the schema migration,
+/// which writes missing tables/indexes into it. That dirtied the
+/// working tree on every test run and, with two tests opening the
+/// same file at once, failed with SQLITE_READONLY.
+fn fixture_copy(name: &str, as_name: &str) -> PathBuf {
+    let tmp = std::env::temp_dir().join(as_name);
+    std::fs::copy(fixture(name), &tmp).unwrap();
+    tmp
+}
+
 #[test]
 fn reads_python_built_database() {
-    let db = Db::open(&fixture("sample.db")).expect("open fixture db");
+    let path = fixture_copy("sample.db", "blindrss_test_read.db");
+    let db = Db::open(&path).expect("open fixture db");
     let cats = db.categories().unwrap();
     assert_eq!(cats.len(), 1);
     assert_eq!(cats[0].title, "Tech");
@@ -28,6 +40,8 @@ fn reads_python_built_database() {
     assert!(articles[0].is_favorite);
     let bbc = db.articles(Some("feed-bbc"), 10).unwrap();
     assert_eq!(bbc.len(), 1);
+    drop(db);
+    std::fs::remove_file(&path).ok();
 }
 
 #[test]

@@ -125,29 +125,51 @@ pub fn stage_restore(zip_path: &std::path::Path, data_dir: &std::path::Path) -> 
 }
 
 /// Apply a staged restore, if one is pending. Call before opening
-/// the database. Returns true when a restore was applied; the
+/// the database. `db_path` is the database the app is actually going
+/// to open (which may be a `BLINDRSS_DB` path or the app folder, not
+/// `<data_dir>/rss.db`). Returns true when a restore was applied; the
 /// replaced files are kept as `.pre-restore` siblings.
-pub fn apply_pending_restore(data_dir: &std::path::Path) -> bool {
+pub fn apply_pending_restore(data_dir: &std::path::Path, db_path: &std::path::Path) -> bool {
     let pending = data_dir.join("restore_pending");
     let staged_db = pending.join("rss.db");
     if !staged_db.exists() {
         return false;
     }
-    let db_path = data_dir.join("rss.db");
-    if db_path.exists() {
-        let _ = std::fs::rename(&db_path, data_dir.join("rss.db.pre-restore"));
+    // Windows refuses to rename onto an existing file, so a second
+    // restore had to clear the previous backup first — it used to
+    // leave the old .pre-restore in place, fail both renames, and
+    // still report success while deleting the staged copy.
+    let db_backup = db_path.with_file_name(format!(
+        "{}.pre-restore",
+        db_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "rss.db".to_string())
+    ));
+    let _ = std::fs::remove_file(&db_backup);
+    if db_path.exists() && std::fs::rename(db_path, &db_backup).is_err() {
+        // The live database could not be moved aside (open elsewhere,
+        // permissions); keep everything staged so the next start can
+        // try again instead of dropping the restore.
+        return false;
     }
-    let applied = std::fs::rename(&staged_db, &db_path).is_ok();
+    if std::fs::rename(&staged_db, db_path).is_err() {
+        // Put the previous database back; the staged copy stays so the
+        // restore is not lost.
+        let _ = std::fs::rename(&db_backup, db_path);
+        return false;
+    }
     let staged_cfg = pending.join("config.json");
     if staged_cfg.exists() {
         let cfg_path = data_dir.join("config.json");
         if cfg_path.exists() {
+            let _ = std::fs::remove_file(data_dir.join("config.json.pre-restore"));
             let _ = std::fs::rename(&cfg_path, data_dir.join("config.json.pre-restore"));
         }
         let _ = std::fs::rename(&staged_cfg, &cfg_path);
     }
     let _ = std::fs::remove_dir_all(&pending);
-    applied
+    true
 }
 
 /// The platform asset name suffix for update downloads.

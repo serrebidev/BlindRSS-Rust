@@ -118,11 +118,24 @@ fn staged_restore_applies_at_start() {
     blindrss_core::maintenance::create_backup(&src, &dir.join("config.json"), &zip_path).unwrap();
     blindrss_core::maintenance::stage_restore(&zip_path, &dir).unwrap();
     assert!(dir.join("restore_pending/rss.db").exists());
-    assert!(blindrss_core::maintenance::apply_pending_restore(&dir));
+    assert!(blindrss_core::maintenance::apply_pending_restore(
+        &dir,
+        &dir.join("rss.db")
+    ));
     assert!(dir.join("rss.db").exists());
     assert!(!dir.join("restore_pending").exists());
     let db = Db::open(&dir.join("rss.db")).unwrap();
     assert_eq!(db.feeds().unwrap().len(), 1);
+    drop(db);
+    // A second restore must apply too: the first one left a
+    // rss.db.pre-restore behind, and deleting the staged copy before
+    // a successful swap lost restores silently.
+    blindrss_core::maintenance::stage_restore(&zip_path, &dir).unwrap();
+    assert!(blindrss_core::maintenance::apply_pending_restore(
+        &dir,
+        &dir.join("rss.db")
+    ));
+    assert!(dir.join("rss.db.pre-restore").exists());
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_file(&src);
 }

@@ -249,16 +249,15 @@ fn start_raop_cast(
             Ok(_) => format!("AirPlay cast to {name} finished: {title}"),
             Err(e) => format!("AirPlay cast to {name} ended: {e}"),
         };
-        let mut should_clear = false;
-        {
+        let should_clear = {
             let guard = raop_stop_registry()
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
-            should_clear = guard
+            guard
                 .as_ref()
                 .map(|s| std::sync::Arc::ptr_eq(s, &stop))
-                .unwrap_or(false);
-        }
+                .unwrap_or(false)
+        };
         if should_clear {
             *raop_stop_registry()
                 .lock()
@@ -545,14 +544,21 @@ fn apply_pending_update() {
     if old.exists() {
         let _ = std::fs::remove_file(&old);
     }
-    // Try to rename the running exe aside; if it fails (locked/AV),
-    // fall back to copying the new exe next to it and leave update pending.
+    // Try to rename the running exe aside; if it fails (locked, the
+    // Windows loader holding it, antivirus), fall back to copying the
+    // new exe over the current one. Only a successful install drops
+    // the staged tree: when even the copy fails the update stays
+    // pending for the next start rather than vanishing silently.
     if std::fs::rename(&current, &old).is_err() {
-        log_line("update: failed to rename running exe, copying staged exe alongside current");
-        if let Err(e) = std::fs::copy(&staged_exe, exe_dir.join(exe_name)) {
-            log_line(&format!("update: failed to copy staged exe: {e}"));
+        match std::fs::copy(&staged_exe, exe_dir.join(exe_name)) {
+            Ok(_) => {
+                log_line("update: copied staged exe in place (rename failed)");
+                let _ = std::fs::remove_dir_all(&pending);
+            }
+            Err(e) => log_line(&format!(
+                "update: could not install the staged exe ({e}); keeping it for the next start"
+            )),
         }
-        let _ = std::fs::remove_dir_all(&pending);
         return;
     }
     // Copy the whole staged tree over the install folder.
@@ -571,7 +577,14 @@ fn apply_pending_update() {
         }
     }
     copy_tree(&staged_root, &exe_dir);
-    let _ = std::fs::remove_dir_all(&pending);
+    if exe_dir.join(exe_name).exists() {
+        let _ = std::fs::remove_dir_all(&pending);
+    } else {
+        // The swap left no executable behind (the copy failed): put
+        // the old binary back and keep the staged tree for a retry.
+        log_line("update: staged exe missing after copy; restoring the previous exe");
+        let _ = std::fs::rename(&old, &current);
+    }
 }
 
 /// Apply the fetch-identity config to the shared HTTP agent
@@ -1762,7 +1775,10 @@ fn refill_inner(state: &mut State, list: &ListCtrl) {
                 .iter()
                 .map(|f| (f.id.as_str(), f.title.as_str()))
                 .collect();
-            if let Ok(all) = db.articles(None, 500) {
+            // The whole library: a smart folder that silently
+            // ignored everything older than the 500 newest articles
+            // reported an empty (or wrong) view.
+            if let Ok(all) = db.articles(None, 100_000) {
                 let tags_map = db.all_article_tags().unwrap_or_default();
                 let opened_ids = db.opened_article_ids().unwrap_or_default();
                 let updated_ids = db.updated_article_ids().unwrap_or_default();
@@ -1925,13 +1941,14 @@ fn locale_root() -> PathBuf {
     if let Ok(p) = std::env::var("BLINDRSS_LOCALE") {
         return PathBuf::from(p);
     }
-    // Release layout: locale/ ships beside the executable.
-    let beside_exe = app_dir().join("locale");
-    if beside_exe.exists() {
-        return beside_exe;
-    }
-    // Dev fallback: the Python checkout's locale tree.
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../blindrss-work/locale")
+    // Release layout: locale/ ships beside the executable; dev builds
+    // use the repo's locale/ tree. Both come from locale_roots(), so
+    // the startup labels and tr() always read the same catalog — the
+    // old dev fallback pointed at a directory that does not exist.
+    locale_roots()
+        .into_iter()
+        .find(|r| r.exists())
+        .unwrap_or_else(app_dir)
 }
 
 /// One pass of the background watcher (Python's
@@ -2313,11 +2330,12 @@ fn main() {
 
         // A staged restore (Python backup.py semantics) applies
         // before the database opens; the replaced files are kept
-        // as .pre-restore siblings.
-        let _ = blindrss_core::maintenance::apply_pending_restore(&data_dir());
+        // as .pre-restore siblings. It swaps the database the app is
+        // about to open, which need not be <data_dir>/rss.db.
+        let path = db_path();
+        let _ = blindrss_core::maintenance::apply_pending_restore(&data_dir(), &path);
         // Open the database and populate (creating it on a fresh
         // install, as Python does).
-        let path = db_path();
         {
             let mut st = state.borrow_mut();
             match Db::open_or_create(&path) {

@@ -148,13 +148,23 @@ fn fmt_speed(rate: f64) -> String {
 
 const SPEEDS: [f64; 9] = [0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0];
 
+/// End-of-media test for the saved playback row: a position within
+/// five seconds of the end counts as completed. A clip shorter than
+/// those five seconds is NOT complete at position zero — the older
+/// `pos >= len - 5000` form compared against a negative bound and
+/// marked every short clip finished the moment it opened, so it
+/// never resumed where the user left it.
+fn reached_end(pos: i64, len: i64) -> bool {
+    len > 0 && pos > 0 && len - pos <= 5_000
+}
+
 fn save_position(state: &PlayerState, media: &MediaCtrl, force_completed: bool) {
     let Ok(db) = Db::open(&state.db_path) else {
         return;
     };
     let pos = media.tell();
     let len = media.length();
-    let completed = force_completed || (len > 0 && pos >= len - 5_000);
+    let completed = force_completed || reached_end(pos, len);
     let _ = db.upsert_playback_state(
         &state.article_id,
         &PlaybackState {
@@ -1054,5 +1064,28 @@ fn open_player_impl(
     // when playback starts (Python default in its settings UI).
     if show_player {
         frame.raise();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn short_media_is_not_complete_at_zero() {
+        // 3-second clip: opening it must not be "finished".
+        assert!(!reached_end(0, 3_000));
+        // Nor is the very start of a long episode.
+        assert!(!reached_end(0, 600_000));
+        assert!(!reached_end(0, 0));
+    }
+
+    #[test]
+    fn near_the_end_is_complete() {
+        assert!(reached_end(596_000, 600_000));
+        assert!(reached_end(600_000, 600_000));
+        // A short clip is complete once it is played past the start.
+        assert!(reached_end(2_900, 3_000));
+        assert!(!reached_end(0, 4_999));
     }
 }

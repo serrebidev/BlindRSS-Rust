@@ -14,8 +14,6 @@ mod imp {
     const GWLP_WNDPROC: i32 = -4;
     const MOD_NOREPEAT: u32 = 0x4000;
 
-    type WndProc = unsafe extern "system" fn(isize, u32, usize, isize) -> isize;
-
     unsafe extern "system" {
         fn LoadLibraryW(name: *const u16) -> usize;
         fn GetProcAddress(module: usize, name: *const u8) -> usize;
@@ -25,6 +23,7 @@ mod imp {
     type UnregisterHotKeyFn = unsafe extern "system" fn(isize, i32) -> i32;
     type SetWindowLongPtrWFn = unsafe extern "system" fn(isize, i32, isize) -> isize;
     type CallWindowProcWFn = unsafe extern "system" fn(isize, isize, u32, usize, isize) -> isize;
+    type DefWindowProcWFn = unsafe extern "system" fn(isize, u32, usize, isize) -> isize;
     type GetForegroundWindowFn = unsafe extern "system" fn() -> isize;
     type SetForegroundWindowFn = unsafe extern "system" fn(isize) -> i32;
 
@@ -68,11 +67,18 @@ mod imp {
             let _ = tx.send(crate::RefreshMsg::ToggleWindow);
         }
         let old = OLD_PROC.load(Ordering::SeqCst);
-        if old == 0 {
-            return 0;
+        if old != 0
+            && let Some(call) = user32::<CallWindowProcWFn>("CallWindowProcW")
+        {
+            return unsafe { call(old as isize, hwnd, msg, wparam, lparam) };
         }
-        match user32::<CallWindowProcWFn>("CallWindowProcW") {
-            Some(call) => unsafe { call(old as isize, hwnd, msg, wparam, lparam) },
+        // The original procedure was never captured (SetWindowLongPtrW
+        // reported failure after installing us, or the export is
+        // missing). Returning 0 here dropped every window message —
+        // painting, sizing, keyboard, timers — leaving the main window
+        // dead. Fall through to the default procedure instead.
+        match user32::<DefWindowProcWFn>("DefWindowProcW") {
+            Some(def) => unsafe { def(hwnd, msg, wparam, lparam) },
             None => 0,
         }
     }
@@ -88,7 +94,7 @@ mod imp {
             return;
         }
         if let Some(set_long) = user32::<SetWindowLongPtrWFn>("SetWindowLongPtrW") {
-            let old = unsafe { set_long(hwnd, GWLP_WNDPROC, subclass_proc as isize) };
+            let old = unsafe { set_long(hwnd, GWLP_WNDPROC, subclass_proc as *const () as isize) };
             if old != 0 {
                 OLD_PROC.store(old as usize, Ordering::SeqCst);
             }
