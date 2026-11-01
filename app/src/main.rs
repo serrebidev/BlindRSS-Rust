@@ -199,11 +199,11 @@ fn start_raop_cast(
     tx: &Sender<RefreshMsg>,
 ) -> Result<String, String> {
     // Stop any cast already running.
-    if let Some(old) = raop_stop_registry().lock().unwrap().take() {
+    if let Some(old) = raop_stop_registry().lock().unwrap_or_else(|p| p.into_inner()).take() {
         old.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    *raop_stop_registry().lock().unwrap() = Some(stop.clone());
+    *raop_stop_registry().lock().unwrap_or_else(|p| p.into_inner()) = Some(stop.clone());
     let ffmpeg =
         blindrss_core::silence::find_ffmpeg().ok_or("AirPlay casting needs ffmpeg (not found)")?;
     let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
@@ -238,18 +238,21 @@ fn start_raop_cast(
             None => Err("ffmpeg gave no output".to_string()),
         };
         let _ = child.kill();
+        let _ = child.wait();
         let note = match result {
             Ok(_) => format!("AirPlay cast to {name} finished: {title}"),
             Err(e) => format!("AirPlay cast to {name} ended: {e}"),
         };
-        if raop_stop_registry()
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(|s| std::sync::Arc::ptr_eq(s, &stop))
-            .unwrap_or(false)
+        let mut should_clear = false;
         {
-            *raop_stop_registry().lock().unwrap() = None;
+            let guard = raop_stop_registry().lock().unwrap_or_else(|p| p.into_inner());
+            should_clear = guard
+                .as_ref()
+                .map(|s| std::sync::Arc::ptr_eq(s, &stop))
+                .unwrap_or(false);
+        }
+        if should_clear {
+            *raop_stop_registry().lock().unwrap_or_else(|p| p.into_inner()) = None;
         }
         let _ = tx.send(RefreshMsg::StatusNote(note));
     });
@@ -532,7 +535,16 @@ fn apply_pending_update() {
     if old.exists() {
         let _ = std::fs::remove_file(&old);
     }
-    let _ = std::fs::rename(&current, &old);
+    // Try to rename the running exe aside; if it fails (locked/AV),
+    // fall back to copying the new exe next to it and leave update pending.
+    if std::fs::rename(&current, &old).is_err() {
+        log_line("update: failed to rename running exe, copying staged exe alongside current");
+        if let Err(e) = std::fs::copy(&staged_exe, exe_dir.join(exe_name)) {
+            log_line(&format!("update: failed to copy staged exe: {e}"));
+        }
+        let _ = std::fs::remove_dir_all(&pending);
+        return;
+    }
     // Copy the whole staged tree over the install folder.
     fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
         if let Ok(rd) = std::fs::read_dir(from) {
@@ -4518,7 +4530,7 @@ fn main() {
         // protocols play autonomously on the device).
         let frame_sac = frame;
         let act_stop_cast: Rc<dyn Fn()> =
-            Rc::new(move || match raop_stop_registry().lock().unwrap().take() {
+            Rc::new(move || match raop_stop_registry().lock().unwrap_or_else(|p| p.into_inner()).take() {
                 Some(flag) => {
                     flag.store(true, std::sync::atomic::Ordering::Relaxed);
                     frame_sac.set_status_text("AirPlay cast stopping", 0);

@@ -48,11 +48,8 @@ const AIRPORT_MODULUS_B64: &str = "59dE8qLieItsH1WgjrcFRKj6eUWqi+bGLOX1HL3U3GhC/
 
 fn random_bytes<const N: usize>() -> [u8; N] {
     let mut out = [0u8; N];
-    for chunk in out.chunks_mut(16) {
-        let uuid = uuid::Uuid::new_v4();
-        let bytes = uuid.as_bytes();
-        chunk.copy_from_slice(&bytes[..chunk.len()]);
-    }
+    use rsa::rand_core::{OsRng, RngCore};
+    OsRng.fill_bytes(&mut out);
     out
 }
 

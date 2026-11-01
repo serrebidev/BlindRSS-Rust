@@ -23,7 +23,7 @@ mod imp {
 
     type RegisterHotKeyFn = unsafe extern "system" fn(isize, i32, u32, u32) -> i32;
     type UnregisterHotKeyFn = unsafe extern "system" fn(isize, i32) -> i32;
-    type SetWindowLongPtrWFn = unsafe extern "system" fn(isize, i32, WndProc) -> isize;
+    type SetWindowLongPtrWFn = unsafe extern "system" fn(isize, i32, isize) -> isize;
     type CallWindowProcWFn = unsafe extern "system" fn(isize, isize, u32, usize, isize) -> isize;
     type GetForegroundWindowFn = unsafe extern "system" fn() -> isize;
     type SetForegroundWindowFn = unsafe extern "system" fn(isize) -> i32;
@@ -44,7 +44,7 @@ mod imp {
         if addr == 0 {
             None
         } else {
-            Some(unsafe { std::mem::transmute_copy(&addr) })
+            unsafe { Some(std::mem::transmute_copy(&addr)) }
         }
     }
 
@@ -88,7 +88,7 @@ mod imp {
             return;
         }
         if let Some(set_long) = user32::<SetWindowLongPtrWFn>("SetWindowLongPtrW") {
-            let old = unsafe { set_long(hwnd, GWLP_WNDPROC, subclass_proc) };
+            let old = unsafe { set_long(hwnd, GWLP_WNDPROC, subclass_proc as isize) };
             if old != 0 {
                 OLD_PROC.store(old as usize, Ordering::SeqCst);
             }
