@@ -6,14 +6,21 @@
 
 use blindrss_core::db::{Article, Db, Feed};
 
-fn temp_db() -> Db {
-    let dir = std::env::temp_dir().join(format!(
-        "blindrss-batch27-{}",
+fn unique_suffix() -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    format!(
+        "{}-{}-{}",
+        std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_nanos()
-    ));
+            .as_nanos(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
+}
+
+fn temp_db() -> Db {
+    let dir = std::env::temp_dir().join(format!("blindrss-batch27-{}", unique_suffix()));
     std::fs::create_dir_all(&dir).unwrap();
     Db::open_or_create(&dir.join("rss.db")).unwrap()
 }

@@ -11,6 +11,19 @@ use blindrss_core::postprocess::{
     strip_proxy_trailing_boilerplate,
 };
 
+fn unique_suffix() -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    format!(
+        "{}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
+}
+
 fn pp(text: &str, url: &str) -> String {
     postprocess_extracted_text(text, url, "")
 }
@@ -525,13 +538,7 @@ fn image_alt_markers_kept_only_when_enabled() {
 
 #[test]
 fn feed_show_images_roundtrip() {
-    let dir = std::env::temp_dir().join(format!(
-        "blindrss-batch25-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let dir = std::env::temp_dir().join(format!("blindrss-batch25-{}", unique_suffix()));
     std::fs::create_dir_all(&dir).unwrap();
     let db = blindrss_core::db::Db::open_or_create(&dir.join("rss.db")).unwrap();
     db.insert_feed_if_missing(&blindrss_core::db::Feed {
@@ -575,13 +582,7 @@ fn ssl_cert_error_detection() {
 #[test]
 fn user_tool_paths_take_priority() {
     use blindrss_core::dependency::{set_user_tool_paths, user_tool_path};
-    let dir = std::env::temp_dir().join(format!(
-        "blindrss-tools-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let dir = std::env::temp_dir().join(format!("blindrss-tools-{}", unique_suffix()));
     std::fs::create_dir_all(&dir).unwrap();
     let fake = dir.join("ffmpeg");
     std::fs::write(&fake, b"fake").unwrap();
@@ -637,13 +638,7 @@ fn open_command_parsing() {
 
 #[test]
 fn category_tree_collection_and_delete() {
-    let dir = std::env::temp_dir().join(format!(
-        "blindrss-cattree-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let dir = std::env::temp_dir().join(format!("blindrss-cattree-{}", unique_suffix()));
     std::fs::create_dir_all(&dir).unwrap();
     let db = blindrss_core::db::Db::open_or_create(&dir.join("rss.db")).unwrap();
     db.add_category("News").unwrap();

@@ -928,12 +928,21 @@ impl Db {
             let id = match existing {
                 Some(id) => id,
                 None => {
-                    let id = uuid::Uuid::new_v4().to_string();
+                    // INSERT OR IGNORE + re-read: "ensure" is an
+                    // idempotent contract, and a concurrent
+                    // opener ensuring the same path must not
+                    // fail on the UNIQUE title (the v0.1.33
+                    // macOS release-run failure).
+                    let candidate = uuid::Uuid::new_v4().to_string();
                     self.conn.execute(
-                        "INSERT INTO categories (id, title, parent_id) VALUES (?1, ?2, ?3)",
-                        params![id, current, parent_id],
+                        "INSERT OR IGNORE INTO categories (id, title, parent_id) VALUES (?1, ?2, ?3)",
+                        params![candidate, current, parent_id],
                     )?;
-                    id
+                    self.conn.query_row(
+                        "SELECT id FROM categories WHERE title = ?1",
+                        params![current],
+                        |r| r.get(0),
+                    )?
                 }
             };
             parent_id = Some(id);

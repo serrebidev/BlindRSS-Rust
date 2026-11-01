@@ -921,6 +921,23 @@ Batch 31 (RAOP/FFI/update hardening) and Audit 5
 HLS/DASH enclosure playability) work — v0.1.31 and v0.1.32
 were tagged but never published, and are not re-tagged.
 
+Batch 34 resolution (v0.1.34): the v0.1.33 release run
+failed on macOS in batch27 — a second race of the same
+class. Two layers: (1) ensure_category_path was
+SELECT-then-INSERT, so concurrent ensures of one path
+died on the UNIQUE categories.title constraint; it now
+INSERT OR IGNOREs and re-reads the winning row, honouring
+its idempotent contract. (2) Four test files built temp
+paths from wall-clock nanoseconds only; on CI runners
+with coarse clock granularity two parallel tests landed
+in the same directory and shared one database file (the
+collision that fed both this failure and, partly, the
+original one). Test temp paths now carry process id +
+nanos + an atomic counter. batch32_slice gains a
+concurrent ensure_category_path regression; batch27 +
+batch32 ran 10x clean locally. v0.1.33 itself is not
+re-tagged; its content ships inside this release.
+
 Open residual (playback engine): Python's player is libVLC
 end to end (7,276-line gui/player.py: VLC caching knobs,
 preferred soundcard, resume_* family, HTTP header control).

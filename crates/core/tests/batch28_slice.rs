@@ -4,14 +4,21 @@
 
 use blindrss_core::dependency::{extract_ffmpeg_zip, managed_ffmpeg_bin_dir};
 
-fn temp_dir(tag: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "blindrss-batch28-{tag}-{}",
+fn unique_suffix() -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    format!(
+        "{}-{}-{}",
+        std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_nanos()
-    ));
+            .as_nanos(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
+}
+
+fn temp_dir(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("blindrss-batch28-{tag}-{}", unique_suffix()));
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
