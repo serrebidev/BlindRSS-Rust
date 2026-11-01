@@ -199,11 +199,17 @@ fn start_raop_cast(
     tx: &Sender<RefreshMsg>,
 ) -> Result<String, String> {
     // Stop any cast already running.
-    if let Some(old) = raop_stop_registry().lock().unwrap_or_else(|p| p.into_inner()).take() {
+    if let Some(old) = raop_stop_registry()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .take()
+    {
         old.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    *raop_stop_registry().lock().unwrap_or_else(|p| p.into_inner()) = Some(stop.clone());
+    *raop_stop_registry()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = Some(stop.clone());
     let ffmpeg =
         blindrss_core::silence::find_ffmpeg().ok_or("AirPlay casting needs ffmpeg (not found)")?;
     let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
@@ -245,14 +251,18 @@ fn start_raop_cast(
         };
         let mut should_clear = false;
         {
-            let guard = raop_stop_registry().lock().unwrap_or_else(|p| p.into_inner());
+            let guard = raop_stop_registry()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
             should_clear = guard
                 .as_ref()
                 .map(|s| std::sync::Arc::ptr_eq(s, &stop))
                 .unwrap_or(false);
         }
         if should_clear {
-            *raop_stop_registry().lock().unwrap_or_else(|p| p.into_inner()) = None;
+            *raop_stop_registry()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = None;
         }
         let _ = tx.send(RefreshMsg::StatusNote(note));
     });
@@ -4529,14 +4539,19 @@ fn main() {
         // Stop AirPlay Cast: ends the RAOP stream (the other
         // protocols play autonomously on the device).
         let frame_sac = frame;
-        let act_stop_cast: Rc<dyn Fn()> =
-            Rc::new(move || match raop_stop_registry().lock().unwrap_or_else(|p| p.into_inner()).take() {
+        let act_stop_cast: Rc<dyn Fn()> = Rc::new(move || {
+            match raop_stop_registry()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take()
+            {
                 Some(flag) => {
                     flag.store(true, std::sync::atomic::Ordering::Relaxed);
                     frame_sac.set_status_text("AirPlay cast stopping", 0);
                 }
                 None => frame_sac.set_status_text("No AirPlay cast is running", 0),
-            });
+            }
+        });
 
         // Backup / Restore / Prune / Updates.
         let frame_bk = frame;
