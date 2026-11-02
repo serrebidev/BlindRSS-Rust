@@ -1301,6 +1301,7 @@ const M_OPEN_ARTICLE: i32 = 2193;
 const M_OPEN_MEDIA: i32 = 2194;
 const M_VIDEO_SEARCH: i32 = 2195;
 const M_PERSISTENT: i32 = 2205;
+const M_ADD_SHORTCUTS: i32 = 2246;
 const M_IMPORT_COOKIES: i32 = 2206;
 const M_ABOUT: i32 = 2196;
 const M_ARTICLE_WINDOW: i32 = 2197;
@@ -4235,6 +4236,13 @@ fn main() {
             }
         });
 
+        // Add Shortcuts (Batch 42): Python's
+        // AddShortcutsDialog.
+        let frame_as = frame;
+        let act_add_shortcuts: Rc<dyn Fn()> = Rc::new(move || {
+            dialogs::show_add_shortcuts(&frame_as);
+        });
+
         // Article Window (Article menu): the selected article in
         // its own window. With the rich view on, the window gets
         // the HTML rendering too and offers Python's "Show in HTML
@@ -6339,7 +6347,19 @@ fn main() {
                 M_PERSISTENT,
                 "&Persistent Search...",
                 "Saved searches across all articles",
-            )
+            );
+        // Add Shortcuts (Batch 42): Python shows the item
+        // on every platform except macOS. It sits beside
+        // Persistent Search for now; Batch 41a's menu
+        // rebuild moves it into File after Configure
+        // Persistent Search..., per Python's map.
+        #[cfg(not(target_os = "macos"))]
+        let tools_menu = tools_menu.append_item(
+            M_ADD_SHORTCUTS,
+            "Add &Shortcuts...",
+            "Add BlindRSS shortcuts to the desktop, Start menu or taskbar",
+        );
+        let tools_menu = tools_menu
             .append_item(
                 M_OPEN_ARTICLE,
                 "Open &Article from URL...",
@@ -6462,6 +6482,7 @@ fn main() {
             (M_VIDEO_SEARCH, act_video_search.clone()),
             (M_IMPORT_COOKIES, act_import_cookies.clone()),
             (M_PERSISTENT, act_persistent.clone()),
+            (M_ADD_SHORTCUTS, act_add_shortcuts.clone()),
             (M_ABOUT, act_about.clone()),
             (M_ARTICLE_WINDOW, act_article_window.clone()),
             (M_PODCAST_ARCHIVE, act_podcast_archive.clone()),
