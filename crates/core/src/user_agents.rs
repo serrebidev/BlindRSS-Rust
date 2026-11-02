@@ -508,7 +508,21 @@ mod tests {
         // Empty custom falls back instead of sending nothing.
         assert!(resolve("custom", "").contains("Chrome/"));
         assert!(resolve("auto", "").contains("Chrome/"));
-        assert!(resolve("installed:firefox", "").contains("Firefox/"));
         assert!(resolve("nonsense", "").contains("Chrome/"));
+        // installed:<browser> resolves against the DETECTED set
+        // (Python: detect_installed match, else preset, else
+        // automatic). Driven with synthetic sets so the test does
+        // not depend on which browsers the test machine has.
+        let firefox = InstalledBrowser {
+            key: "firefox".to_string(),
+            label: "Firefox".to_string(),
+            engine: "firefox",
+            major: 140,
+        };
+        assert!(
+            resolve_with_installed("installed:firefox", "", &[firefox]).contains("Firefox/140")
+        );
+        let fallback = resolve_with_installed("installed:firefox", "", &[]);
+        assert!(fallback.contains("Mozilla/5.0") && !fallback.is_empty());
     }
 }
