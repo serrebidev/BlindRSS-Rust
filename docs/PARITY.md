@@ -1214,3 +1214,56 @@ clears them outright. Regression: batch39_slice
 (per-account paths incl. credential sensitivity and
 re-basing, full purge keeping local data, per-kind purge
 keeping the owning kind's rows and playback state).
+
+Gap 2 resolution (hosted GUI mutation completeness,
+PARITY-2026-11-01 gap 2): the GUI paths that bypassed the
+provider trait and wrote only the local cache now route
+through the hosted provider, mirroring Python — no more,
+no less. (1) Mark All Read (act_markall): with a hosted
+provider active it runs on a worker through
+provider.mark_all_read (remote first, cache after, per
+the trait); the All Feeds view maps to the provider-wide
+mark (None), a feed view to that feed, and a category view
+fans out to one per-feed mark for every feed in the
+category (the trait's per-feed endpoints), with the total
+or the first remote failure reported through the
+ProviderAction drain in the status bar. Smart-folder and
+Recommendations views have no server stream and keep the
+local path. Articles moved or labelled into a category
+from a feed outside it are not covered by the per-feed
+fan-out — Python's server-side label/category mark covers
+them; recorded as the one mapping divergence. (2) Feed
+Properties (act_feed_props): the pre-dialog feed is the
+snapshot; the dialog still applies its edits to the cache
+Db (including the Reset Title re-fetch), and the
+title/url/category diff is then pushed through
+provider.update_feed on a worker — the trait does the
+remote edit and re-applies the cache writes idempotently,
+and a remote failure surfaces in the status bar. The
+encoding override stays local-only (no server field
+exists, as in Python). The Edit Feed prompts and Set Feed
+Category route their changes through the same
+push_feed_update helper (changed fields only; Some("")
+clears a category — a GReader label removal, a Miniflux
+category_id change via update_feed_remote). (3) Favorite
+toggles: propagate_favorite_state now sits beside
+propagate_read_state and is called from the favorite
+action after the local write — active provider only
+(Batch 39 isolation): GReader via set_starred_remote,
+Miniflux via set_bookmark_remote (read-then-toggle-only-
+if-different). (4) Category operations: New Category
+mirrors creation to Miniflux (leaf title only — Miniflux
+categories are flat, Python ignores the parent the same
+way); the GReader family needs no create call (Python's
+add_category there is a no-op; labels appear on
+assignment). mirror_miniflux_category is now
+mirror_hosted_category: rename/delete still mirror to
+Miniflux, and now also to the GReader family through the
+new GReaderClient rename_label_remote (/rename-tag) and
+disable_label_remote (/disable-tag) — Python's exact
+endpoints and form fields — covering rename, delete, and
+delete-with-feeds. Regression: hosted_gui_slice (fixture
+HTTP servers: GReader rename/disable endpoints, form
+fields and failure surfacing; Miniflux category creation
+body). The remaining GUI mutation paths are app-only
+wiring over the already-tested trait/client layer.

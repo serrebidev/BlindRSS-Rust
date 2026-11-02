@@ -385,11 +385,54 @@ pub(crate) fn mark_article_favorite(
     }
 }
 
-/// Mirror a category rename/delete to the Miniflux server when
-/// Miniflux is the active provider (Python's provider methods);
-/// a refusal surfaces as a status note rather than a phantom
-/// local-only success.
-fn mirror_miniflux_category(
+/// Build the GReader client for the ACTIVE hosted account
+/// (theoldreader / bazqux / inoreader), or None when another
+/// provider is active or its credentials are unset. Mirrors
+/// the client construction in propagate_read_state.
+fn active_greader_client(
+    cfg: &blindrss_core::config::Config,
+) -> Option<blindrss_core::providers::GReaderClient> {
+    use blindrss_core::providers::{GReaderClient, GReaderService};
+    let providers = cfg.raw().get("providers")?;
+    let get = |obj: &serde_json::Value, key: &str| -> String {
+        obj.get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    match blindrss_core::provider::active_name(cfg).as_str() {
+        "theoldreader" | "bazqux" => {
+            let key = blindrss_core::provider::active_name(cfg);
+            let service = if key == "bazqux" {
+                GReaderService::BazQux
+            } else {
+                GReaderService::TheOldReader
+            };
+            let section = providers.get(&key)?;
+            let (email, password) = (get(section, "email"), get(section, "password"));
+            if email.is_empty() || password.is_empty() {
+                return None;
+            }
+            Some(GReaderClient::new(service, &email, &password))
+        }
+        "inoreader" => {
+            let section = providers.get("inoreader")?;
+            let token = get(section, "token");
+            if token.is_empty() {
+                return None;
+            }
+            Some(GReaderClient::with_oauth(GReaderService::Inoreader, &token))
+        }
+        _ => None,
+    }
+}
+
+/// Mirror a category rename/delete to the hosted server when a
+/// hosted provider is active (Python's provider methods):
+/// Miniflux renames/deletes its server category, the GReader
+/// family renames/disables the label. A refusal surfaces as a
+/// status note rather than a phantom local-only success.
+fn mirror_hosted_category(
     tx: &std::sync::mpsc::Sender<RefreshMsg>,
     rename: Option<(String, String)>,
     delete: Option<String>,
@@ -397,6 +440,22 @@ fn mirror_miniflux_category(
     let tx = tx.clone();
     std::thread::spawn(move || {
         let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+        // GReader family: labels are the categories.
+        if let Some(client) = active_greader_client(&cfg) {
+            let (label, result) = if let Some((old, new)) = &rename {
+                (old.clone(), client.rename_label_remote(old, new))
+            } else if let Some(title) = &delete {
+                (title.clone(), client.disable_label_remote(title))
+            } else {
+                return;
+            };
+            if let Err(e) = result {
+                let _ = tx.send(RefreshMsg::StatusNote(format!(
+                    "Category {label} sync failed: {e}"
+                )));
+            }
+            return;
+        }
         if blindrss_core::provider::active_name(&cfg) != "miniflux" {
             return;
         }
@@ -434,6 +493,91 @@ fn mirror_miniflux_category(
                 )));
             }
         }
+    });
+}
+
+/// Mirror a category creation to Miniflux when it is the
+/// active provider: Miniflux categories are flat, so only the
+/// leaf of the local path is created (Python's add_category
+/// ignores the parent the same way). The GReader family needs
+/// no call — Python's add_category there is a no-op because
+/// labels come into existence when a feed is assigned one
+/// (see act_set_cat / push_feed_update).
+fn mirror_hosted_category_create(tx: &std::sync::mpsc::Sender<RefreshMsg>, full_path: String) {
+    let tx = tx.clone();
+    std::thread::spawn(move || {
+        let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+        if blindrss_core::provider::active_name(&cfg) != "miniflux" {
+            return;
+        }
+        let get = |key: &str| -> String {
+            cfg.raw()
+                .get("providers")
+                .and_then(|p| p.get("miniflux"))
+                .and_then(|s| s.get(key))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        };
+        let (url, key) = (get("url"), get("api_key"));
+        if url.is_empty() || key.is_empty() {
+            return;
+        }
+        let leaf = full_path
+            .rsplit('/')
+            .next()
+            .unwrap_or(&full_path)
+            .trim()
+            .to_string();
+        if leaf.is_empty() {
+            return;
+        }
+        if let Err(e) =
+            blindrss_core::providers::MinifluxClient::new(&url, &key).create_category_remote(&leaf)
+        {
+            let _ = tx.send(RefreshMsg::StatusNote(format!(
+                "Miniflux category sync failed: {e}"
+            )));
+        }
+    });
+}
+
+/// Push a feed edit (properties dialog, Edit Feed, Set Feed
+/// Category) through the active hosted provider on a worker:
+/// provider.update_feed does the remote edit first and then
+/// re-applies the cache writes the GUI already made, so the
+/// re-apply is idempotent. A remote failure arrives as a
+/// ProviderAction error and surfaces in the status bar.
+/// `before` is the pre-edit snapshot — the GReader path needs
+/// its category to remove the old label. Only changed fields
+/// are passed (None = unchanged); a category of Some("") means
+/// the category was cleared.
+fn push_feed_update(
+    tx: &std::sync::mpsc::Sender<RefreshMsg>,
+    before: blindrss_core::Feed,
+    title: Option<String>,
+    url: Option<String>,
+    category: Option<String>,
+) {
+    if title.is_none() && url.is_none() && category.is_none() {
+        return;
+    }
+    let tx = tx.clone();
+    std::thread::spawn(move || {
+        let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+        if blindrss_core::provider::active_name(&cfg) == "local" {
+            return;
+        }
+        let provider = blindrss_core::provider::get_provider(&cfg, db_path());
+        let result = provider
+            .update_feed(
+                &before,
+                title.as_deref(),
+                url.as_deref(),
+                category.as_deref(),
+            )
+            .map(|_| format!("Feed {} updated on the server", before.title));
+        let _ = tx.send(RefreshMsg::ProviderAction(result));
     });
 }
 
@@ -507,6 +651,56 @@ pub(crate) fn propagate_read_state(article: &blindrss_core::db::Article, read: b
                 }
                 _ => {}
             }
+        }
+    });
+}
+
+/// Favorite counterpart of propagate_read_state: push a
+/// favorite toggle to the ACTIVE hosted provider only (the
+/// Batch 39 isolation rule). GReader favorites are the
+/// server's starred state; Miniflux favorites are bookmarks,
+/// set to the requested state (set_bookmark_remote reads the
+/// server state and toggles only when it differs). The local
+/// cache write already happened in mark_article_favorite.
+pub(crate) fn propagate_favorite_state(article: &blindrss_core::db::Article, favorite: bool) {
+    // Recommendations are local-only state.
+    if article.feed_id == blindrss_core::youtube_account::RECOMMENDATIONS_FEED_ID {
+        return;
+    }
+    let article = article.clone();
+    std::thread::spawn(move || {
+        let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+        let Some(providers) = cfg.raw().get("providers").cloned() else {
+            return;
+        };
+        let get = |obj: &serde_json::Value, key: &str| -> String {
+            obj.get(key)
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        };
+        if article.feed_id.starts_with("miniflux:")
+            && blindrss_core::provider::active_name(&cfg) == "miniflux"
+        {
+            if let Some(section) = providers.get("miniflux") {
+                let (url, key) = (get(section, "url"), get(section, "api_key"));
+                if let Some(entry) = article
+                    .id
+                    .strip_prefix("miniflux-entry:")
+                    .and_then(|s| s.parse::<i64>().ok())
+                    && !url.is_empty()
+                    && !key.is_empty()
+                {
+                    let _ = blindrss_core::providers::MinifluxClient::new(&url, &key)
+                        .set_bookmark_remote(entry, favorite);
+                }
+            }
+            return;
+        }
+        if article.feed_id.starts_with("feed/")
+            && let Some(client) = active_greader_client(&cfg)
+        {
+            let _ = client.set_starred_remote(&article.id, favorite);
         }
     });
 }
@@ -3200,21 +3394,12 @@ fn main() {
                 st.articles[i].is_favorite = new_value;
             }
             // Hosted backend: favorites are the server's
-            // starred/bookmarked state — push through the
-            // active provider (cache write is idempotent).
+            // starred/bookmarked state — propagate to the
+            // active provider only, beside the local write
+            // above (propagate_read_state's pattern).
             // Recommendations are local-only.
-            let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
-            if blindrss_core::provider::active_name(&cfg) != "local" {
-                std::thread::spawn(move || {
-                    let provider = blindrss_core::provider::get_provider(&cfg, db_path());
-                    for article in articles {
-                        if article.feed_id
-                            != blindrss_core::youtube_account::RECOMMENDATIONS_FEED_ID
-                        {
-                            let _ = provider.set_favorite(&article, new_value);
-                        }
-                    }
-                });
+            for article in &articles {
+                propagate_favorite_state(article, new_value);
             }
             refill_articles(&mut st, &list);
             frame_fav.set_status_text(
@@ -3241,7 +3426,75 @@ fn main() {
 
         let state_ma = state.clone();
         let frame_ma = frame;
+        let tx_ma = tx.clone();
         let act_markall: Rc<dyn Fn()> = Rc::new(move || {
+            // Hosted provider: Mark All Read must reach the
+            // server, not just the local cache. Route it
+            // through provider.mark_all_read on a worker (the
+            // trait does the remote mark first, then the cache
+            // update); the completion reloads the view and a
+            // remote failure surfaces in the status bar.
+            // View-id mapping: the All Feeds root (no filter)
+            // is the provider-wide mark (None); a feed node is
+            // that feed; a category node fans out to one
+            // provider mark per feed in the category (the
+            // trait's per-feed remote endpoints — GReader feed
+            // streams, Miniflux feed endpoints — plus each
+            // feed's cache rows). Smart-folder and
+            // Recommendations views have no server stream and
+            // keep the local path below.
+            {
+                let st = state_ma.borrow();
+                let filter = st.selected_feed.clone();
+                let is_feed_view = filter.as_deref().is_some_and(|f| {
+                    !f.starts_with("cat:")
+                        && !f.starts_with("smart:")
+                        && f != blindrss_core::youtube_account::RECOMMENDATIONS_FEED_ID
+                });
+                let is_cat_view = filter.as_deref().is_some_and(|f| f.starts_with("cat:"));
+                if filter.is_none() || is_feed_view || is_cat_view {
+                    let cfg =
+                        blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+                    if blindrss_core::provider::active_name(&cfg) != "local" {
+                        let feeds = st.feeds.clone();
+                        drop(st);
+                        frame_ma.set_status_text("Marking all read...", 0);
+                        let tx = tx_ma.clone();
+                        std::thread::spawn(move || {
+                            let cfg = blindrss_core::config::Config::load(&config_path())
+                                .unwrap_or_default();
+                            let provider = blindrss_core::provider::get_provider(&cfg, db_path());
+                            let result = match filter.as_deref() {
+                                None => provider.mark_all_read(None),
+                                Some(view) if view.starts_with("cat:") => {
+                                    let path = view.strip_prefix("cat:").unwrap_or("");
+                                    let mut total = 0usize;
+                                    let mut first_err: Option<String> = None;
+                                    for feed in feeds_in_category(&feeds, path) {
+                                        match provider.mark_all_read(Some(&feed.id)) {
+                                            Ok(n) => total += n,
+                                            Err(e) => {
+                                                if first_err.is_none() {
+                                                    first_err = Some(e);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    match first_err {
+                                        Some(e) => Err(e),
+                                        None => Ok(total),
+                                    }
+                                }
+                                Some(feed_id) => provider.mark_all_read(Some(feed_id)),
+                            };
+                            let _ = tx.send(RefreshMsg::ProviderAction(
+                                result.map(|n| format!("Marked {n} articles read")),
+                            ));
+                        });
+                        return;
+                    }
+                }
+            }
             let mut st = state_ma.borrow_mut();
             let filter = st.selected_feed.clone();
             let mut count = 0;
@@ -3766,6 +4019,7 @@ fn main() {
         let frame_ef = frame;
         let tree_ef = tree;
         let list_ef = list;
+        let tx_ef = tx.clone();
         let act_edit_feed: Rc<dyn Fn()> = Rc::new(move || {
             let (feed, db_ok) = {
                 let st = state_ef.borrow();
@@ -3822,6 +4076,25 @@ fn main() {
                 );
                 st.feeds = db.feeds().unwrap_or_default();
             }
+            drop(st);
+            // Hosted: the same edit goes to the server through
+            // the provider (changed fields only).
+            push_feed_update(
+                &tx_ef,
+                feed.clone(),
+                if title.trim().is_empty() || title.trim() == feed.title {
+                    None
+                } else {
+                    Some(title.trim().to_string())
+                },
+                if url.trim().is_empty() || url.trim() == feed.url {
+                    None
+                } else {
+                    Some(url.trim().to_string())
+                },
+                None,
+            );
+            let mut st = state_ef.borrow_mut();
             rebuild_tree(&mut st, &tree_ef);
             refill_articles(&mut st, &list_ef);
             frame_ef.set_status_text("Feed updated", 0);
@@ -3874,7 +4147,7 @@ fn main() {
                 st.feeds = db.feeds().unwrap_or_default();
             }
             drop(st);
-            mirror_miniflux_category(
+            mirror_hosted_category(
                 &tx_rc,
                 Some((category.clone(), new_name.trim().to_string())),
                 None,
@@ -3895,6 +4168,7 @@ fn main() {
         let frame_sc = frame;
         let tree_sc = tree;
         let list_sc = list;
+        let tx_sc = tx.clone();
         let act_set_cat: Rc<dyn Fn()> = Rc::new(move || {
             let (feed, db_ok) = {
                 let st = state_sc.borrow();
@@ -3934,6 +4208,17 @@ fn main() {
                 }
                 st.feeds = db.feeds().unwrap_or_default();
             }
+            drop(st);
+            // Hosted: reassignment is a server change too —
+            // a label add/remove for the GReader family, a
+            // category_id change for Miniflux — through
+            // provider.update_feed with the pre-edit feed as
+            // the snapshot (its category is the old label).
+            // Some("") clears the category.
+            if name != feed.category.as_deref().unwrap_or("") {
+                push_feed_update(&tx_sc, feed.clone(), None, None, Some(name.to_string()));
+            }
+            let mut st = state_sc.borrow_mut();
             rebuild_tree(&mut st, &tree_sc);
             refill_articles(&mut st, &list_sc);
             frame_sc.set_status_text("Feed category set", 0);
@@ -4147,6 +4432,7 @@ fn main() {
         let frame_fp = frame;
         let tree_fp = tree;
         let list_fp = list;
+        let tx_fp = tx.clone();
         let act_feed_props: Rc<dyn Fn()> = Rc::new(move || {
             let feed = {
                 let st = state_fp.borrow();
@@ -4158,6 +4444,15 @@ fn main() {
                 frame_fp.set_status_text("Select a feed in the tree first", 0);
                 return;
             };
+            // `feed` is the pre-dialog snapshot (title/url/
+            // category). The dialog applies its edits to the
+            // cache Db directly; for a hosted feed the diff
+            // against this snapshot is then pushed through
+            // provider.update_feed on a worker (remote edit
+            // first, idempotent cache re-apply after success;
+            // a remote failure surfaces in the status bar).
+            // The encoding override stays local-only — hosted
+            // providers have no such server field.
             let changed = {
                 let st = state_fp.borrow();
                 match st.db.as_ref() {
@@ -4166,14 +4461,38 @@ fn main() {
                 }
             };
             if changed {
-                let mut st = state_fp.borrow_mut();
-                st.feeds = st
-                    .db
-                    .as_ref()
-                    .and_then(|db| db.feeds().ok())
-                    .unwrap_or_default();
-                rebuild_tree(&mut st, &tree_fp);
-                refill_articles(&mut st, &list_fp);
+                let after = {
+                    let mut st = state_fp.borrow_mut();
+                    st.feeds = st
+                        .db
+                        .as_ref()
+                        .and_then(|db| db.feeds().ok())
+                        .unwrap_or_default();
+                    rebuild_tree(&mut st, &tree_fp);
+                    refill_articles(&mut st, &list_fp);
+                    st.feeds.iter().find(|f| f.id == feed.id).cloned()
+                };
+                if let Some(after) = after {
+                    push_feed_update(
+                        &tx_fp,
+                        feed.clone(),
+                        if after.title != feed.title {
+                            Some(after.title.clone())
+                        } else {
+                            None
+                        },
+                        if after.url != feed.url {
+                            Some(after.url.clone())
+                        } else {
+                            None
+                        },
+                        if after.category != feed.category {
+                            Some(after.category.clone().unwrap_or_default())
+                        } else {
+                            None
+                        },
+                    );
+                }
             }
             restore_focus(&state_fp.borrow(), &tree_fp, &list_fp);
         });
@@ -5546,6 +5865,7 @@ fn main() {
         let act_add_category: Rc<dyn Fn()> = {
             let state_ac = state.clone();
             let frame_ac = frame;
+            let tx_ac = tx.clone();
             Rc::new(move || {
                 // Uncategorized is not a parent: a category created
                 // "under" it lands at the root, as in Python.
@@ -5567,9 +5887,12 @@ fn main() {
                     Some(p) => format!("{p}/{}", name.trim()),
                     None => name.trim().to_string(),
                 };
-                let mut st = state_ac.borrow_mut();
+                let st = state_ac.borrow();
                 match st.db.as_ref().map(|db| db.ensure_category_path(&full)) {
                     Some(Ok(_)) => {
+                        drop(st);
+                        mirror_hosted_category_create(&tx_ac, full.clone());
+                        let mut st = state_ac.borrow_mut();
                         st.selected_feed = Some(format!("cat:{full}"));
                         rebuild_tree(&mut st, &tree);
                         refill_articles(&mut st, &list);
@@ -5610,7 +5933,7 @@ fn main() {
                 let mut st = state_dc.borrow_mut();
                 let deleted = st.db.as_ref().map(|db| db.delete_category_path(&path));
                 if matches!(deleted, Some(Ok(true))) {
-                    mirror_miniflux_category(&tx_dc, None, Some(path.clone()));
+                    mirror_hosted_category(&tx_dc, None, Some(path.clone()));
                 }
                 match deleted {
                     Some(Ok(true)) => {
@@ -5792,10 +6115,10 @@ fn main() {
                     let mut deepest_first = subcats.clone();
                     deepest_first.sort_by_key(|t| std::cmp::Reverse(t.len()));
                     for sub in &deepest_first {
-                        mirror_miniflux_category(&tx_df, None, Some(sub.clone()));
+                        mirror_hosted_category(&tx_df, None, Some(sub.clone()));
                     }
                     let _ = db.delete_category_tree(&path);
-                    mirror_miniflux_category(&tx_df, None, Some(path.clone()));
+                    mirror_hosted_category(&tx_df, None, Some(path.clone()));
                     st.feeds = db.feeds().unwrap_or_default();
                 }
                 st.selected_feed = None;
