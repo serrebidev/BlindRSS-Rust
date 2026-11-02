@@ -1426,7 +1426,7 @@ batch42_slice (PowerShell literal quoting, create/pin script
 shapes, EncodedCommand base64 round-trip, Start Menu/taskbar
 paths, Desktop fallback chain, launch tuple, off-Windows
 results, result-line formatting).
-Batch 41b resolution (Audit 6 item G1.3): the settings
+Batch 41b resolution (v0.1.44; Audit 6 item G1.3): the settings
 dialog is now a Notebook matching Python's SettingsDialog
 (gui/dialogs.py) instead of one long single page. Pages in
 Python's fixed order: General, Feeds & Articles, YouTube,
