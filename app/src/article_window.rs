@@ -53,20 +53,45 @@ pub fn open(title: &str, body: &str, url: Option<&str>) {
     frame.create_status_bar(1, 0, -1, "Article status");
     let url = url.unwrap_or("").to_string();
     rich.enable(web.is_some() && !url.is_empty());
-    let menu = Menu::builder()
-        .append_item(4001, "&Reload\tF5", "Fetch the article again")
-        .append_item(4002, "Open in &Browser\tCtrl+O", "Open the source page")
-        .append_item(4003, "Copy &Link\tCtrl+Shift+C", "Copy the source URL")
+    // Menus match Python's article_window.py (Batch 41a /
+    // Audit 6 G1.5): File / Edit / View, same items, labels
+    // and order. Ids keep the existing handler mapping below.
+    let file_menu = Menu::builder()
+        .append_item(
+            4002,
+            "Open in &Browser",
+            "Open this address in your web browser",
+        )
+        .append_item(4001, "Re&load", "Fetch this page again")
+        .append_separator()
+        .append_item(4006, "Close &Window\tCtrl+W", "Close this article window")
+        .build();
+    let edit_menu = Menu::builder()
         .append_item(
             4004,
-            "Copy &Text\tCtrl+C",
-            "Copy selected text, or the article",
+            "&Copy Text",
+            "Copy the whole article to the clipboard",
         )
-        .append_check_item(4005, "&HTML view\tCtrl+Shift+H", "Switch reader mode")
-        .append_separator()
-        .append_item(4006, "&Close\tEsc", "Close this article")
+        .append_item(
+            4003,
+            "Copy &Link",
+            "Copy this article's address to the clipboard",
+        )
         .build();
-    frame.set_menu_bar(MenuBar::builder().append(menu, "&Article").build());
+    let view_menu = Menu::builder()
+        .append_check_item(
+            4005,
+            "&HTML View\tCtrl+Shift+H",
+            "Show the page as formatted HTML instead of plain text",
+        )
+        .build();
+    frame.set_menu_bar(
+        MenuBar::builder()
+            .append(file_menu, "&File")
+            .append(edit_menu, "&Edit")
+            .append(view_menu, "&View")
+            .build(),
+    );
     let cached = Rc::new(RefCell::new(None::<String>));
     let generation = Rc::new(Cell::new(0_u64));
     let (tx, rx) = std::sync::mpsc::channel::<(u64, bool, Result<String, String>)>();

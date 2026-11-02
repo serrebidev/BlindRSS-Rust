@@ -701,34 +701,54 @@ fn open_player_impl(
     });
     let stop_click = stop.clone();
     stop_btn.on_click(move |_| stop_click());
-    let m = media;
-    back_btn.on_click(move |_| {
-        m.seek(-seek_back_ms, SeekMode::FromCurrent);
-    });
-    let m = media;
-    fwd_btn.on_click(move |_| {
-        m.seek(seek_fwd_ms, SeekMode::FromCurrent);
-    });
-    let m = media;
-    vdown_btn.on_click(move |_| {
-        let v = (m.get_volume() - volume_step).max(0.0);
-        m.set_volume(v);
-        persist_volume(v);
-        crate::announce(
-            "general",
-            &format!("Volume {}%", (v * 100.0).round() as i64),
-        );
-    });
-    let m = media;
-    vup_btn.on_click(move |_| {
-        let v = (m.get_volume() + volume_step).min(1.0);
-        m.set_volume(v);
-        persist_volume(v);
-        crate::announce(
-            "general",
-            &format!("Volume {}%", (v * 100.0).round() as i64),
-        );
-    });
+    // Seek / volume controls, shared between the window's
+    // buttons and the main window's Player menu (Batch 41a's
+    // player.rewind / player.forward / player.volume_* dispatch
+    // names land in the PLAYERS action match below).
+    let rewind: Rc<dyn Fn()> = {
+        let m = media;
+        Rc::new(move || {
+            m.seek(-seek_back_ms, SeekMode::FromCurrent);
+        })
+    };
+    let forward: Rc<dyn Fn()> = {
+        let m = media;
+        Rc::new(move || {
+            m.seek(seek_fwd_ms, SeekMode::FromCurrent);
+        })
+    };
+    let volume_down: Rc<dyn Fn()> = {
+        let m = media;
+        Rc::new(move || {
+            let v = (m.get_volume() - volume_step).max(0.0);
+            m.set_volume(v);
+            persist_volume(v);
+            crate::announce(
+                "general",
+                &format!("Volume {}%", (v * 100.0).round() as i64),
+            );
+        })
+    };
+    let volume_up: Rc<dyn Fn()> = {
+        let m = media;
+        Rc::new(move || {
+            let v = (m.get_volume() + volume_step).min(1.0);
+            m.set_volume(v);
+            persist_volume(v);
+            crate::announce(
+                "general",
+                &format!("Volume {}%", (v * 100.0).round() as i64),
+            );
+        })
+    };
+    let rw = rewind.clone();
+    back_btn.on_click(move |_| rw());
+    let fw = forward.clone();
+    fwd_btn.on_click(move |_| fw());
+    let vd = volume_down.clone();
+    vdown_btn.on_click(move |_| vd());
+    let vu = volume_up.clone();
+    vup_btn.on_click(move |_| vu());
     // Speed stepping through the standard ladder, announced.
     let change_speed: Rc<dyn Fn(i32)> = {
         let m = media;
@@ -1193,6 +1213,10 @@ fn open_player_impl(
                 match id {
                     "player.play_pause" => play_pause(),
                     "player.stop" => stop(),
+                    "player.rewind" => rewind(),
+                    "player.forward" => forward(),
+                    "player.volume_up" => volume_up(),
+                    "player.volume_down" => volume_down(),
                     "player.show_hide" => {
                         let show = !frame.is_shown();
                         frame.show(show);
