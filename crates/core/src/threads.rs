@@ -492,26 +492,118 @@ fn discourse_parts(url: &str) -> Option<(String, String)> {
     None
 }
 
+const DISCOURSE_MAX_POSTS: usize = 10_000;
+const DISCOURSE_POST_BATCH: usize = 100;
+
 pub fn discourse_thread(url: &str) -> Option<(String, String)> {
     let (origin, id) = discourse_parts(url)?;
-    let topic = get_json(&format!("{origin}/t/{id}.json"))?;
+    discourse_thread_from(&origin, &id, &mut |url| get_json(url))
+}
+
+/// Discourse reconstruction with the fetch seam exposed for tests
+/// (Python forum_sources `download_discourse_thread_html`): the
+/// `print=true` topic document carries the first posts plus the full
+/// post-id stream; the missing ids are fetched in batches of 100
+/// through /t/<id>/posts.json, everything is sorted by post_number
+/// and capped at 10,000 posts. Author is the display name when the
+/// topic carries one, else @username.
+fn discourse_thread_from(
+    origin: &str,
+    id: &str,
+    get: &mut impl FnMut(&str) -> Option<Value>,
+) -> Option<(String, String)> {
+    let topic = get(&format!("{origin}/t/{id}.json?print=true"))?;
     let title = str_field(&topic, "title");
     if title.is_empty() {
         return None; // not a Discourse site: fail closed
     }
-    let posts = topic.get("post_stream")?.get("posts")?.as_array()?.clone();
+    let stream = topic.get("post_stream")?;
+    let mut raw_posts: Vec<Value> = stream
+        .get("posts")?
+        .as_array()?
+        .iter()
+        .filter(|p| p.is_object())
+        .cloned()
+        .collect();
+    let mut seen_ids: std::collections::HashSet<String> = raw_posts
+        .iter()
+        .filter_map(|p| p.get("id").map(|v| v.to_string()))
+        .collect();
+    let wanted: Vec<String> = stream
+        .get("stream")
+        .and_then(|v| v.as_array())
+        .map(|ids| {
+            ids.iter()
+                .take(DISCOURSE_MAX_POSTS)
+                .map(|v| v.to_string())
+                .filter(|id| !seen_ids.contains(id))
+                .collect()
+        })
+        .unwrap_or_default();
+    for batch in wanted.chunks(DISCOURSE_POST_BATCH) {
+        let query = batch
+            .iter()
+            .map(|id| format!("post_ids%5B%5D={id}"))
+            .collect::<Vec<_>>()
+            .join("&");
+        let Some(page) = get(&format!("{origin}/t/{id}/posts.json?{query}")) else {
+            break;
+        };
+        let page_posts = page
+            .get("post_stream")
+            .and_then(|s| s.get("posts"))
+            .or_else(|| page.get("posts"))
+            .and_then(|v| v.as_array())
+            .cloned();
+        let Some(page_posts) = page_posts else { break };
+        for post in page_posts {
+            if !post.is_object() {
+                continue;
+            }
+            let identity = post.get("id").map(|v| v.to_string()).unwrap_or_default();
+            if !identity.is_empty() && seen_ids.insert(identity) {
+                raw_posts.push(post);
+            }
+        }
+        if raw_posts.len() >= DISCOURSE_MAX_POSTS {
+            break;
+        }
+    }
+    raw_posts.sort_by_key(|p| {
+        p.get("post_number")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(i64::MAX)
+    });
     let mut out = Vec::new();
-    for (i, p) in posts.iter().enumerate() {
+    for p in raw_posts.iter().take(DISCOURSE_MAX_POSTS) {
         let cooked = str_field(p, "cooked");
         if cooked.trim().is_empty() {
             continue;
         }
-        out.push(format!(
+        let number = p
+            .get("post_number")
+            .and_then(|v| v.as_i64())
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| (out.len() / 2 + 1).to_string());
+        let username = str_field(p, "username");
+        let display = str_field(p, "name");
+        let author = if !display.is_empty() {
+            display
+        } else if !username.is_empty() {
+            format!("@{username}")
+        } else {
+            "Unknown author".to_string()
+        };
+        let mut heading = format!(
             "Post {} - {} - {}",
-            i + 1,
-            str_field(p, "username"),
+            number,
+            author,
             str_field(p, "created_at")
-        ));
+        );
+        if let Some(reply_to) = p.get("reply_to_post_number").and_then(|v| v.as_i64()) {
+            heading.push_str(&format!(" (reply to post {reply_to})"));
+        }
+        out.push(heading);
         out.push(crate::extract::html_to_text(&cooked));
     }
     if out.is_empty() {
@@ -519,6 +611,65 @@ pub fn discourse_thread(url: &str) -> Option<(String, String)> {
     }
     Some((title, out.join("\n\n")))
 }
+#[cfg(test)]
+mod discourse_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn discourse_fetches_missing_posts_in_batches_and_sorts_by_number() {
+        let topic = json!({
+            "title": "Big topic",
+            "post_stream": {
+                "posts": [
+                    {"id": 11, "post_number": 2, "username": "bob", "name": "Bob B", "created_at": "2026-01-02", "cooked": "<p>Second</p>", "reply_to_post_number": 1},
+                    {"id": 10, "post_number": 1, "username": "alice", "created_at": "2026-01-01", "cooked": "<p>First</p>"}
+                ],
+                "stream": [10, 11, 12]
+            }
+        });
+        let page = json!({
+            "post_stream": {"posts": [
+                {"id": 12, "post_number": 3, "username": "carol", "created_at": "2026-01-03", "cooked": "<p>Third</p>"}
+            ]}
+        });
+        let mut urls = Vec::new();
+        let (title, text) = discourse_thread_from("https://forum.example", "42", &mut |url| {
+            urls.push(url.to_string());
+            Some(if urls.len() == 1 {
+                topic.clone()
+            } else {
+                page.clone()
+            })
+        })
+        .unwrap();
+        assert_eq!(title, "Big topic");
+        assert!(urls[0].ends_with("/t/42.json?print=true"));
+        assert!(
+            urls[1].contains("/t/42/posts.json?post_ids%5B%5D=12"),
+            "{}",
+            urls[1]
+        );
+        let first = text.find("Post 1 - @alice - 2026-01-01").unwrap();
+        let second = text
+            .find("Post 2 - Bob B - 2026-01-02 (reply to post 1)")
+            .unwrap();
+        let third = text.find("Post 3 - @carol - 2026-01-03").unwrap();
+        assert!(first < second && second < third, "{text}");
+        assert!(text.contains("First") && text.contains("Second") && text.contains("Third"));
+    }
+
+    #[test]
+    fn discourse_fails_closed_without_a_topic_title() {
+        assert!(
+            discourse_thread_from("https://example.com", "1", &mut |_| Some(
+                json!({"post_stream": {"posts": []}})
+            ))
+            .is_none()
+        );
+    }
+}
+
 #[cfg(test)]
 mod source_key_tests {
     #[test]

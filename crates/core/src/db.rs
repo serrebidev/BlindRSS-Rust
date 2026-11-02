@@ -114,8 +114,9 @@ CREATE TABLE IF NOT EXISTS youtube_recommendations (
     is_deleted INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (account, video_id));
 CREATE TABLE IF NOT EXISTS youtube_history_state (
-    feed_id TEXT PRIMARY KEY, state INTEGER NOT NULL DEFAULT 0,
-    attempted_at INTEGER NOT NULL DEFAULT 0);
+    feed_id TEXT PRIMARY KEY, done INTEGER NOT NULL DEFAULT 0,
+    last_attempt REAL,
+    FOREIGN KEY(feed_id) REFERENCES feeds(id) ON DELETE CASCADE);
 CREATE TABLE IF NOT EXISTS hosted_article_media (
     cache_key TEXT PRIMARY KEY, media_url TEXT, media_type TEXT,
     checked_at INTEGER NOT NULL DEFAULT 0);
@@ -265,6 +266,33 @@ impl Db {
 
     fn init_schema_locked(&self) -> rusqlite::Result<()> {
         self.conn.execute_batch(SCHEMA)?;
+        // Early Rust builds created youtube_history_state with
+        // (state, attempted_at) columns where Python — the table's
+        // owner in dual-run — uses (done, last_attempt); a database
+        // created by one app broke the other's history queries.
+        // Rename the legacy columns in place (same transaction as
+        // every other schema change here); the values carry over:
+        // state 2 already meant done, state 1 an attempt.
+        {
+            let mut stmt = self
+                .conn
+                .prepare("PRAGMA table_info(youtube_history_state)")?;
+            let cols: Vec<String> = stmt
+                .query_map([], |r| r.get::<_, String>(1))?
+                .collect::<Result<_, _>>()?;
+            drop(stmt);
+            if cols.iter().any(|c| c == "state") && !cols.iter().any(|c| c == "done") {
+                self.conn.execute_batch(
+                    "ALTER TABLE youtube_history_state RENAME COLUMN state TO done;",
+                )?;
+            }
+            if cols.iter().any(|c| c == "attempted_at") && !cols.iter().any(|c| c == "last_attempt")
+            {
+                self.conn.execute_batch(
+                    "ALTER TABLE youtube_history_state RENAME COLUMN attempted_at TO last_attempt;",
+                )?;
+            }
+        }
         for (table, column, decl) in MIGRATION_COLUMNS {
             let mut stmt = self.conn.prepare(&format!("PRAGMA table_info({table})"))?;
             let cols: Vec<String> = stmt
@@ -605,33 +633,59 @@ impl Db {
         )
     }
 
-    /// YouTube channel history-backfill state for a feed:
-    /// (state, attempted_at epoch). State 2 = done (Python
-    /// `db._YOUTUBE_HISTORY_DONE`); 1 = attempted, retry after a day.
-    pub fn youtube_history_state(&self, feed_id: &str) -> rusqlite::Result<(i64, i64)> {
+    /// YouTube channel history-backfill state for a feed, in the
+    /// Python table's own columns (`done`, `last_attempt` epoch):
+    /// done 2 = history listed (Python `db._YOUTUBE_HISTORY_DONE`);
+    /// done 1 = the old Videos-tab listing, which missed live
+    /// streams and must list again; done 0 = not done, with
+    /// `last_attempt` gating the retry. None when never attempted.
+    pub fn youtube_history_state(&self, feed_id: &str) -> rusqlite::Result<Option<(i64, f64)>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT state, attempted_at FROM youtube_history_state WHERE feed_id = ?1")?;
+            .prepare("SELECT done, last_attempt FROM youtube_history_state WHERE feed_id = ?1")?;
         let mut rows = stmt.query_map(params![feed_id], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Option<f64>>(1)?.unwrap_or(0.0),
+            ))
         })?;
         match rows.next() {
-            Some(r) => Ok(r?),
-            None => Ok((0, 0)),
+            Some(r) => Ok(Some(r?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Python `youtube_history_due`: a channel feed needs its
+    /// one-time history listing when it was never attempted, when
+    /// its recorded listing predates the uploads-playlist change
+    /// (done = 1), or when the last failed attempt is a day old.
+    pub fn youtube_history_due(&self, feed_id: &str, now_epoch: f64) -> bool {
+        match self.youtube_history_state(feed_id) {
+            Ok(None) => true,
+            Ok(Some((done, last_attempt))) => {
+                if done >= 2 {
+                    false
+                } else if done == 1 {
+                    true
+                } else {
+                    now_epoch - last_attempt >= 86_400.0
+                }
+            }
+            Err(_) => false,
         }
     }
 
     pub fn set_youtube_history_state(
         &self,
         feed_id: &str,
-        state: i64,
-        attempted_at: i64,
+        done: i64,
+        last_attempt: f64,
     ) -> rusqlite::Result<()> {
         self.conn.execute(
-            "INSERT INTO youtube_history_state (feed_id, state, attempted_at) \
+            "INSERT INTO youtube_history_state (feed_id, done, last_attempt) \
              VALUES (?1, ?2, ?3) ON CONFLICT(feed_id) DO UPDATE SET \
-             state = excluded.state, attempted_at = excluded.attempted_at",
-            params![feed_id, state, attempted_at],
+             done = excluded.done, last_attempt = excluded.last_attempt",
+            params![feed_id, done, last_attempt],
         )?;
         Ok(())
     }

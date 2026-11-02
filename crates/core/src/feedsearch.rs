@@ -213,6 +213,12 @@ pub fn parse_results(
     }
     .and_then(Value::as_array)
     .ok_or("Feed directory returned an unexpected response")?;
+    // Python's NewsBlur autocomplete search caps at 20 results.
+    let limit = if provider == SearchProvider::NewsBlur {
+        limit.min(20)
+    } else {
+        limit
+    };
     let mut seen = HashSet::new();
     let mut results = Vec::new();
     for item in items {
@@ -373,18 +379,29 @@ pub fn search_configured(
             }]);
         }
         SearchProvider::Website => {
-            return crate::discovery::discover_feed_urls(&request_url(provider, query, limit)?)
-                .map(|items| {
-                    items
-                        .into_iter()
-                        .take(limit)
-                        .map(|url| FeedResult {
-                            title: url.clone(),
-                            url,
-                            description: "Website scan".into(),
-                        })
-                        .collect()
-                });
+            let mut results =
+                crate::discovery::discover_feed_urls(&request_url(provider, query, limit)?)?;
+            results.truncate(limit);
+            // Python `_search_blindrss`: fetch the feed title for
+            // the first few candidates so results read as names,
+            // not raw URLs (capped at five extra fetches).
+            let mut results: Vec<FeedResult> = results
+                .into_iter()
+                .map(|url| FeedResult {
+                    title: url.clone(),
+                    url,
+                    description: "Website scan".into(),
+                })
+                .collect();
+            for result in results.iter_mut().take(5) {
+                if let Ok(body) = fetch(&result.url)
+                    && let Ok(parsed) = crate::feeds::parse_feed(body.as_bytes())
+                    && !parsed.title.trim().is_empty()
+                {
+                    result.title = parsed.title.trim().to_string();
+                }
+            }
+            return Ok(results);
         }
         SearchProvider::Awesome => return awesome_search(query, limit),
         SearchProvider::YouTube => return youtube_search(query, limit),
@@ -409,7 +426,107 @@ pub fn search_configured(
             limit - results.len(),
         )?);
     }
+    if provider == SearchProvider::Bluesky && results.len() < limit {
+        // Python `_bluesky_search_response_to_feeds`: a tag-like
+        // query also earns an OpenRSS hashtag result.
+        if let Some(tag) = bluesky_tag_candidate(query)
+            && !results.iter().any(|r| r.title == format!("#{tag}"))
+        {
+            results.push(FeedResult {
+                title: format!("#{tag}"),
+                url: format!("https://openrss.org/https://bsky.app/search?q=%23{tag}"),
+                description: "Bluesky tag (OpenRSS, third-party)".into(),
+            });
+        }
+    }
+    if provider == SearchProvider::Mixcloud {
+        // Python `search_mixcloud_feeds`: a few of each user's
+        // playlists follow the user himself (Mixcloud has no global
+        // playlist search).
+        let mut expanded = Vec::new();
+        for user in results {
+            if expanded.len() >= limit {
+                break;
+            }
+            let playlists = mixcloud_playlists(&user);
+            expanded.push(user);
+            for playlist in playlists {
+                if expanded.len() >= limit {
+                    break;
+                }
+                if !expanded.iter().any(|r: &FeedResult| r.url == playlist.url) {
+                    expanded.push(playlist);
+                }
+            }
+        }
+        results = expanded;
+    }
     Ok(results)
+}
+
+/// Python `_normalize_tag_candidate`: a single hashtag-like token.
+pub fn bluesky_tag_candidate(query: &str) -> Option<String> {
+    let query = query
+        .trim()
+        .strip_prefix('#')
+        .unwrap_or(query.trim())
+        .trim();
+    if query.is_empty()
+        || query.len() > 64
+        || !query
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
+    {
+        return None;
+    }
+    Some(query.to_string())
+}
+
+/// Parse one Mixcloud user's playlist list (Python
+/// `search_mixcloud_feeds`' per-user playlist surfacing).
+pub fn parse_mixcloud_playlists(json: &str, user_name: &str, limit: usize) -> Vec<FeedResult> {
+    let Ok(data) = serde_json::from_str::<Value>(json) else {
+        return Vec::new();
+    };
+    let Some(items) = data.get("data").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for item in items {
+        let address = text(item, &["url"]);
+        if address.is_empty() {
+            continue;
+        }
+        let name = text(item, &["name"]);
+        out.push(FeedResult {
+            title: format!(
+                "{} ({})",
+                if name.is_empty() { address } else { name },
+                user_name
+            ),
+            url: address.to_string(),
+            description: "Mixcloud playlist".into(),
+        });
+        if out.len() >= limit {
+            break;
+        }
+    }
+    out
+}
+
+fn mixcloud_playlists(user: &FeedResult) -> Vec<FeedResult> {
+    let Ok(parsed) = url::Url::parse(&user.url) else {
+        return Vec::new();
+    };
+    let path = parsed.path().trim_end_matches('/');
+    if path.is_empty() {
+        return Vec::new();
+    }
+    let address = format!("https://api.mixcloud.com{path}/playlists/?limit=3");
+    match fetch(&address) {
+        Ok(body) => parse_mixcloud_playlists(&body, &user.title, 3),
+        Err(_) => Vec::new(),
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -598,6 +715,25 @@ fn valid_identifier(value: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || "._-:@".contains(c))
 }
 
+fn thousands(value: u64) -> String {
+    let digits = value.to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+fn count_field(item: &Value, keys: &[&str]) -> Option<i64> {
+    keys.iter().find_map(|key| {
+        item.get(*key)
+            .and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|f| f as i64)))
+    })
+}
+
 fn parse_social(
     provider: SearchProvider,
     data: &Value,
@@ -628,14 +764,24 @@ fn parse_social(
                 let item = &item["data"];
                 let name = text(item, &["display_name"]);
                 if valid_identifier(name) && !name.contains([':', '@', '.']) {
+                    // Python `_search_reddit`: description falls back
+                    // to "r/<name>", with a subscriber suffix.
+                    let mut detail = text(item, &["public_description", "title"]).to_string();
+                    if detail.is_empty() {
+                        detail = format!("r/{name}");
+                    }
+                    if let Some(subs) = count_field(item, &["subscribers"]).filter(|n| *n != 0) {
+                        detail = format!("{detail} ({subs} subs)");
+                    }
                     add(
                         &format!("r/{name}"),
                         format!("https://www.reddit.com/r/{name}/.rss"),
-                        text(item, &["public_description", "title"]),
+                        &detail,
                     );
                 }
             }
             SearchProvider::Lemmy | SearchProvider::PieFed => {
+                let wrapper = item;
                 let item = item
                     .get("community")
                     .or_else(|| item.get("person"))
@@ -644,32 +790,116 @@ fn parse_social(
                 let Some(feed) = federated_feed(actor, provider == SearchProvider::PieFed) else {
                     continue;
                 };
-                add(
-                    text(item, &["title", "name", "user_name"]),
-                    feed,
-                    provider_label(provider),
-                );
+                let counts = wrapper.get("counts").unwrap_or(&Value::Null);
+                let detail = if provider == SearchProvider::PieFed {
+                    // Python `_piefed_search_response_to_feeds`.
+                    if wrapper.get("community").is_some() {
+                        let mut detail = "PieFed community".to_string();
+                        let name = text(item, &["name"]);
+                        if !name.is_empty() {
+                            detail = format!("{detail} ({name})");
+                        }
+                        let domain = text(item, &["ap_domain"]);
+                        if !domain.is_empty() {
+                            detail = format!("{detail} - {domain}");
+                        }
+                        if let Some(subs) = count_field(
+                            counts,
+                            &["subscriptions_count", "total_subscriptions_count"],
+                        ) {
+                            detail = format!("{detail} ({subs} subs)");
+                        }
+                        detail
+                    } else {
+                        let mut detail = "Fediverse user (via PieFed)".to_string();
+                        let user_name = text(item, &["user_name"]);
+                        if !user_name.is_empty() {
+                            detail = format!("{detail} (@{user_name})");
+                        }
+                        let posts = count_field(counts, &["post_count"]);
+                        let comments = count_field(counts, &["comment_count"]);
+                        if posts.is_some() || comments.is_some() {
+                            detail = format!(
+                                "{detail} ({} posts, {} comments)",
+                                posts.unwrap_or(0),
+                                comments.unwrap_or(0)
+                            );
+                        }
+                        detail
+                    }
+                } else {
+                    // Python `_search_lemmy_items`: "Lemmy - name
+                    // (N subs)" / "Kbin - name (N subs)".
+                    let label = if actor.contains("/m/") {
+                        "Kbin"
+                    } else {
+                        "Lemmy"
+                    };
+                    let name = text(item, &["name"]);
+                    let mut detail = format!("{label} - {name}");
+                    if let Some(subs) = count_field(counts, &["subscribers"]).filter(|n| *n != 0) {
+                        detail = format!("{detail} ({subs} subs)");
+                    }
+                    detail
+                };
+                add(text(item, &["title", "name", "user_name"]), feed, &detail);
             }
             SearchProvider::Mastodon => {
                 if let Some(feed) = crate::discovery::social_feed_url(text(item, &["url"])) {
-                    add(text(item, &["display_name", "acct"]), feed, "Mastodon user");
+                    // Python `_mastodon_search_response_to_feeds`.
+                    let acct = text(item, &["acct"]);
+                    let mut detail = "Mastodon user".to_string();
+                    if !acct.is_empty() {
+                        detail = format!("{detail} (@{acct})");
+                    }
+                    if let Some(followers) = count_field(item, &["followers_count"]) {
+                        detail = format!("{detail} ({followers} followers)");
+                    }
+                    let title = text(item, &["display_name"]);
+                    let fallback = format!("@{acct}");
+                    add(
+                        if title.is_empty() && !acct.is_empty() {
+                            &fallback
+                        } else {
+                            title
+                        },
+                        feed,
+                        &detail,
+                    );
                 }
             }
             SearchProvider::Bluesky => {
                 let handle = text(item, &["handle"]);
                 if valid_identifier(handle) {
+                    // Python `_bluesky_search_response_to_feeds`.
+                    let mut detail = format!("Bluesky user (@{handle})");
+                    let did = text(item, &["did"]);
+                    if !did.is_empty() {
+                        detail = format!("{detail} ({did})");
+                    }
+                    let title = text(item, &["displayName"]);
+                    let fallback = format!("@{handle}");
                     add(
-                        text(item, &["displayName", "handle"]),
+                        if title.is_empty() { &fallback } else { title },
                         format!("https://bsky.app/profile/{handle}/rss"),
-                        "Bluesky user",
+                        &detail,
                     );
                 }
             }
-            SearchProvider::Mixcloud => add(
-                text(item, &["name", "username"]),
-                text(item, &["url"]).to_string(),
-                "Mixcloud user",
-            ),
+            SearchProvider::Mixcloud => {
+                // Python `search_mixcloud_feeds`: follower counts in
+                // the detail; the user's playlists are surfaced by
+                // the search path (see search_configured).
+                let mut detail = "Mixcloud user".to_string();
+                if let Some(followers) = count_field(item, &["follower_count"]).filter(|n| *n > 0) {
+                    detail = format!("{detail} • {} followers", thousands(followers as u64));
+                }
+                add(
+                    text(item, &["name", "username"]),
+                    text(item, &["url"]).to_string(),
+                    &detail,
+                );
+            }
             _ => {}
         }
     }
@@ -678,13 +908,22 @@ fn parse_social(
     {
         for tag in tags {
             let name = text(tag, &["name"]);
+            let mut detail = "Mastodon tag".to_string();
+            if let Some(uses) = tag
+                .get("history")
+                .and_then(Value::as_array)
+                .and_then(|history| history.first())
+                .and_then(|day| count_field(day, &["uses"]))
+            {
+                detail = format!("{detail} ({uses} recent uses)");
+            }
             if let Some(feed) = crate::discovery::social_feed_url(text(tag, &["url"])) {
-                add(&format!("#{name}"), feed, "Mastodon tag");
+                add(&format!("#{name}"), feed, &detail);
             } else if valid_identifier(name) {
                 add(
                     &format!("#{name}"),
                     format!("https://mastodon.social/tags/{name}.rss"),
-                    "Mastodon tag",
+                    &detail,
                 );
             }
         }
@@ -754,6 +993,8 @@ pub fn google_news_results(
         format!("Google News: {query}"),
         "News search feed (not a single publisher)",
     )?];
+    // Python's GOOGLE_NEWS_TOPIC_IDS (discovery.py, used by
+    // search_google_news_localized).
     let topic = match query.to_ascii_lowercase().as_str() {
         "world" => "WORLD",
         "politics" => "NATION",
@@ -766,10 +1007,15 @@ pub fn google_news_results(
         _ => "",
     };
     if !topic.is_empty() {
+        // Python titles the topic result with the capitalized term.
+        let mut capitalized = query.to_ascii_lowercase();
+        if let Some(first) = capitalized.get_mut(..1) {
+            first.make_ascii_uppercase();
+        }
         results.push(make(
             &format!("/rss/headlines/section/topic/{topic}"),
             None,
-            format!("Google News: {query} headlines"),
+            format!("Google News: {capitalized} headlines"),
             "News topic feed",
         )?);
     }
@@ -815,6 +1061,59 @@ pub fn parse_html_results(
             .unwrap_or_default()
     };
     let plain = |html: &str| crate::extract::html_to_text(html);
+    if provider == SearchProvider::GroupsIo {
+        // Python `search_groups_io_feeds`: one result per table
+        // row, detail = the row's text with the title prefix
+        // removed, falling back to "Groups.io group".
+        let base = url::Url::parse("https://groups.io/search").unwrap();
+        let row_re = regex::Regex::new(r"(?is)<tr\b[^>]*>(.*?)</tr>").unwrap();
+        let mut rows = Vec::new();
+        for row in row_re.captures_iter(html) {
+            let row_html = &row[1];
+            let Some(anchor) = anchor.captures(row_html) else {
+                continue;
+            };
+            let href = attr(&anchor[1], "href");
+            if !href.contains("/g/") {
+                continue;
+            }
+            let Some(address) = base
+                .join(&href)
+                .ok()
+                .and_then(|url| crate::sources::groups_io_feed_url(url.as_str()))
+            else {
+                continue;
+            };
+            let label = plain(&anchor[2]);
+            let title = if label.is_empty() {
+                address
+                    .trim_end_matches("/rss")
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or("Groups.io")
+                    .to_string()
+            } else {
+                label
+            };
+            let detail = plain(row_html);
+            let detail = if detail.to_lowercase().starts_with(&title.to_lowercase()) {
+                detail[title.len()..]
+                    .trim_start_matches([' ', '-', '–', '—'])
+                    .to_string()
+            } else {
+                detail
+            };
+            rows.push(serde_json::json!({"title": title, "url": address, "site_name": if detail.is_empty() { "Groups.io group".to_string() } else { detail }}));
+            if rows.len() >= limit.min(100) {
+                break;
+            }
+        }
+        return parse_results(
+            SearchProvider::Feedsearch,
+            &Value::Array(rows).to_string(),
+            limit,
+        );
+    }
     let mut rows = Vec::new();
     let mut title = String::new();
     let base = url::Url::parse("https://groups.io/search").unwrap();
@@ -849,7 +1148,16 @@ pub fn parse_html_results(
             _ => return Err("Expected an HTML feed directory".into()),
         };
         if let Some(address) = address {
-            rows.push(serde_json::json!({"title": if provider == SearchProvider::Feedspot && !title.is_empty() { std::mem::take(&mut title) } else { label }, "url": address, "site_name": provider_label(provider)}));
+            // Python `_search_feedspot`: the detail is the feed's host.
+            let detail = if provider == SearchProvider::Feedspot {
+                url::Url::parse(&address)
+                    .ok()
+                    .and_then(|u| u.host_str().map(str::to_string))
+                    .unwrap_or_else(|| provider_label(provider).to_string())
+            } else {
+                provider_label(provider).to_string()
+            };
+            rows.push(serde_json::json!({"title": if provider == SearchProvider::Feedspot && !title.is_empty() { std::mem::take(&mut title) } else { label }, "url": address, "site_name": detail}));
         }
     }
     parse_results(
@@ -983,7 +1291,31 @@ fn soundcloud_search(query: &str, limit: usize) -> Result<Vec<FeedResult>, Strin
             .and_then(Value::as_array)
             .ok_or("Unexpected SoundCloud response")?;
         for item in collection {
-            rows.push(serde_json::json!({"title": text(item, &["username", "title", "permalink"]), "url": text(item, &["permalink_url"]), "site_name": if kind == "users" {"SoundCloud user"} else {"SoundCloud playlist"}}));
+            // Python `search_soundcloud_feeds`: follower counts on
+            // users; playlists titled "Name (Owner)" with owner and
+            // track count in the detail.
+            if kind == "users" {
+                let mut detail = "SoundCloud user".to_string();
+                if let Some(followers) = count_field(item, &["followers_count"]).filter(|n| *n > 0)
+                {
+                    detail = format!("{detail} • {} followers", thousands(followers as u64));
+                }
+                rows.push(serde_json::json!({"title": text(item, &["username", "permalink"]), "url": text(item, &["permalink_url"]), "site_name": detail}));
+            } else {
+                let owner = item
+                    .get("user")
+                    .map(|user| text(user, &["username"]))
+                    .unwrap_or("");
+                let name = text(item, &["title"]);
+                let mut detail = "SoundCloud playlist".to_string();
+                if !owner.is_empty() {
+                    detail = format!("{detail} • {owner}");
+                }
+                if let Some(count) = count_field(item, &["track_count"]).filter(|n| *n > 0) {
+                    detail = format!("{detail} • {count} tracks");
+                }
+                rows.push(serde_json::json!({"title": if owner.is_empty() { name.to_string() } else { format!("{name} ({owner})") }, "url": text(item, &["permalink_url"]), "site_name": detail}));
+            }
         }
     }
     parse_results(
@@ -1059,46 +1391,208 @@ fn youtube_dump(target: &str, limit: usize) -> Result<String, String> {
     }
 }
 
-pub fn parse_youtube_results(
+/// Python `_normalize_youtube_search_text`: lowercase, non-alphanumeric
+/// runs become single spaces.
+fn normalize_youtube_text(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut last_space = true;
+    for c in value.trim().to_lowercase().chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c);
+            last_space = false;
+        } else if !last_space {
+            out.push(' ');
+            last_space = true;
+        }
+    }
+    out.trim().to_string()
+}
+
+/// Python `_youtube_query_match_score`: +100 when the whole query is a
+/// substring of the title, +6 per query token (3+ chars) in the title.
+pub fn youtube_match_score(title: &str, query: &str) -> i64 {
+    let tnorm = normalize_youtube_text(title);
+    let qnorm = normalize_youtube_text(query);
+    if tnorm.is_empty() || qnorm.is_empty() {
+        return 0;
+    }
+    let mut score = 0;
+    if tnorm.contains(&qnorm) {
+        score += 100;
+    }
+    let tokens: Vec<&str> = qnorm.split(' ').filter(|t| t.len() >= 3).collect();
+    if !tokens.is_empty() {
+        let title_tokens: HashSet<&str> = tnorm.split(' ').collect();
+        score += 6 * tokens.iter().filter(|t| title_tokens.contains(**t)).count() as i64;
+    }
+    score
+}
+
+/// Python `_youtube_search_query_variants`: the query itself, then
+/// one-token-dropped variants (from the tail) for sparse or
+/// misspelled searches, at most six.
+pub fn youtube_query_variants(term: &str) -> Vec<String> {
+    let query = term.split_whitespace().collect::<Vec<_>>().join(" ");
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let mut variants = vec![query.clone()];
+    let mut seen: HashSet<String> = HashSet::from([query.to_lowercase()]);
+    static TOKEN: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"[0-9A-Za-z@#']+").unwrap());
+    let tokens: Vec<String> = TOKEN
+        .find_iter(&query)
+        .map(|m| m.as_str().trim().trim_matches('\'').to_lowercase())
+        .filter(|t| !t.is_empty())
+        .collect();
+    if tokens.len() < 2 {
+        return variants;
+    }
+    for drop_idx in (0..tokens.len()).rev() {
+        let candidate: Vec<&str> = tokens
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != drop_idx)
+            .map(|(_, t)| t.as_str())
+            .collect();
+        if candidate.len() < 2 {
+            continue;
+        }
+        let candidate = candidate.join(" ");
+        if !seen.insert(candidate.to_lowercase()) {
+            continue;
+        }
+        variants.push(candidate);
+        if variants.len() >= 6 {
+            break;
+        }
+    }
+    variants
+}
+
+/// Python `_extract_ytdlp_search_entry_play_count`.
+fn youtube_play_count(item: &Value) -> Option<i64> {
+    for key in ["view_count", "play_count"] {
+        if let Some(raw) = item.get(key) {
+            let value = raw.as_i64().or_else(|| {
+                raw.as_f64().map(|f| f as i64).or_else(|| {
+                    raw.as_str()
+                        .and_then(|s| s.trim().parse::<f64>().ok())
+                        .map(|f| f as i64)
+                })
+            });
+            if let Some(value) = value.filter(|v| *v >= 0) {
+                return Some(value);
+            }
+        }
+    }
+    None
+}
+
+/// Python `_youtube_owner_label`: "Name / @handle" (either half may
+/// stand alone; a name equal to the handle collapses to the handle).
+fn youtube_owner_label(item: &Value) -> String {
+    let name = text(
+        item,
+        &[
+            "channel",
+            "uploader",
+            "playlist_uploader",
+            "artist",
+            "creator",
+        ],
+    );
+    let handle = [
+        text(item, &["uploader_id"]),
+        text(item, &["channel_handle"]),
+    ]
+    .into_iter()
+    .find_map(|candidate| {
+        let candidate = candidate.trim();
+        if candidate.is_empty() {
+            None
+        } else if candidate.starts_with('@') {
+            Some(candidate.to_string())
+        } else if candidate.to_uppercase().starts_with("UC") {
+            None
+        } else if candidate.len() >= 2
+            && candidate.len() <= 40
+            && candidate
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
+        {
+            Some(format!("@{candidate}"))
+        } else {
+            None
+        }
+    })
+    .unwrap_or_default();
+    if !name.is_empty() && !handle.is_empty() {
+        if name
+            .trim_start_matches('@')
+            .eq_ignore_ascii_case(handle.trim_start_matches('@'))
+        {
+            return handle;
+        }
+        return format!("{name} / {handle}");
+    }
+    if !name.is_empty() {
+        return name.to_string();
+    }
+    handle
+}
+
+struct YtRow {
+    result: FeedResult,
+    play_count: Option<i64>,
+    playlist: bool,
+}
+
+/// Convert one yt-dlp search dump into ranked feed rows (Python
+/// `_youtube_search_entries_to_channel_feeds` /
+/// `_youtube_search_entries_to_playlist_feeds`): channels sort by
+/// play count, playlists by query match then play count; each id
+/// appears once.
+fn youtube_rows(
     json: &str,
     playlists: bool,
+    query: &str,
     limit: usize,
-) -> Result<Vec<FeedResult>, String> {
+) -> Result<Vec<YtRow>, String> {
     let data: Value = serde_json::from_str(json).map_err(|_| "Invalid YouTube search response")?;
     let items = data
         .get("entries")
         .and_then(Value::as_array)
         .ok_or("Unexpected YouTube search response")?;
-    let mut items: Vec<_> = items.iter().collect();
-    items.sort_by_key(|item| {
-        std::cmp::Reverse(
-            item.get("view_count")
-                .or_else(|| item.get("play_count"))
-                .and_then(Value::as_i64)
-                .unwrap_or(-1),
-        )
-    });
-    let mut rows = Vec::new();
-    for item in items {
+    let mut ranked: Vec<(String, usize, i64, i64, YtRow)> = Vec::new();
+    for (idx, item) in items.iter().enumerate() {
         let entry_url = text(item, &["url", "webpage_url"]);
-        let id_from_url = url::Url::parse(entry_url).ok().and_then(|url| {
-            url.query_pairs()
-                .find(|(key, _)| key == "list")
-                .map(|(_, value)| value.into_owned())
-        });
         let id = if playlists {
-            text(item, &["playlist_id"])
+            let from_url = url::Url::parse(entry_url)
+                .ok()
+                .and_then(|url| {
+                    url.query_pairs()
+                        .find(|(key, _)| key == "list")
+                        .map(|(_, value)| value.into_owned())
+                })
+                .unwrap_or_default();
+            let id = text(item, &["playlist_id"]);
+            if !id.is_empty() {
+                id.to_string()
+            } else if !from_url.is_empty() {
+                from_url
+            } else {
+                let entry_id = text(item, &["id"]);
+                if !entry_id.is_empty() && !entry_id.starts_with("UC") {
+                    entry_id.to_string()
+                } else {
+                    String::new()
+                }
+            }
         } else {
-            text(item, &["channel_id"])
+            text(item, &["channel_id"]).to_string()
         };
-        let id = if id.is_empty() && playlists {
-            id_from_url
-                .as_deref()
-                .unwrap_or_else(|| text(item, &["id"]))
-        } else {
-            id
-        };
-        if !valid_identifier(id) {
+        if !valid_identifier(&id) {
             continue;
         }
         let key = if playlists {
@@ -1107,51 +1601,164 @@ pub fn parse_youtube_results(
             "channel_id"
         };
         let mut address = url::Url::parse("https://www.youtube.com/feeds/videos.xml").unwrap();
-        address.query_pairs_mut().append_pair(key, id);
-        rows.push(serde_json::json!({"url": address.as_str(), "title": if playlists { text(item, &["title", "id"]) } else { text(item, &["channel", "uploader", "title", "channel_id"]) }, "site_name": if playlists { "YouTube playlist" } else { "YouTube channel" }}));
+        address.query_pairs_mut().append_pair(key, &id);
+        let title = if playlists {
+            let title = text(item, &["title"]);
+            if title.is_empty() {
+                id.clone()
+            } else {
+                title.to_string()
+            }
+        } else {
+            let title = text(item, &["channel", "uploader", "title"]);
+            if title.is_empty() {
+                id.clone()
+            } else {
+                title.to_string()
+            }
+        };
+        let play_count = youtube_play_count(item);
+        let mut detail = if playlists {
+            "YouTube playlist".to_string()
+        } else {
+            "YouTube channel".to_string()
+        };
+        let owner = youtube_owner_label(item);
+        if !owner.is_empty() {
+            detail = format!("{detail} ({owner})");
+        }
+        if let Some(count) = play_count {
+            detail = format!("{detail} | {} plays", thousands(count as u64));
+        }
+        let match_score = if playlists {
+            youtube_match_score(&title, query)
+        } else {
+            0
+        };
+        ranked.push((
+            id,
+            idx,
+            match_score,
+            play_count.unwrap_or(-1),
+            YtRow {
+                result: FeedResult {
+                    title,
+                    url: address.to_string(),
+                    description: detail,
+                },
+                play_count,
+                playlist: playlists,
+            },
+        ));
     }
-    parse_results(
-        SearchProvider::Feedsearch,
-        &Value::Array(rows).to_string(),
-        limit,
-    )
+    if playlists {
+        ranked.sort_by_key(|row| (-row.2, -row.3, row.1));
+    } else {
+        ranked.sort_by_key(|row| (-row.3, row.1));
+    }
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for (id, _, _, _, row) in ranked {
+        if seen.insert(id) {
+            out.push(row);
+            if out.len() >= limit.max(1) {
+                break;
+            }
+        }
+    }
+    Ok(out)
+}
+
+pub fn parse_youtube_results(
+    json: &str,
+    playlists: bool,
+    limit: usize,
+) -> Result<Vec<FeedResult>, String> {
+    Ok(youtube_rows(json, playlists, "", limit)?
+        .into_iter()
+        .map(|row| row.result)
+        .collect())
 }
 
 fn youtube_search(query: &str, limit: usize) -> Result<Vec<FeedResult>, String> {
-    let channels = (limit * 3 / 4).max(1);
-    let channel_query = format!("ytsearch{}:{query}", (channels * 3).max(12));
-    let mut playlist_query = url::Url::parse("https://www.youtube.com/results").unwrap();
-    playlist_query
-        .query_pairs_mut()
-        .append_pair("search_query", query)
-        .append_pair("sp", "EgIQAw%3D%3D");
-    let (channels, playlists) = std::thread::scope(|scope| {
-        let channels = scope.spawn(|| {
-            youtube_dump(&channel_query, (channels * 3).max(12))
-                .and_then(|json| parse_youtube_results(&json, false, channels))
+    // Python `search_youtube_feeds`: channels get three quarters of
+    // the budget; query variants fill in when the exact query is
+    // sparse; the merged list ranks playlists first, then by play
+    // count and query match.
+    let limit = limit.clamp(1, 200);
+    let channel_limit = ((limit as f64 * 0.75).round() as usize).clamp(1, limit);
+    let mut out: Vec<FeedResult> = Vec::new();
+    let mut seen_urls = HashSet::new();
+    let mut first_error: Option<String> = None;
+    for variant in youtube_query_variants(query) {
+        let fetch_count = (channel_limit * 3).max(12);
+        let channel_query = format!("ytsearch{fetch_count}:{variant}");
+        let mut playlist_query = url::Url::parse("https://www.youtube.com/results").unwrap();
+        playlist_query
+            .query_pairs_mut()
+            .append_pair("search_query", &variant)
+            .append_pair("sp", "EgIQAw%3D%3D");
+        let (channels, playlists) = std::thread::scope(|scope| {
+            let channels = scope.spawn(|| {
+                youtube_dump(&channel_query, fetch_count)
+                    .and_then(|json| youtube_rows(&json, false, &variant, channel_limit))
+            });
+            let playlists = scope.spawn(|| {
+                youtube_dump(playlist_query.as_str(), limit)
+                    .and_then(|json| youtube_rows(&json, true, &variant, limit))
+            });
+            (
+                channels
+                    .join()
+                    .unwrap_or_else(|_| Err("YouTube channel search stopped".into())),
+                playlists
+                    .join()
+                    .unwrap_or_else(|_| Err("YouTube playlist search stopped".into())),
+            )
         });
-        let playlists = scope.spawn(|| {
-            youtube_dump(playlist_query.as_str(), limit)
-                .and_then(|json| parse_youtube_results(&json, true, limit))
-        });
-        (
-            channels
-                .join()
-                .unwrap_or_else(|_| Err("YouTube channel search stopped".into())),
-            playlists
-                .join()
-                .unwrap_or_else(|_| Err("YouTube playlist search stopped".into())),
-        )
-    });
-    match (channels, playlists) {
-        (Ok(mut channels), Ok(playlists)) => {
-            channels.extend(playlists);
-            channels.truncate(limit);
-            Ok(channels)
+        let mut merged: Vec<(usize, YtRow)> = Vec::new();
+        for result in [channels, playlists] {
+            match result {
+                Ok(rows) => {
+                    let base = merged.len();
+                    merged.extend(rows.into_iter().enumerate().map(|(i, row)| (base + i, row)));
+                }
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+            }
         }
-        (Ok(rows), Err(_)) | (Err(_), Ok(rows)) => Ok(rows),
-        (Err(error), Err(_)) => Err(error),
+        let mut ranked: Vec<(i64, i64, i64, i64, usize, YtRow)> = merged
+            .into_iter()
+            .map(|(idx, row)| {
+                (
+                    if row.playlist { 0 } else { 1 },
+                    if row.play_count.is_some() { 0 } else { 1 },
+                    -row.play_count.unwrap_or(0),
+                    -youtube_match_score(&row.result.title, &variant),
+                    idx,
+                    row,
+                )
+            })
+            .collect();
+        ranked.sort_by_key(|row| (row.0, row.1, row.2, row.3, row.4));
+        for (_, _, _, _, _, row) in ranked {
+            if seen_urls.insert(row.result.url.clone()) {
+                out.push(row.result);
+                if out.len() >= limit {
+                    return Ok(out);
+                }
+            }
+        }
     }
+    if out.is_empty()
+        && let Some(error) = first_error
+    {
+        return Err(error);
+    }
+    Ok(out)
 }
 
 fn news_api_search(

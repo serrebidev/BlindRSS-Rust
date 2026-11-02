@@ -256,9 +256,20 @@ fn listing_entries_shape() {
 fn db_helpers_roundtrip() {
     let (_path, db) = temp_db();
     assert_eq!(db.article_count_for_feed("nope").unwrap(), 0);
-    assert_eq!(db.youtube_history_state("f1").unwrap(), (0, 0));
-    db.set_youtube_history_state("f1", 2, 12345).unwrap();
-    assert_eq!(db.youtube_history_state("f1").unwrap(), (2, 12345));
+    // The state table FK-references feeds (Python's shape), and its
+    // accessors now return Python's (done, last_attempt) columns.
+    db.insert_feed_if_missing(&blindrss_core::Feed {
+        id: "f1".to_string(),
+        url: "https://www.youtube.com/feeds/videos.xml?channel_id=UCx".to_string(),
+        title: "Channel".to_string(),
+        title_is_custom: false,
+        category: None,
+        icon_url: None,
+    })
+    .unwrap();
+    assert_eq!(db.youtube_history_state("f1").unwrap(), None);
+    db.set_youtube_history_state("f1", 2, 12345.0).unwrap();
+    assert_eq!(db.youtube_history_state("f1").unwrap(), Some((2, 12345.0)));
     assert!(db.hosted_article_media("k").unwrap().is_none());
     db.set_hosted_article_media("k", Some("https://x/a.mp3"), Some("audio/mpeg"), 999)
         .unwrap();
