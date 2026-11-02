@@ -16,6 +16,25 @@ pub struct MediaStatus {
     pub position: f64,
     pub duration: f64,
     pub state: String,
+    /// The receiver's idle reason when idle ("FINISHED" when
+    /// an item played to its end), else None.
+    pub idle_reason: Option<String>,
+    pub media_session_id: Option<i64>,
+}
+
+impl MediaStatus {
+    /// The protocol-neutral snapshot (Python
+    /// `_chromecast_status`): Chromecast is the one protocol
+    /// whose status supports session detection.
+    pub fn to_unified(&self) -> crate::cast::CastStatus {
+        crate::cast::CastStatus {
+            position_seconds: Some(self.position),
+            duration_seconds: (self.duration > 0.0).then_some(self.duration),
+            player_state: Some(self.state.clone()),
+            connected: true,
+            supports_session_detection: true,
+        }
+    }
 }
 
 pub fn parse_media_status(value: &serde_json::Value) -> Result<MediaStatus, String> {
@@ -48,6 +67,11 @@ pub fn parse_media_status(value: &serde_json::Value) -> Result<MediaStatus, Stri
             .and_then(|v| v.as_str())
             .unwrap_or("IDLE")
             .into(),
+        idle_reason: media
+            .get("idleReason")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        media_session_id: media.get("mediaSessionId").and_then(|v| v.as_i64()),
     })
 }
 
@@ -285,23 +309,49 @@ impl CastSession {
 
     /// Load a stream URL in the running media receiver.
     pub fn load_media(&mut self, url: &str, content_type: &str, title: &str) -> Result<(), String> {
+        self.load_media_at(url, content_type, title, 0.0)
+    }
+
+    /// Load from `start_seconds` (Python `_play_chromecast` /
+    /// `_load`: the LOAD carries currentTime for a buffered
+    /// stream, and a receiver that ignored it — reporting a
+    /// position more than 5 s short of a start over 5 s — gets
+    /// one bounded corrective seek).
+    pub fn load_media_at(
+        &mut self,
+        url: &str,
+        content_type: &str,
+        title: &str,
+        start_seconds: f64,
+    ) -> Result<(), String> {
         let transport = self
             .app_transport
             .clone()
             .ok_or("launch the receiver first")?;
-        let payload = serde_json::json!({
-            "type": "LOAD",
-            "autoplay": true,
-            "media": {
-                "contentId": url,
-                "streamType": "BUFFERED",
-                "contentType": content_type,
-                "metadata": {
-                    "metadataType": 0,
-                    "title": title,
-                }
+        let start = if start_seconds.is_finite() {
+            start_seconds.max(0.0)
+        } else {
+            0.0
+        };
+        let mut media = serde_json::json!({
+            "contentId": url,
+            "streamType": "BUFFERED",
+            "contentType": content_type,
+            "metadata": {
+                "metadataType": 0,
+                "title": title,
             }
         });
+        let mut payload = serde_json::json!({
+            "type": "LOAD",
+            "autoplay": true,
+            "media": media,
+        });
+        if start > 0.0 {
+            payload["currentTime"] = serde_json::json!(start);
+            media["currentTime"] = serde_json::json!(start);
+            payload["media"] = media;
+        }
         let status = self.request(
             &transport,
             NS_MEDIA,
@@ -317,6 +367,14 @@ impl CastSession {
             .and_then(|v| v.as_i64())
         {
             self.media_session_id = Some(id);
+        }
+        if start > 5.0
+            && let Ok(now) = parse_media_status(&status)
+            && now.position < start - 5.0
+        {
+            // The receiver ignored currentTime on load; one
+            // bounded seek puts the resume where it belongs.
+            let _ = self.seek(start);
         }
         Ok(())
     }

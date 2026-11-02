@@ -26,6 +26,256 @@ pub struct CastDevice {
     pub endpoint: String,
 }
 
+impl CastDevice {
+    /// Python `CastDevice.display_name`: "{name} [{protocol}]".
+    pub fn display_name(&self) -> String {
+        format!("{} [{}]", self.name, protocol_label(&self.kind))
+    }
+
+    /// Python `CastDevice.unique_id`: "{protocol}:{identifier}".
+    /// The identifier is the protocol endpoint when discovery
+    /// resolved one, else the host:port pair.
+    pub fn unique_id(&self) -> String {
+        let id = if self.endpoint.is_empty() {
+            format!("{}:{}", self.host, self.port)
+        } else {
+            self.endpoint.clone()
+        };
+        format!("{}:{id}", protocol_label(&self.kind))
+    }
+}
+
+/// Python `CastProtocol` display values per device kind. DLNA
+/// and generic UPnP share one engine device kind ("dlna" here,
+/// "upnp" in Python's kind map); both label as Python does for
+/// a renderer found through UPnP.
+pub fn protocol_label(kind: &str) -> &'static str {
+    match kind {
+        "chromecast" => "Chromecast",
+        "airplay" => "AirPlay",
+        "sonos" => "Sonos",
+        "roku" => "Roku",
+        "kodi" => "Kodi",
+        _ => "DLNA",
+    }
+}
+
+/// Whether the protocol accepts a seek (Python `CastingManager
+/// ._seek`: every kind but Roku, which has no seek over ECP).
+pub fn supports_seek(kind: &str) -> bool {
+    matches!(kind, "chromecast" | "airplay" | "dlna" | "sonos" | "kodi")
+}
+
+/// Whether the protocol accepts a volume level (Python
+/// `set_volume`: every kind but Roku).
+pub fn supports_volume(kind: &str) -> bool {
+    matches!(kind, "chromecast" | "airplay" | "dlna" | "sonos" | "kodi")
+}
+
+/// Python `_hms`: seconds as "H:MM:SS" (UPnP REL_TIME, Sonos).
+pub fn format_hms(seconds: f64) -> String {
+    let seconds = seconds.max(0.0) as i64;
+    format!(
+        "{}:{:02}:{:02}",
+        seconds / 3600,
+        (seconds % 3600) / 60,
+        seconds % 60
+    )
+}
+
+/// Python `_parse_hms`: "H:MM:SS[.fff]" back to seconds.
+pub fn parse_hms(text: &str) -> Option<f64> {
+    let mut parts = text.trim().split(':');
+    let hours: i64 = parts.next()?.parse().ok()?;
+    let minutes: i64 = parts.next()?.parse().ok()?;
+    let seconds: f64 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() || !(0..60).contains(&minutes) {
+        return None;
+    }
+    Some(hours as f64 * 3600.0 + minutes as f64 * 60.0 + seconds)
+}
+
+/// A protocol-neutral cast status snapshot (Python
+/// `CastingManager.get_status`): every protocol's status is
+/// normalised into this shape, with the clock position filling
+/// in where a receiver cannot report one.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CastStatus {
+    pub position_seconds: Option<f64>,
+    pub duration_seconds: Option<f64>,
+    pub player_state: Option<String>,
+    pub connected: bool,
+    /// Only Chromecast reports a media session, so only it can
+    /// positively detect a dropped session (Python's flag).
+    pub supports_session_detection: bool,
+}
+
+impl CastStatus {
+    /// The item has ended: an idle/stopped report after the
+    /// session was live. Live relays also idle between loads,
+    /// so callers gate this on `was_active` (see CastQueue).
+    pub fn is_finished(&self) -> bool {
+        matches!(self.player_state.as_deref(), Some("IDLE" | "STOPPED"))
+    }
+}
+
+/// Position by the clock, for receivers that cannot report one
+/// (Python `_clock_set` / `_clock_position`, and the AirPlay
+/// `_AirSession.position`): a base position plus the elapsed
+/// monotonic time while playing; frozen while paused.
+#[derive(Debug, Clone)]
+pub struct CastClock {
+    state: Option<String>,
+    base: f64,
+    since: Option<std::time::Instant>,
+}
+
+impl Default for CastClock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CastClock {
+    pub fn new() -> Self {
+        CastClock {
+            state: None,
+            base: 0.0,
+            since: None,
+        }
+    }
+
+    /// Python `_clock_set(state, position=None)`: keep the
+    /// current (extrapolated) position unless one is given.
+    pub fn set(&mut self, state: &str, position: Option<f64>) {
+        let current = self.position();
+        self.base = position.unwrap_or(current.unwrap_or(0.0));
+        self.state = Some(state.to_string());
+        self.since = (state == "playing").then(std::time::Instant::now);
+    }
+
+    pub fn clear(&mut self) {
+        self.state = None;
+        self.since = None;
+    }
+
+    pub fn state(&self) -> Option<&str> {
+        self.state.as_deref()
+    }
+
+    pub fn position(&self) -> Option<f64> {
+        self.state.as_ref()?;
+        let mut pos = self.base;
+        if self.state.as_deref() == Some("playing")
+            && let Some(since) = self.since
+        {
+            pos += since.elapsed().as_secs_f64();
+        }
+        Some(pos)
+    }
+}
+
+/// One item a cast session can play (a resolved stream).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CastQueueItem {
+    pub url: String,
+    pub title: String,
+    pub mime: String,
+}
+
+/// What a status poll decided about the cast queue.
+#[derive(Debug, Clone, PartialEq)]
+pub enum QueueAdvance {
+    /// Keep playing the current item.
+    None,
+    /// The current item ended; play this next one.
+    Next(CastQueueItem),
+    /// The current item ended and the queue is exhausted.
+    Finished,
+}
+
+/// The cast play queue (the local player's media-finished
+/// advance, applied to a cast session): when the receiver
+/// reports the current item finished — an idle/stopped state
+/// after the item was seen playing, paused or buffering — the
+/// next queued item is handed back for the caller to load.
+#[derive(Debug, Clone)]
+pub struct CastQueue {
+    items: Vec<CastQueueItem>,
+    index: Option<usize>,
+    was_active: bool,
+}
+
+impl CastQueue {
+    pub fn new(items: Vec<CastQueueItem>) -> Self {
+        CastQueue {
+            items,
+            index: None,
+            was_active: false,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    /// Start (or restart) at the first item.
+    pub fn start(&mut self) -> Option<&CastQueueItem> {
+        self.index = if self.items.is_empty() { None } else { Some(0) };
+        self.was_active = false;
+        self.current()
+    }
+
+    pub fn current(&self) -> Option<&CastQueueItem> {
+        self.index.and_then(|i| self.items.get(i))
+    }
+
+    pub fn current_index(&self) -> Option<usize> {
+        self.index
+    }
+
+    /// Skip to the next item on the user's say-so.
+    pub fn skip_next(&mut self) -> Option<&CastQueueItem> {
+        let next = self.index? + 1;
+        if next >= self.items.len() {
+            self.index = None;
+            return None;
+        }
+        self.index = Some(next);
+        self.was_active = false;
+        self.current()
+    }
+
+    /// Feed one status poll; advances the queue when the
+    /// current item is finished (Python's player advances its
+    /// queue on media-finished — for a cast session the
+    /// receiver's idle report is that event).
+    pub fn note_status(&mut self, status: &CastStatus) -> QueueAdvance {
+        if self.index.is_none() {
+            return QueueAdvance::None;
+        }
+        if let Some("PLAYING" | "PAUSED" | "BUFFERING") = status.player_state.as_deref() {
+            self.was_active = true;
+            return QueueAdvance::None;
+        }
+        if status.position_seconds.is_some_and(|p| p > 0.0) {
+            self.was_active = true;
+        }
+        if !self.was_active || !status.is_finished() {
+            return QueueAdvance::None;
+        }
+        self.was_active = false;
+        match self.skip_next() {
+            Some(item) => QueueAdvance::Next(item.clone()),
+            None => QueueAdvance::Finished,
+        }
+    }
+}
+
 /// Parse one SSDP response (or NOTIFY) packet into a device, when
 /// it is a Chromecast (its LOCATION points at a DIAL description
 /// and the server/ST mentions Cast). Pure; fixture-tested.
