@@ -1314,7 +1314,7 @@ XenForo fixture, Google Groups + Support rebuilds,
 history-state due rules incl. the legacy-column repair,
 feedsearch details) plus threads.rs discourse unit
 tests.
-Batch casting-depth resolution (PARITY-2026-11-01 gap 8):
+Casting depth resolution (v0.1.42; PARITY-2026-11-01 gap 8):
 the cross-protocol cast session depth is ported. Audit
 against Python core/casting.py found Chromecast already at
 depth (CASTv2 session with play/pause/stop/seek/volume/

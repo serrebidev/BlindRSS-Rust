@@ -193,85 +193,6 @@ fn raop_stop_registry()
     RAOP_STOP.get_or_init(|| std::sync::Mutex::new(None))
 }
 
-/// Start (or replace) the AirPlay cast of `url` (an http(s)
-/// URL or local file) to the RAOP device. ffmpeg decodes to
-/// PCM; the RAOP sender streams it with the configured EQ.
-fn start_raop_cast(
-    device: &blindrss_core::cast::CastDevice,
-    title: &str,
-    url: &str,
-    tx: &Sender<RefreshMsg>,
-) -> Result<String, String> {
-    // Stop any cast already running.
-    if let Some(old) = raop_stop_registry()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .take()
-    {
-        old.store(true, std::sync::atomic::Ordering::Relaxed);
-    }
-    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    *raop_stop_registry()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner()) = Some(stop.clone());
-    let ffmpeg =
-        blindrss_core::silence::find_ffmpeg().ok_or("AirPlay casting needs ffmpeg (not found)")?;
-    let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
-    let eq = blindrss_core::equalizer::EqConfig::from_config(&cfg);
-    let (host, port) = (device.host.clone(), device.port);
-    let url = url.to_string();
-    let tx = tx.clone();
-    let name = device.name.clone();
-    let title_thread = title.to_string();
-    let title = title.to_string();
-    std::thread::spawn(move || {
-        let title = title_thread;
-        let mut child = match std::process::Command::new(&ffmpeg)
-            .args([
-                "-v", "error", "-i", &url, "-f", "s16le", "-ar", "44100", "-ac", "2", "-",
-            ])
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-        {
-            Ok(c) => c,
-            Err(e) => {
-                let _ = tx.send(RefreshMsg::StatusNote(format!(
-                    "AirPlay cast failed to start ffmpeg: {e}"
-                )));
-                return;
-            }
-        };
-        let mut pcm = child.stdout.take();
-        let result = match pcm.as_mut() {
-            Some(p) => blindrss_core::raop::stream_pcm(&host, port, p, Some(&eq), 80, stop.clone()),
-            None => Err("ffmpeg gave no output".to_string()),
-        };
-        let _ = child.kill();
-        let _ = child.wait();
-        let note = match result {
-            Ok(_) => format!("AirPlay cast to {name} finished: {title}"),
-            Err(e) => format!("AirPlay cast to {name} ended: {e}"),
-        };
-        let should_clear = {
-            let guard = raop_stop_registry()
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
-            guard
-                .as_ref()
-                .map(|s| std::sync::Arc::ptr_eq(s, &stop))
-                .unwrap_or(false)
-        };
-        if should_clear {
-            *raop_stop_registry()
-                .lock()
-                .unwrap_or_else(|p| p.into_inner()) = None;
-        }
-        let _ = tx.send(RefreshMsg::StatusNote(note));
-    });
-    Ok(format!("Casting {title} to {} (AirPlay)", device.name))
-}
-
 pub(crate) fn playback_headers_for(
     article: &Article,
     media_url: &str,
@@ -289,46 +210,6 @@ pub(crate) fn playback_headers_for(
         article.media_url.as_deref().unwrap_or(&article.url),
         &cookies,
     )
-}
-
-fn cast_to_device(
-    device: &blindrss_core::cast::CastDevice,
-    article: &Article,
-    url: &str,
-    tx: &Sender<RefreshMsg>,
-) -> Result<String, String> {
-    let mime = article
-        .media_type
-        .clone()
-        .filter(|t| t.contains('/'))
-        .unwrap_or_else(|| "audio/mpeg".to_string());
-    if device.kind == "airplay" {
-        // RAOP streams from us: no URL handoff. Audio only —
-        // a video article casts its soundtrack.
-        return start_raop_cast(device, &article.title, url, tx);
-    }
-    if device.kind == "chromecast" {
-        let mut session =
-            blindrss_core::castsession::CastSession::connect(&device.host, device.port)?;
-        session.launch_default_receiver()?;
-        session.load_media(url, &mime, &article.title)?;
-        return Ok(format!("Casting {} to {}", article.title, device.name));
-    }
-    let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
-    let reachable = if url.starts_with("http://") || url.starts_with("https://") {
-        blindrss_core::proxy::stream_url(url)
-    } else {
-        blindrss_core::proxy::file_url(std::path::Path::new(url))
-    };
-    blindrss_core::castupnp::play(
-        device,
-        &reachable,
-        &article.title,
-        &mime,
-        cfg.get_str("cast_kodi_user", ""),
-        cfg.get_str("cast_kodi_password", ""),
-    )?;
-    Ok(format!("Casting {} to {}", article.title, device.name))
 }
 
 /// The play-cache step (youtube_play_via_download): when a
@@ -7403,26 +7284,24 @@ fn main() {
                         };
                         restore_focus(&state_tick.borrow(), &tree, &list);
                         if let Some(device) = device {
-                            if device.kind == "chromecast" {
-                                let mime = article
-                                    .media_type
-                                    .clone()
-                                    .filter(|t| t.contains('/'))
-                                    .unwrap_or_else(|| "audio/mpeg".into());
-                                let reachable =
-                                    if url.starts_with("http://") || url.starts_with("https://") {
-                                        blindrss_core::proxy::stream_url(&url)
-                                    } else {
-                                        blindrss_core::proxy::file_url(std::path::Path::new(&url))
-                                    };
-                                casting::open(device, article.title, reachable, mime);
-                                continue;
-                            }
-                            let tx2 = tx.clone();
-                            std::thread::spawn(move || {
-                                let result = cast_to_device(&device, &article, &url, &tx2);
-                                let _ = tx2.send(RefreshMsg::CastDone(result));
-                            });
+                            // Every device kind goes through the
+                            // persistent controls window now: its
+                            // session layer dispatches Chromecast,
+                            // AirPlay/RAOP and the unified UPnP
+                            // protocols, and carries the play
+                            // queue (casting-depth integration).
+                            let mime = article
+                                .media_type
+                                .clone()
+                                .filter(|t| t.contains('/'))
+                                .unwrap_or_else(|| "audio/mpeg".into());
+                            let reachable =
+                                if url.starts_with("http://") || url.starts_with("https://") {
+                                    blindrss_core::proxy::stream_url(&url)
+                                } else {
+                                    blindrss_core::proxy::file_url(std::path::Path::new(&url))
+                                };
+                            casting::open(device, article.title, reachable, mime);
                         }
                     }
                     Ok(RefreshMsg::CastDone(result)) => match result {
