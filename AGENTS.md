@@ -364,9 +364,11 @@ must stay compatible with):
   off) and gated on the backend actually being available; navigation
   from it follows the Python link-diversion rules (issue #102).
 - The Accessible Browser front-end (Python `gui/accessibility.py`,
-  the VoiceOver-first window) is an open residual — see PARITY.md.
-  Reading behaviour added to the main window is not "done" for macOS
-  until it exists there too, once that window lands.
+  the VoiceOver-first window) landed in v0.1.38
+  (`app/src/accessible_browser.rs`, core model in
+  `crates/core/src/accessible.rs`; see the Batch 37 resolution in
+  PARITY.md). Reading behaviour added to the main window is not
+  "done" for macOS until it exists there too.
 
 ### 5. Translation
 - Off by default. Operates on rendered full-text output in chunks,

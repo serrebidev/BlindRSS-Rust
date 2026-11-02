@@ -184,6 +184,52 @@ fn body_arbitration_feed_fallback_after_web_failure_not_cached() {
 }
 
 #[test]
+fn humanize_dates_and_labels() {
+    let now = parse_test_ts();
+    assert_eq!(humanize_article_date("garbage", now), "");
+    assert_eq!(
+        humanize_article_date("2026-11-01T19:59:30Z", now),
+        "Just now"
+    );
+    assert_eq!(
+        humanize_article_date("2026-11-01T19:30:00Z", now),
+        "30 minutes ago"
+    );
+    assert_eq!(
+        humanize_article_date("2026-11-01T18:00:00Z", now),
+        "2 hours ago"
+    );
+    assert_eq!(
+        humanize_article_date("2026-10-30T10:00:00Z", now),
+        "2026-10-30 10:00"
+    );
+    // Offset forms resolve to the same instant.
+    assert_eq!(
+        humanize_article_date("2026-11-01T12:59:30-07:00", now),
+        "Just now"
+    );
+
+    let header = article_header("Title", "2 hours ago", "Ann", "https://x");
+    assert!(header.starts_with("Title\nDate: 2 hours ago\nAuthor: Ann\nLink: https://x\n"));
+    assert!(header.contains(&"-".repeat(40)));
+
+    assert_eq!(
+        article_list_label("T", "Feed", "", "2026-10-30 10:00", false),
+        "T | Feed | 2026-10-30 10:00 | Unread"
+    );
+    assert_eq!(article_list_label("T", "", "", "", true), "T | Read");
+
+    assert!(article_matches_filter("Hello World post", "hello post"));
+    assert!(!article_matches_filter("Hello World post", "hello missing"));
+    assert!(article_matches_filter("anything", "  "));
+}
+
+fn parse_test_ts() -> i64 {
+    // 2026-11-01T20:00:00Z
+    1793563200
+}
+
+#[test]
 fn articles_page_views_and_totals() {
     use blindrss_core::db::{Article, Db, Feed};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -219,13 +265,19 @@ fn articles_page_views_and_totals() {
         media_url: None,
         media_type: None,
     };
-    db.insert_article_if_new(&mk("a1", "2026-10-30T00:00:00Z", false, false)).unwrap();
-    db.insert_article_if_new(&mk("a2", "2026-10-31T00:00:00Z", true, true)).unwrap();
-    db.insert_article_if_new(&mk("a3", "2026-11-01T00:00:00Z", false, true)).unwrap();
+    db.insert_article_if_new(&mk("a1", "2026-10-30T00:00:00Z", false, false))
+        .unwrap();
+    db.insert_article_if_new(&mk("a2", "2026-10-31T00:00:00Z", true, true))
+        .unwrap();
+    db.insert_article_if_new(&mk("a3", "2026-11-01T00:00:00Z", false, true))
+        .unwrap();
 
     let (page, total) = db.articles_page("all", 0, 2).unwrap();
     assert_eq!(total, 3);
-    assert_eq!(page.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(), vec!["a3", "a2"]);
+    assert_eq!(
+        page.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(),
+        vec!["a3", "a2"]
+    );
     let (page, total) = db.articles_page("all", 2, 2).unwrap();
     assert_eq!((page.len(), total), (1, 3));
     let (page, total) = db.articles_page("unread:all", 0, 10).unwrap();

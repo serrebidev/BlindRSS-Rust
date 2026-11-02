@@ -1115,3 +1115,65 @@ installed-browser true-version UA detection. The report also
 warns that this file's §1/§2 tables and §5 lists are stale
 snapshots contradicting the resolution paragraphs in ~15
 places — the resolutions and Audit 5 govern.
+
+Batch 37 resolution (v0.1.38): the Accessible Browser
+(Python `gui/accessibility.py`, §5 item 3 — the flattened,
+speech-first VoiceOver window) is ported. Core
+(`crates/core/src/accessible.rs`): the view-entry model —
+special views (all / unread:all / read:all / favorites:all),
+categories in case-insensitive depth-first path order,
+feeds title-sorted with Python's ", unread: N" suffix and
+parenthesized category breadcrumb, the `Uncategorized`
+sentinel, and visible-entry filtering against the expanded
+set with ", expanded" / ", collapsed" label suffixes and
+two-space-per-level indent; article-body arbitration
+(web extraction vs feed-cleaned vs feed-raw vs provider
+fetch, longest wins, the 1,500-character provider floor,
+Python's cacheability rules); chapter normalization and
+timestamp formatting (h:mm:ss past an hour, mm:ss below);
+the reader header, list label, relative-date humanizer and
+whitespace-term filter; the macOS VoiceOver probe. Paged
+view queries land as `Db::articles_page` (all / unread: /
+read: / favorites: prefixes, bare feed ids, and
+`category:` paths through the membership-clause query).
+App (`app/src/accessible_browser.rs`): the singleton
+window itself — views list, 400-article pages with Load
+More, the reader (header + body + chapters), a 300-entry /
+8 MB body cache with look-ahead prefetch of the next eight
+articles, the Rich Full-Text View WebView mode with the
+port's link-diversion policy, the full File / Article /
+Player / Tools / Help menu set and both context menus
+matching Python's commands one for one, MSAA Direct
+Annotation names on every control, and Ctrl+W / Ctrl+R /
+Ctrl+F / Ctrl+D / Delete handling. Main-window commands
+run through delegates wired in `main.rs` (Python's
+`_delegate` targets: add feed, add category, smart folder,
+OPML import/export, Takeout import, refresh, settings,
+the queue trio, the equalizer, persistent search, filter
+rules, Find Feeds, the podcast archive, Video Search,
+cookie import, shortcuts, feed errors, update check,
+About); download, view history, mark-view-read, feed
+removal, category removal, notification toggling and
+feed-URL copy are per-article/per-view adapters over the
+same core paths the main window uses. The window opens
+from View > Open Accessible Browser and the remappable
+`view.accessible_browser` command, and auto-opens once,
+about 900 ms after startup, when VoiceOver is running on
+macOS (Python's `_maybe_open_accessible_browser_for_
+voiceover`; tray-only launches skip it, as in Python).
+Recorded deviations, not silent drops: chapters come from
+the local chapters table only (YouTube chapters reach it
+through the playback path, which writes the same table;
+Python's frame additionally resolves them inline);
+"View Feed Description" shows the selected article's
+description because Rust feeds carry no feed-level
+description field; Delete has no undo inside this window
+(Python's restore view is the Deleted view, which this
+window's view model does not include — restore stays in
+the main window); the relative-date helper formats
+absolute dates in the stored wall time rather than
+converting to local time (core stays free of a timezone
+database); prefetch uses two workers to Python's three.
+Regression: batch37_slice (core view model, chapter
+formatting, body arbitration, date/header/label helpers,
+paged queries).

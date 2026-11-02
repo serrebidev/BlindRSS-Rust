@@ -217,6 +217,151 @@ pub fn extract_article_body(
     }
 }
 
+/// Python `humanize_article_date`: relative inside 24 hours
+/// ("Just now", "N minutes ago", "N hours ago"), otherwise the
+/// absolute "%Y-%m-%d %H:%M". Unparseable input yields "".
+/// (Python renders the absolute form in local time; the stored
+/// stamps are UTC and std has no local-offset source, so the
+/// absolute form uses the stored wall time.)
+pub fn humanize_article_date(date_str: &str, now_unix: i64) -> String {
+    let Some(ts) = parse_iso_unix(date_str) else {
+        return String::new();
+    };
+    let delta = (now_unix - ts).max(0);
+    if delta <= 24 * 3600 {
+        if delta < 60 {
+            return "Just now".to_string();
+        }
+        let mins = delta / 60;
+        if mins < 60 {
+            return if mins == 1 {
+                "1 minute ago".to_string()
+            } else {
+                format!("{mins} minutes ago")
+            };
+        }
+        let hours = mins / 60;
+        return if hours == 1 {
+            "1 hour ago".to_string()
+        } else {
+            format!("{hours} hours ago")
+        };
+    }
+    let (y, mo, d, h, mi) = unix_to_ymdhm(ts);
+    format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}")
+}
+
+/// Minimal ISO-8601 / RFC-2822-ish parser to Unix seconds for
+/// the stored date shapes (YYYY-MM-DD[T ]HH:MM[:SS][.frac][Z|±HH:MM]).
+fn parse_iso_unix(s: &str) -> Option<i64> {
+    let s = s.trim();
+    if s.len() < 16 {
+        return None;
+    }
+    let year: i64 = s.get(0..4)?.parse().ok()?;
+    if s.get(4..5)? != "-" {
+        return None;
+    }
+    let month: i64 = s.get(5..7)?.parse().ok()?;
+    let day: i64 = s.get(8..10)?.parse().ok()?;
+    let hour: i64 = s.get(11..13)?.parse().ok()?;
+    let min: i64 = s.get(14..16)?.parse().ok()?;
+    let sec: i64 = s.get(17..19).and_then(|p| p.parse().ok()).unwrap_or(0);
+    let mut offset: i64 = 0;
+    let rest = &s[16.min(s.len())..];
+    if let Some(pos) = rest.rfind(['+', '-']) {
+        let tail = &rest[pos..];
+        if tail.len() >= 5
+            && let (Ok(h), Ok(m)) = (
+                tail.get(1..3).unwrap_or("").parse::<i64>(),
+                tail.get(4..6).unwrap_or("").parse::<i64>(),
+            )
+        {
+            offset = if tail.starts_with('+') {
+                h * 3600 + m * 60
+            } else {
+                -(h * 3600 + m * 60)
+            };
+        }
+    }
+    let days = days_from_civil(year, month, day);
+    Some(days * 86_400 + hour * 3600 + min * 60 + sec - offset)
+}
+
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y_adj = if m <= 2 { y - 1 } else { y };
+    let era = if y_adj >= 0 { y_adj } else { y_adj - 399 } / 400;
+    let yoe = y_adj - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+fn unix_to_ymdhm(ts: i64) -> (i64, i64, i64, i64, i64) {
+    let days = ts.div_euclid(86_400);
+    let secs = ts.rem_euclid(86_400);
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (
+        if m <= 2 { y + 1 } else { y },
+        m,
+        d,
+        secs / 3600,
+        (secs % 3600) / 60,
+    )
+}
+
+/// Python `_article_header`: title, Date/Author/Link lines, a
+/// 40-dash rule, and a blank line, ahead of the body.
+pub fn article_header(title: &str, date_text: &str, author: &str, url: &str) -> String {
+    format!(
+        "{title}\nDate: {date_text}\nAuthor: {author}\nLink: {url}\n{}\n\n",
+        "-".repeat(40)
+    )
+}
+
+/// Python `_article_label`: title | feed | author | date |
+/// Read/Unread, empty parts skipped (status always present).
+pub fn article_list_label(
+    title: &str,
+    feed_title: &str,
+    author: &str,
+    date_text: &str,
+    is_read: bool,
+) -> String {
+    let mut parts: Vec<&str> = vec![title];
+    if !feed_title.is_empty() {
+        parts.push(feed_title);
+    }
+    if !author.is_empty() {
+        parts.push(author);
+    }
+    if !date_text.is_empty() {
+        parts.push(date_text);
+    }
+    parts.push(if is_read { "Read" } else { "Unread" });
+    parts.join(" | ")
+}
+
+/// Python `_filter_articles`: every whitespace-separated term
+/// must appear in the article's search text (case-insensitive).
+pub fn article_matches_filter(search_text: &str, query: &str) -> bool {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return true;
+    }
+    let text = search_text.to_lowercase();
+    query.split_whitespace().all(|term| text.contains(term))
+}
+
 /// Python `voiceover_is_running`: macOS only; pgrep -x
 /// VoiceOver. False on every other platform.
 pub fn voiceover_is_running() -> bool {

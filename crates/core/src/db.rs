@@ -497,11 +497,7 @@ impl Db {
                 })
                 .collect();
             let total = filtered.len() as i64;
-            let page = filtered
-                .into_iter()
-                .skip(offset)
-                .take(limit)
-                .collect();
+            let page = filtered.into_iter().skip(offset).take(limit).collect();
             return Ok((page, total));
         }
         let feed_clause = if base == "all" || base.is_empty() {
