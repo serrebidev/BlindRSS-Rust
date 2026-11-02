@@ -749,6 +749,98 @@ impl Db {
         Ok(())
     }
 
+    /// Hosted-cache row shapes: GReader feeds carry their
+    /// stream id (`feed/<url>`), Miniflux feeds are
+    /// `miniflux:<server id>`, Miniflux articles are
+    /// `miniflux-entry:<entry id>`. Local feeds use UUID ids,
+    /// so these shapes never belong to local data. Older syncs
+    /// wrote every configured account into whichever database
+    /// was active; each hosted account now has its own cache
+    /// file (see provider::db_path_for_provider) and its
+    /// server is the source of truth, so these rows are safe
+    /// to remove wherever they do not belong.
+    ///
+    /// Removes every hosted-shaped feed and article (plus
+    /// dependent chapter/playback/label/version rows).
+    /// Returns the number of feeds removed.
+    pub fn purge_hosted_rows(&self) -> rusqlite::Result<usize> {
+        self.purge_hosted_rows_inner(None)
+    }
+
+    /// Like `purge_hosted_rows`, but keeps the hosted feeds
+    /// whose ids start with `keep_feed_prefix` (and, for
+    /// Miniflux, their `miniflux-entry:` articles): the purge
+    /// for one account's cache file, dropping rows a sync for
+    /// a different kind of account wrote into it.
+    pub fn purge_hosted_rows_except(&self, keep_feed_prefix: &str) -> rusqlite::Result<usize> {
+        self.purge_hosted_rows_inner(Some(keep_feed_prefix))
+    }
+
+    fn purge_hosted_rows_inner(&self, keep_feed_prefix: Option<&str>) -> rusqlite::Result<usize> {
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        tx.execute(
+            "CREATE TEMP TABLE IF NOT EXISTS purge_feeds (id TEXT PRIMARY KEY)",
+            [],
+        )?;
+        tx.execute("DELETE FROM purge_feeds", [])?;
+        match keep_feed_prefix {
+            Some(prefix) => {
+                let pat = format!("{prefix}%");
+                tx.execute(
+                    "INSERT INTO purge_feeds SELECT id FROM feeds WHERE (id LIKE 'feed/%' OR id LIKE 'miniflux:%') AND id NOT LIKE ?1",
+                    params![pat],
+                )?;
+            }
+            None => {
+                tx.execute(
+                    "INSERT INTO purge_feeds SELECT id FROM feeds WHERE id LIKE 'feed/%' OR id LIKE 'miniflux:%'",
+                    [],
+                )?;
+            }
+        }
+        let keep_miniflux_articles = keep_feed_prefix == Some("miniflux:");
+        tx.execute(
+            "CREATE TEMP TABLE IF NOT EXISTS purge_articles (id TEXT PRIMARY KEY)",
+            [],
+        )?;
+        tx.execute("DELETE FROM purge_articles", [])?;
+        tx.execute(
+            "INSERT INTO purge_articles SELECT id FROM articles WHERE feed_id IN (SELECT id FROM purge_feeds)",
+            [],
+        )?;
+        if !keep_miniflux_articles {
+            tx.execute(
+                "INSERT OR IGNORE INTO purge_articles SELECT id FROM articles WHERE id LIKE 'miniflux-entry:%'",
+                [],
+            )?;
+        }
+        for table in ["chapters", "article_labels", "article_versions"] {
+            tx.execute(
+                &format!("DELETE FROM {table} WHERE article_id IN (SELECT id FROM purge_articles)"),
+                [],
+            )?;
+        }
+        tx.execute(
+            "DELETE FROM playback_state WHERE id IN (SELECT id FROM purge_articles)",
+            [],
+        )?;
+        tx.execute(
+            "DELETE FROM articles WHERE id IN (SELECT id FROM purge_articles)",
+            [],
+        )?;
+        let removed = tx.execute(
+            "DELETE FROM feeds WHERE id IN (SELECT id FROM purge_feeds)",
+            [],
+        )?;
+        tx.execute("DROP TABLE purge_feeds", [])?;
+        tx.execute("DROP TABLE purge_articles", [])?;
+        tx.commit()?;
+        Ok(removed)
+    }
+
     /// Chapters for an article, ordered by start (seconds).
     pub fn chapters(&self, article_id: &str) -> rusqlite::Result<Vec<Chapter>> {
         let mut stmt = self.conn.prepare(

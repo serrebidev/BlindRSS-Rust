@@ -217,6 +217,19 @@ impl HostedProvider {
         }
     }
 
+    /// Drop hosted rows belonging to a different kind of
+    /// account (a sync aimed at the wrong cache file before
+    /// per-account paths were enforced). Hygiene only: a
+    /// failure never blocks the sync.
+    fn purge_foreign(&self) {
+        if let Ok(db) = self.db() {
+            let _ = match self.kind {
+                HostedKind::GReader(_) => db.purge_hosted_rows_except("feed/"),
+                HostedKind::Miniflux => db.purge_hosted_rows_except("miniflux:"),
+            };
+        }
+    }
+
     fn miniflux(&self) -> Result<MinifluxClient, String> {
         let (url, key) = (self.cred("url"), self.cred("api_key"));
         if url.is_empty() || key.is_empty() {
@@ -229,6 +242,7 @@ impl HostedProvider {
         force: bool,
         on_background: Box<dyn FnOnce(Result<String, String>) + Send>,
     ) -> Result<String, String> {
+        self.purge_foreign();
         let client = self.miniflux()?;
         let pending = client.request_refresh(force);
         let synced = client.sync(&self.db()?, 100);
@@ -417,6 +431,7 @@ impl Provider for HostedProvider {
         match self.kind {
             HostedKind::Miniflux => self.refresh_miniflux(force, on_background),
             HostedKind::GReader(_) => {
+                self.purge_foreign();
                 let client = self.greader()?;
                 if force {
                     client.invalidate_caches();
@@ -467,8 +482,22 @@ pub fn active_name(cfg: &Config) -> String {
 /// Hosted accounts keep separate rebuildable caches; the existing local database is untouched.
 /// No data is migrated: a previously used hosted account needs its first sync in this cache.
 pub fn active_db_path(cfg: &Config, base: &Path) -> PathBuf {
+    db_path_for_provider(cfg, base, &active_name(cfg))
+}
+
+/// The database file for one named provider ("local" = the
+/// base file itself). Every hosted account gets its own
+/// cache file, keyed by a hash of its credentials, so two
+/// accounts' rows can never share a namespace; syncs and
+/// views must open the file for the account they serve,
+/// never another account's.
+pub fn db_path_for_provider(cfg: &Config, base: &Path, name: &str) -> PathBuf {
     use sha2::Digest;
-    let name = active_name(cfg);
+    let name = if PROVIDER_NAMES.contains(&name) {
+        name
+    } else {
+        "local"
+    };
     let stem = base.file_stem().and_then(|s| s.to_str()).unwrap_or("rss");
     let scoped = stem.contains(".hosted-");
     let stem = stem.split(".hosted-").next().unwrap_or(stem);
@@ -480,7 +509,7 @@ pub fn active_db_path(cfg: &Config, base: &Path) -> PathBuf {
             base.to_path_buf()
         };
     }
-    let section = cfg.raw().get("providers").and_then(|p| p.get(&name));
+    let section = cfg.raw().get("providers").and_then(|p| p.get(name));
     let cred = |key: &str| {
         section
             .and_then(|p| p.get(key))

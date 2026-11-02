@@ -1177,3 +1177,40 @@ database); prefetch uses two workers to Python's three.
 Regression: batch37_slice (core view model, chapter
 formatting, body arbitration, date/header/label helpers,
 paged queries).
+
+Batch 39 resolution (v0.1.39): hosted account storage
+isolation (PARITY-2026-11-01 gap 1) is closed. The
+per-account cache files already existed
+(`rss.hosted-<provider>-<credential hash>.db`, core
+provider.rs), but three paths still crossed accounts.
+(1) The Sync Providers action synced every configured
+account into whichever database was active — with Local
+active, The Old Reader, BazQux, Inoreader and Miniflux
+all poured into rss.db and collided on the shared
+`feed/<url>` stream ids; with a hosted account active,
+the other accounts contaminated its cache. Each sync
+worker now opens its own account's file through the new
+`provider::db_path_for_provider` (active_db_path
+delegates to it). (2) Read-state propagation tried every
+configured GReader service in turn and wrote to whichever
+accepted, leaking read state across accounts when the
+same item id existed on both; it now writes only to the
+active provider, and the Miniflux branch is gated on
+Miniflux being active. (3) Stray rows from the
+pre-isolation syncs are purged: `Db::purge_hosted_rows`
+removes hosted-shaped rows (GReader `feed/…` feeds,
+`miniflux:…` feeds, `miniflux-entry:…` articles, plus
+their chapter, playback, label and version rows) and
+runs at startup whenever Local is active — local feed
+ids are UUIDs, so the shapes are unambiguous, and hosted
+servers are the source of truth for the dropped caches.
+Each hosted cache likewise drops the other kind's rows
+before a sync (`purge_hosted_rows_except`, called from
+the provider refresh paths). Same-kind rows written into
+the wrong account's cache by the old Sync action cannot
+be told apart by shape; they age out through normal
+sync, and deleting that account's rebuildable cache file
+clears them outright. Regression: batch39_slice
+(per-account paths incl. credential sensitivity and
+re-basing, full purge keeping local data, per-kind purge
+keeping the owning kind's rows and playback state).

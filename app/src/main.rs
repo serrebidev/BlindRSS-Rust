@@ -454,7 +454,9 @@ pub(crate) fn propagate_read_state(article: &blindrss_core::db::Article, read: b
                 .unwrap_or("")
                 .to_string()
         };
-        if article.feed_id.starts_with("miniflux:") {
+        if article.feed_id.starts_with("miniflux:")
+            && blindrss_core::provider::active_name(&cfg) == "miniflux"
+        {
             if let Some(section) = providers.get("miniflux") {
                 let (url, key) = (get(section, "url"), get(section, "api_key"));
                 if let Some(entry) = article
@@ -473,28 +475,37 @@ pub(crate) fn propagate_read_state(article: &blindrss_core::db::Article, read: b
         }
         if article.feed_id.starts_with("feed/") {
             use blindrss_core::providers::{GReaderClient, GReaderService};
-            for (key, service) in [
-                ("theoldreader", GReaderService::TheOldReader),
-                ("bazqux", GReaderService::BazQux),
-            ] {
-                if let Some(section) = providers.get(key) {
-                    let (email, password) = (get(section, "email"), get(section, "password"));
-                    if !email.is_empty()
-                        && !password.is_empty()
-                        && GReaderClient::new(service, &email, &password)
-                            .set_read_remote(&article.id, read)
-                            .is_ok()
-                    {
-                        return;
+            // The article belongs to the ACTIVE account (its
+            // cache is the open database); write only there.
+            // Spraying every configured GReader service leaked
+            // read state into the user's other accounts when
+            // the same item id existed on both.
+            match blindrss_core::provider::active_name(&cfg).as_str() {
+                "theoldreader" | "bazqux" => {
+                    let key = blindrss_core::provider::active_name(&cfg);
+                    let service = if key == "bazqux" {
+                        GReaderService::BazQux
+                    } else {
+                        GReaderService::TheOldReader
+                    };
+                    if let Some(section) = providers.get(&key) {
+                        let (email, password) = (get(section, "email"), get(section, "password"));
+                        if !email.is_empty() && !password.is_empty() {
+                            let _ = GReaderClient::new(service, &email, &password)
+                                .set_read_remote(&article.id, read);
+                        }
                     }
                 }
-            }
-            if let Some(section) = providers.get("inoreader") {
-                let token = get(section, "token");
-                if !token.is_empty() {
-                    let _ = GReaderClient::with_oauth(GReaderService::Inoreader, &token)
-                        .set_read_remote(&article.id, read);
+                "inoreader" => {
+                    if let Some(section) = providers.get("inoreader") {
+                        let token = get(section, "token");
+                        if !token.is_empty() {
+                            let _ = GReaderClient::with_oauth(GReaderService::Inoreader, &token)
+                                .set_read_remote(&article.id, read);
+                        }
+                    }
                 }
+                _ => {}
             }
         }
     });
@@ -2554,6 +2565,20 @@ fn main() {
             let mut st = state.borrow_mut();
             match Db::open_or_create(&path) {
                 Ok(db) => {
+                    // Hosted isolation: with Local active, the
+                    // base database must not carry hosted-cache
+                    // rows (older syncs wrote every account into
+                    // it). Each hosted account keeps its own
+                    // cache file and its server is authoritative,
+                    // so the strays are dropped before the tree
+                    // loads.
+                    {
+                        let cfg =
+                            blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+                        if blindrss_core::provider::active_name(&cfg) == "local" {
+                            let _ = db.purge_hosted_rows();
+                        }
+                    }
                     st.feeds = db.feeds().unwrap_or_default();
                     st.db = Some(db);
                     frame.set_status_text(&format!("Loaded {}", path.display()), 0);
@@ -3432,7 +3457,11 @@ fn main() {
                 }
                 started += 1;
                 let tx = tx_sync.clone();
-                let path = db_path();
+                // Hosted isolation: this account's sync writes
+                // only its own cache file, never the active
+                // provider's database.
+                let path =
+                    blindrss_core::provider::db_path_for_provider(&cfg, &base_db_path(), key);
                 std::thread::spawn(move || {
                     let result = Db::open(&path).map_err(|e| format!("{e}")).and_then(|db| {
                         blindrss_core::providers::GReaderClient::new(service, &email, &password)
@@ -3446,9 +3475,13 @@ fn main() {
                 if !token.is_empty() {
                     started += 1;
                     let tx = tx_sync.clone();
-                    let path = db_path();
+                    let path = blindrss_core::provider::db_path_for_provider(
+                        &cfg,
+                        &base_db_path(),
+                        "inoreader",
+                    );
+                    let page_size = blindrss_core::providers::page_size_from_config(&cfg);
                     std::thread::spawn(move || {
-                        let page_size = blindrss_core::providers::page_size_from_config(&cfg);
                         let result = Db::open(&path).map_err(|e| format!("{e}")).and_then(|db| {
                             blindrss_core::providers::GReaderClient::with_oauth(
                                 blindrss_core::providers::GReaderService::Inoreader,
@@ -3466,7 +3499,11 @@ fn main() {
                 if !url.is_empty() && !api_key.is_empty() {
                     started += 1;
                     let tx = tx_sync.clone();
-                    let path = db_path();
+                    let path = blindrss_core::provider::db_path_for_provider(
+                        &cfg,
+                        &base_db_path(),
+                        "miniflux",
+                    );
                     std::thread::spawn(move || {
                         let result = Db::open(&path).map_err(|e| format!("{e}")).and_then(|db| {
                             blindrss_core::providers::MinifluxClient::new(&url, &api_key)
