@@ -1214,3 +1214,35 @@ clears them outright. Regression: batch39_slice
 (per-account paths incl. credential sensitivity and
 re-basing, full purge keeping local data, per-kind purge
 keeping the owning kind's rows and playback state).
+
+Batch 40 resolution (v0.1.40): the Accessible Browser is
+REMOVED from the Rust port at the owner's direction
+(2026-11-01), reversing the Batch 37 resolution above.
+Research first, per the owner's instruction ("search
+GitHub for voiceover rust... if a separate GUI for Mac is
+not required, drop it"): GitHub most-recent and
+most-starred, Codeberg and GitLab (no relevant results on
+either). Findings: blind-focused wxDragon applications
+(BrailleCraft, Wixen Mail) ship ONE GUI for all platforms
+with VoiceOver as a primary audience; wxDragon upstream
+actively maintains VoiceOver support in the main surface
+(dedicated macOS/VoiceOver issues; it adopted the new
+wxWidgets accessibility APIs in 3.3.4); wxWidgets 3.3.4
+(2026-10) advertises improved accessibility on all
+platforms including wxOSX, and the historic 2013
+wxListCtrl/VoiceOver tracker item (wxWidgets#15411) is
+closed as completed. Nothing found requires a separate
+macOS GUI; AccessKit addresses custom-drawn toolkits, not
+wx native controls, and was already rejected for this app
+with evidence. Python keeps its Accessible Browser (there
+it is the primary VoiceOver reading surface); the removal
+is a deliberate Rust-only deviation, recorded as Audit 6
+item D1. Removed: app/src/accessible_browser.rs, the core
+accessible module, Db::articles_page, the View menu item,
+the view.accessible_browser shortcut command (the Rust
+registry now intentionally differs from Python's by this
+one command), the VoiceOver auto-open, the F1 help topic
+mapping, and the help-guide section in all 16 locales.
+The main window is the single reading surface on every
+platform; its reader already carries the mitigations that
+matter (content replacement on load, announcements).

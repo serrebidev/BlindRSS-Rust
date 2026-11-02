@@ -363,12 +363,12 @@ must stay compatible with):
 - The Rich View (wx WebView) is opt-in (`full_text_rich_view`, default
   off) and gated on the backend actually being available; navigation
   from it follows the Python link-diversion rules (issue #102).
-- The Accessible Browser front-end (Python `gui/accessibility.py`,
-  the VoiceOver-first window) landed in v0.1.38
-  (`app/src/accessible_browser.rs`, core model in
-  `crates/core/src/accessible.rs`; see the Batch 37 resolution in
-  PARITY.md). Reading behaviour added to the main window is not
-  "done" for macOS until it exists there too.
+- The Accessible Browser front-end (Python `gui/accessibility.py`)
+  landed in v0.1.38 and was REMOVED in v0.1.40 at the owner's
+  direction: research found no separate macOS GUI is required
+  for VoiceOver in a wx app (see the Batch 40 resolution in
+  PARITY.md and Audit 6 item D1). Do not re-add it. The main
+  window is the single reading surface on every platform.
 
 ### 5. Translation
 - Off by default. Operates on rendered full-text output in chunks,

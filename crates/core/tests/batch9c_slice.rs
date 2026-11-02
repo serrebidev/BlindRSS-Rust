@@ -58,7 +58,9 @@ fn jaws_process_gate_matches_python() {
 
 #[test]
 fn registry_basics() {
-    assert_eq!(TOPICS.len(), 80);
+    // 79 since Batch 40 removed the accessible-browser topic
+    // with the Accessible Browser itself (owner-directed).
+    assert_eq!(TOPICS.len(), 79);
     assert_eq!(normalize("no-such-topic"), DEFAULT_TOPIC);
     assert_eq!(normalize("main-window"), "main-window");
     assert_eq!(topic_title("user-guide"), "BlindRSS User Guide");

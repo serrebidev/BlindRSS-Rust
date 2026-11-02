@@ -5,7 +5,6 @@
 //! is a Stage 0/6 acceptance item); layout follows BlindFB's proven
 //! patterns: sizer-based, labelled controls, status bar announcements.
 
-mod accessible_browser;
 mod article_window;
 mod casting;
 mod dialogs;
@@ -1451,7 +1450,6 @@ const M_RICH_VIEW: i32 = 2218;
 const M_OPEN_BROWSER: i32 = 2219;
 const M_DOWNLOAD_AS: i32 = 2220;
 const M_EDIT_SELECTED: i32 = 2221;
-const M_ACCESSIBLE_BROWSER: i32 = 2222;
 
 /// Route remappable commands through the same actions as native menus.
 fn shortcut_menu_id(command: &str) -> Option<i32> {
@@ -1488,7 +1486,6 @@ fn shortcut_menu_id(command: &str) -> Option<i32> {
         "article.view_description" => M_VIEW_DESC,
         "view.toggle_search" => M_TOGGLE_SEARCH,
         "view.rich_view" => M_RICH_VIEW,
-        "view.accessible_browser" => M_ACCESSIBLE_BROWSER,
         "filter.read_all" => M_FILTER_ALL,
         "filter.read_unread" => M_FILTER_UNREAD,
         "filter.read_read" => M_FILTER_READ,
@@ -6427,11 +6424,6 @@ fn main() {
             )
             .append_separator()
             .append_separator()
-            .append_item(
-                M_ACCESSIBLE_BROWSER,
-                "Open &Accessible Browser",
-                "Open the Accessible Browser window",
-            )
             .append_item(M_FIND, "&Find in Article...", "Search the article text")
             .append_item(M_FIND_NEXT, "Find &Next", "Repeat the last find")
             .build();
@@ -6519,153 +6511,6 @@ fn main() {
                 bar.check_item(M_RICH_VIEW, cfg.get_bool("full_text_rich_view", false));
             }
         }
-        // Accessible Browser (Python's AccessibleBrowserFrame):
-        // a singleton window; its main-window commands run
-        // through these delegates (Python's _delegate targets).
-        let act_accessible_browser: Rc<dyn Fn()> = {
-            let frame_ab = frame;
-            let cb = accessible_browser::AbCallbacks {
-                add_feed: Some(act_add.clone()),
-                open_article_url: Some(act_open_article.clone()),
-                detect_page_feeds: Some(act_feed_search.clone()),
-                add_category: Some(act_add_category.clone()),
-                new_smart_folder: Some(act_new_sf.clone()),
-                import_opml: Some(act_import.clone()),
-                import_takeout: Some(act_takeout.clone()),
-                export_opml: Some(act_export.clone()),
-                refresh_feeds: Some(act_refresh.clone()),
-                stop_refresh: Some(act_stop_refresh.clone()),
-                settings: Some(act_settings.clone()),
-                toggle_player: None,
-                play_queue: Some(act_queue_open.clone()),
-                play_queue_next: Some(act_queue_next.clone()),
-                play_queue_prev: Some(act_queue_prev.clone()),
-                equalizer: Some(act_equalizer.clone()),
-                persistent_search: Some(act_persistent.clone()),
-                filter_rules: Some(act_filter_rules.clone()),
-                find_feed: Some(act_feed_search.clone()),
-                podcast_archive: Some(act_podcast_archive.clone()),
-                video_search: Some(act_video_search.clone()),
-                import_cookies: Some(act_import_cookies.clone()),
-                shortcuts: Some(act_keys.clone()),
-                feed_errors: Some(act_feed_errors.clone()),
-                check_updates: Some(act_update.clone()),
-                about: Some(act_about.clone()),
-                download_article: Some(Rc::new(|article: &Article| {
-                    let article = article.clone();
-                    std::thread::spawn(move || {
-                        let mut cfg =
-                            blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
-                        if !cfg.get_bool("downloads_enabled", true) {
-                            return;
-                        }
-                        let format = cfg.get_str("download_format", "video_best").to_string();
-                        let dir = std::path::PathBuf::from(cfg.get_str("download_path", ""));
-                        let dir = if dir.as_os_str().is_empty() {
-                            home_dir().join("Downloads").join("BlindRSS")
-                        } else {
-                            dir
-                        };
-                        let result = if let Some(media) = article.media_url.as_deref().filter(|u| {
-                            !u.is_empty()
-                                && blindrss_core::media::is_playable_media(
-                                    u,
-                                    article.media_type.as_deref(),
-                                )
-                                && !blindrss_core::media::is_ytdlp_supported(u)
-                        }) {
-                            blindrss_core::download::download_direct(media, &dir, &article.title)
-                        } else if !article.url.is_empty() {
-                            match blindrss_core::media::resolve_for_play(
-                                article.media_url.as_deref(),
-                                article.media_type.as_deref(),
-                                &article.url,
-                                article.content.as_deref(),
-                            ) {
-                                Ok(r) if r.via_ytdlp => {
-                                    blindrss_core::download::download_with_ytdlp(
-                                        &article.url,
-                                        &dir,
-                                        &format,
-                                    )
-                                }
-                                Ok(r) => blindrss_core::download::download_direct(
-                                    &r.url,
-                                    &dir,
-                                    &article.title,
-                                ),
-                                Err(e) => Err(e),
-                            }
-                        } else {
-                            Err("Article has nothing to download".to_string())
-                        };
-                        if let Ok(path) = &result {
-                            let _ = blindrss_core::download::record_article_download(
-                                &mut cfg, &article, path,
-                            );
-                        }
-                    });
-                })),
-                view_history: Some(Rc::new(move |article: &Article| {
-                    if let Ok(db) = Db::open(&db_path()) {
-                        dialogs::show_article_history(&frame_ab, &db, article);
-                    }
-                })),
-                mark_view_read: Some(Rc::new(|view_id: &str| {
-                    if let Ok(db) = Db::open(&db_path())
-                        && let Ok((articles, _)) = db.articles_page(view_id, 0, 100_000)
-                    {
-                        for a in &articles {
-                            if !a.is_read {
-                                mark_article_read(&db, a, true);
-                                propagate_read_state(a, true);
-                            }
-                        }
-                    }
-                })),
-                remove_feed: Some(Rc::new(|feed_id: &str| {
-                    if let Ok(db) = Db::open(&db_path()) {
-                        let _ = db.remove_feed(feed_id);
-                    }
-                })),
-                remove_category: Some(Rc::new(|cat_name: &str| {
-                    if let Ok(db) = Db::open(&db_path())
-                        && let Ok(cats) = db.categories()
-                        && let Some(cat) = cats.iter().find(|c| c.title == cat_name)
-                    {
-                        let _ = db.remove_category(&cat.id);
-                    }
-                })),
-                toggle_feed_notifications: Some(Rc::new(|feed_id: &str| {
-                    let mut cfg =
-                        blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
-                    let mut ids = notification_excluded_ids(&cfg);
-                    if let Some(pos) = ids.iter().position(|id| id == feed_id) {
-                        ids.remove(pos);
-                    } else {
-                        ids.push(feed_id.to_string());
-                    }
-                    cfg.set_path("notification_excluded_feed_ids", serde_json::json!(ids));
-                    let _ = cfg.save(&config_path());
-                })),
-                copy_feed_url: Some(Rc::new(|feed_id: &str| {
-                    if let Ok(db) = Db::open(&db_path())
-                        && let Ok(feeds) = db.feeds()
-                        && let Some(feed) = feeds.iter().find(|f| f.id == feed_id)
-                    {
-                        let _ = Clipboard::get().set_text(&feed.url);
-                    }
-                })),
-            };
-            Rc::new(move || {
-                if accessible_browser::is_open() {
-                    accessible_browser::raise_existing();
-                } else {
-                    accessible_browser::open_accessible_browser(&frame_ab, cb.clone());
-                }
-            })
-        };
-
         let menu_actions: Vec<(i32, Rc<dyn Fn()>)> = vec![
             (M_ADD_FEED, act_add.clone()),
             (M_IMPORT_OPML, act_import.clone()),
@@ -6754,7 +6599,6 @@ fn main() {
             (M_COPY_URL, act_copy_url.clone()),
             (M_COPY_MEDIA, act_copy_media.clone()),
             (M_COPY_FEED_URL, act_copy_feed_url.clone()),
-            (M_ACCESSIBLE_BROWSER, act_accessible_browser.clone()),
         ];
         let frame_menu = frame;
         let quit_menu = quit_flag.clone();
@@ -7081,26 +6925,11 @@ fn main() {
         let timer = Box::leak(Box::new(Timer::new(&frame)));
         let state_tick = state.clone();
         let frame_tick = frame;
-        let act_ab_vo = act_accessible_browser.clone();
-        let vo_ticks = Rc::new(std::cell::Cell::new(0u32));
         let rich_view_tick = rich_view.clone();
         let rich_loading_tick = rich_loading.clone();
         let rx_tick = rx.clone();
         let tx_tick = tx.clone();
         timer.on_tick(move |_| {
-            // VoiceOver auto-open (macOS, once, ~900 ms after
-            // startup; Python's _maybe_open_accessible_browser_
-            // for_voiceover).
-            {
-                let n = vo_ticks.get() + 1;
-                vo_ticks.set(n);
-                if n == 6
-                    && cfg!(target_os = "macos")
-                    && blindrss_core::accessible::voiceover_is_running()
-                {
-                    act_ab_vo();
-                }
-            }
             if frame_tick.is_shown() && frame_tick.is_iconized() {
                 let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
                 if cfg.get_bool("minimize_to_tray", true) {

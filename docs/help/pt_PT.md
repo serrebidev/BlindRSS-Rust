@@ -367,7 +367,6 @@ Enter em um artigo na lista o abre. Dependendo do artigo e das suas definições
 
 - Abrir artigo no menu de contexto faz o mesmo.
 - Abrir no navegador passa o endereço do artigo para o navegador web do sistema.
-- Abrir navegador acessível lê a página dentro do BlindRSS. Consulte Navegador acessível.
 
 Abrir um artigo o marca como lido, a menos que tenha alterado esse comportamento.
 
@@ -413,12 +412,6 @@ Ctrl+Shift+H alterna o painel de leitura para a vista HTML avançada, que render
 A vista de texto simples é o padrão porque é mais rápida e nunca surpreende o utilizador. A vista avançada vale a pena para artigos cuja estrutura transmite significado.
 
 Um feed pode ser configurado para sempre abrir na vista avançada pelas Propriedades do feed, e links na vista avançada abrem no navegador do sistema em vez de dentro da vista.
-
-## Navegador acessível {#accessible-browser}
-
-Exibir, Abrir navegador acessível abre uma página dentro do BlindRSS em uma janela criada para leitura por leitores de tela, em vez de passá-la ao navegador do sistema.
-
-É a ferramenta certa para uma página que precisa ser lida em vez de utilizada interativamente, e para sites cuja própria interface é difícil de navegar. Ele compartilha as definições de cookies e de identificação do navegador do BlindRSS, portanto páginas atrás de uma verificação de navegador também abrem aqui depois que importar cookies para elas.
 
 ## Vídeos do YouTube {#youtube}
 

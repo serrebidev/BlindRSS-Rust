@@ -582,8 +582,6 @@ HTML-Ansicht.
 - „Artikel öffnen“ im Kontextmenü tut dasselbe.
 - „Im Standardbrowser öffnen“ übergibt die Adresse des Artikels an Ihren
   Webbrowser.
-- „Barrierefreien Browser öffnen“ liest die Seite stattdessen in BlindRSS.
-  Siehe „Barrierefreier Browser“.
 
 Das Öffnen eines Artikels markiert ihn als gelesen, sofern Sie dieses Verhalten
 nicht geändert haben.
@@ -657,18 +655,6 @@ trägt.
 Ein Feed kann über seine Feed-Eigenschaften so eingestellt werden, dass er
 immer in der HTML-Ansicht öffnet; Links in der HTML-Ansicht öffnen sich in
 Ihrem Webbrowser statt innerhalb der Ansicht.
-
-## Barrierefreier Browser {#accessible-browser}
-
-&Ansicht, „Barrierefreien Browser öffnen“ öffnet eine Seite innerhalb von
-BlindRSS in einem Fenster, das für das Lesen mit einem Bildschirmleser gebaut
-ist, statt sie an Ihren Webbrowser zu übergeben.
-
-Es ist das richtige Werkzeug für eine Seite, die gelesen statt bedient werden
-soll, und für Websites, deren eigene Oberfläche schwer zu navigieren ist. Es
-teilt sich die Cookie- und Browser-Identitätseinstellungen von BlindRSS, sodass
-sich Seiten hinter einer Browserprüfung auch hier öffnen, sobald Sie Cookies
-dafür importiert haben.
 
 ## YouTube-Videos {#youtube}
 

@@ -525,7 +525,6 @@ to panel czytania, osobne okno albo bogaty widok HTML.
 
 - Otwórz artykuł w menu kontekstowym robi to samo.
 - Otwórz w przeglądarce przekazuje adres artykułu systemowej przeglądarce internetowej.
-- Otwórz dostępną przeglądarkę odczytuje stronę w BlindRSS. Zobacz Dostępna przeglądarka.
 
 Otwarcie artykułu oznacza go jako przeczytany, chyba że zmieniono to zachowanie.
 
@@ -589,16 +588,6 @@ Bogaty widok jest wart użycia dla artykułów, których struktura niesie znacze
 
 Kanał można ustawić tak, aby zawsze otwierał się w bogatym widoku z jego Właściwości
 kanału, a łącza w bogatym widoku otwierają się w przeglądarce systemowej, a nie wewnątrz widoku.
-
-## Dostępna przeglądarka {#accessible-browser}
-
-Widok, Otwórz dostępną przeglądarkę otwiera stronę w BlindRSS w oknie zbudowanym
-do czytania przez czytnik ekranu, zamiast przekazywać ją systemowej przeglądarce.
-
-Jest to właściwe narzędzie dla strony, którą trzeba przeczytać, a nie obsłużyć, oraz
-dla witryn, których własny interfejs jest trudny w nawigacji. Współdzieli ustawienia
-ciasteczek i identyfikacji przeglądarki BlindRSS, więc strony za sprawdzeniem
-przeglądarki także otwierają się tutaj po zaimportowaniu dla nich ciasteczek.
 
 ## Filmy YouTube {#youtube}
 

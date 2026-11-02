@@ -83,12 +83,6 @@ pub const COMMANDS: &[(&str, &str, &str, &str)] = &[
         "Ctrl+Shift+H",
     ),
     (
-        "view.accessible_browser",
-        "View",
-        "Open Accessible Browser",
-        "",
-    ),
-    (
         "filter.read_all",
         "Article Filter",
         "All Articles",

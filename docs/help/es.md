@@ -529,8 +529,6 @@ vista.
 
 - Abrir Artículo en el menú contextual hace lo mismo.
 - Abra en Browser da la dirección del artículo a su navegador web del sistema.
-- Open Accessible Browser lee la página dentro de BlindRSS en su lugar.
-  Navegador accesible.
 
 Abrir un artículo lo lee a menos que haya cambiado ese comportamiento.
 
@@ -596,16 +594,6 @@ la rica vista vale la pena para artículos cuya estructura tiene significado.
 
 Una alimentación se puede configurar para siempre abrir en la rica vista desde sus propiedades federales, y
 enlaces en la vista rica abierta en su navegador de sistema en lugar de dentro de la vista.
-
-## Navegador accesible {#accessible-browser}
-
-Ver, Open Accessible Browser abre una página dentro de BlindRSS en una ventana construida
-para lectura de pantalla, en lugar de entregarlo a su navegador del sistema.
-
-Es la herramienta adecuada para una página que necesita ser leída en lugar de interactuar
-con, y para sitios cuya propia interfaz es difícil de navegar. Comparte
-Ajustes de cookies y de identidad del navegador de BlindRSS, así que páginas detrás de un navegador
-comprobar abierto aquí también una vez que haya importado galletas para ellos.
 
 ## Videos de YouTube {#youtube}
 

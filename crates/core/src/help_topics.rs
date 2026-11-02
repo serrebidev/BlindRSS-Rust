@@ -50,7 +50,6 @@ pub const TOPICS: &[(&str, &str)] = &[
     ("deleted-articles", "Deleted Articles"),
     ("full-text", "Full-Text Article Recovery"),
     ("rich-view", "Rich Full-Text View"),
-    ("accessible-browser", "Accessible Browser"),
     ("youtube", "YouTube Videos"),
     ("forums", "Forum and Discussion Threads"),
     ("clipboard", "Cut, Copy, and Paste"),
@@ -159,7 +158,6 @@ pub const COMMAND_TOPIC_PAIRS: &[(&str, &str)] = &[
     ("tools.restore_data", "export-opml"),
     ("tools.settings", "settings"),
     ("tools.youtube_account", "import-youtube-takeout"),
-    ("view.accessible_browser", "accessible-browser"),
     ("view.focus_search", "search-field"),
     ("view.rich_view", "rich-view"),
     ("view.toggle_search", "search-field"),
@@ -167,7 +165,6 @@ pub const COMMAND_TOPIC_PAIRS: &[(&str, &str)] = &[
 
 pub const DIALOG_TOPIC_PAIRS: &[(&str, &str)] = &[
     ("AboutDialog", "about"),
-    ("AccessibleBrowserFrame", "accessible-browser"),
     ("AddFeedDialog", "adding-feeds"),
     ("AddShortcutsDialog", "desktop-shortcuts"),
     ("ArticleWindow", "article-window"),

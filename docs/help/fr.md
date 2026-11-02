@@ -430,8 +430,6 @@ cela signifie le volet de lecture, une fenêtre distincte ou la vue HTML enrichi
 - Ouvrir l’article dans le menu contextuel fait la même chose.
 - Ouvrir dans le navigateur transmet l’adresse de l’article à votre navigateur
   web système.
-- Ouvrir le navigateur accessible lit plutôt la page dans BlindRSS. Voir
-  Navigateur accessible.
 
 Ouvrir un article le marque comme lu, sauf si vous avez modifié ce comportement.
 
@@ -502,18 +500,6 @@ structure porte du sens.
 Un flux peut être configuré pour s’ouvrir toujours dans la vue enrichie depuis
 ses propriétés, et les liens de la vue enrichie s’ouvrent dans votre navigateur
 système plutôt qu’à l’intérieur de la vue.
-
-## Navigateur accessible {#accessible-browser}
-
-Affichage, Ouvrir le navigateur accessible ouvre une page dans BlindRSS, dans
-une fenêtre conçue pour la lecture avec un lecteur d’écran, plutôt que de la
-transmettre à votre navigateur système.
-
-C’est l’outil approprié pour une page à lire plutôt qu’à utiliser de manière
-interactive, et pour les sites dont l’interface est difficile à parcourir. Il
-partage les paramètres de cookies et d’identité de navigateur de BlindRSS ; les
-pages derrière une vérification de navigateur s’y ouvrent donc elles aussi une
-fois leurs cookies importés.
 
 ## Vidéos YouTube {#youtube}
 

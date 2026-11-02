@@ -367,7 +367,6 @@ Invio su un articolo nell'elenco lo apre. A seconda dell'articolo e delle impost
 
 - Apri articolo nel menu contestuale fa la stessa cosa.
 - Apri nel browser passa l'indirizzo dell'articolo al browser web di sistema.
-- Apri browser accessibile legge invece la pagina all'interno di BlindRSS. Vedere Browser accessibile.
 
 L'apertura di un articolo lo contrassegna come letto salvo modifica di questo comportamento.
 
@@ -413,12 +412,6 @@ Ctrl+Shift+H porta il riquadro di lettura alla vista HTML ricca, che rende l'art
 La vista testo semplice è l'impostazione predefinita perché è più veloce e non sorprende mai. La vista ricca è utile per gli articoli la cui struttura trasmette significato.
 
 Un feed può essere impostato per aprirsi sempre nella vista ricca dalle Proprietà feed, e i collegamenti nella vista ricca si aprono nel browser di sistema anziché nella vista.
-
-## Browser accessibile {#accessible-browser}
-
-Visualizza, Apri browser accessibile apre una pagina dentro BlindRSS in una finestra realizzata per la lettura con screen reader, anziché passarla al browser di sistema.
-
-È lo strumento giusto per una pagina da leggere anziché con cui interagire, e per siti la cui interfaccia è difficile da navigare. Condivide le impostazioni cookie e identità del browser di BlindRSS, quindi anche le pagine dietro un controllo del browser si aprono qui dopo avere importato i loro cookie.
 
 ## Video YouTube {#youtube}
 

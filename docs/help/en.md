@@ -568,8 +568,6 @@ view.
 
 - Open Article on the context menu does the same thing.
 - Open in Browser hands the article's address to your system web browser.
-- Open Accessible Browser reads the page inside BlindRSS instead. See
-  Accessible Browser.
 
 Opening an article marks it read unless you have changed that behaviour.
 
@@ -635,16 +633,6 @@ you. The rich view is worth it for articles whose structure carries meaning.
 
 A feed can be set to always open in the rich view from its Feed Properties, and
 links in the rich view open in your system browser rather than inside the view.
-
-## Accessible Browser {#accessible-browser}
-
-View, Open Accessible Browser opens a page inside BlindRSS in a window built
-for screen-reader reading, rather than handing it to your system browser.
-
-It is the right tool for a page that needs to be read rather than interacted
-with, and for sites whose own interface is hard to navigate. It shares
-BlindRSS's cookie and browser-identity settings, so pages behind a browser
-check open here too once you have imported cookies for them.
 
 ## YouTube Videos {#youtube}
 

@@ -367,7 +367,6 @@ Enter op een artikel in de lijst opent het. Afhankelijk van artikel en instellin
 
 - Artikel openen in het contextmenu doet hetzelfde.
 - In browser openen geeft het adres van het artikel door aan uw systeemwebbrowser.
-- Toegankelijke browser openen leest de pagina in plaats daarvan in BlindRSS. Zie Toegankelijke browser.
 
 Een artikel openen markeert het als gelezen tenzij u dat gedrag hebt gewijzigd.
 
@@ -413,12 +412,6 @@ Ctrl+Shift+H schakelt het leesvenster naar de rijke HTML-weergave, die het artik
 De plattetekstweergave is standaard omdat zij sneller is en u nooit verrast. De rijke weergave is de moeite waard voor artikelen waarvan de structuur betekenis draagt.
 
 Een feed kan vanuit Feedeigenschappen altijd in de rijke weergave laten openen; koppelingen in de rijke weergave openen in uw systeembrowser en niet in de weergave zelf.
-
-## Toegankelijke browser {#accessible-browser}
-
-Beeld, Toegankelijke browser openen opent een pagina in BlindRSS in een venster dat is gemaakt voor lezen met een schermlezer, in plaats van hem aan uw systeembrowser door te geven.
-
-Dit is het juiste hulpmiddel voor een pagina die gelezen moet worden in plaats van gebruikt, en voor sites waarvan de eigen interface lastig te navigeren is. Hij deelt BlindRSS' cookie- en browseridentiteitsinstellingen, dus pagina's achter een browsercontrole openen hier ook zodra u er cookies voor hebt geïmporteerd.
 
 ## YouTube-video's {#youtube}
 

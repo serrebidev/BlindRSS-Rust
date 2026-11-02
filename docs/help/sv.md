@@ -367,7 +367,6 @@ Enter på en artikel i listan öppnar den. Beroende på artikeln och dina instä
 
 - Öppna artikel på snabbmenyn gör samma sak.
 - Öppna i webbläsare lämnar artikelns adress till systemets webbläsare.
-- Öppna tillgänglig webbläsare läser i stället sidan i BlindRSS. Se Tillgänglig webbläsare.
 
 Att öppna en artikel markerar den som läst om du inte har ändrat det beteendet.
 
@@ -413,12 +412,6 @@ Ctrl+Shift+H växlar läsrutan till den rika HTML-vyn, som återger artikeln som
 Oformaterad textvy är standard eftersom den är snabbare och aldrig överraskar dig. Den rika vyn är värd det för artiklar vars struktur bär betydelse.
 
 Ett flöde kan ställas in att alltid öppnas i den rika vyn från sina Flödesegenskaper, och länkar i den rika vyn öppnas i systemets webbläsare i stället för i vyn.
-
-## Tillgänglig webbläsare {#accessible-browser}
-
-Visa, Öppna tillgänglig webbläsare öppnar en sida i BlindRSS i ett fönster gjort för läsning med skärmläsare, i stället för att lämna den till systemets webbläsare.
-
-Det är rätt verktyg för en sida som behöver läsas snarare än användas interaktivt och för webbplatser vars egna gränssnitt är svåra att navigera. Den delar BlindRSS inställningar för kakor och webbläsaridentitet, så sidor bakom en webbläsarkontroll öppnas också här när du har importerat kakor för dem.
 
 ## YouTube-videor {#youtube}
 
