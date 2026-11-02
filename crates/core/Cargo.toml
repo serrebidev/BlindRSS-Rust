@@ -29,6 +29,8 @@ alac-encoder = "0.3"
 rsa = { version = "0.9", default-features = false, features = ["std", "getrandom"] }
 ammonia = "4.2.4"
 url = "2.5.8"
+tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
+quick-xml = "0.42"
 
 [dev-dependencies]
 rusqlite = { version = "0.40", features = ["bundled"] }

@@ -244,6 +244,7 @@ fn listing_entries_shape() {
         },
     ];
     let entries = items_to_entries(items);
+    assert!(entries.iter().all(|entry| entry.tags.is_empty()));
     assert_eq!(entries[0].date.as_deref(), Some("2026-10-05T00:00:00Z"));
     // Undated and display-string dates fall back to a current stamp,
     // never a year-0001 sort position.

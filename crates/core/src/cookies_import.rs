@@ -341,17 +341,66 @@ pub fn auto_import_downloads(
     newest
 }
 
+fn profile_import_mode(config: &Config, now: i64) -> Option<bool> {
+    if config.get_bool("installed_browser_cookie_import_enabled", false) {
+        let last = config
+            .raw()
+            .get("site_cookies_full_import_last_run")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        if last <= 0.0 || !(0.0..21600.0).contains(&(now as f64 - last)) {
+            return Some(true);
+        }
+    }
+    config
+        .get_bool("auto_import_browser_cookies", true)
+        .then_some(false)
+}
+
+fn permitted_profile_records(config: &Config, records: Vec<JarRecord>, now: i64) -> Vec<JarRecord> {
+    let full = profile_import_mode(config, now) == Some(true);
+    let clearance = config.get_bool("auto_import_browser_cookies", true);
+    records
+        .into_iter()
+        .filter(|record| {
+            let name = record.name.trim().to_ascii_lowercase();
+            let harvestable = [
+                "cf_clearance",
+                "__cf_bm",
+                "datadome",
+                "reese84",
+                "incap_ses",
+                "visid_incap",
+                "_px3",
+                "_pxvid",
+                "bm_sz",
+                "ak_bmsc",
+            ]
+            .iter()
+            .any(|prefix| name.starts_with(prefix));
+            (full || (clearance && harvestable))
+                && !record.value.is_empty()
+                && (record.expires == 0 || record.expires >= now)
+        })
+        .collect()
+}
+
 /// Re-read Chromium profiles whose cookie DB changed since the
 /// last pass and merge their cookies into the site jar. Returns
 /// the number of cookies stored (Python's
 /// site_cookies.auto_import_browser_profiles).
 pub fn auto_import_browser_profiles(config: &mut Config, jar_path: &Path, now: i64) -> usize {
-    if !config.get_bool("auto_import_browser_cookies", true) {
+    let Some(full) = profile_import_mode(config, now) else {
         return 0;
-    }
+    };
+    let marker = if full {
+        "site_cookies_full_profile_mtimes"
+    } else {
+        "site_cookies_profile_mtimes"
+    };
     let mut seen: serde_json::Map<String, serde_json::Value> = config
         .raw()
-        .get("site_cookies_profile_mtimes")
+        .get(marker)
         .and_then(|v| v.as_object())
         .cloned()
         .unwrap_or_default();
@@ -365,24 +414,105 @@ pub fn auto_import_browser_profiles(config: &mut Config, jar_path: &Path, now: i
         if db_mtime <= previous {
             continue;
         }
-        seen.insert(key, serde_json::json!(db_mtime));
-        changed = true;
         let outcome = crate::chromium::read_profile_cookies(profile);
         if outcome.records.is_empty() {
             continue;
         }
+        let records = permitted_profile_records(config, outcome.records, now);
         let existing = std::fs::read_to_string(jar_path).unwrap_or_default();
-        let count = outcome.records.len();
-        let merged = merge_into_jar(&existing, &outcome.records, now);
+        let count = records.len();
+        let merged = merge_into_jar(&existing, &records, now);
         if std::fs::write(jar_path, merged).is_ok() {
             stored += count;
+            seen.insert(key, serde_json::json!(db_mtime));
+            changed = true;
         }
     }
     if changed {
-        config.set_path(
-            "site_cookies_profile_mtimes",
-            serde_json::Value::Object(seen),
-        );
+        config.set_path(marker, serde_json::Value::Object(seen));
+    }
+    if full {
+        config.set_path("site_cookies_full_import_last_run", serde_json::json!(now));
     }
     stored
+}
+
+#[cfg(test)]
+mod consent_tests {
+    use super::*;
+
+    fn record(name: &str) -> JarRecord {
+        JarRecord {
+            host: ".example.com".into(),
+            include_subdomains: true,
+            path: "/".into(),
+            secure: true,
+            expires: 0,
+            name: name.into(),
+            value: "fixture".into(),
+            http_only: true,
+        }
+    }
+
+    #[test]
+    fn automatic_import_keeps_only_clearance_without_separate_session_consent() {
+        let mut config = Config::default();
+        let records = vec![
+            record("SID"),
+            record("cf_clearance"),
+            record("incap_ses_123"),
+        ];
+        let selected = permitted_profile_records(&config, records.clone(), 100);
+        assert_eq!(
+            selected.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            ["cf_clearance", "incap_ses_123"]
+        );
+        config.set_path(
+            "installed_browser_cookie_import_enabled",
+            serde_json::json!(true),
+        );
+        assert_eq!(
+            permitted_profile_records(&config, records.clone(), 100).len(),
+            3
+        );
+        config.set_path("auto_import_browser_cookies", serde_json::json!(false));
+        assert_eq!(
+            permitted_profile_records(&config, records.clone(), 100).len(),
+            3
+        );
+        config.set_path(
+            "installed_browser_cookie_import_enabled",
+            serde_json::json!(false),
+        );
+        assert!(permitted_profile_records(&config, records, 100).is_empty());
+    }
+
+    #[test]
+    fn expired_or_empty_cookies_are_never_imported() {
+        let mut expired = record("cf_clearance");
+        expired.expires = 50;
+        let mut empty = record("__cf_bm");
+        empty.value.clear();
+        assert!(
+            permitted_profile_records(&Config::default(), vec![expired, empty], 100).is_empty()
+        );
+    }
+
+    #[test]
+    fn full_import_cadence_does_not_stop_clearance_refreshes() {
+        let mut config = Config::default();
+        config.set_path(
+            "installed_browser_cookie_import_enabled",
+            serde_json::json!(true),
+        );
+        config.set_path("site_cookies_full_import_last_run", serde_json::json!(100));
+        assert_eq!(profile_import_mode(&config, 101), Some(false));
+        let selected =
+            permitted_profile_records(&config, vec![record("SID"), record("cf_clearance")], 101);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].name, "cf_clearance");
+        config.set_path("auto_import_browser_cookies", serde_json::json!(false));
+        assert_eq!(profile_import_mode(&config, 101), None);
+        assert_eq!(profile_import_mode(&config, 21_700), Some(true));
+    }
 }

@@ -17,7 +17,43 @@
 //!   silently dropped (the Heise case Python itself fails today).
 
 use regex::Regex;
-use std::sync::OnceLock;
+use std::collections::VecDeque;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+const EMPTY_EXTRACTION_TTL: Duration = Duration::from_secs(15 * 60);
+
+#[derive(Default)]
+struct EmptyExtractions(VecDeque<((String, String), Instant)>);
+
+impl EmptyExtractions {
+    fn contains(&mut self, url: &str, encoding: &str, now: Instant) -> bool {
+        let Some(index) = self
+            .0
+            .iter()
+            .position(|((u, e), _)| u == url && e == encoding)
+        else {
+            return false;
+        };
+        let entry = self.0.remove(index).unwrap();
+        if now.duration_since(entry.1) >= EMPTY_EXTRACTION_TTL {
+            return false;
+        }
+        self.0.push_back(entry);
+        true
+    }
+
+    fn remember(&mut self, url: &str, encoding: &str, now: Instant) {
+        self.0.retain(|((u, e), _)| u != url || e != encoding);
+        if self.0.len() == 256 {
+            self.0.pop_front();
+        }
+        self.0
+            .push_back(((url.to_string(), encoding.to_string()), now));
+    }
+}
+
+static EMPTY_EXTRACTIONS: OnceLock<Mutex<EmptyExtractions>> = OnceLock::new();
 
 /// Block markers, ported in full from Python
 /// `core/article_extractor.py::_BOT_INTERSTITIAL_MARKERS`.
@@ -80,13 +116,6 @@ const PAYWALL_STUB_MAX_CHARS: usize = 600;
 const METERED_MARKERS: &[&str] = &["to read as many articles as you like"];
 const METERED_NOTICE: &str = "Only the free preview of this article is published on the page — the rest requires a subscription. Open the original link in your browser to read it.";
 
-pub(crate) fn metered_preview_notice(html: &str) -> Option<&'static str> {
-    let lower = html.to_lowercase();
-    METERED_MARKERS
-        .iter()
-        .any(|marker| lower.contains(marker))
-        .then_some(METERED_NOTICE)
-}
 const PAYWALL_NOTICE: &str = "This article is behind a paywall (subscription required), so the full text can't be fetched automatically. Open the original link in your browser to read it.";
 
 /// The Register's leading section kickers (Python
@@ -237,6 +266,9 @@ fn json_ld_text(html: &str) -> String {
             _ => {}
         }
     }
+    static ESCAPED_BLOCK_RE: OnceLock<Regex> = OnceLock::new();
+    let escaped_blocks =
+        ESCAPED_BLOCK_RE.get_or_init(|| Regex::new(r"(?i)&lt;/(?:p|h[1-6]|li)&gt;").unwrap());
     let mut best = String::new();
     for raw in blocks(html, "script", "application/ld+json") {
         let Ok(data) = serde_json::from_str::<serde_json::Value>(raw.trim()) else {
@@ -244,7 +276,13 @@ fn json_ld_text(html: &str) -> String {
         };
         let mut candidates = Vec::new();
         collect(&data, &mut candidates);
-        for c in candidates {
+        for mut c in candidates {
+            // Several block closers distinguish escaped markup from prose mentioning a tag.
+            if !tag_tokens(&c).iter().any(|tag| !tag.close)
+                && escaped_blocks.find_iter(&c).take(3).count() == 3
+            {
+                c = unescape_entities(&c);
+            }
             let text = if c.contains('<') {
                 fragment_to_text(&c)
             } else {
@@ -2528,12 +2566,12 @@ pub fn looks_like_metered_preview(html: &str) -> bool {
         return false;
     }
     let head: String = html.chars().take(400_000).collect();
-    head.to_lowercase()
-        .contains("to read as many articles as you like")
+    let lower = head.to_lowercase();
+    METERED_MARKERS.iter().any(|marker| lower.contains(marker))
 }
 
 pub fn metered_preview_notice() -> &'static str {
-    "Only the free preview of this article is published on the page — the rest requires a subscription. Open the original link in your browser to read it."
+    METERED_NOTICE
 }
 
 // --- Pagination (Python _find_next_page + _merge_texts) ---
@@ -2547,117 +2585,79 @@ const NO_PAGINATION_FOLLOW_HOSTS: [&str; 6] = [
     "github.com",
 ];
 
-fn absolutize(base: &str, href: &str) -> String {
-    let href = href.trim();
-    if href.starts_with("http://") || href.starts_with("https://") {
-        return href.to_string();
-    }
-    let (scheme, rest) = base.split_once("://").unwrap_or(("https", base));
-    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
-    if let Some(stripped) = href.strip_prefix("//") {
-        return format!("{scheme}://{stripped}");
-    }
-    if href.starts_with('/') {
-        return format!("{scheme}://{host}{href}");
-    }
-    // Page-relative: resolve against the base's directory.
-    let clean = base.split(['?', '#']).next().unwrap_or(base);
-    match clean.rfind('/') {
-        Some(i) if i > scheme.len() + 2 => format!("{}{href}", &clean[..=i]),
-        _ => format!("{scheme}://{host}/{href}"),
-    }
-}
-
-/// The next-page URL of a paginated article, or None (Python
-/// `_find_next_page`: link rel=next, then a rel=next, then labelled
-/// pagination anchors — never a "next story" teaser).
+/// Find an article continuation, excluding next-story navigation and
+/// cross-origin links. Cookies must never travel to an unrelated host.
 pub fn find_next_page(html: &str, base_url: &str) -> Option<String> {
-    if html.is_empty() {
-        return None;
-    }
-    let host = host_of(base_url);
+    let base = url::Url::parse(base_url).ok()?;
+    let host = base.host_str()?;
     if NO_PAGINATION_FOLLOW_HOSTS
         .iter()
-        .any(|d| host == *d || host.ends_with(&format!(".{d}")))
+        .any(|domain| host == *domain || host.ends_with(&format!(".{domain}")))
     {
         return None;
     }
-    static NEXT_STORY_RE: OnceLock<Regex> = OnceLock::new();
-    let next_story_re = NEXT_STORY_RE.get_or_init(|| {
-        Regex::new(r"next[\s_-]*(?:stor(?:y|ies)|articles?|posts?|read|up)\b").unwrap()
-    });
-    static LABEL_RE: OnceLock<Regex> = OnceLock::new();
-    let label_re = LABEL_RE.get_or_init(|| {
-        Regex::new(r"^(?:next|older)(?:\s+(?:page|pages|entries))?\s*(?:[›»>]+)?$").unwrap()
-    });
-    // 1) <link rel="next">
-    for sp in find_elements(html, Some("link"), &|open: &str| {
-        attr_value(open, "rel")
-            .map(|r| r.to_lowercase().contains("next"))
-            .unwrap_or(false)
-    }) {
-        if let Some(href) = attr_value(&html[sp.start..sp.inner_start], "href")
-            && !href.trim().is_empty()
-        {
-            return Some(absolutize(base_url, &href));
-        }
-    }
-    // 2) <a rel="next">
-    for sp in find_elements(html, Some("a"), &|open: &str| {
-        attr_value(open, "rel")
-            .map(|r| r.to_lowercase().contains("next"))
-            .unwrap_or(false)
-    }) {
-        if let Some(href) = attr_value(&html[sp.start..sp.inner_start], "href")
-            && !href.trim().is_empty()
-        {
-            return Some(absolutize(base_url, &href));
-        }
-    }
-    // 3) Labelled pagination anchors.
-    for sp in find_elements(html, Some("a"), &|_| true) {
-        let open = &html[sp.start..sp.inner_start];
-        let Some(href) = attr_value(open, "href") else {
-            continue;
-        };
-        if href.trim().is_empty() {
-            continue;
-        }
-        let text = leaf_text(&html[sp.inner_start..sp.inner_end]).to_lowercase();
-        let cls = attr_value(open, "class").unwrap_or_default().to_lowercase();
-        let aria = attr_value(open, "aria-label")
-            .unwrap_or_default()
-            .to_lowercase();
-        let data_attrs: String = ["data-track", "data-action", "data-event"]
-            .iter()
-            .filter_map(|name| attr_value(open, name))
-            .collect::<Vec<_>>()
-            .join(" ")
-            .to_lowercase();
-        let haystack = format!("{text} {cls} {aria} {data_attrs}");
-        if next_story_re.is_match(&haystack) {
-            continue;
-        }
-        if label_re.is_match(text.trim())
-            || [">", ">>", "›", "»"].contains(&text.trim())
-            || cls.contains("next")
-            || aria.starts_with("next")
-        {
-            let abs = absolutize(base_url, &href);
-            let lower = abs.to_lowercase();
-            if [
-                "facebook.com",
-                "twitter.com",
-                "x.com",
-                "linkedin.com",
-                "pinterest.com",
-            ]
-            .iter()
-            .any(|s| lower.contains(s))
+    let next_story =
+        regex::Regex::new(r"(?i)next[\s_-]*(?:stor(?:y|ies)|articles?|posts?|read|up)\b").unwrap();
+    let label = regex::Regex::new(
+        r"(?i)^(?:(?:next|older)(?:\s+(?:page|pages|entries))?\s*[›»>]*|[›»>]+)$",
+    )
+    .unwrap();
+    let tokens = tag_tokens(html);
+    // Explicit rel=next takes precedence over heuristic navigation labels.
+    for pass in 0..3 {
+        for token in &tokens {
+            if token.close || (token.name != "link" && token.name != "a") {
+                continue;
+            }
+            let open = &html[token.start..token.end];
+            let explicit = attr_value(open, "rel")
+                .is_some_and(|v| v.split_whitespace().any(|r| r.eq_ignore_ascii_case("next")));
+            if match pass {
+                0 => token.name != "link" || !explicit,
+                1 => token.name != "a" || !explicit,
+                _ => token.name != "a" || explicit,
+            } {
+                continue;
+            }
+            let text = if token.name == "a" {
+                let rest = &html[token.end..];
+                let end = rest.to_ascii_lowercase().find("</a").unwrap_or(0);
+                html_to_text(&rest[..end]).trim().to_lowercase()
+            } else {
+                String::new()
+            };
+            let class = attr_value(open, "class").unwrap_or_default().to_lowercase();
+            let aria = attr_value(open, "aria-label")
+                .unwrap_or_default()
+                .to_lowercase();
+            if next_story.is_match(&format!("{text} {class} {aria} {open}")) {
+                continue;
+            }
+            if !explicit
+                && !(label.is_match(&text) || class.contains("next") || aria.starts_with("next"))
             {
                 continue;
             }
-            return Some(abs);
+            let Some(href) = attr_value(open, "href") else {
+                continue;
+            };
+            let href = unescape_entities(&href);
+            if href.trim().is_empty() {
+                continue;
+            }
+            let mut target = match base.join(href.trim()) {
+                Ok(target) => target,
+                Err(_) => continue,
+            };
+            target.set_fragment(None);
+            let mut current = base.clone();
+            current.set_fragment(None);
+            if matches!(target.scheme(), "http" | "https")
+                && target.origin() == base.origin()
+                && target != current
+            {
+                return Some(target.to_string());
+            }
         }
     }
     None
@@ -2880,6 +2880,11 @@ pub(crate) fn is_google_news_url(url: &str) -> bool {
     path.starts_with("/articles/") || path.starts_with("/read/")
 }
 
+/// Rebuilt source documents retain replies, headings and links that a generic scraper drops.
+pub(crate) fn reconstructed_article_html(url: &str) -> Option<(String, String)> {
+    crate::threads::github_html(url).or_else(|| crate::forum_sources::topic_html(url))
+}
+
 /// Fetch a page and extract its full text, running Python's
 /// fallback chain when the direct fetch is gated or empty.
 /// Returns the outcome plus the direct-fetch HTML when there
@@ -2906,6 +2911,48 @@ pub fn fetch_full_text_opts(
     encoding_override: &str,
     keep_alt: bool,
 ) -> (ExtractOutcome, Option<String>) {
+    let url = url.trim();
+    if EMPTY_EXTRACTIONS
+        .get_or_init(|| Mutex::new(EmptyExtractions::default()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(url, encoding_override, Instant::now())
+    {
+        let text = feed_text
+            .map(|text| html_to_text_opts(text, keep_alt))
+            .unwrap_or_default();
+        return (
+            if text.trim().is_empty() {
+                ExtractOutcome::Empty
+            } else {
+                ExtractOutcome::Article {
+                    title: String::new(),
+                    text,
+                    source: "feed",
+                }
+            },
+            None,
+        );
+    }
+    if let Some((title, html)) = reconstructed_article_html(url) {
+        let mut text = html_to_text_opts(&html, keep_alt);
+        if !crate::postprocess::is_github_page_url(url)
+            && let Some(feed) = feed_text.map(|feed| html_to_text_opts(feed, keep_alt))
+            && feed.chars().count() > text.chars().count()
+        {
+            text = feed;
+        }
+        if !text.trim().is_empty() {
+            return (
+                ExtractOutcome::Article {
+                    title,
+                    text,
+                    source: "thread",
+                },
+                Some(html),
+            );
+        }
+    }
     // Thread reconstructions (Lemmy/GitHub/Reddit/Discourse
     // APIs) beat HTML scraping for thread URLs.
     if let Some((title, text)) = crate::threads::thread_text(url) {
@@ -3010,7 +3057,6 @@ pub fn fetch_full_text_opts(
         let expanded = expand_sky_flourish_tables(html, url);
         let outcome = extract_article_opts(&expanded, url, feed_text, keep_alt);
         gate_seen = matches!(outcome, ExtractOutcome::Gate { .. });
-<<<<<<< Updated upstream
         if let ExtractOutcome::Article {
             title,
             text,
@@ -3045,12 +3091,18 @@ pub fn fetch_full_text_opts(
                     _ => break,
                 }
             }
+            // Each page's extractor adds its own notice; keep one at the end of the merged story.
+            for text in &mut texts {
+                if let Some(body) = text.trim_end().strip_suffix(METERED_NOTICE) {
+                    *text = body.trim_end().to_string();
+                }
+            }
             let mut merged = if texts.len() > 1 {
                 merge_texts(&texts)
             } else {
                 texts.into_iter().next().unwrap_or_default()
             };
-            if looks_like_metered_preview(html) {
+            if source != "feed" && looks_like_metered_preview(html) {
                 merged = format!("{}\n\n{}", merged.trim_end(), metered_preview_notice());
             }
             return (
@@ -3059,18 +3111,6 @@ pub fn fetch_full_text_opts(
                     text: merged,
                     source,
                 },
-=======
-        if matches!(outcome, ExtractOutcome::Article { .. }) {
-            return (
-                follow_article_pages(
-                    outcome,
-                    html,
-                    url,
-                    cookie_header,
-                    encoding_override,
-                    keep_alt,
-                ),
->>>>>>> Stashed changes
                 first_html,
             );
         }
@@ -3125,6 +3165,13 @@ pub fn fetch_full_text_opts(
     }
     // Nothing worked: report the direct outcome (Gate/Empty)
     // or the fetch failure as a Gate with its reason.
+    if matches!(direct_outcome, Some(ExtractOutcome::Empty)) {
+        EMPTY_EXTRACTIONS
+            .get_or_init(|| Mutex::new(EmptyExtractions::default()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remember(url, encoding_override, Instant::now());
+    }
     match direct_outcome {
         Some(outcome) => (outcome, first_html),
         None => (
@@ -3133,151 +3180,6 @@ pub fn fetch_full_text_opts(
             },
             first_html,
         ),
-    }
-}
-
-/// Find an article continuation, excluding next-story navigation and
-/// cross-origin links. Cookies must never travel to an unrelated host.
-pub fn find_next_page(html: &str, base_url: &str) -> Option<String> {
-    let base = url::Url::parse(base_url).ok()?;
-    let host = base.host_str()?;
-    if [
-        "wired.com",
-        "ning.com",
-        "neowin.net",
-        "bloomberg.com",
-        "slashdot.org",
-        "github.com",
-    ]
-    .iter()
-    .any(|domain| host == *domain || host.ends_with(&format!(".{domain}")))
-    {
-        return None;
-    }
-    let next_story =
-        regex::Regex::new(r"(?i)next[\s_-]*(?:stor(?:y|ies)|articles?|posts?|read|up)\b").unwrap();
-    let label = regex::Regex::new(
-        r"(?i)^(?:(?:next|older)(?:\s+(?:page|pages|entries))?\s*[›»>]*|[›»>]+)$",
-    )
-    .unwrap();
-    let tokens = tag_tokens(html);
-    // Explicit rel=next takes precedence over heuristic navigation labels.
-    for pass in 0..3 {
-        for token in &tokens {
-            if token.close || (token.name != "link" && token.name != "a") {
-                continue;
-            }
-            let open = &html[token.start..token.end];
-            let explicit = attr_value(open, "rel")
-                .is_some_and(|v| v.split_whitespace().any(|r| r.eq_ignore_ascii_case("next")));
-            if match pass {
-                0 => token.name != "link" || !explicit,
-                1 => token.name != "a" || !explicit,
-                _ => token.name != "a" || explicit,
-            } {
-                continue;
-            }
-            let text = if token.name == "a" {
-                let rest = &html[token.end..];
-                let end = rest.to_ascii_lowercase().find("</a").unwrap_or(0);
-                html_to_text(&rest[..end]).trim().to_lowercase()
-            } else {
-                String::new()
-            };
-            let class = attr_value(open, "class").unwrap_or_default().to_lowercase();
-            let aria = attr_value(open, "aria-label")
-                .unwrap_or_default()
-                .to_lowercase();
-            if next_story.is_match(&format!("{text} {class} {aria} {open}")) {
-                continue;
-            }
-            if !explicit
-                && !(label.is_match(&text) || class.contains("next") || aria.starts_with("next"))
-            {
-                continue;
-            }
-            let href = unescape_entities(&attr_value(open, "href")?);
-            let mut target = match base.join(href.trim()) {
-                Ok(target) => target,
-                Err(_) => continue,
-            };
-            target.set_fragment(None);
-            let mut current = base.clone();
-            current.set_fragment(None);
-            if matches!(target.scheme(), "http" | "https")
-                && target.origin() == base.origin()
-                && target != current
-            {
-                return Some(target.to_string());
-            }
-        }
-    }
-    None
-}
-
-fn follow_article_pages(
-    outcome: ExtractOutcome,
-    html: &str,
-    url: &str,
-    cookie_header: &str,
-    encoding_override: &str,
-    keep_alt: bool,
-) -> ExtractOutcome {
-    let ExtractOutcome::Article {
-        title,
-        text,
-        source,
-    } = outcome
-    else {
-        return outcome;
-    };
-    let mut visited = std::collections::HashSet::from([url.to_string()]);
-    let mut next = find_next_page(html, url);
-    let mut texts = vec![text];
-    for _ in 1..6 {
-        let Some(current) = next.take().filter(|u| visited.insert(u.clone())) else {
-            break;
-        };
-        let Ok((bytes, content_type)) = fetch_page_bytes(&current, cookie_header) else {
-            break;
-        };
-        let html = decode_bytes(&bytes, &content_type, encoding_override);
-        let ExtractOutcome::Article { text, .. } =
-            extract_article_opts(&html, &current, None, keep_alt)
-        else {
-            break;
-        };
-        texts.push(text);
-        next = find_next_page(&html, &current);
-    }
-    let text = if texts.len() == 1 {
-        texts.pop().unwrap_or_default()
-    } else {
-        let mut seen = std::collections::HashSet::new();
-        texts
-            .into_iter()
-            .flat_map(|text| {
-                text.split("\n\n")
-                    .map(str::trim)
-                    .filter(|p| !p.is_empty())
-                    .map(str::to_owned)
-                    .collect::<Vec<_>>()
-            })
-            .filter(|paragraph| {
-                let key = paragraph
-                    .split_whitespace()
-                    .collect::<Vec<_>>()
-                    .join(" ")
-                    .to_lowercase();
-                key.chars().count() < 25 || seen.insert(key)
-            })
-            .collect::<Vec<_>>()
-            .join("\n\n")
-    };
-    ExtractOutcome::Article {
-        title,
-        text,
-        source,
     }
 }
 
@@ -3383,4 +3285,83 @@ pub fn meta_content(html: &str, name: &str) -> Option<String> {
         search = end;
     }
     None
+}
+
+#[cfg(test)]
+mod parity_recovery_tests {
+    use super::*;
+
+    #[test]
+    fn empty_extractions_expire_and_include_encoding_in_the_key() {
+        let now = Instant::now();
+        let mut cache = EmptyExtractions::default();
+        cache.remember("https://example.test/story", "utf-8", now);
+        assert!(!cache.contains("https://example.test/story", "windows-1252", now));
+        assert!(cache.contains(
+            "https://example.test/story",
+            "utf-8",
+            now + Duration::from_secs(899)
+        ));
+        assert!(!cache.contains(
+            "https://example.test/story",
+            "utf-8",
+            now + EMPTY_EXTRACTION_TTL
+        ));
+    }
+
+    #[test]
+    fn empty_extractions_evict_the_least_recently_used_url() {
+        let now = Instant::now();
+        let mut cache = EmptyExtractions::default();
+        for i in 0..256 {
+            cache.remember(&format!("https://example.test/{i}"), "", now);
+        }
+        assert!(cache.contains("https://example.test/0", "", now));
+        cache.remember("https://example.test/256", "", now);
+        assert_eq!(cache.0.len(), 256);
+        assert!(cache.contains("https://example.test/0", "", now));
+        assert!(!cache.contains("https://example.test/1", "", now));
+    }
+
+    #[test]
+    fn cached_empty_extraction_keeps_feed_fallback_available() {
+        let url = "https://cached-empty.invalid/story";
+        EMPTY_EXTRACTIONS
+            .get_or_init(|| Mutex::new(EmptyExtractions::default()))
+            .lock()
+            .unwrap()
+            .remember(url, "", Instant::now());
+        assert_eq!(
+            fetch_full_text(url, "", None, ""),
+            (ExtractOutcome::Empty, None)
+        );
+        let (outcome, html) = fetch_full_text(url, "", Some("<p>Authored feed content.</p>"), "");
+        assert!(
+            matches!(outcome, ExtractOutcome::Article { text, source: "feed", .. } if text == "Authored feed content.")
+        );
+        assert!(html.is_none());
+    }
+
+    #[test]
+    fn json_ld_decodes_escaped_block_markup_but_preserves_prose_tags() {
+        let prose = "The researchers carefully checked the evidence and published their detailed findings for independent review. ";
+        let body = format!(
+            "&lt;h2&gt;Findings&lt;/h2&gt;&lt;p&gt;{prose}&lt;/p&gt;&lt;p&gt;{prose}&lt;/p&gt;"
+        );
+        let page = format!(
+            "<script type='application/ld+json'>{}</script>",
+            serde_json::json!({"articleBody": body})
+        );
+        let text = json_ld_text(&page);
+        assert!(text.contains("Findings"));
+        assert!(text.contains(prose.trim()));
+        assert!(!text.contains("<p>"));
+        assert!(!text.contains("<h2>"));
+        let body = format!("{prose}Use &lt;/p&gt; to close a paragraph. {prose}");
+        let page = format!(
+            "<script type='application/ld+json'>{}</script>",
+            serde_json::json!({"articleBody": body})
+        );
+        assert!(json_ld_text(&page).contains("Use </p> to close a paragraph."));
+    }
 }

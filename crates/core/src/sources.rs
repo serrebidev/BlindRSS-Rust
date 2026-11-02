@@ -717,7 +717,7 @@ fn fetch_soundcloud(
 
 /// Scrape a client_id from SoundCloud's own web assets (the same
 /// approach yt-dlp uses; nothing is hardcoded).
-fn soundcloud_client_id() -> Option<String> {
+pub(crate) fn soundcloud_client_id() -> Option<String> {
     static CACHE: OnceLock<std::sync::Mutex<Option<String>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| std::sync::Mutex::new(None));
     if let Ok(guard) = cache.lock()
@@ -1347,6 +1347,33 @@ fn fetch_groups_io_search(
 // Dispatch
 // ---------------------------------------------------------------------------
 
+fn listing_limit(config: &crate::config::Config, kind: SourceKind, initial: bool) -> usize {
+    let (key, default, maximum) = match kind {
+        SourceKind::Odysee if initial => ("odysee_max_items_initial", 150, 500),
+        SourceKind::Odysee => ("odysee_max_items_refresh", 60, 500),
+        SourceKind::Rumble if initial => ("rumble_max_pages_initial", 3, 10),
+        SourceKind::Rumble => ("rumble_max_pages_refresh", 1, 10),
+        SourceKind::SoundCloud | SourceKind::Mixcloud if initial => {
+            ("audio_listing_max_items_initial", 80, 300)
+        }
+        SourceKind::SoundCloud | SourceKind::Mixcloud => {
+            ("audio_listing_max_items_refresh", 40, 300)
+        }
+        SourceKind::YoutubeSearch => ("youtube_search_max_items", 30, 100),
+        SourceKind::GoogleGroup => ("google_groups_max_items", 30, 100),
+        SourceKind::GroupsIoSearch => ("groups_io_search_max_items", 100, 1000),
+    };
+    let value = config.raw().get(key);
+    value
+        .and_then(|value| {
+            value
+                .as_i64()
+                .or_else(|| value.as_str().and_then(|text| text.trim().parse().ok()))
+        })
+        .unwrap_or(default)
+        .clamp(1, maximum) as usize
+}
+
 /// Fetch a listing feed's items. `existing_count` selects Python's
 /// initial vs refresh caps. Returns (feed title, items).
 pub fn fetch_listing(
@@ -1356,26 +1383,27 @@ pub fn fetch_listing(
     existing_count: i64,
 ) -> Result<(String, Vec<SourceItem>), String> {
     let initial = existing_count == 0;
+    let limit = listing_limit(&crate::source_feeds::config(), kind, initial);
     let (title, mut items) = match kind {
-        SourceKind::Odysee => fetch_odysee(url, if initial { 150 } else { 60 }),
+        SourceKind::Odysee => fetch_odysee(url, limit),
         SourceKind::Rumble => {
             let normalized = normalize_rumble_feed_url(url);
-            fetch_rumble(&normalized, if initial { 3 } else { 1 })
+            fetch_rumble(&normalized, limit)
         }
         SourceKind::YoutubeSearch => {
             let q = youtube_search_query(url).ok_or("Not a YouTube search URL")?;
-            fetch_youtube_search(&q, 30)
+            fetch_youtube_search(&q, limit)
         }
         SourceKind::SoundCloud => {
             let kind = soundcloud_listing_kind(url);
-            fetch_soundcloud(url, kind, if initial { 80 } else { 40 })
+            fetch_soundcloud(url, kind, limit)
         }
         SourceKind::Mixcloud => {
             let (_, key) = mixcloud_listing(url).ok_or("Not a Mixcloud listing URL")?;
-            fetch_mixcloud(&key, if initial { 80 } else { 40 })
+            fetch_mixcloud(&key, limit)
         }
-        SourceKind::GoogleGroup => fetch_google_group(url, 30),
-        SourceKind::GroupsIoSearch => fetch_groups_io_search(url, 100),
+        SourceKind::GoogleGroup => fetch_google_group(url, limit),
+        SourceKind::GroupsIoSearch => fetch_groups_io_search(url, limit),
     }?;
     // Per-source article-id shaping (Python's store paths).
     match kind {
@@ -1408,6 +1436,7 @@ pub fn items_to_entries(items: Vec<SourceItem>) -> Vec<ParsedEntry> {
             author: it.author,
             media_url: it.media_url,
             media_type: it.media_type,
+            tags: Vec::new(),
         })
         .collect()
 }
@@ -1696,4 +1725,94 @@ pub fn sky_podcast_audio(
         }
     }
     None
+}
+
+#[cfg(test)]
+mod listing_limit_tests {
+    use super::*;
+
+    #[test]
+    fn python_listing_caps_use_shared_audio_keys_and_clamp_configured_values() {
+        for (kind, key, initial, default, maximum) in [
+            (
+                SourceKind::Odysee,
+                "odysee_max_items_initial",
+                true,
+                150,
+                500,
+            ),
+            (
+                SourceKind::Odysee,
+                "odysee_max_items_refresh",
+                false,
+                60,
+                500,
+            ),
+            (SourceKind::Rumble, "rumble_max_pages_initial", true, 3, 10),
+            (SourceKind::Rumble, "rumble_max_pages_refresh", false, 1, 10),
+            (
+                SourceKind::SoundCloud,
+                "audio_listing_max_items_initial",
+                true,
+                80,
+                300,
+            ),
+            (
+                SourceKind::SoundCloud,
+                "audio_listing_max_items_refresh",
+                false,
+                40,
+                300,
+            ),
+            (
+                SourceKind::Mixcloud,
+                "audio_listing_max_items_initial",
+                true,
+                80,
+                300,
+            ),
+            (
+                SourceKind::Mixcloud,
+                "audio_listing_max_items_refresh",
+                false,
+                40,
+                300,
+            ),
+            (
+                SourceKind::YoutubeSearch,
+                "youtube_search_max_items",
+                false,
+                30,
+                100,
+            ),
+            (
+                SourceKind::GoogleGroup,
+                "google_groups_max_items",
+                false,
+                30,
+                100,
+            ),
+            (
+                SourceKind::GroupsIoSearch,
+                "groups_io_search_max_items",
+                false,
+                100,
+                1000,
+            ),
+        ] {
+            let mut config = crate::config::Config::default();
+            assert_eq!(listing_limit(&config, kind, initial), default);
+            for (value, expected) in [
+                (serde_json::json!(0), 1),
+                (serde_json::json!(-10), 1),
+                (serde_json::json!(100_000), maximum),
+                (serde_json::json!(" 7 "), 7),
+                (serde_json::json!("invalid"), default),
+                (serde_json::Value::Null, default),
+            ] {
+                config.raw_mut()[key] = value;
+                assert_eq!(listing_limit(&config, kind, initial), expected, "{key}");
+            }
+        }
+    }
 }

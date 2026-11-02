@@ -645,6 +645,76 @@ impl GReaderClient {
         Ok(())
     }
 
+    pub fn update_feed_remote(
+        &self,
+        stream_id: &str,
+        title: Option<&str>,
+        url: Option<&str>,
+        category: Option<&str>,
+        previous_category: Option<&str>,
+    ) -> Result<(), String> {
+        if url.is_some() {
+            return Err("This provider does not support changing subscription URLs".to_string());
+        }
+        let mut token = crate::http::agent()
+            .get(&format!("{}/token", self.api_base))
+            .header("Authorization", &self.auth_header()?)
+            .call()
+            .map_err(|e| format!("token fetch failed: {e}"))?;
+        let token = token
+            .body_mut()
+            .read_to_string()
+            .map_err(|e| e.to_string())?;
+        let mut form = vec![("s", stream_id), ("ac", "edit"), ("T", token.trim())];
+        if let Some(title) = title {
+            form.push(("t", title));
+        }
+        let old = previous_category.map(|c| format!("user/-/label/{c}"));
+        let new = category
+            .filter(|c| !c.is_empty())
+            .map(|c| format!("user/-/label/{c}"));
+        if category.is_some() {
+            if let Some(old) = &old {
+                form.push(("r", old));
+            }
+            if let Some(new) = &new {
+                form.push(("a", new));
+            }
+        }
+        crate::http::agent()
+            .post(&format!("{}/subscription/edit", self.api_base))
+            .header("Authorization", &self.auth_header()?)
+            .send_form(form)
+            .map_err(|e| format!("subscription edit failed: {e}"))?;
+        self.invalidate_caches();
+        Ok(())
+    }
+
+    pub fn mark_all_read_remote(&self, feed_id: Option<&str>) -> Result<(), String> {
+        let mut token = crate::http::agent()
+            .get(&format!("{}/token", self.api_base))
+            .header("Authorization", &self.auth_header()?)
+            .call()
+            .map_err(|e| format!("token fetch failed: {e}"))?;
+        let token = token
+            .body_mut()
+            .read_to_string()
+            .map_err(|e| e.to_string())?;
+        crate::http::agent()
+            .post(&format!("{}/mark-all-as-read", self.api_base))
+            .header("Authorization", &self.auth_header()?)
+            .send_form([
+                (
+                    "s",
+                    feed_id.unwrap_or("user/-/state/com.google/reading-list"),
+                ),
+                ("T", token.trim()),
+            ])
+            .map_err(|e| format!("mark all read failed: {e}"))?;
+        self.invalidate_caches();
+        Ok(())
+    }
+
     /// Mark many items read with one action token (the
     /// mark-all-read path for hosted feeds).
     pub fn mark_read_batch(&self, item_ids: &[String]) -> Result<(), String> {
@@ -717,11 +787,29 @@ fn chrono_rfc3339(secs: i64) -> String {
 // Miniflux
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 pub struct MinifluxClient {
     /// Base URL without trailing /v1.
     pub base_url: String,
     pub api_key: String,
+    refresh_config: crate::config::Config,
+    refresh_state: std::sync::Arc<std::sync::Mutex<MinifluxRefreshState>>,
 }
+
+#[derive(Default)]
+struct MinifluxRefreshState {
+    failures: std::collections::HashMap<i64, (u32, std::time::Instant)>,
+    cooldown_until: Option<std::time::Instant>,
+    in_flight: std::collections::HashSet<i64>,
+}
+
+type MinifluxRefreshStates =
+    std::collections::HashMap<String, std::sync::Arc<std::sync::Mutex<MinifluxRefreshState>>>;
+static MINIFLUX_REFRESH_STATES: std::sync::OnceLock<std::sync::Mutex<MinifluxRefreshStates>> =
+    std::sync::OnceLock::new();
+
+/// Completion of requests still running after the manual-refresh soft deadline.
+pub type MinifluxRefreshPending = std::sync::mpsc::Receiver<Result<(), String>>;
 
 #[derive(Deserialize)]
 pub struct MfFeed {
@@ -732,6 +820,10 @@ pub struct MfFeed {
     feed_url: String,
     #[serde(default)]
     category: Option<MfCategory>,
+    #[serde(default)]
+    parsing_error_count: i64,
+    #[serde(default)]
+    checked_at: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -779,12 +871,240 @@ pub struct MfEnclosure {
 
 impl MinifluxClient {
     pub fn new(base_url: &str, api_key: &str) -> Self {
+        use sha2::Digest;
+        let base_url = base_url
+            .trim_end_matches('/')
+            .trim_end_matches("/v1")
+            .to_string();
+        let identity = sha2::Sha256::digest(format!("{base_url}|{api_key}"))
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let refresh_state = MINIFLUX_REFRESH_STATES
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .entry(identity)
+            .or_default()
+            .clone();
         Self {
-            base_url: base_url
-                .trim_end_matches('/')
-                .trim_end_matches("/v1")
-                .to_string(),
+            base_url,
             api_key: api_key.to_string(),
+            refresh_config: Default::default(),
+            refresh_state,
+        }
+    }
+
+    pub fn with_refresh_config(mut self, cfg: &crate::config::Config) -> Self {
+        self.refresh_config = cfg.clone();
+        self
+    }
+
+    fn refresh_workers(&self, count: usize) -> usize {
+        (self
+            .refresh_config
+            .get_i64("miniflux_targeted_refresh_workers", 8)
+            .clamp(1, 32) as usize)
+            .min(count.max(1))
+    }
+
+    fn refresh_seconds(&self, key: &str, default: f64) -> f64 {
+        self.refresh_config
+            .raw()
+            .get(key)
+            .and_then(serde_json::Value::as_f64)
+            .filter(|v| v.is_finite())
+            .unwrap_or(default)
+            .clamp(0.0, 86400.0)
+    }
+
+    /// Manual refresh fetches each healthy feed synchronously on the server;
+    /// scheduled refresh only recovers up to 15 feeds overdue by the client interval.
+    pub fn request_refresh(&self, force: bool) -> Result<Option<MinifluxRefreshPending>, String> {
+        let feeds = self.feeds()?;
+        let skip = self
+            .refresh_config
+            .get_i64("miniflux_force_skip_error_count", 3)
+            .max(0);
+        // SQLite already owns the cache's timestamp normalization, including UTC offsets.
+        let clock = rusqlite::Connection::open_in_memory()
+            .map_err(|e| format!("refresh clock failed: {e}"))?;
+        let interval = self
+            .refresh_config
+            .get_i64("refresh_interval", 300)
+            .max(300);
+        let mut ids = Vec::new();
+        for feed in feeds {
+            if skip > 0 && feed.parsing_error_count >= skip {
+                continue;
+            }
+            let due = force
+                || clock
+                    .query_row(
+                        "SELECT COALESCE(unixepoch(?1) <= unixepoch() - ?2, 1)",
+                        rusqlite::params![feed.checked_at, interval],
+                        |r| r.get::<_, bool>(0),
+                    )
+                    .map_err(|e| format!("refresh clock failed: {e}"))?;
+            if due {
+                ids.push(feed.id);
+            }
+            if !force && ids.len() == 15 {
+                break;
+            }
+        }
+        let ids = self.claim_refresh_ids(&ids, force);
+        if ids.is_empty() {
+            return Ok(None);
+        }
+        let deadline = if force && ids.len() >= 3 && self.refresh_workers(ids.len()) > 1 {
+            self.refresh_seconds("miniflux_refresh_soft_deadline_s", 5.0)
+        } else {
+            0.0
+        };
+        let client = self.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(client.run_refresh_pool(ids));
+        });
+        if deadline == 0.0 {
+            rx.recv()
+                .map_err(|_| "Miniflux refresh worker stopped".to_string())??;
+            return Ok(None);
+        }
+        match rx.recv_timeout(std::time::Duration::from_secs_f64(deadline)) {
+            Ok(result) => result.map(|()| None),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Ok(Some(rx)),
+            Err(_) => Err("Miniflux refresh worker stopped".to_string()),
+        }
+    }
+
+    fn claim_refresh_ids(&self, ids: &[i64], force: bool) -> Vec<i64> {
+        let now = std::time::Instant::now();
+        let mut state = self.refresh_state.lock().unwrap_or_else(|p| p.into_inner());
+        if state.cooldown_until.is_some_and(|until| until > now) {
+            return Vec::new();
+        }
+        ids.iter()
+            .copied()
+            .filter(|id| {
+                let backoff = state
+                    .failures
+                    .get(id)
+                    .is_some_and(|(count, until)| *until > now && (!force || *count >= 2));
+                *id > 0 && !backoff && state.in_flight.insert(*id)
+            })
+            .collect()
+    }
+
+    /// Trigger explicit feed refreshes without fetching or changing cached articles.
+    pub fn request_feed_refreshes(&self, ids: &[i64], force: bool) -> Result<(), String> {
+        self.run_refresh_pool(self.claim_refresh_ids(ids, force))
+    }
+
+    fn run_refresh_pool(&self, ids: Vec<i64>) -> Result<(), String> {
+        let workers = self.refresh_workers(ids.len());
+        let limit = self
+            .refresh_config
+            .get_i64("miniflux_targeted_refresh_5xx_limit", 3)
+            .max(0) as usize;
+        let cooldown = self.refresh_seconds("miniflux_targeted_refresh_cooldown_s", 300.0);
+        let base_timeout = self
+            .refresh_config
+            .get_i64("feed_timeout_seconds", 15)
+            .clamp(5, 120);
+        let floor = self
+            .refresh_config
+            .get_i64("miniflux_per_feed_refresh_timeout_s", 18);
+        let timeout = base_timeout.max(if floor == 0 { 18 } else { floor }) as u64;
+        let mut errors = Vec::new();
+        std::thread::scope(|scope| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let mut queue = ids.iter().copied();
+            let mut active = 0;
+            let mut probing = limit > 0 && workers > 1;
+            let mut consecutive = 0;
+            let mut parked = false;
+            loop {
+                let window = if probing { workers.min(limit) } else { workers };
+                let fill = !probing || active == 0;
+                while fill && !parked && active < window {
+                    let Some(id) = queue.next() else { break };
+                    let tx = tx.clone();
+                    scope.spawn(move || {
+                        // Every worker owns its HTTP agent; no shared session crosses threads.
+                        let config = ureq::Agent::config_builder()
+                            .user_agent(crate::http::user_agent())
+                            .timeout_global(Some(std::time::Duration::from_secs(timeout)))
+                            .build();
+                        let result = ureq::Agent::new_with_config(config)
+                            .put(&format!("{}/v1/feeds/{id}/refresh", self.base_url))
+                            .header("X-Auth-Token", &self.api_key)
+                            .send_empty();
+                        let status = match &result {
+                            Ok(r) => Some(r.status().as_u16()),
+                            Err(ureq::Error::StatusCode(s)) => Some(*s),
+                            Err(_) => None,
+                        };
+                        let _ = tx.send((id, result.is_ok(), status));
+                    });
+                    active += 1;
+                }
+                if active == 0 {
+                    break;
+                }
+                let Ok((id, ok, status)) = rx.recv() else {
+                    break;
+                };
+                active -= 1;
+                let mut state = self.refresh_state.lock().unwrap_or_else(|p| p.into_inner());
+                if ok {
+                    state.failures.remove(&id);
+                } else {
+                    let count = state
+                        .failures
+                        .get(&id)
+                        .map_or(1, |(n, _)| n.saturating_add(1));
+                    let seconds =
+                        (60_u64.saturating_mul(1_u64 << count.saturating_sub(1).min(5))).min(1800);
+                    state.failures.insert(
+                        id,
+                        (
+                            count,
+                            std::time::Instant::now() + std::time::Duration::from_secs(seconds),
+                        ),
+                    );
+                    errors.push(match status {
+                        Some(s) => format!("feed {id}: HTTP {s}"),
+                        None => format!("feed {id}: request failed or timed out"),
+                    });
+                }
+                consecutive = if status.is_some_and(|s| s >= 500) {
+                    consecutive + 1
+                } else {
+                    0
+                };
+                if limit > 0 && consecutive >= limit && cooldown > 0.0 {
+                    state.cooldown_until = Some(
+                        std::time::Instant::now() + std::time::Duration::from_secs_f64(cooldown),
+                    );
+                    parked = true;
+                }
+                // Let every initial probe settle before admitting more requests.
+                if probing && active > 0 {
+                    continue;
+                }
+                probing = false;
+            }
+        });
+        let mut state = self.refresh_state.lock().unwrap_or_else(|p| p.into_inner());
+        for id in ids {
+            state.in_flight.remove(&id);
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(format!("Miniflux refresh failed: {}", errors.join("; ")))
         }
     }
 
@@ -847,6 +1167,32 @@ impl MinifluxClient {
             .header("Content-Type", "application/json")
             .send(body.to_string())
             .map_err(|e| format!("mark read failed: {e}"))?;
+        Ok(())
+    }
+
+    /// Use the server account/feed endpoint rather than paging cached article IDs.
+    pub fn mark_all_read_remote(&self, feed_id: Option<i64>) -> Result<(), String> {
+        let path = if let Some(id) = feed_id {
+            if id <= 0 {
+                return Err("Invalid Miniflux feed".to_string());
+            }
+            format!("/v1/feeds/{id}/mark-all-as-read")
+        } else {
+            #[derive(Deserialize)]
+            struct Me {
+                id: i64,
+            }
+            let me: Me = self.get_json("/v1/me")?;
+            if me.id <= 0 {
+                return Err("Invalid Miniflux account response".to_string());
+            }
+            format!("/v1/users/{}/mark-all-as-read", me.id)
+        };
+        crate::http::agent()
+            .put(&format!("{}{path}", self.base_url))
+            .header("X-Auth-Token", &self.api_key)
+            .send_empty()
+            .map_err(|e| format!("mark all read failed: {e}"))?;
         Ok(())
     }
 
@@ -1074,6 +1420,11 @@ impl MinifluxClient {
     /// Refresh ONE feed's entries into the database (per-feed
     /// refresh for hosted feeds). Returns how many were new.
     pub fn refresh_feed(&self, db: &Db, mf_id: i64) -> Result<usize, String> {
+        self.request_feed_refreshes(&[mf_id], true)?;
+        self.sync_feed_entries(db, mf_id)
+    }
+
+    fn sync_feed_entries(&self, db: &Db, mf_id: i64) -> Result<usize, String> {
         let local_id = format!("miniflux:{mf_id}");
         let tombstones = db.deleted_article_ids().unwrap_or_default();
         let mut new = 0;

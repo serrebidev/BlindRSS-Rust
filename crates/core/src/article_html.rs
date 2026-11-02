@@ -1278,18 +1278,10 @@ fn structured_youtube_html(text: &str) -> String {
 /// body), falling back to cleaned feed content when the page can't be
 /// fetched or yields no usable body. Returns None only when there is
 /// nothing at all to show. The returned `<article>` carries a `lang`
-<<<<<<< Updated upstream
 /// attribute resolved by issue #72's priority order. Batch 35b ported
 /// Python's remaining render paths: the YouTube structured-text
 /// special case, the ID3 show-notes path, the Google News proxy
 /// fallback, the metered-preview notice, and multi-page following.
-=======
-/// attribute resolved by issue #72's priority order.
-///
-/// Not ported from Python's render (PARITY residuals): the YouTube
-/// structured-text special case, the ID3 show-notes path, the Google
-/// News proxy path.
->>>>>>> Stashed changes
 #[allow(clippy::too_many_arguments)]
 pub fn render_rich_article(
     url: &str,
@@ -1307,15 +1299,19 @@ pub fn render_rich_article(
     let author = fallback_author.to_string();
     let mut body = String::new();
     let mut page_lang: Option<String> = None;
-<<<<<<< Updated upstream
     let mut metered_preview = false;
-=======
-    let mut preview_notice = None;
->>>>>>> Stashed changes
+
+    if let Some((source_title, source_html)) = crate::extract::reconstructed_article_html(url) {
+        if title.is_empty() {
+            title = source_title;
+        }
+        body = clean_article_html(&source_html, url, false);
+    }
 
     // Direct podcast enclosure (Batch 35b): preserve links from the
     // bounded embedded ID3 show notes (Python article_html).
-    if !url.is_empty()
+    if body.is_empty()
+        && !url.is_empty()
         && crate::extract::looks_like_id3_media_url(url)
         && fallback_html.trim().is_empty()
         && let Some((t, _a, content)) = crate::extract::id3_metadata(url)
@@ -1346,7 +1342,6 @@ pub fn render_rich_article(
         && let Ok((bytes, content_type)) = fetch_page_bytes(url, cookie_header)
     {
         let page_html = crate::extract::decode_bytes(&bytes, &content_type, "");
-        preview_notice = crate::extract::metered_preview_notice(&page_html);
         page_lang = crate::article_lang::lang_from_page_html(&page_html);
         metered_preview = crate::extract::looks_like_metered_preview(&page_html);
         if title.is_empty() {
@@ -1356,7 +1351,6 @@ pub fn render_rich_article(
             );
             title = t;
         }
-<<<<<<< Updated upstream
         // Sky Flourish + GSMArena expansions, then multi-page
         // following with whole-page dedupe (Python's page loop).
         let expanded = crate::extract::expand_sky_flourish_tables(&page_html, url);
@@ -1411,27 +1405,6 @@ pub fn render_rich_article(
             .map(|p| format!("<p>{}</p>", esc_text(p.trim())))
             .collect::<Vec<_>>()
             .join("");
-=======
-        body = clean_article_html(&page_html, url, true);
-        let mut seen = HashSet::from([norm(&leaf_text(&body))]);
-        let mut visited = HashSet::from([url.to_string()]);
-        let mut next = crate::extract::find_next_page(&page_html, url);
-        for _ in 1..6 {
-            let Some(current) = next.take().filter(|u| visited.insert(u.clone())) else {
-                break;
-            };
-            let Ok((bytes, content_type)) = fetch_page_bytes(&current, cookie_header) else {
-                break;
-            };
-            let page_html = crate::extract::decode_bytes(&bytes, &content_type, "");
-            let page_body = clean_article_html(&page_html, &current, true);
-            let signature = norm(&leaf_text(&page_body));
-            if !signature.is_empty() && seen.insert(signature) {
-                body.push_str(&page_body);
-            }
-            next = crate::extract::find_next_page(&page_html, &current);
-        }
->>>>>>> Stashed changes
     }
 
     // Some publishers serve a truncated page but syndicate the complete
@@ -1445,20 +1418,15 @@ pub fn render_rich_article(
             if (feed_len as f64) > body_len as f64 * 1.25 {
                 let embeds = harvest_embeds(&body);
                 body = format!("{feed_body}{embeds}");
-<<<<<<< Updated upstream
                 // The feed carried more than the page did, so the
                 // free-excerpt notice no longer applies.
                 metered_preview = false;
-=======
-                preview_notice = None;
->>>>>>> Stashed changes
             }
         }
     }
 
     if body.is_empty() {
         body = feed_fallback_html(fallback_html, url);
-<<<<<<< Updated upstream
         metered_preview = false;
     }
     // Metered publishers serve a few paragraphs and withhold the
@@ -1468,12 +1436,6 @@ pub fn render_rich_article(
             "{body}<p class=\"awv-notice\">{}</p>",
             esc_text(crate::extract::metered_preview_notice())
         );
-=======
-        preview_notice = None;
-    }
-    if let Some(notice) = preview_notice {
-        body.push_str(&format!("<p class=\"awv-notice\">{notice}</p>"));
->>>>>>> Stashed changes
     }
     assemble_rich(
         &body,

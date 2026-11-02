@@ -88,23 +88,33 @@ fn ui_language() -> String {
     "en".to_string()
 }
 
-/// Closest-tag language match rank (Python `_language_match`):
-/// 0 = exact or primary-tag match, higher = looser, None = no match.
-fn language_match(code: &str, wanted: &str) -> Option<i32> {
-    let code = code.to_lowercase();
-    let wanted = wanted.to_lowercase();
-    if wanted.is_empty() {
+/// Subtitle language rank: exact tag, Chinese script, bare base, other variant.
+pub(crate) fn language_match(code: &str, wanted: &str) -> Option<u8> {
+    let code = code.to_ascii_lowercase().replace('_', "-");
+    let code = code.strip_suffix("-orig").unwrap_or(&code);
+    let wanted = wanted.to_ascii_lowercase().replace('_', "-");
+    if code.is_empty() || wanted.is_empty() {
         return None;
     }
     if code == wanted {
         return Some(0);
     }
-    let code_primary = code.split('-').next().unwrap_or("");
-    let wanted_primary = wanted.split('-').next().unwrap_or("");
-    if code_primary == wanted_primary && !code_primary.is_empty() {
+    let script = match wanted.as_str() {
+        "zh-cn" | "zh-sg" => "zh-hans",
+        "zh-tw" | "zh-hk" | "zh-mo" => "zh-hant",
+        _ => "",
+    };
+    if code == script {
         return Some(1);
     }
-    None
+    let base = wanted.split('-').next().unwrap_or("");
+    if code == base {
+        Some(2)
+    } else if code.split('-').next() == Some(base) {
+        Some(3)
+    } else {
+        None
+    }
 }
 
 fn json_str(v: &Value, key: &str) -> String {
@@ -368,7 +378,7 @@ fn track_translation(track: &Value) -> String {
 }
 
 struct SubCandidate {
-    rank: (i32, i32),
+    rank: (i32, u8),
     kind_rank: i32,
     language: String,
     track: Value,
@@ -645,5 +655,26 @@ pub fn extract_article(url: &str) -> Option<(String, String, String)> {
         None
     } else {
         Some((title, author, text))
+    }
+}
+
+#[cfg(test)]
+mod language_tests {
+    use super::language_match;
+
+    #[test]
+    fn subtitle_language_ranks_match_python() {
+        for (code, wanted, rank) in [
+            ("en_US-orig", "en-US", Some(0)),
+            ("zh-Hant", "zh-TW", Some(1)),
+            ("zh-Hans", "zh-SG", Some(1)),
+            ("en", "en-GB", Some(2)),
+            ("en-US", "en-GB", Some(3)),
+            ("fr", "en", None),
+            ("", "en", None),
+            ("en", "", None),
+        ] {
+            assert_eq!(language_match(code, wanted), rank, "{code} / {wanted}");
+        }
     }
 }

@@ -3,6 +3,7 @@
 //! Direct media downloads stream to disk; page URLs go through
 //! yt-dlp with a small preset set mirroring Python's format choices.
 
+use crate::ytfull::language_match;
 use std::path::{Path, PathBuf};
 
 fn download_index_keys(cfg: &crate::config::Config, article: &crate::Article) -> Vec<String> {
@@ -508,34 +509,6 @@ pub fn youtube_full_text_in_language(url: &str, ui_language: &str) -> Result<Str
         comments
     });
     Ok(sections.join("\n\n"))
-}
-
-fn language_match(code: &str, wanted: &str) -> Option<u8> {
-    let code = code.to_ascii_lowercase().replace('_', "-");
-    let code = code.strip_suffix("-orig").unwrap_or(&code);
-    let wanted = wanted.to_ascii_lowercase().replace('_', "-");
-    if code.is_empty() || wanted.is_empty() {
-        return None;
-    }
-    if code == wanted {
-        return Some(0);
-    }
-    let script = match wanted.as_str() {
-        "zh-cn" | "zh-sg" => "zh-hans",
-        "zh-tw" | "zh-hk" | "zh-mo" => "zh-hant",
-        _ => "",
-    };
-    if code == script {
-        return Some(1);
-    }
-    let base = wanted.split('-').next().unwrap_or("");
-    if code == base {
-        Some(2)
-    } else if code.split('-').next() == Some(base) {
-        Some(3)
-    } else {
-        None
-    }
 }
 
 fn subtitle_candidates(

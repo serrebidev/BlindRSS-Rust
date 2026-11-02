@@ -23,6 +23,82 @@
 use serde_json::Value;
 mod github;
 
+static CONFIG_PATH: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
+
+pub fn configure(_cfg: &crate::config::Config, path: &std::path::Path) {
+    *CONFIG_PATH.lock().unwrap_or_else(|p| p.into_inner()) = Some(path.to_owned());
+}
+
+fn resolve_source_key(
+    names: &[&str],
+    key: &str,
+    cfg: &crate::config::Config,
+    mut environment: impl FnMut(&str) -> Option<String>,
+) -> String {
+    names
+        .iter()
+        .filter_map(|name| environment(name))
+        .map(|v| v.trim().to_string())
+        .find(|v| !v.is_empty())
+        .unwrap_or_else(|| cfg.get_str(key, "").trim().to_string())
+}
+
+pub(crate) fn escape_source_html(value: &str) -> String {
+    github::escape(value)
+}
+
+pub(crate) fn source_key(names: &[&str], key: &str) -> String {
+    let path = CONFIG_PATH
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone();
+    let cfg = path
+        .and_then(|p| crate::config::Config::load(&p).ok())
+        .unwrap_or_default();
+    resolve_source_key(names, key, &cfg, |name| std::env::var(name).ok())
+}
+
+pub(crate) fn source_api_json(url: &str, host: &str, token: &str, github: bool) -> Option<Value> {
+    let parsed = url::Url::parse(url).ok()?;
+    if parsed.scheme() != "https"
+        || parsed.host_str() != Some(host)
+        || parsed.port_or_known_default() != Some(443)
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return None;
+    }
+    // Never forward source credentials through redirects or imported browser cookies.
+    let agent = ureq::Agent::new_with_config(
+        ureq::Agent::config_builder()
+            .user_agent(crate::http::user_agent())
+            .timeout_global(Some(std::time::Duration::from_secs(
+                crate::http::timeout_secs(),
+            )))
+            .max_redirects(0)
+            .build(),
+    );
+    let mut request = agent.get(url).header(
+        "Accept",
+        if github {
+            "application/vnd.github.full+json"
+        } else {
+            "application/json"
+        },
+    );
+    if github {
+        request = request.header("X-GitHub-Api-Version", "2022-11-28");
+    }
+    if !token.is_empty() {
+        request = request.header("Authorization", format!("Bearer {token}"));
+    }
+    let mut response = request.call().ok()?;
+    if response.status() != 200 {
+        return None;
+    }
+    serde_json::from_str(&response.body_mut().read_to_string().ok()?).ok()
+}
+
 /// Try every thread reconstructor for this URL.
 pub fn thread_text(url: &str) -> Option<(String, String)> {
     lemmy_thread(url)
@@ -132,71 +208,13 @@ pub fn lemmy_thread(url: &str) -> Option<(String, String)> {
 // GitHub: issue / PR / commit / release pages -> REST API.
 // ---------------------------------------------------------------------------
 
-fn github_parts(url: &str) -> Option<(String, String, String, String)> {
-    // (owner, repo, kind, number-or-sha)
-    let rest = url.strip_prefix("https://github.com/")?;
-    let parts: Vec<&str> = rest.split('/').collect();
-    if parts.len() < 4 {
-        return None;
-    }
-    let (owner, repo, kind, num) = (parts[0], parts[1], parts[2], parts[3]);
-    match kind {
-        "issues" | "pull" if num.chars().all(|c| c.is_ascii_digit()) && !num.is_empty() => Some((
-            owner.to_string(),
-            repo.to_string(),
-            kind.to_string(),
-            num.to_string(),
-        )),
-        _ => None,
-    }
-}
-
+/// Read issue and pull-request threads through the complete GitHub renderer.
 pub fn github_thread(url: &str) -> Option<(String, String)> {
-    let (owner, repo, kind, num) = github_parts(url)?;
-    let api = format!("https://api.github.com/repos/{owner}/{repo}/issues/{num}");
-    let issue = get_json(&api)?;
-    let title = str_field(&issue, "title");
-    if title.is_empty() {
+    let target = github::parse_target(url)?;
+    if !matches!(target.kind.as_str(), "issue" | "pull") {
         return None;
     }
-    let author = issue
-        .get("user")
-        .map(|u| str_field(u, "login"))
-        .unwrap_or_default();
-    let mut out = vec![format!(
-        "Post 1 - {} - {}",
-        author,
-        str_field(&issue, "created_at")
-    )];
-    let body = str_field(&issue, "body");
-    if !body.trim().is_empty() {
-        out.push(body);
-    }
-    let comments_url = str_field(&issue, "comments_url");
-    if !comments_url.is_empty()
-        && let Some(comments) = get_json(&format!("{comments_url}?per_page=100"))
-        && let Some(items) = comments.as_array()
-    {
-        for (i, c) in items.iter().enumerate() {
-            let cbody = str_field(c, "body");
-            if cbody.trim().is_empty() {
-                continue;
-            }
-            let cauthor = c
-                .get("user")
-                .map(|u| str_field(u, "login"))
-                .unwrap_or_default();
-            out.push(format!(
-                "Post {} - {} - {}",
-                i + 2,
-                cauthor,
-                str_field(c, "created_at")
-            ));
-            out.push(cbody);
-        }
-    }
-    let _ = kind;
-    Some((title, out.join("\n\n")))
+    github_html(url).map(|(title, html)| (title, crate::extract::html_to_text(&html)))
 }
 
 // ---------------------------------------------------------------------------
@@ -281,220 +299,37 @@ pub fn github_page_parts(url: &str) -> Option<GithubPage> {
     }
 }
 
-fn login_of(v: &Value) -> String {
-    v.get("user")
-        .map(|u| str_field(u, "login"))
-        .unwrap_or_default()
+/// Semantic GitHub document for both reader renderings.
+pub fn github_html(url: &str) -> Option<(String, String)> {
+    let mut target = github::parse_target(url)?;
+    if target.kind == "org_discussion" {
+        target.kind = "discussion".into();
+        target.repo = ".github".into();
+    }
+    let token = source_key(
+        &["BLINDRSS_GITHUB_TOKEN", "GITHUB_TOKEN", "GH_TOKEN"],
+        "github_token",
+    );
+    github::document(&target, &mut |path| {
+        source_api_json(
+            &format!("https://api.github.com{path}"),
+            "api.github.com",
+            &token,
+            true,
+        )
+    })
 }
 
 pub fn github_page_text(url: &str) -> Option<(String, String)> {
-    match github_page_parts(url)? {
-        GithubPage::Commit(owner, repo, sha) => github_commit_text(&owner, &repo, &sha),
-        GithubPage::Release(owner, repo, tag) => github_release_text(&owner, &repo, &tag),
-        GithubPage::Discussion(owner, repo, num) => github_discussion_text(&owner, &repo, &num)
-            // Python `_discussion_document`: anything the REST API
-            // cannot serve falls through to the rendered page.
-            .or_else(|| github_org_discussion_text(&owner, &num, url)),
-        GithubPage::OrgDiscussion(owner, num) => github_org_discussion_text(&owner, &num, url),
-    }
-}
-
-fn github_commit_text(owner: &str, repo: &str, sha: &str) -> Option<(String, String)> {
-    let base = format!("https://api.github.com/repos/{owner}/{repo}");
-    let commit = get_json(&format!("{base}/commits/{sha}"))?;
-    let full_sha = str_field(&commit, "sha");
-    if full_sha.is_empty() {
-        return None;
-    }
-    let info = commit.get("commit").cloned().unwrap_or(Value::Null);
-    let author_info = info.get("author").cloned().unwrap_or(Value::Null);
-    let mut author = login_of(&commit);
-    if author.is_empty() || author == "ghost" {
-        author = str_field(&author_info, "name");
-        if author.is_empty() {
-            author = "unknown".to_string();
-        }
-    }
-    let when = str_field(&author_info, "date");
-    let message = str_field(&info, "message");
-    let subject = message
-        .lines()
-        .next()
-        .unwrap_or("(no commit message)")
-        .trim()
-        .to_string();
-    let slug = format!("{owner}/{repo}");
-    let mut out: Vec<String> = Vec::new();
-    let mut heading = format!("Commit by {author}");
-    if !when.is_empty() {
-        heading += &format!(" - {when}");
-    }
-    out.push(heading);
-    let mut bullets = vec![format!("Commit: {}", &full_sha[..full_sha.len().min(12)])];
-    if let Some(stats) = commit.get("stats") {
-        let add = stats.get("additions").and_then(|v| v.as_i64()).unwrap_or(0);
-        let del = stats.get("deletions").and_then(|v| v.as_i64()).unwrap_or(0);
-        bullets.push(format!("{add} additions, {del} deletions"));
-    }
-    if let Some(parents) = commit.get("parents").and_then(|v| v.as_array())
-        && !parents.is_empty()
-    {
-        let short: Vec<String> = parents
-            .iter()
-            .map(|p| {
-                let s = str_field(p, "sha");
-                s[..s.len().min(7)].to_string()
-            })
-            .collect();
-        bullets.push(format!("Parents: {}", short.join(", ")));
-    }
-    bullets.push(format!("Repository: {slug}"));
-    out.push(bullets.join("\n"));
-    if !message.trim().is_empty() {
-        out.push(message.trim().to_string());
-    }
-    // Commit comments.
-    if let Some(comments) = get_json(&format!("{base}/commits/{sha}/comments?per_page=100"))
-        && let Some(items) = comments.as_array()
-    {
-        for c in items {
-            let body = str_field(c, "body");
-            if body.trim().is_empty() {
-                continue;
+    let page = github_page_parts(url)?;
+    github_html(url)
+        .map(|(title, html)| (title, crate::extract::html_to_text(&html)))
+        .or_else(|| match page {
+            GithubPage::Discussion(owner, _, num) | GithubPage::OrgDiscussion(owner, num) => {
+                github_org_discussion_text(&owner, &num, url)
             }
-            out.push(format!(
-                "Comment by {} - {}",
-                login_of(c),
-                str_field(c, "created_at")
-            ));
-            out.push(body.trim().to_string());
-        }
-    }
-    // Changed files with patches (Python caps: 60 files with patch,
-    // 400 diff lines per file, 4000 total).
-    if let Some(files) = commit.get("files").and_then(|v| v.as_array())
-        && !files.is_empty()
-    {
-        out.push(format!("Changed files ({})", files.len()));
-        let mut diff_lines_total = 0usize;
-        for (i, f) in files.iter().enumerate() {
-            let name = str_field(f, "filename");
-            let status = str_field(f, "status");
-            let add = f.get("additions").and_then(|v| v.as_i64()).unwrap_or(0);
-            let del = f.get("deletions").and_then(|v| v.as_i64()).unwrap_or(0);
-            out.push(format!("{name} ({status}, +{add} -{del})"));
-            if i < 60 && diff_lines_total < 4000 {
-                let patch = str_field(f, "patch");
-                if !patch.is_empty() {
-                    let lines: Vec<&str> = patch.lines().take(400).collect();
-                    diff_lines_total += lines.len();
-                    out.push(lines.join("\n"));
-                }
-            }
-        }
-    }
-    Some((format!("{subject} ({slug})"), out.join("\n\n")))
-}
-
-fn github_release_text(owner: &str, repo: &str, tag: &str) -> Option<(String, String)> {
-    let base = format!("https://api.github.com/repos/{owner}/{repo}");
-    let release = get_json(&format!("{base}/releases/tags/{tag}"))?;
-    let tag_name = str_field(&release, "tag_name");
-    if tag_name.is_empty() {
-        return None;
-    }
-    let slug = format!("{owner}/{repo}");
-    let author = login_of(&release);
-    let mut title = str_field(&release, "name");
-    if title.is_empty() {
-        title = tag_name.clone();
-    }
-    let published = {
-        let p = str_field(&release, "published_at");
-        if p.is_empty() {
-            str_field(&release, "created_at")
-        } else {
-            p
-        }
-    };
-    let mut out: Vec<String> = Vec::new();
-    let mut heading = format!("Release published by {author}");
-    if !published.is_empty() {
-        heading += &format!(" - {published}");
-    }
-    out.push(heading);
-    let mut bullets = vec![format!("Tag: {tag_name}")];
-    if release.get("prerelease").and_then(|v| v.as_bool()) == Some(true) {
-        bullets.push("Pre-release".to_string());
-    }
-    if release.get("draft").and_then(|v| v.as_bool()) == Some(true) {
-        bullets.push("Draft".to_string());
-    }
-    bullets.push(format!("Repository: {slug}"));
-    out.push(bullets.join("\n"));
-    let body = str_field(&release, "body");
-    if !body.trim().is_empty() {
-        out.push(body.trim().to_string());
-    }
-    if let Some(assets) = release.get("assets").and_then(|v| v.as_array())
-        && !assets.is_empty()
-    {
-        out.push(format!("Assets ({})", assets.len()));
-        let rows: Vec<String> = assets
-            .iter()
-            .map(|a| {
-                let name = str_field(a, "name");
-                let name = if name.is_empty() { "asset" } else { &name };
-                match a.get("download_count").and_then(|v| v.as_i64()) {
-                    Some(d) => format!("{name} ({d} downloads)"),
-                    None => name.to_string(),
-                }
-            })
-            .collect();
-        out.push(rows.join("\n"));
-    }
-    Some((format!("{title} ({slug})"), out.join("\n\n")))
-}
-
-fn github_discussion_text(owner: &str, repo: &str, num: &str) -> Option<(String, String)> {
-    let base = format!("https://api.github.com/repos/{owner}/{repo}");
-    let disc = get_json(&format!("{base}/discussions/{num}"))?;
-    let title = str_field(&disc, "title");
-    if title.is_empty() {
-        return None;
-    }
-    let slug = format!("{owner}/{repo}");
-    let mut out: Vec<String> = Vec::new();
-    out.push(format!(
-        "Discussion opened by {} - {}",
-        login_of(&disc),
-        str_field(&disc, "created_at")
-    ));
-    let body = str_field(&disc, "body");
-    if !body.trim().is_empty() {
-        out.push(body.trim().to_string());
-    }
-    if let Some(comments) = get_json(&format!("{base}/discussions/{num}/comments?per_page=100"))
-        && let Some(items) = comments.as_array()
-    {
-        let mut sorted: Vec<&Value> = items.iter().collect();
-        sorted.sort_by_key(|c| str_field(c, "created_at"));
-        for c in sorted {
-            let body = str_field(c, "body");
-            if body.trim().is_empty() {
-                continue;
-            }
-            let is_reply = c.get("parent_id").map(|v| !v.is_null()).unwrap_or(false);
-            let label = if is_reply { "Reply" } else { "Comment" };
-            out.push(format!(
-                "{label} by {} - {}",
-                login_of(c),
-                str_field(c, "created_at")
-            ));
-            out.push(body.trim().to_string());
-        }
-    }
-    Some((format!("{title} ({slug}#{num})"), out.join("\n\n")))
+            _ => None,
+        })
 }
 
 fn github_org_discussion_text(owner: &str, num: &str, url: &str) -> Option<(String, String)> {
@@ -683,4 +518,43 @@ pub fn discourse_thread(url: &str) -> Option<(String, String)> {
         return None;
     }
     Some((title, out.join("\n\n")))
+}
+#[cfg(test)]
+mod source_key_tests {
+    #[test]
+    fn source_credentials_reject_other_origins_before_requesting() {
+        for url in [
+            "https://api.github.com.evil.test/repos/o/r",
+            "http://api.github.com/repos/o/r",
+            "https://api.github.com:444/repos/o/r",
+            "https://name@api.github.com/repos/o/r",
+        ] {
+            assert!(
+                super::source_api_json(url, "api.github.com", "fake-test-token", true).is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn source_key_prefers_first_nonempty_environment_then_config() {
+        let mut cfg = crate::config::Config::default();
+        *cfg.raw_mut() = serde_json::json!({"github_token":" config-token "});
+        assert_eq!(
+            super::resolve_source_key(
+                &["FIRST", "SECOND"],
+                "github_token",
+                &cfg,
+                |name| match name {
+                    "FIRST" => Some("  ".into()),
+                    "SECOND" => Some(" env-token ".into()),
+                    _ => None,
+                }
+            ),
+            "env-token"
+        );
+        assert_eq!(
+            super::resolve_source_key(&[], "github_token", &cfg, |_| None),
+            "config-token"
+        );
+    }
 }

@@ -61,7 +61,6 @@ pub fn store_parsed(
             .map_err(|e| format!("store failed: {e}"))?
         {
             inserted += 1;
-<<<<<<< Updated upstream
             // NPR / Sky media attach (Python's generic parse path):
             // those program feeds ship no enclosure, so resolve the
             // audio for media-less new articles at store time.
@@ -80,7 +79,7 @@ pub fn store_parsed(
                 if let Some((mu, mt)) = attach {
                     let _ = db.update_article_media(&article.id, &mu, Some(&mt));
                 }
-=======
+            }
             if !entry.tags.is_empty() {
                 db.apply_enrichment(
                     &article.id,
@@ -90,7 +89,6 @@ pub fn store_parsed(
                     },
                 )
                 .map_err(|e| format!("store tags failed: {e}"))?;
->>>>>>> Stashed changes
             }
             if !rules.is_empty() {
                 let view = crate::rules::RuleArticle {
@@ -132,7 +130,6 @@ fn apply_filter_pipeline(db: &Db, eff: &crate::rules::EffectiveActions, article:
 
 /// Refresh one feed; returns how many new articles were stored.
 pub fn refresh_feed(db: &Db, feed: &Feed) -> Result<usize, String> {
-<<<<<<< Updated upstream
     // Listing sources (Batch 35): subscriptions with no native RSS
     // are enumerated by their source fetcher, mirroring the branch
     // order of Python `providers/local.py::_refresh_single_feed`.
@@ -167,7 +164,7 @@ pub fn refresh_feed(db: &Db, feed: &Feed) -> Result<usize, String> {
         };
         return store_parsed(db, feed, &parsed);
     }
-    let parsed = match fetch_and_parse(&feed.url) {
+    let parsed = match crate::feeds::fetch_with_cache(db, &feed.url, false) {
         Ok(p) => p,
         Err(e) => {
             // YouTube channel feeds answer 404/500 at random for
@@ -243,10 +240,6 @@ fn youtube_history_backfill(db: &Db, feed: &Feed, channel_id: &str) {
             let _ = db.set_youtube_history_state(&feed.id, 1, now);
         }
     }
-=======
-    let parsed = crate::feeds::fetch_with_cache(db, &feed.url, false)?;
-    store_parsed(db, feed, &parsed)
->>>>>>> Stashed changes
 }
 
 /// Refresh every feed, collecting per-feed results. One feed failing

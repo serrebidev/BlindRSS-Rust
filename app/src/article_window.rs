@@ -1,0 +1,243 @@
+//! Standalone reader with cached plain/rich modes and window-local commands.
+
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
+use wxdragon::event::webview_events::WebViewEvents;
+use wxdragon::prelude::*;
+use wxdragon::widgets::webview::{WebView, WebViewBackend};
+
+pub fn open(title: &str, body: &str, url: Option<&str>) {
+    let frame = Frame::builder()
+        .with_title(&format!("BlindRSS - {title}"))
+        .with_size(Size::new(760, 560))
+        .build();
+    let layout = BoxSizer::builder(Orientation::Vertical).build();
+    let rich = CheckBox::builder(&frame)
+        .with_label("Show in &HTML view")
+        .build();
+    layout.add(&rich, 0, SizerFlag::All, 4);
+    let reader = TextCtrl::builder(&frame)
+        .with_style(TextCtrlStyle::MultiLine | TextCtrlStyle::ReadOnly)
+        .build();
+    crate::msaa_names::set_name(&reader, &crate::tr("Article text"));
+    reader.set_value(body);
+    layout.add(&reader, 1, SizerFlag::Expand | SizerFlag::All, 4);
+    let web = WebView::is_backend_available(WebViewBackend::Default)
+        .then(|| WebView::builder(&frame).build());
+    let loading = Rc::new(Cell::new(false));
+    if let Some(view) = web {
+        layout.add(&view, 1, SizerFlag::Expand | SizerFlag::All, 4);
+        view.show(false);
+        let flag = loading.clone();
+        view.on_loaded(move |_| flag.set(false));
+        let flag = loading.clone();
+        view.on_navigating(move |event| {
+            if flag.get() || !event.get_target().unwrap_or_default().is_empty() {
+                return;
+            }
+            if let Some(url) = event.get_url()
+                && !crate::rich_embed_url(&url)
+                && let Some(url) = crate::rich_external_url(&url)
+            {
+                event.event.event.veto();
+                crate::open_article_link(&frame, &url);
+            }
+        });
+        view.on_new_window(move |event| {
+            if let Some(url) = event.get_url().and_then(|u| crate::rich_external_url(&u)) {
+                crate::open_article_link(&frame, &url);
+            }
+        });
+    }
+    frame.set_sizer(layout, true);
+    frame.create_status_bar(1, 0, -1, "Article status");
+    let url = url.unwrap_or("").to_string();
+    rich.enable(web.is_some() && !url.is_empty());
+    let menu = Menu::builder()
+        .append_item(4001, "&Reload\tF5", "Fetch the article again")
+        .append_item(4002, "Open in &Browser\tCtrl+O", "Open the source page")
+        .append_item(4003, "Copy &Link\tCtrl+Shift+C", "Copy the source URL")
+        .append_item(
+            4004,
+            "Copy &Text\tCtrl+C",
+            "Copy selected text, or the article",
+        )
+        .append_check_item(4005, "&HTML view\tCtrl+Shift+H", "Switch reader mode")
+        .append_separator()
+        .append_item(4006, "&Close\tEsc", "Close this article")
+        .build();
+    frame.set_menu_bar(MenuBar::builder().append(menu, "&Article").build());
+    let cached = Rc::new(RefCell::new(None::<String>));
+    let generation = Rc::new(Cell::new(0_u64));
+    let (tx, rx) = std::sync::mpsc::channel::<(u64, bool, Result<String, String>)>();
+    let load: Rc<dyn Fn(bool)> = {
+        let url = url.clone();
+        let title = title.to_string();
+        let fallback = body.to_string();
+        let cached = cached.clone();
+        let generation = generation.clone();
+        let loading = loading.clone();
+        Rc::new(move |reload| {
+            let want_rich = rich.is_checked() && web.is_some();
+            if let Some(bar) = frame.get_menu_bar() {
+                bar.check_item(4005, want_rich);
+            }
+            if !want_rich {
+                reader.show(true);
+                if let Some(view) = web {
+                    view.show(false);
+                }
+                frame.layout();
+            }
+            if !reload {
+                if !want_rich {
+                    return;
+                }
+                if let Some(html) = cached.borrow().as_ref() {
+                    if let Some(view) = web {
+                        loading.set(true);
+                        view.set_page(&crate::rich_document(html), &url);
+                        reader.show(false);
+                        view.show(true);
+                        frame.layout();
+                    }
+                    return;
+                }
+            } else {
+                *cached.borrow_mut() = None;
+            }
+            if url.is_empty() {
+                return;
+            }
+            generation.set(generation.get() + 1);
+            let token = generation.get();
+            frame.set_status_text("Loading article...", 0);
+            let tx = tx.clone();
+            let url = url.clone();
+            let title = title.clone();
+            let fallback = fallback.clone();
+            std::thread::spawn(move || {
+                let jar = blindrss_core::cookies::load_jar_beside(&crate::config_path());
+                let header = blindrss_core::cookies::cookie_header_for(&jar, &url);
+                let result = if want_rich {
+                    blindrss_core::article_html::render_rich_article(
+                        &url,
+                        &fallback,
+                        &title,
+                        "",
+                        "",
+                        &header,
+                        "",
+                        "",
+                        &crate::ui_language(),
+                    )
+                    .ok_or_else(|| "Could not load HTML; switch to the text reader.".into())
+                } else {
+                    match blindrss_core::extract::fetch_full_text(
+                        &url,
+                        &header,
+                        Some(&fallback),
+                        "",
+                    )
+                    .0
+                    {
+                        blindrss_core::ExtractOutcome::Article { text, .. } => Ok(text),
+                        blindrss_core::ExtractOutcome::Gate { reason } => Err(reason),
+                        blindrss_core::ExtractOutcome::Empty => Err("No article text found".into()),
+                    }
+                };
+                let _ = tx.send((token, want_rich, result));
+            });
+        })
+    };
+    let action = load.clone();
+    rich.on_toggled(move |_| action(false));
+    let action = load.clone();
+    let source = url.clone();
+    frame.on_menu(move |event| match event.get_id() {
+        4001 => action(true),
+        4002 => {
+            if !source.is_empty() {
+                crate::open_article_link(&frame, &source);
+            }
+        }
+        4003 => {
+            Clipboard::get().set_text(&source);
+        }
+        4004 => {
+            let selected = reader.get_string_selection();
+            let text = if selected.is_empty() {
+                reader.get_value()
+            } else {
+                selected
+            };
+            Clipboard::get().set_text(&text);
+        }
+        4005 => {
+            rich.set_value(!rich.is_checked() && web.is_some() && !source.is_empty());
+            action(false);
+        }
+        4006 => {
+            frame.close(false);
+        }
+        _ => event.skip(true),
+    });
+    let timer = Box::leak(Box::new(Timer::new(&frame)));
+    let source = url;
+    timer.on_tick(move |_| {
+        while let Ok((token, html, result)) = rx.try_recv() {
+            if token != generation.get() || html != rich.is_checked() {
+                continue;
+            }
+            match result {
+                Ok(text) if html => {
+                    *cached.borrow_mut() = Some(text.clone());
+                    if let Some(view) = web {
+                        loading.set(true);
+                        view.set_page(&crate::rich_document(&text), &source);
+                        reader.show(false);
+                        view.show(true);
+                        frame.layout();
+                    }
+                    frame.set_status_text("HTML article loaded", 0);
+                }
+                Ok(text) => {
+                    reader.set_value(&text);
+                    frame.set_status_text("Article loaded", 0);
+                }
+                Err(error) => frame.set_status_text(&error, 0),
+            }
+        }
+    });
+    timer.start(150, false);
+    frame.on_close(move |event| {
+        timer.stop();
+        event.skip(true);
+    });
+    frame.bind_internal(EventType::CHAR_HOOK, move |event| {
+        let key = event.get_key_code().unwrap_or(0);
+        if key == 27 {
+            frame.close(false);
+            event.skip(false);
+        } else if key == 13
+            && reader.has_focus()
+            && !event.control_down()
+            && !event.alt_down()
+            && blindrss_core::config::Config::load(&crate::config_path())
+                .unwrap_or_default()
+                .get_bool("article_structure_links", false)
+            && crate::open_reader_link(&reader, &frame)
+        {
+            event.skip(false);
+        } else {
+            event.skip(true);
+        }
+    });
+    frame.show(true);
+    reader.set_focus();
+    let cfg = blindrss_core::config::Config::load(&crate::config_path()).unwrap_or_default();
+    if cfg.get_bool("full_text_rich_view", false) && web.is_some() {
+        rich.set_value(true);
+        load(false);
+    }
+}

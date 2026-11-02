@@ -17,7 +17,6 @@ use std::cell::RefCell;
 use std::path::Path;
 use std::rc::Rc;
 use wxdragon::prelude::*;
-use wxdragon::widgets::webview::{WebView, WebViewBackend};
 
 /// (key, label) text fields, Python's TEXT_FIELDS order.
 const TEXT_FIELDS: [(&str, &str); 7] = [
@@ -806,57 +805,6 @@ pub fn show_about(frame: &Frame) {
 /// article text in its own frame, non-modal.
 pub fn show_article_window(title: &str, body: &str) {
     crate::article_window::open(title, body, None);
-}
-
-/// Article window with a rich (HTML) view (Python's ArticleWindow):
-/// a "Show in HTML view" checkbox switches between the WebView
-/// rendering and the plain-text reader without closing the window.
-/// Falls back to the text-only window when no rich fragment is
-/// available or no WebView backend exists.
-pub fn show_article_window_rich(title: &str, body: &str, url: &str, rich_html: Option<String>) {
-    let rich_html = rich_html.filter(|h| !h.trim().is_empty());
-    if rich_html.is_none() || !WebView::is_backend_available(WebViewBackend::Default) {
-        show_article_window(title, body);
-        return;
-    }
-    let frame = Frame::builder()
-        .with_title(&format!("BlindRSS - {title}"))
-        .with_size(Size::new(760, 560))
-        .build();
-    let sizer = BoxSizer::builder(Orientation::Vertical).build();
-    let toggle = CheckBox::builder(&frame)
-        .with_label(&crate::tr("Show in &HTML view"))
-        .build();
-    toggle.set_name(&crate::tr("HTML view"));
-    toggle.set_value(true);
-    sizer.add(&toggle, 0, SizerFlag::All, 4);
-    let webview = WebView::builder(&frame).build();
-    webview.set_page(
-        &crate::rich_document(rich_html.as_deref().unwrap_or("")),
-        url,
-    );
-    sizer.add(&webview, 1, SizerFlag::Expand | SizerFlag::All, 4);
-    let reader = TextCtrl::builder(&frame)
-        .with_style(TextCtrlStyle::MultiLine | TextCtrlStyle::ReadOnly)
-        .build();
-    reader.set_value(body);
-    reader.show(false);
-    sizer.add(&reader, 1, SizerFlag::Expand | SizerFlag::All, 4);
-    frame.set_sizer(sizer, true);
-    frame.show(true);
-    let frame_t = frame;
-    toggle.on_toggled(move |e| {
-        let rich = e.is_checked();
-        webview.show(rich);
-        reader.show(!rich);
-        frame_t.layout();
-        if rich {
-            webview.set_focus();
-        } else {
-            reader.set_focus();
-        }
-    });
-    webview.set_focus();
 }
 
 /// Article change history (Python's on_view_article_history):
@@ -1779,15 +1727,22 @@ pub fn show_feed_search(frame: &Frame) -> Option<String> {
         .build();
     sizer.add(&label, 0, SizerFlag::All, 4);
     let provider = Choice::builder(&dialog).build();
-    provider.append("All directories");
+    provider.append("All sources");
+    provider.append("All podcast sources");
+    provider.append("All RSS feed sources");
+    provider.set_name("Search source");
     for (_, label) in blindrss_core::feedsearch::SEARCH_PROVIDERS {
         provider.append(label);
     }
     provider.set_selection(0);
     sizer.add(&provider, 0, SizerFlag::Expand | SizerFlag::All, 4);
     let list = ListBox::builder(&dialog).build();
+    list.set_name("Feed search results");
     sizer.add(&list, 1, SizerFlag::Expand | SizerFlag::All, 4);
-    let status = StaticText::builder(&dialog).with_label("").build();
+    let status = TextCtrl::builder(&dialog)
+        .with_style(TextCtrlStyle::ReadOnly)
+        .build();
+    status.set_name("Search status");
     sizer.add(&status, 0, SizerFlag::All, 4);
     let row = BoxSizer::builder(Orientation::Horizontal).build();
     let mk = |label: &str| {
@@ -1803,7 +1758,7 @@ pub fn show_feed_search(frame: &Frame) -> Option<String> {
     let candidates: Rc<RefCell<Vec<blindrss_core::feedsearch::FeedResult>>> =
         Rc::new(RefCell::new(Vec::new()));
     let (tx, rx) =
-        std::sync::mpsc::channel::<Result<Vec<blindrss_core::feedsearch::FeedResult>, String>>();
+        std::sync::mpsc::channel::<Result<blindrss_core::feedsearch::SearchReport, String>>();
     let rx = Rc::new(rx);
     {
         let tx = tx.clone();
@@ -1814,28 +1769,29 @@ pub fn show_feed_search(frame: &Frame) -> Option<String> {
             if url.is_empty() {
                 return;
             }
-            status2.set_label("Searching...");
+            status2.set_value("Searching...");
+            search_btn.enable(false);
+            sub_btn.enable(false);
+            list.clear();
+            url_ctrl.enable(false);
+            provider.enable(false);
             let source = provider.get_selection().unwrap_or(0) as usize;
             let tx = tx.clone();
             std::thread::spawn(move || {
-                let result = if url.starts_with("http://") || url.starts_with("https://") {
-                    blindrss_core::discovery::discover_feed_urls(&url).map(|urls| {
-                        urls.into_iter()
-                            .map(|url| blindrss_core::feedsearch::FeedResult {
-                                title: url.clone(),
-                                url,
-                                description: String::new(),
-                            })
-                            .collect()
-                    })
-                } else if source == 0 {
-                    blindrss_core::feedsearch::search_all(&url, 50)
-                } else {
-                    blindrss_core::feedsearch::search(
-                        blindrss_core::feedsearch::SEARCH_PROVIDERS[source - 1].0,
+                use blindrss_core::feedsearch::{
+                    SEARCH_PROVIDERS, SearchGroup, search_group, search_group_providers,
+                };
+                let config = Config::load(&crate::config_path()).unwrap_or_default();
+                let result = match source {
+                    0 => search_group(SearchGroup::All, &url, 100, &config),
+                    1 => search_group(SearchGroup::Podcasts, &url, 100, &config),
+                    2 => search_group(SearchGroup::Rss, &url, 100, &config),
+                    _ => search_group_providers(
+                        &[SEARCH_PROVIDERS[source - 3].0],
                         &url,
-                        50,
-                    )
+                        100,
+                        &config,
+                    ),
                 };
                 let _ = tx.send(result);
             });
@@ -1859,7 +1815,7 @@ pub fn show_feed_search(frame: &Frame) -> Option<String> {
     close_btn.on_click(move |_| d.end_modal(5101));
 
     // Drain worker results while the dialog is open.
-    let timer = Box::leak(Box::new(Timer::new(&dialog)));
+    let timer = Timer::new(&dialog);
     {
         let rx = rx.clone();
         let candidates = candidates.clone();
@@ -1867,8 +1823,13 @@ pub fn show_feed_search(frame: &Frame) -> Option<String> {
         let status3 = status;
         timer.on_tick(move |_| {
             while let Ok(result) = rx.try_recv() {
+                search_btn.enable(true);
+                url_ctrl.enable(true);
+                provider.enable(true);
                 match result {
-                    Ok(urls) => {
+                    Ok(report) => {
+                        let urls = report.results;
+                        sub_btn.enable(!urls.is_empty());
                         list2.clear();
                         for result in &urls {
                             list2.append(&format!("{} — {}", result.title, result.url));
@@ -1876,10 +1837,22 @@ pub fn show_feed_search(frame: &Frame) -> Option<String> {
                         if !urls.is_empty() {
                             list2.set_selection(0, true);
                         }
-                        status3.set_label(&format!("{} feed(s) found", urls.len()));
+                        let mut message = format!("{} feed(s) found", urls.len());
+                        if !report.errors.is_empty() {
+                            message.push_str(&format!(
+                                ". Some sources failed: {}",
+                                report.errors.join("; ")
+                            ));
+                        }
+                        status3.set_value(&message);
+                        crate::announce("feed_search", &message);
                         *candidates.borrow_mut() = urls;
                     }
-                    Err(e) => status3.set_label(&format!("Search failed: {e}")),
+                    Err(e) => {
+                        let message = format!("Search failed: {e}");
+                        status3.set_value(&message);
+                        crate::announce("feed_search", &message);
+                    }
                 }
             }
         });
@@ -1892,6 +1865,7 @@ pub fn show_feed_search(frame: &Frame) -> Option<String> {
     } else {
         None
     };
+    timer.stop();
     dialog.destroy();
     picked
 }

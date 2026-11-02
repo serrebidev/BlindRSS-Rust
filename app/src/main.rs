@@ -12,6 +12,7 @@ mod help;
 mod hotkey;
 mod keys;
 mod media_backend;
+mod msaa_names;
 mod player;
 mod settings;
 mod startup;
@@ -269,6 +270,25 @@ fn start_raop_cast(
         let _ = tx.send(RefreshMsg::StatusNote(note));
     });
     Ok(format!("Casting {title} to {} (AirPlay)", device.name))
+}
+
+pub(crate) fn playback_headers_for(
+    article: &Article,
+    media_url: &str,
+    path: &std::path::Path,
+) -> Vec<(String, String)> {
+    let channel = Db::open(path)
+        .ok()
+        .and_then(|db| db.feed_settings(&article.feed_id).ok())
+        .unwrap_or_default();
+    let cookies = blindrss_core::cookies::load_jar_beside(&config_path());
+    blindrss_core::http_headers::playback_headers(
+        &channel,
+        media_url,
+        &article.url,
+        article.media_url.as_deref().unwrap_or(&article.url),
+        &cookies,
+    )
 }
 
 fn cast_to_device(
@@ -599,6 +619,8 @@ fn apply_http_config() {
     blindrss_core::forum_sources::configure(&cfg, &config_path());
     blindrss_core::feeds::configure_cookies(&config_path());
     blindrss_core::dependency::init_tool_paths_from_config(&cfg);
+    blindrss_core::dependency::set_managed_ytdlp_dir(&data_dir());
+    blindrss_core::source_feeds::configure(&config_path());
     // SAFETY: called on the UI thread before workers that read
     // these variables are spawned for a new action; this is the
     // same trade-off the process env always carries.
@@ -611,15 +633,6 @@ fn apply_http_config() {
         // The resolved UI language for core consumers that rank by
         // it (YouTube subtitle track selection in ytfull).
         std::env::set_var("BLINDRSS_UI_LANGUAGE", ui_language());
-        // Managed yt-dlp (dependency self-update installs into
-        // <data_dir>/bin) wins over PATH when present and the
-        // user has not pinned their own binary.
-        if std::env::var_os("BLINDRSS_YTDLP").is_none() {
-            let managed = blindrss_core::dependency::managed_ytdlp(&data_dir());
-            if managed.exists() {
-                std::env::set_var("BLINDRSS_YTDLP", &managed);
-            }
-        }
         // Same for the managed ffmpeg/ffprobe install: point the
         // finders at its bin dir when the user has not pinned
         // their own binaries.
@@ -908,9 +921,6 @@ fn open_in_browser(url: &str) {
 /// document (Python's design), the cleaned fragment drops into the
 /// body, and the fragment's `<article lang="...">` carries the
 /// content language for assistive tech.
-<<<<<<< Updated upstream
-pub(crate) fn rich_document(fragment: &str) -> String {
-=======
 fn open_reader_link(reader: &TextCtrl, frame: &Frame) -> bool {
     let Some((x, y)) = reader.position_to_xy(reader.get_insertion_point()) else {
         return false;
@@ -936,8 +946,7 @@ fn open_reader_link(reader: &TextCtrl, frame: &Frame) -> bool {
     }
 }
 
-fn rich_document(fragment: &str) -> String {
->>>>>>> Stashed changes
+pub(crate) fn rich_document(fragment: &str) -> String {
     format!(
         "<!DOCTYPE html><html><head><meta charset=\"utf-8\">\
          <style>body {{ font-family: sans-serif; line-height: 1.5; margin: 1em; }} \
@@ -1158,6 +1167,11 @@ fn prompt_focus(
 }
 
 fn db_path() -> PathBuf {
+    let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+    blindrss_core::provider::active_db_path(&cfg, &base_db_path())
+}
+
+fn base_db_path() -> PathBuf {
     if let Ok(p) = std::env::var("BLINDRSS_DB") {
         return PathBuf::from(p);
     }
@@ -1182,8 +1196,24 @@ fn db_path() -> PathBuf {
     target
 }
 
+fn reader_cache_key(article: &Article, keep_alt: bool) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    (
+        &article.id,
+        &article.url,
+        &article.content,
+        &article.description,
+        keep_alt,
+        ui_language(),
+    )
+        .hash(&mut hash);
+    format!("{:016x}", hash.finish())
+}
+
 struct State {
     db: Option<Db>,
+    store_path: PathBuf,
     feeds: Vec<Feed>,
     articles: Vec<Article>,
     selected_feed: Option<String>,
@@ -1241,35 +1271,42 @@ struct State {
     /// Queue context for the in-flight queue playback: the
     /// entry articles and the index being started.
     pending_queue: Option<(Vec<Article>, usize)>,
+    reader_cache: blindrss_core::reader_cache::ReaderCache,
+    reader_generation: u64,
+    pending_fulltext: Option<(u64, String)>,
 }
 
+/// A resolved playback stream: URL, optional yt-dlp info and request headers.
+type MediaResolution = (
+    String,
+    Option<blindrss_core::media::MediaInfo>,
+    Vec<(String, String)>,
+);
+
 enum RefreshMsg {
-    FeedDone(Feed, Result<ParsedFeed, String>),
-    AllDone,
+    FeedDone(PathBuf, Feed, Result<ParsedFeed, String>),
+    AllDone(PathBuf),
     /// Result of adding a feed by URL: (url, fetch result).
     Added(String, Result<(String, ParsedFeed), String>, Option<String>),
     /// Result of a hosted-provider sync: (provider name, (feeds, new)).
     ProviderDone(String, Result<(usize, usize), String>),
     /// Fetched article page HTML for full-text extraction.
     FullText(
-        String,
+        blindrss_core::reader_cache::ReaderRequest,
         blindrss_core::extract::ExtractOutcome,
         Option<String>,
     ),
     /// Rich (WebView) full article: (article id, fragment if any).
     RichHtml(String, Option<String>),
-    /// Article window content with an optional rich fragment:
-    /// (title, text body, article URL, rich fragment if rendered).
-    ArticleWindowRich(String, String, String, Option<String>),
     /// yt-dlp resolution for playback: (stream URL, info if fetched).
-    MediaReady(
-        String,
-        Result<(String, Option<blindrss_core::media::MediaInfo>), String>,
-    ),
+    MediaReady(String, Result<MediaResolution, String>),
     /// A finished download: description of what landed where.
     DownloadDone(Article, Result<PathBuf, String>),
     /// YouTube full text for an article.
-    YoutubeText(String, Result<String, String>),
+    YoutubeText(
+        blindrss_core::reader_cache::ReaderRequest,
+        Result<String, String>,
+    ),
     /// Archive rescan for a feed: (feed title, new count).
     ArchiveDone(String, Result<usize, String>),
     /// A finished cast attempt.
@@ -1876,6 +1913,8 @@ fn article_cell(
 }
 
 fn refill_articles(state: &mut State, list: &ListCtrl) {
+    state.reader_generation = state.reader_generation.wrapping_add(1);
+    state.pending_fulltext = None;
     // Freeze/Thaw around the whole fill: without it every
     // inserted row repaints the control — arrowing between
     // categories froze for ~1s at a time on big categories.
@@ -2117,7 +2156,14 @@ fn run_watcher_once(tx: &std::sync::mpsc::Sender<RefreshMsg>) {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs_f64())
         .unwrap_or(0.0);
-    let markers_before = cfg.raw().get("site_cookies_profile_mtimes").cloned();
+    let cookie_markers = |cfg: &blindrss_core::config::Config| {
+        (
+            cfg.raw().get("site_cookies_profile_mtimes").cloned(),
+            cfg.raw().get("site_cookies_full_profile_mtimes").cloned(),
+            cfg.raw().get("site_cookies_full_import_last_run").cloned(),
+        )
+    };
+    let markers_before = cookie_markers(&cfg);
     let mut notes: Vec<String> = Vec::new();
     let mut dirty = false;
     if ci::auto_import_youtube_cookies(&mut cfg, &dir, None, now_s).is_some() {
@@ -2135,7 +2181,7 @@ fn run_watcher_once(tx: &std::sync::mpsc::Sender<RefreshMsg>) {
         ));
         dirty = true;
     }
-    if cfg.raw().get("site_cookies_profile_mtimes").cloned() != markers_before {
+    if cookie_markers(&cfg) != markers_before {
         dirty = true;
     }
     if cfg.get_bool(tu::CFG_ENABLED, true) {
@@ -2318,6 +2364,7 @@ fn main() {
         let markall_btn = Button::builder(&frame).with_label("Mark All Read").build();
         let deleted_btn = Button::builder(&frame).with_label("Deleted...").build();
         let search_box = TextCtrl::builder(&frame).build();
+        msaa_names::set_name(&search_box, &tr("Search"));
         let search_btn = Button::builder(&frame).with_label("Search").build();
         let fulltext_btn = Button::builder(&frame).with_label("Read Full Text").build();
         let toggle_read_btn = Button::builder(&frame).with_label("Toggle Read").build();
@@ -2345,6 +2392,7 @@ fn main() {
         let (tx, rx): (Sender<RefreshMsg>, Receiver<RefreshMsg>) = channel();
         let splitter = SplitterWindow::builder(&frame).build();
         let tree = TreeCtrl::builder(&splitter).build();
+        msaa_names::set_name(&tree, &tr("Feeds and categories"));
         let right = Panel::builder(&splitter).build();
         let list = ListCtrl::builder(&right)
             .with_style(ListCtrlStyle::Report)
@@ -2352,6 +2400,8 @@ fn main() {
         let reader = TextCtrl::builder(&right)
             .with_style(TextCtrlStyle::MultiLine | TextCtrlStyle::ReadOnly)
             .build();
+        msaa_names::set_name(&list, &tr("Articles"));
+        msaa_names::set_name(&reader, &tr("Article text"));
 
         // Rich reader WebView (opt-in, config full_text_rich_view).
         // Created whenever a backend exists but only shown in rich
@@ -2454,6 +2504,7 @@ fn main() {
 
         let state = Rc::new(RefCell::new(State {
             db: None,
+            store_path: db_path(),
             feeds: Vec::new(),
             articles: Vec::new(),
             selected_feed: None,
@@ -2479,6 +2530,9 @@ fn main() {
             collapsed_cats: std::collections::HashSet::new(),
             cols_sig: String::new(),
             refill_pending: false,
+            reader_cache: blindrss_core::reader_cache::ReaderCache::default(),
+            reader_generation: 0,
+            pending_fulltext: None,
         }));
 
         // A staged restore (Python backup.py semantics) applies
@@ -2546,6 +2600,8 @@ fn main() {
                 .and_then(|d| d.downcast_ref::<String>().cloned())
                 .filter(|s| !s.is_empty());
             let mut st = state_tree.borrow_mut();
+            st.reader_generation = st.reader_generation.wrapping_add(1);
+            st.pending_fulltext = None;
             st.selected_feed = filter;
             st.focus_list = false;
             if st.remember_last_feed {
@@ -2606,6 +2662,8 @@ fn main() {
                 return;
             }
             let mut st = state_list.borrow_mut();
+            st.reader_generation = st.reader_generation.wrapping_add(1);
+            st.pending_fulltext = None;
             st.selected_article = Some(idx as usize);
             st.focus_list = true;
             let Some(a) = st.articles.get(idx as usize).cloned() else {
@@ -2725,8 +2783,9 @@ fn main() {
             let per_host = cfg.get_i64("per_host_max_connections", 4).clamp(1, 64) as usize;
             let attempts = cfg.get_i64("feed_retry_attempts", 1).clamp(1, 10) as u32;
             let total = feeds.len();
+            let path = db_path();
             if total == 0 {
-                let _ = tx.send(RefreshMsg::AllDone);
+                let _ = tx.send(RefreshMsg::AllDone(path));
                 return;
             }
             let queue = std::sync::Arc::new(std::sync::Mutex::new(
@@ -2745,8 +2804,9 @@ fn main() {
                 let cancel = cancel.clone();
                 let stopped = stopped.clone();
                 let workers_left = workers_left.clone();
+                let path = path.clone();
                 std::thread::spawn(move || {
-                    let database = Db::open(&db_path());
+                    let database = Db::open(&path);
                     loop {
                         if cancel.load(std::sync::atomic::Ordering::Relaxed) {
                             stopped.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -2782,10 +2842,10 @@ fn main() {
                             result = fetch();
                         }
                         gate.release();
-                        let _ = tx.send(RefreshMsg::FeedDone(feed, result));
+                        let _ = tx.send(RefreshMsg::FeedDone(path.clone(), feed, result));
                     }
                     if workers_left.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 1 {
-                        let _ = tx.send(RefreshMsg::AllDone);
+                        let _ = tx.send(RefreshMsg::AllDone(path));
                     }
                 });
             }
@@ -2857,11 +2917,17 @@ fn main() {
                     frame_btn.set_status_text("Syncing provider...", 0);
                     announce("start_update", "Refresh Feeds");
                     let tx = tx_refresh.clone();
+                    let path = blindrss_core::provider::active_db_path(&cfg, &base_db_path());
                     std::thread::spawn(move || {
-                        let cfg =
-                            blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
-                        let provider = blindrss_core::provider::get_provider(&cfg, db_path());
-                        let _ = tx.send(RefreshMsg::ProviderAction(provider.refresh()));
+                        let provider = blindrss_core::provider::get_provider(&cfg, path);
+                        let tx_late = tx.clone();
+                        let result = provider.refresh_with_updates(
+                            force_full,
+                            Box::new(move |result| {
+                                let _ = tx_late.send(RefreshMsg::ProviderAction(result));
+                            }),
+                        );
+                        let _ = tx.send(RefreshMsg::ProviderAction(result));
                     });
                     return;
                 }
@@ -2952,6 +3018,7 @@ fn main() {
                                 );
                                 let id: i64 = mf.parse().map_err(|_| "bad feed id")?;
                                 return blindrss_core::providers::MinifluxClient::new(&url, &key)
+                                    .with_refresh_config(&cfg)
                                     .refresh_feed(&db, id);
                             }
                             use blindrss_core::providers::{GReaderClient, GReaderService};
@@ -3443,7 +3510,7 @@ fn main() {
         let tx_ft = tx.clone();
         let rich_view_ft = rich_view.clone();
         let act_fulltext: Rc<dyn Fn()> = Rc::new(move || {
-            let st = state_ft.borrow();
+            let mut st = state_ft.borrow_mut();
             let Some(article) = st
                 .selected_article
                 .and_then(|i| st.articles.get(i))
@@ -3456,13 +3523,41 @@ fn main() {
                 frame_ft.set_status_text("Article has no link", 0);
                 return;
             }
-            frame_ft.set_status_text("Fetching full text...", 0);
-            let keep_alt = {
-                let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
-                show_image_alt_for(&cfg, st.db.as_ref(), &article.feed_id)
+            let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+            let keep_alt = show_image_alt_for(&cfg, st.db.as_ref(), &article.feed_id);
+            let cache_key = reader_cache_key(&article, keep_alt);
+            if let Some((text, source)) = st
+                .reader_cache
+                .get(&cache_key, cfg.get_bool("cache_full_text", false))
+            {
+                st.reader_generation = st.reader_generation.wrapping_add(1);
+                st.pending_fulltext = None;
+                reader.set_value(&format!("{}\n\n{}", article.title, text));
+                frame_ft.set_status_text(&format!("Full text ({source}, cached)"), 0);
+                if cfg.get_bool("full_text_rich_view", false) && rich_view_ft.as_ref().is_some() {
+                    spawn_rich_fetch(&tx_ft, &article);
+                }
+                return;
+            }
+            if st
+                .pending_fulltext
+                .as_ref()
+                .is_some_and(|(generation, key)| {
+                    *generation == st.reader_generation && key == &cache_key
+                })
+            {
+                return;
+            }
+            st.reader_generation = st.reader_generation.wrapping_add(1);
+            st.pending_fulltext = Some((st.reader_generation, cache_key.clone()));
+            let request = blindrss_core::reader_cache::ReaderRequest {
+                key: cache_key,
+                article_id: article.id.clone(),
+                url: article.url.clone(),
+                generation: st.reader_generation,
             };
+            frame_ft.set_status_text("Fetching full text...", 0);
             let tx = tx_ft.clone();
-            let id = article.id.clone();
             let url = article.url.clone();
             let article_feed = article.feed_id.clone();
             let article_content = article.content.clone();
@@ -3475,7 +3570,7 @@ fn main() {
                         &url,
                         &ui_language(),
                     );
-                    let _ = tx.send(RefreshMsg::YoutubeText(id, result));
+                    let _ = tx.send(RefreshMsg::YoutubeText(request, result));
                 } else {
                     let jar = blindrss_core::cookies::load_jar_beside(&config_path());
                     let header = blindrss_core::cookies::cookie_header_for(&jar, &url);
@@ -3502,7 +3597,7 @@ fn main() {
                     // the local cascade; the more complete
                     // result wins.
                     let outcome = arbitrate_full_text(outcome, &article_id);
-                    let _ = tx.send(RefreshMsg::FullText(id, outcome, first_html));
+                    let _ = tx.send(RefreshMsg::FullText(request, outcome, first_html));
                 }
             });
             // Rich mode: the WebView gets its own full article. The
@@ -3804,9 +3899,7 @@ fn main() {
             set_cat_btn.on_click(move |_| a());
         }
 
-        // Play Media: direct media URL plays immediately; a page
-        // URL (YouTube etc.) resolves through yt-dlp on a worker
-        // thread first.
+        // Resolve media and its request headers on a worker.
         let state_pm = state.clone();
         let frame_pm = frame;
         let tx_pm = tx.clone();
@@ -3820,39 +3913,12 @@ fn main() {
                 frame_pm.set_status_text("No article selected", 0);
                 return;
             };
-            // Direct media (a playable enclosure) plays at once.
-            // Anything else goes through the resolution chain on a
-            // worker: Python never feeds an arbitrary article page
-            // straight to yt-dlp (podcast pages without enclosures
-            // failed with a raw "Unsupported URL" error).
-            let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
-            let local = blindrss_core::download::downloaded_media_path(&cfg, &article)
-                .and_then(|path| blindrss_core::media::local_media_url(&path).ok());
-            if let Some(media_url) = local.or_else(|| {
-                article
-                    .media_url
-                    .clone()
-                    .filter(|u| !u.is_empty())
-                    .filter(|u| {
-                        blindrss_core::media::is_playable_media(u, article.media_type.as_deref())
-                    })
-            }) {
-                let chapters = st
-                    .db
-                    .as_ref()
-                    .and_then(|db| db.chapters(&article.id).ok())
-                    .unwrap_or_default();
-                drop(st);
-                player::open_player(&frame_pm, article, media_url, chapters);
-                return;
-            }
-            if article.url.is_empty() {
-                frame_pm.set_status_text("Article has no media or link", 0);
-                return;
-            }
+            drop(st);
+            state_pm.borrow_mut().pending_play = Some(article.clone());
             frame_pm.set_status_text("Finding playable media...", 0);
             let tx = tx_pm.clone();
             let id = article.id.clone();
+            let path = db_path();
             std::thread::spawn(move || {
                 let result = blindrss_core::media::resolve_article_for_play(
                     &blindrss_core::config::Config::load(&config_path()).unwrap_or_default(),
@@ -3860,7 +3926,7 @@ fn main() {
                 )
                 .map(|r| {
                     if r.detected
-                        && let Ok(db) = Db::open(&db_path())
+                        && let Ok(db) = Db::open(&path)
                     {
                         let _ =
                             db.update_article_media(&article.id, &r.url, r.media_type.as_deref());
@@ -3871,7 +3937,8 @@ fn main() {
                         None
                     };
                     let url = maybe_cache_youtube(&article, &r.url, r.via_ytdlp);
-                    (url, info)
+                    let headers = playback_headers_for(&article, &r.url, &path);
+                    (url, info, headers)
                 });
                 let _ = tx.send(RefreshMsg::MediaReady(id, result));
             });
@@ -4127,6 +4194,7 @@ fn main() {
         let state_om = state.clone();
         let tree_om = tree;
         let list_om = list;
+        let tx_om = tx.clone();
         let act_open_media: Rc<dyn Fn()> = Rc::new(move || {
             let Some(url) = prompt_focus(
                 &frame_om,
@@ -4161,7 +4229,14 @@ fn main() {
                 media_url: Some(url.clone()),
                 media_type: None,
             };
-            player::open_player(&frame_om, article, url, Vec::new());
+            state_om.borrow_mut().pending_play = Some(article.clone());
+            frame_om.set_status_text("Loading media...", 0);
+            let tx = tx_om.clone();
+            let path = db_path();
+            std::thread::spawn(move || {
+                let headers = playback_headers_for(&article, &url, &path);
+                let _ = tx.send(RefreshMsg::MediaReady(article.id, Ok((url, None, headers))));
+            });
         });
 
         // Video Search (Tools): cross-site yt-dlp search dialog;
@@ -4194,6 +4269,7 @@ fn main() {
                         }
                         frame_vs.set_status_text("Loading...", 0);
                         let tx = tx_vs.clone();
+                        let path = db_path();
                         std::thread::spawn(move || {
                             let id = article.id.clone();
                             let resolved = blindrss_core::media::resolve_article_for_play(
@@ -4207,7 +4283,8 @@ fn main() {
                                 } else {
                                     None
                                 };
-                                (r.url, info)
+                                let headers = playback_headers_for(&article, &r.url, &path);
+                                (r.url, info, headers)
                             });
                             let _ = tx.send(RefreshMsg::MediaReady(id, resolved));
                         });
@@ -4242,7 +4319,6 @@ fn main() {
         // view" switch; the render runs on a worker.
         let state_aw = state.clone();
         let frame_aw = frame;
-        let tx_aw = tx.clone();
         let act_article_window: Rc<dyn Fn()> = Rc::new(move || {
             let st = state_aw.borrow();
             let Some(article) = st
@@ -4263,49 +4339,7 @@ fn main() {
             } else {
                 body
             };
-<<<<<<< Updated upstream
-            let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
-            if cfg.get_bool("full_text_rich_view", false) {
-                let tx = tx_aw.clone();
-                let title = article.title.clone();
-                let url = article.url.clone();
-                let fallback = article
-                    .content
-                    .clone()
-                    .filter(|c| !c.trim().is_empty())
-                    .or_else(|| article.description.clone())
-                    .unwrap_or_default();
-                let author = article.author.clone().unwrap_or_default();
-                let date = article
-                    .date
-                    .clone()
-                    .unwrap_or_default()
-                    .split('T')
-                    .next()
-                    .unwrap_or("")
-                    .to_string();
-                std::thread::spawn(move || {
-                    let jar = blindrss_core::cookies::load_jar_beside(&config_path());
-                    let header = blindrss_core::cookies::cookie_header_for(&jar, &url);
-                    let frag = blindrss_core::article_html::render_rich_article(
-                        &url,
-                        &fallback,
-                        &title,
-                        &author,
-                        &date,
-                        &header,
-                        "",
-                        "",
-                        &ui_language(),
-                    );
-                    let _ = tx.send(RefreshMsg::ArticleWindowRich(title, body, url, frag));
-                });
-            } else {
-                dialogs::show_article_window(&article.title, &body);
-            }
-=======
             article_window::open(&article.title, &body, Some(&article.url));
->>>>>>> Stashed changes
         });
 
         // Podcast Archive (Tools): pick a podcast feed, rescan
@@ -4354,6 +4388,7 @@ fn main() {
             }
             frame_qp.set_status_text("Loading queue entry...", 0);
             let tx = tx_qp.clone();
+            let path = db_path();
             std::thread::spawn(move || {
                 let id = article.id.clone();
                 let result = blindrss_core::media::resolve_article_for_play(
@@ -4366,7 +4401,8 @@ fn main() {
                     } else {
                         None
                     };
-                    (r.url, info)
+                    let headers = playback_headers_for(&article, &r.url, &path);
+                    (r.url, info, headers)
                 });
                 let _ = tx.send(RefreshMsg::MediaReady(id, result));
             });
@@ -4744,6 +4780,7 @@ fn main() {
             };
             frame_cast.set_status_text("Looking for cast devices...", 0);
             let tx = tx_cast.clone();
+            let path = path.clone();
             std::thread::spawn(move || {
                 let result =
                     (|| -> Result<(Vec<blindrss_core::cast::CastDevice>, String), String> {
@@ -4783,7 +4820,12 @@ fn main() {
                         if devices.is_empty() {
                             return Err("No cast devices found on this network".to_string());
                         }
-                        Ok((devices, resolved.url))
+                        let headers = playback_headers_for(&article, &resolved.url, &path);
+                        let url = blindrss_core::http_headers::protected_media_url(
+                            &resolved.url,
+                            &headers,
+                        );
+                        Ok((devices, url))
                     })();
                 match result {
                     Ok((devices, url)) => {
@@ -4954,6 +4996,44 @@ fn main() {
                 .unwrap_or_else(|_| "Ctrl+Alt+B".to_string());
             let intent = settings::show_settings(&frame_set, &config_path());
             apply_http_config();
+            let path = db_path();
+            if state_set.borrow().store_path != path {
+                let mut st = state_set.borrow_mut();
+                st.cancel_refresh
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                st.cancel_refresh = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                st.refresh_stopped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                st.refreshing = false;
+                st.last_refresh_end = None;
+                st.store_path = path.clone();
+                st.db = None;
+                st.feeds.clear();
+                st.articles.clear();
+                st.selected_feed = None;
+                st.selected_article = None;
+                st.pending_play = None;
+                st.pending_queue = None;
+                st.pending_fulltext = None;
+                st.reader_generation = st.reader_generation.wrapping_add(1);
+                st.reader_cache = blindrss_core::reader_cache::ReaderCache::default();
+                st.refresh_new.clear();
+                st.refresh_failed = false;
+                st.expanded_cats.clear();
+                st.collapsed_cats.clear();
+                match Db::open_or_create(&path) {
+                    Ok(db) => {
+                        st.feeds = db.feeds().unwrap_or_default();
+                        st.db = Some(db);
+                        frame_set.set_status_text("Account changed; refresh to sync its feeds", 0);
+                    }
+                    Err(e) => {
+                        frame_set.set_status_text(&format!("Could not open account cache: {e}"), 0)
+                    }
+                }
+                reader.clear();
+                rebuild_tree(&mut st, &tree_set);
+                refill_articles(&mut st, &list_set);
+            }
             // Global hotkey change (Windows): register the new
             // combo; a rejected one reverts in config too, or the
             // bad value would be all that is left next launch
@@ -6828,8 +6908,11 @@ fn main() {
             loop {
                 let msg = rx_tick.borrow().try_recv();
                 match msg {
-                    Ok(RefreshMsg::FeedDone(feed, Ok(parsed))) => {
+                    Ok(RefreshMsg::FeedDone(path, feed, Ok(parsed))) => {
                         let mut st = state_tick.borrow_mut();
+                        if path != st.store_path {
+                            continue;
+                        }
                         let mut stored_new = 0usize;
                         if let Some(db) = st.db.as_ref() {
                             match store_parsed(db, &feed, &parsed) {
@@ -6849,8 +6932,11 @@ fn main() {
                                 .push((feed.id.clone(), feed.title.clone(), stored_new));
                         }
                     }
-                    Ok(RefreshMsg::FeedDone(feed, Err(e))) => {
+                    Ok(RefreshMsg::FeedDone(path, feed, Err(e))) => {
                         let mut st = state_tick.borrow_mut();
+                        if path != st.store_path {
+                            continue;
+                        }
                         st.refresh_failed = true;
                         if let Some(db) = st.db.as_ref() {
                             let _ = db.record_feed_error(&feed.id, &e);
@@ -7043,9 +7129,35 @@ fn main() {
                             Err(e) => frame_tick.set_status_text(&format!("{name}: {e}"), 0),
                         }
                     }
-                    Ok(RefreshMsg::FullText(id, outcome, first_html)) => {
-                        let st = state_tick.borrow();
-                        let article = st.articles.iter().find(|a| a.id == id).cloned();
+                    Ok(RefreshMsg::FullText(request, outcome, first_html)) => {
+                        let mut st = state_tick.borrow_mut();
+                        if let blindrss_core::extract::ExtractOutcome::Article {
+                            text,
+                            source,
+                            ..
+                        } = &outcome
+                        {
+                            st.reader_cache.insert(
+                                request.key.clone(),
+                                text.clone(),
+                                source,
+                                request.generation,
+                            );
+                        }
+                        if st
+                            .pending_fulltext
+                            .as_ref()
+                            .is_some_and(|(generation, key)| {
+                                *generation == request.generation && key == &request.key
+                            })
+                        {
+                            st.pending_fulltext = None;
+                        }
+                        let article = st
+                            .articles
+                            .iter()
+                            .find(|a| a.id == request.article_id)
+                            .cloned();
                         // Metadata enrichment: the fetched page
                         // declares author/tags the feed omitted.
                         if let (Some(article), Some(html)) = (&article, &first_html)
@@ -7055,6 +7167,12 @@ fn main() {
                             if !meta.author.is_empty() || !meta.tags.is_empty() {
                                 let _ = db.apply_enrichment(&article.id, &meta);
                             }
+                        }
+                        let current = st.selected_article.and_then(|i| st.articles.get(i));
+                        if !current.is_some_and(|a| {
+                            request.is_current(st.reader_generation, &a.id, &a.url)
+                        }) {
+                            continue;
                         }
                         match (article, outcome) {
                             (
@@ -7108,9 +7226,6 @@ fn main() {
                             }
                         }
                     }
-                    Ok(RefreshMsg::ArticleWindowRich(title, body, url, frag)) => {
-                        dialogs::show_article_window_rich(&title, &body, &url, frag);
-                    }
                     Ok(RefreshMsg::MediaReady(id, result)) => {
                         let mut st = state_tick.borrow_mut();
                         let article = st
@@ -7124,7 +7239,7 @@ fn main() {
                             st.pending_play = None;
                         }
                         match (article, result) {
-                            (Some(article), Ok((stream, info))) => {
+                            (Some(article), Ok((stream, info, headers))) => {
                                 let mut chapters = st
                                     .db
                                     .as_ref()
@@ -7146,10 +7261,15 @@ fn main() {
                                         stream,
                                         entries,
                                         index,
+                                        headers,
                                     ),
-                                    None => {
-                                        player::open_player(&frame_tick, article, stream, chapters)
-                                    }
+                                    None => player::open_player(
+                                        &frame_tick,
+                                        article,
+                                        stream,
+                                        chapters,
+                                        headers,
+                                    ),
                                 }
                             }
                             (_, Err(e)) => frame_tick.set_status_text(&format!("Play: {e}"), 0),
@@ -7180,14 +7300,33 @@ fn main() {
                         }
                         Err(e) => frame_tick.set_status_text(&format!("Download: {e}"), 0),
                     },
-                    Ok(RefreshMsg::YoutubeText(id, result)) => {
-                        let st = state_tick.borrow();
-                        let title = st
-                            .articles
-                            .iter()
-                            .find(|a| a.id == id)
-                            .map(|a| a.title.clone())
-                            .unwrap_or_default();
+                    Ok(RefreshMsg::YoutubeText(request, result)) => {
+                        let mut st = state_tick.borrow_mut();
+                        if let Ok(text) = &result {
+                            st.reader_cache.insert(
+                                request.key.clone(),
+                                text.clone(),
+                                "youtube",
+                                request.generation,
+                            );
+                        }
+                        if st
+                            .pending_fulltext
+                            .as_ref()
+                            .is_some_and(|(generation, key)| {
+                                *generation == request.generation && key == &request.key
+                            })
+                        {
+                            st.pending_fulltext = None;
+                        }
+                        let Some(article) = st.selected_article.and_then(|i| st.articles.get(i))
+                        else {
+                            continue;
+                        };
+                        if !request.is_current(st.reader_generation, &article.id, &article.url) {
+                            continue;
+                        }
+                        let title = article.title.clone();
                         match result {
                             Ok(text) => {
                                 reader.set_value(&format!("{title}\n\n{text}"));
@@ -7288,7 +7427,10 @@ fn main() {
                         }
                         Err(e) => frame_tick.set_status_text(&format!("Updates: {e}"), 0),
                     },
-                    Ok(RefreshMsg::AllDone) => {
+                    Ok(RefreshMsg::AllDone(path)) => {
+                        if path != state_tick.borrow().store_path {
+                            continue;
+                        }
                         finished = true;
                         break;
                     }

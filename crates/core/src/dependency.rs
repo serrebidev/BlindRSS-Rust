@@ -2,9 +2,8 @@
 //!
 //! Detect yt-dlp and ffmpeg, report their versions, and
 //! self-update yt-dlp from its GitHub releases into
-//! <data_dir>/bin (which find_ytdlp consults through the
-//! BLINDRSS_YTDLP environment the app sets when a managed
-//! copy exists).
+//! <data_dir>/bin, registered at startup and checked by find_ytdlp
+//! before PATH on every lookup.
 
 /// One tool's detection result.
 #[derive(Debug, Clone, PartialEq)]
@@ -24,6 +23,20 @@ pub struct ToolStatus {
 
 static USER_TOOL_PATHS: std::sync::Mutex<Option<std::collections::HashMap<String, String>>> =
     std::sync::Mutex::new(None);
+
+static MANAGED_YTDLP: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
+
+/// Register the runtime location; lookup checks it again after background installs.
+pub fn set_managed_ytdlp_dir(data_dir: &std::path::Path) {
+    *MANAGED_YTDLP.lock().unwrap_or_else(|p| p.into_inner()) = Some(managed_ytdlp(data_dir));
+}
+
+pub(crate) fn managed_ytdlp_path() -> Option<std::path::PathBuf> {
+    MANAGED_YTDLP
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone()
+}
 
 fn canon_tool_name(name: &str) -> String {
     name.trim()
@@ -213,6 +226,7 @@ pub fn update_ytdlp(data_dir: &std::path::Path) -> Result<std::path::PathBuf, St
         let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755));
     }
     std::fs::rename(&tmp, &dest).map_err(|e| format!("install: {e}"))?;
+    set_managed_ytdlp_dir(data_dir);
     Ok(dest)
 }
 

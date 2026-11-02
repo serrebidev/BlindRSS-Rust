@@ -396,11 +396,8 @@ impl Entry {
             }
         }
         let target = self.target_url();
-        let mut req = agent().get(&target);
-        for (k, v) in self.origin_headers(Some((0, 0))) {
-            req = req.header(&k, &v);
-        }
-        let resp = req.call();
+        let resp =
+            crate::http_headers::media_get(&self.url, &target, &self.origin_headers(Some((0, 0))));
         match resp {
             Err(_) => {
                 let mut st = self.state.lock().unwrap();
@@ -501,11 +498,11 @@ impl Entry {
         }
         *last = Instant::now();
         drop(last);
-        let mut req = agent().get(&self.url);
-        for (k, v) in self.origin_headers(Some((0, 0))) {
-            req = req.header(&k, &v);
-        }
-        match req.call() {
+        match crate::http_headers::media_get(
+            &self.url,
+            &self.url,
+            &self.origin_headers(Some((0, 0))),
+        ) {
             Ok(resp) => {
                 use ureq::ResponseExt as _;
                 let status = resp.status().as_u16();
@@ -528,11 +525,11 @@ impl Entry {
     fn open_range(&self, start: u64, end: u64) -> Option<RangeFetch> {
         let mut target = self.target_url();
         for attempt in 0..2 {
-            let mut req = agent().get(&target);
-            for (k, v) in self.origin_headers(Some((start, end))) {
-                req = req.header(&k, &v);
-            }
-            match req.call() {
+            match crate::http_headers::media_get(
+                &self.url,
+                &target,
+                &self.origin_headers(Some((start, end))),
+            ) {
                 Ok(resp) => {
                     let status = resp.status().as_u16();
                     if attempt == 0 && [401, 403, 404, 410].contains(&status) {
@@ -962,18 +959,6 @@ impl Entry {
             std::thread::sleep(Duration::from_millis(100));
         }
     }
-}
-
-/// The range-cache origin agent: statuses are data here, not
-/// errors, and playback fetches get a playback-sized timeout
-/// rather than the feed timeout.
-fn agent() -> ureq::Agent {
-    let config = ureq::Agent::config_builder()
-        .timeout_global(Some(Duration::from_secs(60)))
-        .user_agent(crate::http::user_agent())
-        .http_status_as_error(false)
-        .build();
-    ureq::Agent::new_with_config(config)
 }
 
 // ---------------------------------------------------------------------
@@ -1429,22 +1414,13 @@ fn serve_media(
 /// Straight relay of the origin response (Python's
 /// range-unsupported passthrough in do_GET).
 fn serve_passthrough(stream: &mut std::net::TcpStream, ent: &Arc<Entry>, range_hdr: &str) {
-    let mut req = agent().get(&ent.url);
     let mut headers = ent.origin_headers(None);
     if !range_hdr.is_empty() {
         headers.retain(|(k, _)| !k.eq_ignore_ascii_case("Range"));
         headers.push(("Range".into(), range_hdr.to_string()));
     }
-    for (k, v) in &headers {
-        req = req.header(k.as_str(), v.as_str());
-    }
-    match req.call() {
-        Err(e) => respond_bytes(
-            stream,
-            "502 Bad Gateway",
-            &[],
-            format!("Origin fetch failed: {e}").as_bytes(),
-        ),
+    match crate::http_headers::media_get(&ent.url, &ent.url, &headers) {
+        Err(()) => respond_bytes(stream, "502 Bad Gateway", &[], b"Origin fetch failed"),
         Ok(mut resp) => {
             let status = resp.status().as_u16();
             let reason = if status == 206 {

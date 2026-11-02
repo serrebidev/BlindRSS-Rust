@@ -77,3 +77,41 @@ fn refresh_stores_new_articles_once() {
     assert_eq!(inserted, 0);
     std::fs::remove_file(&path).ok();
 }
+
+#[test]
+fn refresh_revalidates_cached_feed_and_stores_tags() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let mut requests = Vec::new();
+        for attempt in 0..2 {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut bytes = [0; 4096];
+            let size = stream.read(&mut bytes).unwrap();
+            requests.push(String::from_utf8_lossy(&bytes[..size]).to_lowercase());
+            let body = "<rss version='2.0'><channel><title>Feed</title><item><guid>cached-item</guid><title>Tagged</title><category>Technology</category></item></channel></rss>";
+            let reply = if attempt == 0 {
+                format!(
+                    "HTTP/1.1 200 OK\r\nETag: \"refresh1\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+            } else {
+                "HTTP/1.1 304 Not Modified\r\nConnection: close\r\n\r\n".into()
+            };
+            stream.write_all(reply.as_bytes()).unwrap();
+        }
+        requests
+    });
+    let path = std::env::temp_dir().join(format!("blindrss-refresh-{}.db", uuid::Uuid::new_v4()));
+    let db = Db::open_or_create(&path).unwrap();
+    let feed = db
+        .add_feed(&format!("http://{address}/feed"), "Feed", None)
+        .unwrap();
+    assert_eq!(refresh_feed(&db, &feed).unwrap(), 1);
+    assert_eq!(db.article_tags("cached-item").unwrap(), vec!["Technology"]);
+    assert_eq!(refresh_feed(&db, &feed).unwrap(), 0);
+    let requests = server.join().unwrap();
+    assert!(requests[1].contains("if-none-match: \"refresh1\""));
+    drop(db);
+    std::fs::remove_file(path).unwrap();
+}

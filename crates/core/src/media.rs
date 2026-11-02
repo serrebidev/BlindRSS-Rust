@@ -66,22 +66,32 @@ pub fn parse_info(json: &str) -> Result<MediaInfo, String> {
 }
 
 /// Locate the yt-dlp executable: user-configured path, explicit
-/// override env, then PATH.
+/// override env, managed runtime, then PATH.
 pub fn find_ytdlp() -> Option<PathBuf> {
     let names: &[&str] = if cfg!(windows) {
         &["yt-dlp.exe", "yt-dlp"]
     } else {
         &["yt-dlp"]
     };
-    if let Some(p) = crate::dependency::user_tool_path("yt-dlp", names) {
-        return Some(p);
-    }
-    if let Ok(p) = std::env::var("BLINDRSS_YTDLP")
-        && !p.is_empty()
-    {
-        return Some(PathBuf::from(p));
-    }
-    crate::dependency::find_on_path(names)
+    resolve_ytdlp(
+        crate::dependency::user_tool_path("yt-dlp", names),
+        std::env::var_os("BLINDRSS_YTDLP")
+            .filter(|p| !p.is_empty())
+            .map(PathBuf::from),
+        crate::dependency::managed_ytdlp_path(),
+        || crate::dependency::find_on_path(names),
+    )
+}
+
+fn resolve_ytdlp(
+    user: Option<PathBuf>,
+    explicit: Option<PathBuf>,
+    managed: Option<PathBuf>,
+    on_path: impl FnOnce() -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    user.or(explicit)
+        .or_else(|| managed.filter(|p| p.is_file()))
+        .or_else(on_path)
 }
 
 /// Extra yt-dlp arguments from the app's environment, set at
@@ -546,6 +556,43 @@ pub fn resolve_for_play(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ytdlp_managed_copy_beats_path_and_detects_install_after_startup() {
+        let dir = std::env::temp_dir().join(format!("blindrss-ytdlp-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let managed = crate::dependency::managed_ytdlp(&dir);
+        let path = dir.join("path-ytdlp");
+        let find = || resolve_ytdlp(None, None, Some(managed.clone()), || Some(path.clone()));
+        assert_eq!(find(), Some(path.clone()));
+        std::fs::create_dir_all(managed.parent().unwrap()).unwrap();
+        std::fs::write(&managed, b"managed").unwrap();
+        assert_eq!(find(), Some(managed.clone()));
+        let user = dir.join("user-ytdlp");
+        let explicit = dir.join("explicit-ytdlp");
+        assert_eq!(
+            resolve_ytdlp(
+                Some(user.clone()),
+                Some(explicit.clone()),
+                Some(managed.clone()),
+                || Some(path.clone())
+            ),
+            Some(user),
+        );
+        assert_eq!(
+            resolve_ytdlp(
+                None,
+                Some(explicit.clone()),
+                Some(managed.clone()),
+                || Some(path.clone())
+            ),
+            Some(explicit),
+        );
+        std::fs::remove_file(&managed).unwrap();
+        std::fs::create_dir(&managed).unwrap();
+        assert_eq!(find(), Some(path));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn hls_and_dash_enclosures_are_playable() {

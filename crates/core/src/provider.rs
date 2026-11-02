@@ -17,7 +17,7 @@
 use crate::config::Config;
 use crate::db::{Article, Db, Feed};
 use crate::providers::{GReaderClient, GReaderService, MinifluxClient};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Provider names in UI order; "local" is the default.
 pub const PROVIDER_NAMES: [&str; 5] = ["local", "theoldreader", "bazqux", "inoreader", "miniflux"];
@@ -46,9 +46,33 @@ pub trait Provider {
     fn add_feed(&self, url: &str) -> Result<String, String>;
     /// Unsubscribe/remove a feed (cache + server when hosted).
     fn remove_feed(&self, feed: &Feed) -> Result<(), String>;
+    /// Edit subscription metadata, committing the cache only after remote success.
+    fn update_feed(
+        &self,
+        feed: &Feed,
+        title: Option<&str>,
+        url: Option<&str>,
+        category: Option<&str>,
+    ) -> Result<(), String>;
+    fn mark_all_read(&self, feed_id: Option<&str>) -> Result<usize, String>;
     /// Pull the provider's latest content into the cache.
     /// Returns a human summary.
     fn refresh(&self) -> Result<String, String>;
+    fn refresh_scheduled(&self) -> Result<String, String> {
+        self.refresh()
+    }
+    /// Later updates are delivered on a worker, never on the UI thread.
+    fn refresh_with_updates(
+        &self,
+        force: bool,
+        _on_background: Box<dyn FnOnce(Result<String, String>) + Send>,
+    ) -> Result<String, String> {
+        if force {
+            self.refresh()
+        } else {
+            self.refresh_scheduled()
+        }
+    }
 }
 
 /// The local backend: everything goes to the on-disk database.
@@ -99,6 +123,25 @@ impl Provider for LocalProvider {
     fn remove_feed(&self, feed: &Feed) -> Result<(), String> {
         self.db()?.remove_feed(&feed.id).map_err(|e| format!("{e}"))
     }
+    fn update_feed(
+        &self,
+        feed: &Feed,
+        title: Option<&str>,
+        url: Option<&str>,
+        category: Option<&str>,
+    ) -> Result<(), String> {
+        let db = self.db()?;
+        db.update_feed(&feed.id, title, url)
+            .map_err(|e| e.to_string())?;
+        if let Some(category) = category {
+            db.set_feed_category(&feed.id, Some(category))
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+    fn mark_all_read(&self, feed_id: Option<&str>) -> Result<usize, String> {
+        self.db()?.mark_all_read(feed_id).map_err(|e| e.to_string())
+    }
     fn refresh(&self) -> Result<String, String> {
         // The app runs local refresh through its worker pool
         // (progress + cancel); the trait path does the same
@@ -127,7 +170,7 @@ pub struct HostedProvider {
 
 impl HostedProvider {
     fn db(&self) -> Result<Db, String> {
-        Db::open(&self.db_path).map_err(|e| format!("{e}"))
+        Db::open_or_create(&self.db_path).map_err(|e| format!("{e}"))
     }
 
     fn section(&self) -> Option<serde_json::Value> {
@@ -179,7 +222,35 @@ impl HostedProvider {
         if url.is_empty() || key.is_empty() {
             return Err("Miniflux URL or API key is not set".to_string());
         }
-        Ok(MinifluxClient::new(&url, &key))
+        Ok(MinifluxClient::new(&url, &key).with_refresh_config(&self.cfg))
+    }
+    fn refresh_miniflux(
+        &self,
+        force: bool,
+        on_background: Box<dyn FnOnce(Result<String, String>) + Send>,
+    ) -> Result<String, String> {
+        let client = self.miniflux()?;
+        let pending = client.request_refresh(force);
+        let synced = client.sync(&self.db()?, 100);
+        let background = pending?;
+        if let Some(pending) = background {
+            // The original account-scoped path survives account switches; workers own connections.
+            let path = self.db_path.clone();
+            std::thread::spawn(move || {
+                let requests = pending
+                    .recv()
+                    .map_err(|_| "Miniflux refresh worker stopped".to_string())
+                    .and_then(|r| r);
+                let sync = Db::open(&path)
+                    .map_err(|e| e.to_string())
+                    .and_then(|db| client.sync(&db, 100));
+                let result = requests
+                    .and(sync)
+                    .map(|(feeds, new)| format!("{feeds} feeds, {new} new article(s)"));
+                on_background(result);
+            });
+        }
+        synced.map(|(feeds, new)| format!("{feeds} feeds, {new} new article(s)"))
     }
 }
 
@@ -282,19 +353,78 @@ impl Provider for HostedProvider {
         }
         self.db()?.remove_feed(&feed.id).map_err(|e| format!("{e}"))
     }
-    fn refresh(&self) -> Result<String, String> {
+    fn update_feed(
+        &self,
+        feed: &Feed,
+        title: Option<&str>,
+        url: Option<&str>,
+        category: Option<&str>,
+    ) -> Result<(), String> {
+        match self.kind {
+            HostedKind::Miniflux => {
+                let id = feed
+                    .id
+                    .strip_prefix("miniflux:")
+                    .and_then(|s| s.parse().ok())
+                    .ok_or("Invalid Miniflux feed")?;
+                self.miniflux()?
+                    .update_feed_remote(id, title, url, category)?;
+            }
+            HostedKind::GReader(_) => self.greader()?.update_feed_remote(
+                &feed.id,
+                title,
+                url,
+                category,
+                feed.category.as_deref(),
+            )?,
+        }
         let db = self.db()?;
-        let (feeds, new) = match self.kind {
+        db.update_feed(&feed.id, title, url)
+            .map_err(|e| e.to_string())?;
+        if let Some(category) = category {
+            db.set_feed_category(&feed.id, Some(category))
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+    fn mark_all_read(&self, feed_id: Option<&str>) -> Result<usize, String> {
+        match self.kind {
+            HostedKind::Miniflux => {
+                let id = feed_id
+                    .map(|id| {
+                        id.strip_prefix("miniflux:")
+                            .and_then(|s| s.parse().ok())
+                            .ok_or("Invalid Miniflux feed")
+                    })
+                    .transpose()?;
+                self.miniflux()?.mark_all_read_remote(id)?;
+            }
+            HostedKind::GReader(_) => self.greader()?.mark_all_read_remote(feed_id)?,
+        }
+        self.db()?.mark_all_read(feed_id).map_err(|e| e.to_string())
+    }
+    fn refresh(&self) -> Result<String, String> {
+        self.refresh_with_updates(true, Box::new(|_| {}))
+    }
+    fn refresh_scheduled(&self) -> Result<String, String> {
+        self.refresh_with_updates(false, Box::new(|_| {}))
+    }
+    fn refresh_with_updates(
+        &self,
+        force: bool,
+        on_background: Box<dyn FnOnce(Result<String, String>) + Send>,
+    ) -> Result<String, String> {
+        match self.kind {
+            HostedKind::Miniflux => self.refresh_miniflux(force, on_background),
             HostedKind::GReader(_) => {
                 let client = self.greader()?;
-                // A manual refresh bypasses the Inoreader
-                // caches (Python's invalidation rule).
-                client.invalidate_caches();
-                client.sync(&db, 100)?
+                if force {
+                    client.invalidate_caches();
+                }
+                let (feeds, new) = client.sync(&self.db()?, 100)?;
+                Ok(format!("{feeds} feeds, {new} new article(s)"))
             }
-            HostedKind::Miniflux => self.miniflux()?.sync(&db, 100)?,
-        };
-        Ok(format!("{feeds} feeds, {new} new article(s)"))
+        }
     }
 }
 
@@ -303,11 +433,12 @@ impl Provider for HostedProvider {
 /// like Python's else branch.
 pub fn get_provider(cfg: &Config, db_path: PathBuf) -> Box<dyn Provider + Send> {
     let name = cfg.get_str("active_provider", "local").to_string();
+    let hosted_path = active_db_path(cfg, &db_path);
     let hosted = |name: &'static str, kind: HostedKind| -> Box<dyn Provider + Send> {
         Box::new(HostedProvider {
             name,
             kind,
-            db_path: db_path.clone(),
+            db_path: hosted_path.clone(),
             cfg: cfg.clone(),
         })
     };
@@ -331,4 +462,42 @@ pub fn active_name(cfg: &Config) -> String {
     } else {
         "local".to_string()
     }
+}
+
+/// Hosted accounts keep separate rebuildable caches; the existing local database is untouched.
+/// No data is migrated: a previously used hosted account needs its first sync in this cache.
+pub fn active_db_path(cfg: &Config, base: &Path) -> PathBuf {
+    use sha2::Digest;
+    let name = active_name(cfg);
+    let stem = base.file_stem().and_then(|s| s.to_str()).unwrap_or("rss");
+    let scoped = stem.contains(".hosted-");
+    let stem = stem.split(".hosted-").next().unwrap_or(stem);
+    let extension = base.extension().and_then(|s| s.to_str()).unwrap_or("db");
+    if name == "local" {
+        return if scoped {
+            base.with_file_name(format!("{stem}.{extension}"))
+        } else {
+            base.to_path_buf()
+        };
+    }
+    let section = cfg.raw().get("providers").and_then(|p| p.get(&name));
+    let cred = |key: &str| {
+        section
+            .and_then(|p| p.get(key))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+    };
+    let url = cred("url").trim_end_matches('/').trim_end_matches("/v1");
+    let identity = serde_json::json!([
+        name,
+        url,
+        cred("email").to_lowercase(),
+        cred("api_key"),
+        cred("token")
+    ]);
+    let hash: String = sha2::Sha256::digest(identity.to_string())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    base.with_file_name(format!("{stem}.hosted-{name}-{hash}.{extension}"))
 }

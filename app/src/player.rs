@@ -19,6 +19,8 @@ use wxdragon::prelude::*;
 use wxdragon::widgets::media_ctrl::SeekMode;
 
 type PlayerCommand = Rc<dyn Fn(&str) -> bool>;
+type ResolvedMedia = (String, Vec<(String, String)>);
+type QueueResult = (usize, Result<ResolvedMedia, String>);
 
 thread_local! {
     static PLAYERS: RefCell<Vec<(usize, PlayerCommand)>> = const { RefCell::new(Vec::new()) };
@@ -80,6 +82,7 @@ struct PlayerState {
     autoplay_level: u8,
     /// Raw stream URL of the current load (for escalation).
     stream: String,
+    headers: Vec<(String, String)>,
     /// Last text written to the position readout.
     last_pos_text: String,
     /// Position at the last playback-state save (saves are
@@ -133,8 +136,8 @@ impl wxdragon::accessible::AccessibleImpl for SeekAccessible {
 struct QueueCtx {
     entries: Vec<Article>,
     index: usize,
-    rx: std::sync::mpsc::Receiver<(usize, Result<String, String>)>,
-    tx: std::sync::mpsc::Sender<(usize, Result<String, String>)>,
+    rx: std::sync::mpsc::Receiver<QueueResult>,
+    tx: std::sync::mpsc::Sender<QueueResult>,
     /// A resolve for the next entry is in flight.
     loading: bool,
 }
@@ -290,8 +293,14 @@ fn spawn_skip_workers(
     skip_rx
 }
 
-pub fn open_player(_parent: &Frame, article: Article, stream_url: String, chapters: Vec<Chapter>) {
-    open_player_impl(_parent, article, stream_url, chapters, None);
+pub fn open_player(
+    _parent: &Frame,
+    article: Article,
+    stream_url: String,
+    chapters: Vec<Chapter>,
+    headers: Vec<(String, String)>,
+) {
+    open_player_impl(_parent, article, stream_url, chapters, None, headers);
 }
 
 /// Open the player on one queue entry, advancing through the
@@ -302,6 +311,7 @@ pub fn open_player_queue(
     stream_url: String,
     entries: Vec<Article>,
     index: usize,
+    headers: Vec<(String, String)>,
 ) {
     set_queue_index(index as i64);
     let chapters = Db::open(&crate::db_path())
@@ -314,6 +324,7 @@ pub fn open_player_queue(
         stream_url,
         chapters,
         Some((entries, index)),
+        headers,
     );
 }
 
@@ -330,12 +341,15 @@ fn persist_volume(volume: f64) {
 /// EQ; the stream is an ffmpeg transcode with the filter
 /// chain applied — seeking inside it is limited). Otherwise
 /// the URL passes through untouched.
-fn eq_wrap(url: &str, cfg: &blindrss_core::config::Config) -> String {
+fn eq_wrap(url: &str, cfg: &blindrss_core::config::Config, headers: &[(String, String)]) -> String {
     let eq = blindrss_core::equalizer::EqConfig::from_config(cfg);
     if eq.enabled && (eq.bands.iter().any(|g| *g != 0.0) || eq.effective_preamp_db() != 0.0) {
         let chain = blindrss_core::equalizer::ffmpeg_filter_chain(&eq);
         if !chain.is_empty() {
-            return blindrss_core::proxy::eq_url(url, &chain);
+            return blindrss_core::proxy::eq_url(
+                &blindrss_core::http_headers::protected_media_url(url, headers),
+                &chain,
+            );
         }
     }
     url.to_string()
@@ -350,28 +364,29 @@ fn eq_wrap(url: &str, cfg: &blindrss_core::config::Config) -> String {
 /// app's own HTTP stack and streamed over the local proxy,
 /// then a live ffmpeg transcode of the URL. Returns which
 /// path loaded: "" direct, "proxy", "ffmpeg", or "failed".
-<<<<<<< Updated upstream
-fn load_with_fallbacks(media: &MediaCtrl, url: &str) -> &'static str {
+fn load_with_fallbacks(
+    media: &MediaBackend,
+    url: &str,
+    headers: &[(String, String)],
+) -> &'static str {
     // The primary load goes through the range cache when the
     // Python gate says so (Batch 36): it serves a truthful
     // Content-Length and real 206 ranges from a disk cache, so
     // the backend neither clamps seeks to a wrong duration nor
     // re-streams bytes it already fetched.
     let cfg = blindrss_core::config::Config::load(&crate::config_path()).unwrap_or_default();
-    let primary = blindrss_core::rangecache::maybe_range_cache_url(url, &[], false, None, &cfg);
-    if media.load_uri(&primary) {
-=======
-fn load_with_fallbacks(media: &MediaBackend, url: &str) -> &'static str {
-    if media.load_uri(url) {
->>>>>>> Stashed changes
+    let primary = blindrss_core::rangecache::maybe_range_cache_url(url, headers, false, None, &cfg);
+    let primary_headers = if primary == url { headers } else { &[] };
+    if media.load_uri_with_headers(&primary, primary_headers) {
         return "";
     }
     if url.starts_with("http://") || url.starts_with("https://") {
-        if media.load_uri(&blindrss_core::proxy::stream_url(url)) {
+        let protected = blindrss_core::http_headers::protected_media_url(url, headers);
+        if media.load_uri(&blindrss_core::proxy::stream_url(&protected)) {
             return "proxy";
         }
         if blindrss_core::silence::find_ffmpeg().is_some()
-            && media.load_uri(&blindrss_core::proxy::play_url(url))
+            && media.load_uri(&blindrss_core::proxy::play_url(&protected))
         {
             return "ffmpeg";
         }
@@ -385,6 +400,7 @@ fn open_player_impl(
     stream_url: String,
     chapters: Vec<Chapter>,
     queue: Option<(Vec<Article>, usize)>,
+    headers: Vec<(String, String)>,
 ) {
     let db_path = crate::db_path();
     let cfg = blindrss_core::config::Config::load(&crate::config_path()).unwrap_or_default();
@@ -478,9 +494,17 @@ fn open_player_impl(
     // "slider" and a bare list box as just "list" — the names
     // are what a screen reader announces for them (Python's
     // player labels every control the same way).
-    seek_slider.set_name(&crate::tr("Seek"));
-    chapter_list.set_name(&crate::tr("Chapters"));
-    pos_label.set_name(&crate::tr("Position"));
+    crate::msaa_names::set_name(&seek_slider, &crate::tr("Seek"));
+    crate::msaa_names::set_name(&chapter_list, &crate::tr("Chapters"));
+    crate::msaa_names::set_name(&pos_label, &crate::tr("Position"));
+    crate::msaa_names::set_name(
+        &back_btn,
+        &format!("{} {}s", crate::tr("Rewind"), seek_back_ms / 1000),
+    );
+    crate::msaa_names::set_name(
+        &fwd_btn,
+        &format!("{} {}s", crate::tr("Fast Forward"), seek_fwd_ms / 1000),
+    );
     let seek_caption = StaticText::builder(&frame)
         .with_label(&crate::tr("Seek"))
         .build();
@@ -541,6 +565,7 @@ fn open_player_impl(
         autoplay_ticks: 0,
         autoplay_level: 0,
         stream: String::new(),
+        headers: headers.clone(),
         last_pos_text: String::new(),
         last_saved_pos: -1,
         queue: queue.map(|(entries, index)| {
@@ -558,7 +583,7 @@ fn open_player_impl(
     let wrapped = if media.uses_vlc() {
         stream_url.clone()
     } else {
-        eq_wrap(&stream_url, &cfg)
+        eq_wrap(&stream_url, &cfg, &headers)
     };
     // An EQ-wrapped URL is already a local ffmpeg stream (its
     // own network path is ffmpeg's), so it loads directly;
@@ -570,7 +595,7 @@ fn open_player_impl(
             "failed"
         }
     } else {
-        load_with_fallbacks(&media, &stream_url)
+        load_with_fallbacks(&media, &stream_url, &headers)
     };
     if via != "failed" {
         media.set_volume(start_volume);
@@ -623,12 +648,19 @@ fn open_player_impl(
             let next = q.index + 1;
             let entry = q.entries[next].clone();
             let tx = q.tx.clone();
+            let path = s.db_path.clone();
             drop(s);
             std::thread::spawn(move || {
                 let cfg =
                     blindrss_core::config::Config::load(&crate::config_path()).unwrap_or_default();
-                let result = blindrss_core::media::resolve_article_for_play(&cfg, &entry)
-                    .map(|r| crate::maybe_cache_youtube(&entry, &r.url, r.via_ytdlp));
+                let result =
+                    blindrss_core::media::resolve_article_for_play(&cfg, &entry).map(|r| {
+                        let headers = crate::playback_headers_for(&entry, &r.url, &path);
+                        (
+                            crate::maybe_cache_youtube(&entry, &r.url, r.via_ytdlp),
+                            headers,
+                        )
+                    });
                 let _ = tx.send((next, result));
             });
         });
@@ -921,7 +953,7 @@ fn open_player_impl(
         seek_pos_t.store(pos, std::sync::atomic::Ordering::Relaxed);
         seek_len_t.store(len, std::sync::atomic::Ordering::Relaxed);
         let mut seek_to: Option<(i64, String)> = None;
-        let mut queue_load: Option<(String, String, String)> = None;
+        let mut queue_load = None;
         let mut queue_error: Option<String> = None;
         {
             let mut s = st.borrow_mut();
@@ -940,7 +972,7 @@ fn open_player_impl(
                     }
                     q.loading = false;
                     match res {
-                        Ok(stream) => {
+                        Ok((stream, headers)) => {
                             q.index = idx;
                             let entry = q.entries[idx].clone();
                             s.article_id = entry.id.clone();
@@ -983,9 +1015,9 @@ fn open_player_impl(
                             let wrapped = if m.uses_vlc() {
                                 stream.clone()
                             } else {
-                                eq_wrap(&stream, &cfg2)
+                                eq_wrap(&stream, &cfg2, &headers)
                             };
-                            queue_load = Some((wrapped, stream, entry.title.clone()));
+                            queue_load = Some((wrapped, stream, entry.title.clone(), headers));
                         }
                         Err(e) => queue_error = Some(e),
                     }
@@ -1027,17 +1059,18 @@ fn open_player_impl(
             frame_tick.set_status_text(&label, 0);
             crate::announce("sponsor_skip", &label);
         }
-        if let Some((wrapped, raw, title)) = queue_load {
+        if let Some((wrapped, raw, title, headers)) = queue_load {
             let via = if wrapped != raw {
                 if m.load_uri(&wrapped) { "" } else { "failed" }
             } else {
-                load_with_fallbacks(&m, &raw)
+                load_with_fallbacks(&m, &raw, &headers)
             };
             if via != "failed" {
                 m.play();
                 {
                     let mut s = st.borrow_mut();
                     s.stream = raw.clone();
+                    s.headers = headers;
                     s.autoplay_level = match via {
                         "proxy" => 1,
                         "ffmpeg" => 2,
@@ -1078,10 +1111,12 @@ fn open_player_impl(
                         m.play();
                     } else if t == 9 && s.autoplay_level < 2 {
                         s.autoplay_level += 1;
+                        let protected =
+                            blindrss_core::http_headers::protected_media_url(&s.stream, &s.headers);
                         let next = if s.autoplay_level == 1 {
-                            blindrss_core::proxy::stream_url(&s.stream)
+                            blindrss_core::proxy::stream_url(&protected)
                         } else {
-                            blindrss_core::proxy::play_url(&s.stream)
+                            blindrss_core::proxy::play_url(&protected)
                         };
                         if m.load_uri(&next) {
                             m.play();

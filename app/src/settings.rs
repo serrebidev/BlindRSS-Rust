@@ -1275,6 +1275,18 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
     btn_row.add(&save_btn, 0, SizerFlag::All, 4);
     btn_row.add(&cancel_btn, 0, SizerFlag::All, 4);
     sizer.add_sizer(&btn_row, 0, SizerFlag::All, 4);
+    let browser_cookie_import_cb = add_check(
+        &dialog,
+        &sizer,
+        "Import signed-in cookies from installed browsers",
+        cfg.get_bool("installed_browser_cookie_import_enabled", false),
+    );
+    let cache_full_text_cb = add_check(
+        &dialog,
+        &sizer,
+        "Prefer web extraction over cached provider full text",
+        cfg.get_bool("cache_full_text", false),
+    );
     dialog.set_sizer(sizer, true);
     dialog.set_size(Size::new(620, 1180));
 
@@ -1623,6 +1635,14 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
             );
             let login_new = start_login_cb.is_checked();
             cfg.set_path("start_on_windows_login", serde_json::json!(login_new));
+            cfg.set_path(
+                "installed_browser_cookie_import_enabled",
+                serde_json::json!(browser_cookie_import_cb.is_checked()),
+            );
+            cfg.set_path(
+                "cache_full_text",
+                serde_json::json!(cache_full_text_cb.is_checked()),
+            );
             let _ = cfg.save(&path_s);
             // Apply the OS registration when the login setting
             // changed (Python applies it on settings save and
