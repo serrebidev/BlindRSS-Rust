@@ -99,6 +99,10 @@ impl MediaBackend {
 
     pub fn load_uri(&self, url: &str) -> bool {
         if let Some(engine) = self.engine() {
+            // Re-attach on every load: at construction the surface may
+            // not be realized yet (on wxGTK its X11 window id does not
+            // exist until then), and set_xwindow must land before play.
+            engine.attach_video(self.surface.get_handle());
             let cfg = Config::load(&crate::config_path()).unwrap_or_default();
             let jar = blindrss_core::cookies::load_jar_beside(&crate::config_path());
             let cookie = blindrss_core::cookies::cookie_header_for(&jar, url);
