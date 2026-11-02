@@ -1835,3 +1835,103 @@ the old mirror_miniflux_category name; it now calls
 mirror_hosted_category with the same arguments, so a rename
 made through the dialog mirrors to GReader-family labels as
 well as Miniflux, like every other rename path.
+Podcast archive resolution (PARITY-2026-11-01 gap 6):
+podcast archive depth is closed. The core scanner
+already had progress + cancel, lineage following, CDX
+parsing and identity bridging; this batch adds what the
+audit found missing around it. (1) Scheduling lives in
+core: `archive_store::ArchiveSettings` reads Python's
+config keys (`podcast_archive_enabled`,
+`podcast_archive_max_snapshots` clamped 1..=5000,
+default 5000, `podcast_archive_rescan_days` default 30,
+a stored 0 meaning the default) with Python's interval
+formulas (local `max(1, days)` days; hosted at least one
+day), and the claim due rules (fresh success skips,
+error backoff `min(max(1h, rescan), 1d)`, scanning
+backoff 6h) drive `due_archive_feeds` plus the serial
+PodcastArchiveWorker queue (`queue_local_scan` /
+`queue_hosted_scans`, in-flight dedup per
+store+scope+feed, process-wide scan lock). The queue
+entry points are core API; calling them from the
+refresh paths is app wiring that lands with the main.rs
+integration, recorded here rather than silently
+dropped. (2) Progress + cancel: `ScanProgress` now
+carries `feed_urls` and `episodes_found`, every fetch
+goes through Python's retry policy (3 attempts, 1s/2s
+backoff, transient 429/500/502/503/504 and network
+errors, cancel-aware sleeps), and the local and hosted
+orchestrations (`perform_local_scan` /
+`run_hosted_scan`) claim, scan, store and finish/reset
+state like Python's LocalProvider and
+HostedPodcastArchiveMixin flows — hosted failure
+preserves earlier sidecar rows, a no-media hosted
+document clears them and finishes complete, cancel
+resets the claim. (3) Sidecar state: scope strings are
+byte-identical to Python's (generic
+`<name>:<sha256(name|identity)[:20]>` with the
+per-provider identities, Miniflux's own
+base-url|api-key scope) and derived from config by
+`scope_for_config`; state and entries live in the
+active account's own database file under its scope
+(Batch 39 file isolation), never in the local store or
+another account's file, verified by a two-file /
+two-scope regression test. Two store bugs fixed on the
+way: `entries()` ordering is Python's `date DESC,
+title COLLATE NOCASE`, and `replace_entries` keeps
+Python's non-empty-media rule. Episode identity
+matches Python exactly: the hosted episode key (sha256
+of the sorted identity keys, with Python's fallback
+seed), the local stable id, GUID canonicalization only
+for URL-shaped GUIDs, the title-date / title-duration
+rule (the duration branch is implemented and
+unit-tested but inert until the feed parser retains
+itunes:duration — `ParsedEntry` carries no duration),
+dropping identity-less episodes, and blanking feed-rs's
+invented UUID id/URL so guid-less episodes key only by
+their real media/title keys, stably across parses
+(feedparser leaves both empty). (4) The archive
+manager dialog is at Python parity: a feed choice over
+all subscribed feeds, the episode list merged with the
+account sidecar for hosted providers, a filter over
+title/author/date, the four archive-state status
+wordings with playable and snapshot counts, a
+Downloaded / Available online media column, Play,
+Download selected / Download all with Python's
+`downloads_enabled` gate, confirmation, per-episode
+progress, cancel and summary, in-dialog Rescan with
+live progress text and cancel, Find or add podcast,
+and Python's close-while-busy veto. Recorded
+deviations: the dialog's Play opens the episode window
+(in-player playback needs a main-window player
+callback; main.rs was outside this batch, so the
+dialog returns None and its own workers do the work —
+the main window's one-shot `rescan_archive` path is
+unchanged but no longer reached from this dialog), and
+`rescan_archive(&Db)` still stores without touching
+the state store because `Db` exposes no path — the
+state-tracked entry points take the store path.
+Regression: archive_parity (settings/scope/due-rule
+vectors, episode-key and stable-id vectors, identity
+rules incl. the invented-id blanking, retry policy,
+current-document progress, local + hosted
+orchestration incl. cross-account isolation, serial
+job queue).
+
+Integration addendum (gap 6, at the v0.1.53 landing): the
+app wiring the batch deferred is in. Local: when a refresh
+finishes (AllDone, every feed committed), a worker thread
+queues queue_local_scan for each feed — Python claims and
+queues only after the live-feed transaction commits, and
+the claim enforces the due rules, so not-due feeds cost one
+state read. Hosted: the provider sync thread queues
+queue_hosted_scans for the account's feeds right after a
+successful sync, with podcast_source_url applied to the
+pairs (its first caller). One recorded deviation:
+queue_local_scan's document parameter is now Option — the
+app's parsed refresh result carries no raw bytes, so it
+passes None and the scan fetches the current document
+itself; Python reuses the refresh's downloaded document.
+The due-claim rules bound the extra fetch to the rescan
+interval (30 days local default), and plumbing raw bytes
+through ParsedFeed would have touched every feed-source
+construction site for that saving alone.

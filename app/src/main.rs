@@ -3293,7 +3293,7 @@ fn main() {
                     let tx = tx_refresh.clone();
                     let path = blindrss_core::provider::active_db_path(&cfg, &base_db_path());
                     std::thread::spawn(move || {
-                        let provider = blindrss_core::provider::get_provider(&cfg, path);
+                        let provider = blindrss_core::provider::get_provider(&cfg, path.clone());
                         let tx_late = tx.clone();
                         let result = provider.refresh_with_updates(
                             force_full,
@@ -3301,6 +3301,35 @@ fn main() {
                                 let _ = tx_late.send(RefreshMsg::ProviderAction(result));
                             }),
                         );
+                        // Podcast archive (gap 6): after a
+                        // hosted sync, queue archive scans for
+                        // the due feeds (Python's
+                        // _queue_podcast_archive_scans).
+                        if result.is_ok() {
+                            let settings =
+                                blindrss_core::archive_store::ArchiveSettings::from_config(&cfg);
+                            if settings.enabled {
+                                let scope = blindrss_core::archive_store::scope_for_config(&cfg);
+                                if let Ok(db) = Db::open(&path) {
+                                    let pairs: Vec<(String, String)> = db
+                                        .feeds()
+                                        .unwrap_or_default()
+                                        .iter()
+                                        .map(|f| {
+                                            (
+                                                f.id.clone(),
+                                                blindrss_core::archive_store::podcast_source_url(
+                                                    &f.id, &f.url,
+                                                ),
+                                            )
+                                        })
+                                        .collect();
+                                    blindrss_core::archive_store::queue_hosted_scans(
+                                        &path, &scope, &settings, &pairs,
+                                    );
+                                }
+                            }
+                        }
                         let _ = tx.send(RefreshMsg::ProviderAction(result));
                     });
                     return;
@@ -8663,8 +8692,35 @@ fn main() {
                 }
                 let new_by_feed = std::mem::take(&mut st.refresh_new);
                 let failed = std::mem::take(&mut st.refresh_failed);
+                let store_path = st.store_path.clone();
+                let refreshed_feeds = st.feeds.clone();
                 drop(st);
                 refresh_side_effects(&tray, &new_by_feed, failed);
+                // Podcast archive (gap 6): every refresh has
+                // committed, so queue the due feeds' archive
+                // scans — Python claims and queues only after
+                // the live-feed transaction commits, so a fast
+                // archive job can never race a save. The claim
+                // inside queue_local_scan enforces the due
+                // rules; off the UI thread because claiming is
+                // a database write per feed.
+                {
+                    let cfg =
+                        blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+                    let settings = blindrss_core::archive_store::ArchiveSettings::from_config(&cfg);
+                    if settings.enabled {
+                        std::thread::spawn(move || {
+                            for feed in &refreshed_feeds {
+                                blindrss_core::archive_store::queue_local_scan(
+                                    &store_path,
+                                    feed,
+                                    &settings,
+                                    None,
+                                );
+                            }
+                        });
+                    }
+                }
             }
         });
         timer.start(150, false);

@@ -1,8 +1,361 @@
 //! Python-compatible persistent archive state and hosted-account sidecar.
+//!
+//! The tables are Python's (`podcast_archive_state`,
+//! `hosted_podcast_archive_state`, `hosted_podcast_archive_entries`)
+//! and live in whichever database file the caller passes: the
+//! local store for local feeds, the account's own cache file for
+//! hosted feeds (Batch 39 isolation), with the Python provider
+//! scope string scoping rows inside that file as well. Hosted
+//! archive state must never be written into the local store or
+//! another account's file/scope.
 
 use crate::{Article, archive::ArchiveEpisode};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
+
+/// Wall-clock seconds for state timestamps (Python `time.time()`).
+pub fn now_seconds() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
+/// The `podcast_archive_*` config family (Python defaults from
+/// `core/config.py`: enabled, 5000 max snapshots, 30 rescan days).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ArchiveSettings {
+    pub enabled: bool,
+    pub max_snapshots: usize,
+    pub rescan_days: f64,
+}
+
+impl Default for ArchiveSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_snapshots: 5000,
+            rescan_days: 30.0,
+        }
+    }
+}
+
+impl ArchiveSettings {
+    pub fn from_config(cfg: &crate::config::Config) -> Self {
+        // Python reads these through ConfigManager, whose defaults
+        // are the config.py values; a stored 0 falls back to the
+        // default exactly like Python's `or DEFAULT` reads.
+        let days = cfg
+            .raw()
+            .get("podcast_archive_rescan_days")
+            .and_then(|v| v.as_f64())
+            .filter(|v| *v != 0.0)
+            .unwrap_or(30.0);
+        let max_snapshots = cfg
+            .raw()
+            .get("podcast_archive_max_snapshots")
+            .and_then(|v| v.as_i64())
+            .filter(|v| *v != 0)
+            .unwrap_or(5000);
+        Self {
+            enabled: cfg.get_bool("podcast_archive_enabled", true),
+            max_snapshots: max_snapshots.clamp(1, 5000) as usize,
+            rescan_days: days,
+        }
+    }
+
+    /// LocalProvider's interval: days clamped to at least one.
+    pub fn local_rescan_seconds(&self) -> f64 {
+        self.rescan_days.max(1.0) * 86400.0
+    }
+
+    /// The hosted mixin's interval: at least a day, no upper
+    /// clamp on the configured days.
+    pub fn hosted_rescan_seconds(&self) -> f64 {
+        (self.rescan_days * 86400.0).max(86400.0)
+    }
+}
+
+/// Python `HostedPodcastArchiveMixin._podcast_archive_scope`:
+/// `{name.casefold()}:{sha256("{name}|{identity}")[:20]}`. The
+/// name keeps its Python display case inside the digest
+/// ("BazQux", "TheOldReader", "Inoreader"); the prefix is folded.
+pub fn hosted_scope(provider_name: &str, account_identity: &str) -> String {
+    use sha2::Digest;
+    let digest: String = sha2::Sha256::digest(format!("{provider_name}|{account_identity}"))
+        .iter()
+        .take(10)
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!("{}:{digest}", provider_name.to_lowercase())
+}
+
+/// Miniflux overrides the scope shape entirely (Python
+/// `MinifluxProvider._podcast_archive_scope`):
+/// `miniflux:{sha256("{base_url}|{api_key}")[:20]}` with the base
+/// URL lowercased and stripped of trailing slashes.
+pub fn miniflux_scope(base_url: &str, api_key: &str) -> String {
+    use sha2::Digest;
+    let base = base_url.trim_end_matches('/').to_lowercase();
+    let digest: String = sha2::Sha256::digest(format!("{base}|{api_key}"))
+        .iter()
+        .take(10)
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!("miniflux:{digest}")
+}
+
+/// The archive scope for the configured active provider, or the
+/// empty (local) scope when the local provider is active.
+/// Account identities follow Python's per-provider overrides:
+/// GReader services use `{base_url}|{email}`; Inoreader uses its
+/// refresh/access token (falling back to the app id key); when a
+/// credential Python would use is not in config, the mixin's
+/// default identity (the provider name itself) applies.
+pub fn scope_for_config(cfg: &crate::config::Config) -> String {
+    let name = crate::provider::active_name(cfg);
+    let section = cfg.raw().get("providers").and_then(|p| p.get(&name));
+    let cred = |key: &str| {
+        section
+            .and_then(|p| p.get(key))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string()
+    };
+    match name.as_str() {
+        "local" => String::new(),
+        "miniflux" => {
+            let url = cred("url");
+            let url = if url.is_empty() {
+                "https://localhost".to_string()
+            } else {
+                url
+            };
+            miniflux_scope(&url, &cred("api_key"))
+        }
+        "bazqux" => hosted_scope(
+            "BazQux",
+            &format!(
+                "https://www.bazqux.com/reader/api/0|{}",
+                cred("email").to_lowercase()
+            ),
+        ),
+        "theoldreader" => hosted_scope(
+            "TheOldReader",
+            &format!(
+                "https://theoldreader.com/reader/api/0|{}",
+                cred("email").to_lowercase()
+            ),
+        ),
+        "inoreader" => {
+            let token = ["refresh_token", "token", "app_id"]
+                .iter()
+                .map(|key| cred(key))
+                .find(|value| !value.is_empty())
+                .unwrap_or_else(|| "Inoreader".to_string());
+            hosted_scope(
+                "Inoreader",
+                &format!("https://www.inoreader.com/reader/api/0|{token}"),
+            )
+        }
+        _ => hosted_scope(&name, &name),
+    }
+}
+
+/// Python `podcast_source_url`: a GReader `feed/<url>` id encodes
+/// its source URL; anything else falls back to the advertised URL.
+pub fn podcast_source_url(feed_id: &str, advertised_url: &str) -> String {
+    if let Some(encoded) = feed_id.trim().strip_prefix("feed/") {
+        let encoded = encoded.trim();
+        if encoded.to_lowercase().starts_with("http://")
+            || encoded.to_lowercase().starts_with("https://")
+        {
+            return encoded.to_string();
+        }
+    }
+    advertised_url.trim().to_string()
+}
+
+/// The due subset of `feeds` ((feed_id, feed_url) pairs) under
+/// the claim rules, from one states read — the planning half of
+/// Python's `_queue_podcast_archive_scans`. Feeds with no URL, or
+/// whose state is still fresh / scanning / in error backoff, are
+/// skipped. The queued job re-checks through the atomic claim,
+/// so a stale plan can never double-run a scan.
+pub fn due_archive_feeds(
+    states: &[ArchiveState],
+    feeds: &[(String, String)],
+    rescan_seconds: f64,
+    now: f64,
+) -> Vec<(String, String)> {
+    feeds
+        .iter()
+        .filter(|(feed_id, feed_url)| {
+            if feed_id.is_empty() || feed_url.is_empty() {
+                return false;
+            }
+            let state = states
+                .iter()
+                .find(|state| &state.feed_id == feed_id)
+                .cloned()
+                .unwrap_or_else(|| ArchiveState::never(feed_id));
+            state.is_due(rescan_seconds, now)
+        })
+        .cloned()
+        .collect()
+}
+
+/// In-process already-queued guard (Python's
+/// `_podcast_archive_queued_ids`), keyed by database file +
+/// scope + feed so two accounts never block each other.
+fn queued_ids() -> &'static std::sync::Mutex<std::collections::HashSet<(String, String, String)>> {
+    static QUEUED: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashSet<(String, String, String)>>,
+    > = std::sync::OnceLock::new();
+    QUEUED.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Queue automatic hosted scans for every due feed (Python
+/// `_queue_podcast_archive_scans`): each job claims atomically
+/// inside the job, then runs the hosted orchestration on the
+/// serial archive worker. Returns how many jobs were queued.
+pub fn queue_hosted_scans(
+    path: &Path,
+    scope: &str,
+    settings: &ArchiveSettings,
+    feeds: &[(String, String)],
+) -> usize {
+    if !settings.enabled {
+        return 0;
+    }
+    let Ok(all_states) = states(path, scope) else {
+        return 0;
+    };
+    let due = due_archive_feeds(
+        &all_states,
+        feeds,
+        settings.hosted_rescan_seconds(),
+        now_seconds(),
+    );
+    let mut queued = 0;
+    for (feed_id, feed_url) in due {
+        let key = (
+            path.to_string_lossy().into_owned(),
+            scope.to_string(),
+            feed_id.clone(),
+        );
+        {
+            let mut guard = queued_ids().lock().unwrap_or_else(|p| p.into_inner());
+            if !guard.insert(key.clone()) {
+                continue;
+            }
+        }
+        queued += 1;
+        let path = path.to_path_buf();
+        let scope = scope.to_string();
+        let settings = settings.clone();
+        crate::archive::enqueue_archive_job(move || {
+            let claimed = claim(
+                &path,
+                &scope,
+                &feed_id,
+                &feed_url,
+                settings.hosted_rescan_seconds(),
+                false,
+                now_seconds(),
+            )
+            .unwrap_or(false);
+            if claimed {
+                crate::archive::run_hosted_scan(
+                    &path,
+                    &scope,
+                    &feed_id,
+                    &feed_url,
+                    &settings,
+                    &AtomicBool::new(false),
+                    |_| {},
+                );
+            }
+            queued_ids()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&key);
+        });
+    }
+    queued
+}
+
+/// Queue one automatic local scan (Python's deferred archive
+/// job): the claim is taken first, exactly as LocalProvider
+/// claims after the refresh commit, and the job then runs the
+/// scan already holding it. The refresh's just-downloaded
+/// document travels with the job when the caller has it
+/// (Python's does); `None` lets the scan fetch the document
+/// itself, which is what the app passes — its parsed refresh
+/// result carries no raw bytes. Returns false when the feed
+/// was not due (or already queued).
+pub fn queue_local_scan(
+    path: &Path,
+    feed: &crate::db::Feed,
+    settings: &ArchiveSettings,
+    current_document: Option<Vec<u8>>,
+) -> bool {
+    if !settings.enabled {
+        return false;
+    }
+    let key = (
+        path.to_string_lossy().into_owned(),
+        String::new(),
+        feed.id.clone(),
+    );
+    {
+        let guard = queued_ids().lock().unwrap_or_else(|p| p.into_inner());
+        if guard.contains(&key) {
+            return false;
+        }
+    }
+    let claimed = match claim(
+        path,
+        "",
+        &feed.id,
+        &feed.url,
+        settings.local_rescan_seconds(),
+        false,
+        now_seconds(),
+    ) {
+        Ok(claimed) => claimed,
+        Err(_) => return false,
+    };
+    if !claimed {
+        return false;
+    }
+    queued_ids()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(key.clone());
+    let path = path.to_path_buf();
+    let feed = feed.clone();
+    let settings = settings.clone();
+    crate::archive::enqueue_archive_job(move || {
+        let _ = crate::archive::perform_local_scan_with_fetch(
+            &path,
+            &feed,
+            &settings,
+            crate::archive::Claim::AlreadyHeld,
+            current_document,
+            &AtomicBool::new(false),
+            |_| {},
+            crate::archive::http_fetch,
+        );
+        queued_ids()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&key);
+    });
+    true
+}
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS podcast_archive_state (
@@ -255,7 +608,10 @@ pub fn replace_entries(
             params![scope, feed_id],
         )
         .map_err(|e| e.to_string())?;
-    for episode in episodes.iter().filter(|e| e.entry.media_url.is_some()) {
+    for episode in episodes
+        .iter()
+        .filter(|e| e.entry.media_url.as_deref().is_some_and(|m| !m.is_empty()))
+    {
         let entry = &episode.entry;
         transaction.execute("INSERT INTO hosted_podcast_archive_entries(provider_scope,feed_id,episode_key,title,url,content,date,author,media_url,media_type) \
             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)", params![scope,feed_id,episode.key(),entry.title,entry.url,entry.content_text,entry.date,entry.author,entry.media_url,entry.media_type]).map_err(|e| e.to_string())?;
@@ -265,8 +621,9 @@ pub fn replace_entries(
 
 pub fn entries(path: &Path, scope: &str, feed_id: &str) -> Result<Vec<Article>, String> {
     let connection = open(path)?;
+    // Python's order: date DESC, title ascending case-insensitively.
     let mut statement = connection.prepare("SELECT episode_key,title,url,content,date,author,media_url,media_type FROM hosted_podcast_archive_entries \
-        WHERE provider_scope=?1 AND feed_id=?2 ORDER BY date DESC,title DESC").map_err(|e| e.to_string())?;
+        WHERE provider_scope=?1 AND feed_id=?2 ORDER BY date DESC, title COLLATE NOCASE").map_err(|e| e.to_string())?;
     let rows = statement
         .query_map(params![scope, feed_id], |row| {
             Ok(Article {
