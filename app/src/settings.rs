@@ -1,4 +1,9 @@
-//! Settings dialog: provider accounts + download path.
+//! Settings dialog: a Notebook of pages mirroring Python's
+//! SettingsDialog (gui/dialogs.py), in Python's fixed page
+//! order: General, Feeds & Articles, YouTube, Media Player,
+//! Provider, Notifications, Translate, List Headers, Advanced,
+//! CAPTCHA Solving. Never insert a page mid-notebook — tab
+//! positions are screen-reader muscle memory.
 //!
 //! Writes into the shared Python-format config.json
 //! (providers.theoldreader / bazqux / miniflux / inoreader,
@@ -9,6 +14,7 @@
 use blindrss_core::config::Config;
 use std::path::Path;
 use wxdragon::prelude::*;
+use wxdragon::sizers::base::Sizer;
 
 fn get_path(cfg: &Config, path: &str) -> String {
     let mut cur = cfg.raw();
@@ -22,20 +28,20 @@ fn get_path(cfg: &Config, path: &str) -> String {
 }
 
 fn add_field(
-    dialog: &Dialog,
-    sizer: &BoxSizer,
+    parent: &impl WxWidget,
+    sizer: &Sizer,
     label: &str,
     value: &str,
     password: bool,
 ) -> TextCtrl {
     let row = BoxSizer::builder(Orientation::Horizontal).build();
-    let text = StaticText::builder(dialog).with_label(label).build();
+    let text = StaticText::builder(parent).with_label(label).build();
     let style = if password {
         TextCtrlStyle::Password
     } else {
         TextCtrlStyle::default()
     };
-    let ctrl = TextCtrl::builder(dialog).with_style(style).build();
+    let ctrl = TextCtrl::builder(parent).with_style(style).build();
     ctrl.set_value(value);
     row.add(&text, 0, SizerFlag::All, 4);
     row.add(&ctrl, 1, SizerFlag::Expand | SizerFlag::All, 4);
@@ -44,8 +50,8 @@ fn add_field(
 }
 
 /// A labeled checkbox row; returns the checkbox.
-fn add_check(dialog: &Dialog, sizer: &BoxSizer, label: &str, value: bool) -> CheckBox {
-    let cb = CheckBox::builder(dialog).with_label(label).build();
+fn add_check(parent: &impl WxWidget, sizer: &Sizer, label: &str, value: bool) -> CheckBox {
+    let cb = CheckBox::builder(parent).with_label(label).build();
     cb.set_value(value);
     sizer.add(&cb, 0, SizerFlag::All, 2);
     cb
@@ -53,15 +59,15 @@ fn add_check(dialog: &Dialog, sizer: &BoxSizer, label: &str, value: bool) -> Che
 
 /// A labeled choice row; returns the choice control.
 fn add_choice(
-    dialog: &Dialog,
-    sizer: &BoxSizer,
+    parent: &impl WxWidget,
+    sizer: &Sizer,
     label: &str,
     items: &[&str],
     selected: usize,
 ) -> Choice {
     let row = BoxSizer::builder(Orientation::Horizontal).build();
-    let text = StaticText::builder(dialog).with_label(label).build();
-    let choice = Choice::builder(dialog).build();
+    let text = StaticText::builder(parent).with_label(label).build();
+    let choice = Choice::builder(parent).build();
     for item in items {
         choice.append(item);
     }
@@ -72,10 +78,44 @@ fn add_choice(
     choice
 }
 
-/// A section heading.
-fn add_heading(dialog: &Dialog, sizer: &BoxSizer, label: &str) {
-    let text = StaticText::builder(dialog).with_label(label).build();
-    sizer.add(&text, 0, SizerFlag::All, 4);
+/// A static explanatory paragraph (Python's page notes).
+fn add_note(parent: &impl WxWidget, sizer: &Sizer, text: &str) {
+    let note = StaticText::builder(parent).with_label(text).build();
+    sizer.add(&note, 0, SizerFlag::All, 4);
+}
+
+/// One page of the settings notebook: a scrolled window (long
+/// pages stay reachable, the same reason Python's Notifications
+/// page is a ScrolledWindow) plus its vertical sizer.
+struct SettingsPage {
+    win: ScrolledWindow,
+    sizer: BoxSizer,
+}
+
+impl SettingsPage {
+    fn new(notebook: &Notebook) -> SettingsPage {
+        let win = ScrolledWindow::builder(notebook).build();
+        win.set_scroll_rate(0, 12);
+        SettingsPage {
+            win,
+            sizer: BoxSizer::builder(Orientation::Vertical).build(),
+        }
+    }
+
+    /// A labelled group on this page (Python's StaticBox groups:
+    /// "Startup & Tray", "Downloads", "Sounds", ...). Controls are
+    /// parented to the page and laid out by the returned sizer.
+    fn group(&self, label: &str) -> StaticBoxSizer {
+        let group =
+            StaticBoxSizerBuilder::new_with_label(Orientation::Vertical, &self.win, label).build();
+        self.sizer
+            .add_sizer(&group, 0, SizerFlag::Expand | SizerFlag::All, 8);
+        group
+    }
+
+    fn finish(&self) {
+        self.win.set_sizer(self.sizer, true);
+    }
 }
 
 /// Fire a test desktop notification from Settings (platform
@@ -277,237 +317,55 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
     let dialog = Dialog::builder(frame, "BlindRSS Settings").build();
     crate::dialogs::bind_f1(frame, &dialog, "SettingsDialog");
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
+    let notebook = Notebook::builder(&dialog).build();
+    sizer.add(&notebook, 1, SizerFlag::Expand | SizerFlag::All, 4);
 
-    // Active provider (Python's Provider page + factory.py):
-    // the backend the whole UI reads/writes through.
-    add_heading(&dialog, &sizer, "Provider");
-    let active_sel = blindrss_core::provider::PROVIDER_NAMES
-        .iter()
-        .position(|n| *n == cfg.get_str("active_provider", "local"))
-        .unwrap_or(0);
-    let active_choice = add_choice(
-        &dialog,
-        &sizer,
-        "Active provider",
-        &blindrss_core::provider::PROVIDER_LABELS,
-        active_sel,
-    );
-
-    let tor_email = add_field(
-        &dialog,
-        &sizer,
-        "The Old Reader email",
-        &get_path(&cfg, "providers.theoldreader.email"),
+    // Pages in Python's fixed order (SettingsDialog in
+    // gui/dialogs.py). Append new pages at the end only: tab
+    // positions are screen-reader muscle memory.
+    let general = SettingsPage::new(&notebook);
+    let feeds = SettingsPage::new(&notebook);
+    let youtube = SettingsPage::new(&notebook);
+    let media = SettingsPage::new(&notebook);
+    let provider = SettingsPage::new(&notebook);
+    let notifications = SettingsPage::new(&notebook);
+    let translate = SettingsPage::new(&notebook);
+    let headers = SettingsPage::new(&notebook);
+    let advanced = SettingsPage::new(&notebook);
+    let captcha_page = SettingsPage::new(&notebook);
+    notebook.add_page(&general.win, &crate::tr("General"), true, None);
+    notebook.add_page(&feeds.win, &crate::tr("Feeds && Articles"), false, None);
+    notebook.add_page(&youtube.win, &crate::tr("YouTube"), false, None);
+    notebook.add_page(&media.win, &crate::tr("Media Player"), false, None);
+    notebook.add_page(&provider.win, &crate::tr("Provider"), false, None);
+    notebook.add_page(&notifications.win, &crate::tr("Notifications"), false, None);
+    notebook.add_page(&translate.win, &crate::tr("Translate"), false, None);
+    notebook.add_page(&headers.win, &crate::tr("List Headers"), false, None);
+    notebook.add_page(&advanced.win, &crate::tr("Advanced"), false, None);
+    notebook.add_page(
+        &captcha_page.win,
+        &crate::tr("CAPTCHA Solving"),
         false,
-    );
-    let tor_pass = add_field(
-        &dialog,
-        &sizer,
-        "The Old Reader password",
-        &get_path(&cfg, "providers.theoldreader.password"),
-        true,
-    );
-    let baz_email = add_field(
-        &dialog,
-        &sizer,
-        "BazQux email",
-        &get_path(&cfg, "providers.bazqux.email"),
-        false,
-    );
-    let baz_pass = add_field(
-        &dialog,
-        &sizer,
-        "BazQux password",
-        &get_path(&cfg, "providers.bazqux.password"),
-        true,
-    );
-    let mini_url = add_field(
-        &dialog,
-        &sizer,
-        "Miniflux URL",
-        &get_path(&cfg, "providers.miniflux.url"),
-        false,
-    );
-    let mini_key = add_field(
-        &dialog,
-        &sizer,
-        "Miniflux API key",
-        &get_path(&cfg, "providers.miniflux.api_key"),
-        true,
-    );
-    let ino_id = add_field(
-        &dialog,
-        &sizer,
-        "Inoreader app ID",
-        &get_path(&cfg, "providers.inoreader.app_id"),
-        false,
-    );
-    let ino_key = add_field(
-        &dialog,
-        &sizer,
-        "Inoreader app key",
-        &get_path(&cfg, "providers.inoreader.app_key"),
-        true,
-    );
-    let dl_path = add_field(
-        &dialog,
-        &sizer,
-        "Download folder",
-        &get_path(&cfg, "download_path"),
-        false,
+        None,
     );
 
-    // Startup state (Python parity keys).
-    let startup_label = StaticText::builder(&dialog)
-        .with_label(&crate::tr("Startup"))
-        .build();
-    sizer.add(&startup_label, 0, SizerFlag::All, 4);
-    let remember_cb = CheckBox::builder(&dialog)
-        .with_label(&crate::tr("Remember last feed"))
-        .build();
-    remember_cb.set_value(cfg.get_bool("remember_last_feed", false));
-    sizer.add(&remember_cb, 0, SizerFlag::All, 4);
-    let maximized_cb = CheckBox::builder(&dialog)
-        .with_label(&crate::tr("Start maximized"))
-        .build();
-    maximized_cb.set_value(cfg.get_bool("start_maximized", false));
-    sizer.add(&maximized_cb, 0, SizerFlag::All, 4);
-    let expand_cb = CheckBox::builder(&dialog)
-        .with_label(&crate::tr("Expand categories by default"))
-        .build();
-    expand_cb.set_value(cfg.get_bool("category_tree_default_expanded", false));
-    sizer.add(&expand_cb, 0, SizerFlag::All, 4);
-    let hotkey_field = add_field(
-        &dialog,
-        &sizer,
-        "Global show/hide hotkey (Windows, blank = off)",
-        cfg.get_str("global_show_hide_hotkey", "Ctrl+Alt+B"),
-        false,
-    );
-    // Start at login (Python windows_integration): the checkbox
-    // mirrors the config key; saving applies the OS registration
-    // when the value changed. Disabled where unsupported.
-    let start_login_cb = add_check(
-        &dialog,
-        &sizer,
-        crate::startup::setting_label(),
-        cfg.get_bool("start_on_windows_login", false),
-    );
-    if !crate::startup::supported() {
-        start_login_cb.enable(false);
-    }
-
-    // Refresh scheduling (Python keys: refresh_on_startup defaults
-    // on, refresh_interval is in seconds, 300 default, 0 = off).
-    let refresh_label = StaticText::builder(&dialog)
-        .with_label(&crate::tr("Refresh"))
-        .build();
-    sizer.add(&refresh_label, 0, SizerFlag::All, 4);
-    let refresh_startup_cb = CheckBox::builder(&dialog)
-        .with_label(&crate::tr("Refresh feeds on startup"))
-        .build();
-    refresh_startup_cb.set_value(cfg.get_bool("refresh_on_startup", true));
-    sizer.add(&refresh_startup_cb, 0, SizerFlag::All, 4);
-    let interval_field = add_field(
-        &dialog,
-        &sizer,
-        "Refresh interval (seconds, 0 = off)",
-        &cfg.get_i64("refresh_interval", 300).to_string(),
-        false,
-    );
-
-    // Announcements (PARITY 7.4): per-event speech/Braille mode,
-    // mirroring Python's Settings > Announcements page.
-    let announce_label = StaticText::builder(&dialog)
-        .with_label(&crate::tr("Announcements"))
-        .build();
-    sizer.add(&announce_label, 0, SizerFlag::All, 4);
-    let current_modes = blindrss_core::announce::Announcements::from_config(&cfg);
-    let mut announce_choices: Vec<Choice> = Vec::new();
-    for ev in blindrss_core::announce::EVENTS.iter() {
-        let row = BoxSizer::builder(Orientation::Horizontal).build();
-        let lbl = StaticText::builder(&dialog).with_label(ev.label).build();
-        row.add(&lbl, 1, SizerFlag::All, 4);
-        let choice = Choice::builder(&dialog).build();
-        for label in blindrss_core::announce::MODE_LABELS {
-            choice.append(label);
-        }
-        choice.set_selection(current_modes.mode_index(ev.id) as u32);
-        row.add(&choice, 0, SizerFlag::All, 4);
-        sizer.add_sizer(&row, 0, SizerFlag::Expand | SizerFlag::All, 2);
-        announce_choices.push(choice);
-    }
-    let announce_test_btn = Button::builder(&dialog)
-        .with_label(&crate::tr("Test Announcement"))
-        .build();
-    sizer.add(&announce_test_btn, 0, SizerFlag::All, 4);
-
-    // Refresh engine (Audit 3 keys).
-    add_heading(&dialog, &sizer, "Refresh Engine");
-    let max_conc_field = add_field(
-        &dialog,
-        &sizer,
-        "Max concurrent refreshes",
-        &cfg.get_i64("max_concurrent_refreshes", 16).to_string(),
-        false,
-    );
-    let timeout_field = add_field(
-        &dialog,
-        &sizer,
-        "Feed timeout (seconds)",
-        &cfg.get_i64("feed_timeout_seconds", 15).to_string(),
-        false,
-    );
-    let retries_field = add_field(
-        &dialog,
-        &sizer,
-        "Feed retry attempts",
-        &cfg.get_i64("feed_retry_attempts", 1).to_string(),
-        false,
-    );
-    let per_host_field = add_field(
-        &dialog,
-        &sizer,
-        "Max connections per host",
-        &cfg.get_i64("per_host_max_connections", 4).to_string(),
-        false,
-    );
-    let workload = cfg.get_str(
-        "automatic_feed_refresh_workload",
-        if cfg.get_bool("ignore_feed_cache", false) {
-            "always_full"
-        } else {
-            "startup_full"
-        },
-    );
-    let refresh_workload = add_choice(
-        &dialog,
-        &sizer,
-        "Automatic feed refresh",
-        &[
-            "Use feed cache",
-            "Full fetch at startup, cached later",
-            "Always fetch in full",
-        ],
-        match workload {
-            "cached" => 0,
-            "always_full" => 2,
-            _ => 1,
-        },
-    );
-
-    // Reading.
-    add_heading(&dialog, &sizer, "Reading");
+    // ---- General page (Python's General tab, in its order) ----
     let search_mode_choice = add_choice(
-        &dialog,
-        &sizer,
-        "Search looks in",
-        &["Titles and content", "Titles only"],
+        &general.win,
+        &general.sizer,
+        "Search Matches:",
+        &["Titles only", "Titles and article text"],
         if cfg.get_str("search_mode", "title_content") == "title_only" {
-            1
-        } else {
             0
+        } else {
+            1
         },
+    );
+    let confirm_delete_cb = add_check(
+        &general.win,
+        &general.sizer,
+        "Confirm before deleting articles",
+        cfg.get_bool("confirm_article_delete", true),
     );
     let delete_behavior0 = cfg.get_str("delete_behavior", "deleted").to_string();
     let delete_path0 = delete_behavior0
@@ -515,13 +373,13 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
         .unwrap_or("")
         .to_string();
     let delete_choice = add_choice(
-        &dialog,
-        &sizer,
-        "Deleting an article",
+        &general.win,
+        &general.sizer,
+        "When I delete an article:",
         &[
-            "Moves it to the Deleted view",
-            "Deletes it permanently",
-            "Moves it to a category instead",
+            "Move it to Deleted Articles (restorable)",
+            "Remove it permanently",
+            "Move it to a category",
         ],
         if delete_behavior0 == "purge" {
             1
@@ -532,501 +390,31 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
         },
     );
     let delete_path_field = add_field(
-        &dialog,
-        &sizer,
-        "Category path for the move-instead option",
+        &general.win,
+        &general.sizer,
+        "Delete target category (full path)",
         &delete_path0,
         false,
     );
-    let confirm_delete_cb = add_check(
-        &dialog,
-        &sizer,
-        "Confirm before deleting an article",
-        cfg.get_bool("confirm_article_delete", true),
-    );
     let show_alt_cb = add_check(
-        &dialog,
-        &sizer,
-        "Show image alt text",
+        &general.win,
+        &general.sizer,
+        "Include image alt text in articles (announces images, can override per feed)",
         cfg.get_bool("show_image_alt", false),
     );
-    let rich_view_cb = add_check(
-        &dialog,
-        &sizer,
-        "Show articles as rich HTML (WebView)",
-        cfg.get_bool("full_text_rich_view", false),
-    );
-    let structure_choices: Vec<(&str, CheckBox)> = [
-        ("article_structure_tables", "Describe article tables", true),
-        (
-            "article_structure_headings",
-            "Announce article heading levels",
-            false,
-        ),
-        (
-            "article_structure_lists",
-            "Preserve article list markers",
-            false,
-        ),
-        ("article_structure_quotes", "Mark article quotations", false),
-        (
-            "article_structure_links",
-            "Include link targets in article text",
-            false,
-        ),
-    ]
-    .into_iter()
-    .map(|(key, label, default)| {
-        (
-            key,
-            add_check(&dialog, &sizer, label, cfg.get_bool(key, default)),
-        )
-    })
-    .collect();
-    // Article opening (Python issue #31): default browser or a
-    // custom command template with %1 for the URL.
-    let open_method_choice = add_choice(
-        &dialog,
-        &sizer,
-        "Article opening method",
-        &["Default browser", "Custom command"],
-        if cfg
-            .get_str("article_open_method", "default")
-            .eq_ignore_ascii_case("custom")
-        {
-            1
-        } else {
-            0
-        },
-    );
-    let open_cmd_field = add_field(
-        &dialog,
-        &sizer,
-        "Custom command (%1 = article URL)",
-        cfg.get_str("article_open_command", ""),
-        false,
-    );
-    let open_cmd_test_btn = Button::builder(&dialog)
-        .with_label("Test Custom Command")
-        .build();
-    sizer.add(&open_cmd_test_btn, 0, SizerFlag::All, 2);
-
-    // External tools: user-chosen executable paths take the
-    // highest detection priority (blank = auto-detect).
-    add_heading(&dialog, &sizer, "External Tools");
-    let ffmpeg_path_field = add_field(
-        &dialog,
-        &sizer,
-        "ffmpeg path (blank = auto)",
-        cfg.get_str("custom_ffmpeg_path", ""),
-        false,
-    );
-    let ffprobe_path_field = add_field(
-        &dialog,
-        &sizer,
-        "ffprobe path (blank = auto)",
-        cfg.get_str("custom_ffprobe_path", ""),
-        false,
-    );
-    let ytdlp_path_field = add_field(
-        &dialog,
-        &sizer,
-        "yt-dlp path (blank = auto)",
-        cfg.get_str("custom_ytdlp_path", ""),
-        false,
+    let remember_cb = add_check(
+        &general.win,
+        &general.sizer,
+        "Remember last selected feed/folder on startup",
+        cfg.get_bool("remember_last_feed", false),
     );
 
-    // Downloads.
-    add_heading(&dialog, &sizer, "Downloads");
-    let downloads_enabled_cb = add_check(
-        &dialog,
-        &sizer,
-        "Downloads enabled",
-        cfg.get_bool("downloads_enabled", false),
-    );
-    let format_labels: Vec<&str> = blindrss_core::download::DOWNLOAD_FORMAT_IDS
-        .iter()
-        .map(|id| blindrss_core::download::download_format_label(id))
-        .collect();
-    let format_sel = blindrss_core::download::DOWNLOAD_FORMAT_IDS
-        .iter()
-        .position(|id| *id == cfg.get_str("download_format", "video_best"))
-        .unwrap_or(0);
-    let format_choice = add_choice(
-        &dialog,
-        &sizer,
-        "Download format",
-        &format_labels,
-        format_sel,
-    );
-    let max_dl_field = add_field(
-        &dialog,
-        &sizer,
-        "Max downloads kept in the queue",
-        &cfg.get_i64("max_downloads", 32).to_string(),
-        false,
-    );
-    let retention_labels: Vec<String> = blindrss_core::retention::RETENTION_CHOICES
-        .iter()
-        .map(|(id, _)| blindrss_core::retention::retention_label(id))
-        .collect();
-    let retention_refs: Vec<&str> = retention_labels.iter().map(|s| s.as_str()).collect();
-    let art_ret_sel = blindrss_core::retention::RETENTION_CHOICES
-        .iter()
-        .position(|(id, _)| *id == cfg.get_str("article_retention", "unlimited"))
-        .unwrap_or(11);
-    let art_ret_choice = add_choice(
-        &dialog,
-        &sizer,
-        "Keep articles for",
-        &retention_refs,
-        art_ret_sel,
-    );
-    let dl_ret_sel = blindrss_core::retention::RETENTION_CHOICES
-        .iter()
-        .position(|(id, _)| *id == cfg.get_str("download_retention", "unlimited"))
-        .unwrap_or(11);
-    let dl_ret_choice = add_choice(
-        &dialog,
-        &sizer,
-        "Keep downloads for",
-        &retention_refs,
-        dl_ret_sel,
-    );
-
-    // Player / media.
-    add_heading(&dialog, &sizer, "Player");
-    let show_player_cb = add_check(
-        &dialog,
-        &sizer,
-        "Show player when playback starts",
-        cfg.get_bool("show_player_on_play", true),
-    );
-    let resume_cb = add_check(
-        &dialog,
-        &sizer,
-        "Resume playback from the saved position",
-        cfg.get_bool("resume_playback", true),
-    );
-    let playback_fields: Vec<(&str, TextCtrl, i64, i64)> = [
-        (
-            "resume_save_interval_s",
-            "Save playback position every (seconds)",
-            15,
-            1,
-            3600,
-        ),
-        (
-            "resume_back_ms",
-            "Rewind on resume (milliseconds)",
-            10_000,
-            0,
-            600_000,
-        ),
-        (
-            "resume_min_ms",
-            "Minimum saved position to resume (milliseconds)",
-            0,
-            0,
-            3_600_000,
-        ),
-        (
-            "resume_complete_threshold_ms",
-            "Treat remaining playback as complete below (milliseconds)",
-            60_000,
-            0,
-            3_600_000,
-        ),
-        (
-            "vlc_network_caching_ms",
-            "VLC network buffer (milliseconds)",
-            1000,
-            0,
-            60_000,
-        ),
-        (
-            "vlc_local_proxy_network_caching_ms",
-            "VLC local proxy network buffer (milliseconds)",
-            1000,
-            0,
-            60_000,
-        ),
-        (
-            "vlc_local_proxy_file_caching_ms",
-            "VLC local proxy file buffer (milliseconds)",
-            1000,
-            0,
-            60_000,
-        ),
-    ]
-    .into_iter()
-    .map(|(key, label, default, lo, hi)| {
-        (
-            key,
-            add_field(
-                &dialog,
-                &sizer,
-                label,
-                &cfg.get_i64(key, default).to_string(),
-                false,
-            ),
-            lo,
-            hi,
-        )
-    })
-    .collect();
-    let mut soundcards = vec![("System default".to_string(), String::new())];
-    soundcards.extend(crate::media_backend::soundcards(&cfg));
-    let saved_soundcard = cfg.get_str("preferred_soundcard", "").to_string();
-    if !saved_soundcard.is_empty() && !soundcards.iter().any(|(_, id)| id == &saved_soundcard) {
-        soundcards.push((
-            format!("Saved device (currently unavailable): {saved_soundcard}"),
-            saved_soundcard.to_string(),
-        ));
-    }
-    let labels: Vec<&str> = soundcards.iter().map(|(label, _)| label.as_str()).collect();
-    let soundcard_choice = add_choice(
-        &dialog,
-        &sizer,
-        "Audio output device",
-        &labels,
-        soundcards
-            .iter()
-            .position(|(_, id)| id == &saved_soundcard)
-            .unwrap_or(0),
-    );
-    let speed_field = add_field(
-        &dialog,
-        &sizer,
-        "Playback speed (1.0 = normal)",
-        &cfg.raw()
-            .get("playback_speed")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(1.0)
-            .to_string(),
-        false,
-    );
-    let seek_back_field = add_field(
-        &dialog,
-        &sizer,
-        "Seek back (milliseconds)",
-        &cfg.get_i64("seek_back_ms", 10_000).to_string(),
-        false,
-    );
-    let seek_fwd_field = add_field(
-        &dialog,
-        &sizer,
-        "Seek forward (milliseconds)",
-        &cfg.get_i64("seek_forward_ms", 10_000).to_string(),
-        false,
-    );
-    let vol_step_field = add_field(
-        &dialog,
-        &sizer,
-        "Volume step (percent)",
-        &cfg.get_i64("volume_step", 5).to_string(),
-        false,
-    );
-    let sponsor_cb = add_check(
-        &dialog,
-        &sizer,
-        "Skip sponsors (SponsorBlock)",
-        cfg.get_bool("sponsorblock_enabled", true),
-    );
-    let sponsor_cats_field = add_field(
-        &dialog,
-        &sizer,
-        "SponsorBlock categories (comma separated)",
-        &cfg.raw()
-            .get("sponsorblock_categories")
-            .and_then(|v| v.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            })
-            .unwrap_or_else(|| "sponsor, selfpromo, interaction".to_string()),
-        false,
-    );
-    let silence_cb = add_check(
-        &dialog,
-        &sizer,
-        "Skip silence in playback",
-        cfg.get_bool("skip_silence", true),
-    );
-    let silence_db_field = add_field(
-        &dialog,
-        &sizer,
-        "Silence threshold (dB)",
-        &cfg.raw()
-            .get("silence_skip_threshold_db")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(-38.0)
-            .to_string(),
-        false,
-    );
-    let silence_ms_field = add_field(
-        &dialog,
-        &sizer,
-        "Minimum silence (milliseconds)",
-        &cfg.get_i64("silence_skip_min_ms", 700).to_string(),
-        false,
-    );
-
-    // Equalizer (its own dialog, opened via the intent
-    // mechanism like Article Columns).
-    add_heading(&dialog, &sizer, "Equalizer");
-    let eq_btn = Button::builder(&dialog)
-        .with_label(&crate::tr("Equalizer..."))
-        .build();
-    sizer.add(&eq_btn, 0, SizerFlag::All, 2);
-
-    // Notifications + sounds.
-    add_heading(&dialog, &sizer, "Notifications and Sounds");
-    let notif_cb = add_check(
-        &dialog,
-        &sizer,
-        "Desktop notifications for new articles",
-        cfg.get_bool("windows_notifications_enabled", false),
-    );
-    let notif_name_cb = add_check(
-        &dialog,
-        &sizer,
-        "Include the feed name in notifications",
-        cfg.get_bool("windows_notifications_include_feed_name", true),
-    );
-    let notif_max_field = add_field(
-        &dialog,
-        &sizer,
-        "Max notifications per refresh (0 = unlimited)",
-        &cfg.get_i64("windows_notifications_max_per_refresh", 0)
-            .to_string(),
-        false,
-    );
-    let notif_summary_cb = add_check(
-        &dialog,
-        &sizer,
-        "Show one summary when notifications are capped",
-        cfg.get_bool("windows_notifications_show_summary_when_capped", true),
-    );
-    let notif_row = BoxSizer::builder(Orientation::Horizontal).build();
-    let exclude_btn = Button::builder(&dialog)
-        .with_label(&crate::tr("Exclude Feeds..."))
-        .build();
-    let test_notif_btn = Button::builder(&dialog)
-        .with_label(&crate::tr("Test Notification"))
-        .build();
-    notif_row.add(&exclude_btn, 0, SizerFlag::All, 4);
-    notif_row.add(&test_notif_btn, 0, SizerFlag::All, 4);
-    sizer.add_sizer(&notif_row, 0, SizerFlag::All, 2);
-    let sounds_cb = add_check(
-        &dialog,
-        &sizer,
-        "Play sounds when a refresh finishes",
-        cfg.get_bool("sounds_enabled", true),
-    );
-
-    // Window / tray / backup / updates / advanced.
-    add_heading(&dialog, &sizer, "Window and Tray");
-    let close_tray_cb = add_check(
-        &dialog,
-        &sizer,
-        "Close button hides to the tray",
-        cfg.get_bool("close_to_tray", false),
-    );
-    let minimize_tray_cb = add_check(
-        &dialog,
-        &sizer,
-        "Minimizing hides to the tray",
-        cfg.get_bool("minimize_to_tray", true),
-    );
-    let start_tray_cb = add_check(
-        &dialog,
-        &sizer,
-        "Start in the system tray",
-        cfg.get_bool("start_in_system_tray", false),
-    );
-    add_heading(&dialog, &sizer, "Backup");
-    let auto_backup_cb = add_check(
-        &dialog,
-        &sizer,
-        "Back up daily, automatically (keeps 7)",
-        cfg.get_bool("auto_backup_enabled", false),
-    );
-    let auto_backup_dir_field = add_field(
-        &dialog,
-        &sizer,
-        "Auto-backup folder (blank = data folder/backups)",
-        cfg.get_str("auto_backup_dir", ""),
-        false,
-    );
-    add_heading(&dialog, &sizer, "Updates");
-    let auto_check_cb = add_check(
-        &dialog,
-        &sizer,
-        "Check for updates on startup",
-        cfg.get_bool("auto_check_updates", true),
-    );
-    let auto_install_cb = add_check(
-        &dialog,
-        &sizer,
-        "Install updates automatically",
-        cfg.get_bool("install_updates_automatically", false),
-    );
-    // Translation (six LLM providers).
-    add_heading(&dialog, &sizer, "Translation");
-    let translation_cb = add_check(
-        &dialog,
-        &sizer,
-        "Translation enabled",
-        cfg.get_bool("translation_enabled", false),
-    );
-    let tr_sel = blindrss_core::translate::PROVIDERS
-        .iter()
-        .position(|p| *p == cfg.get_str("translation_provider", "grok"))
-        .unwrap_or(0);
-    let tr_provider_choice = add_choice(
-        &dialog,
-        &sizer,
-        "Translation provider",
-        &blindrss_core::translate::PROVIDER_LABELS,
-        tr_sel,
-    );
-    let tr_target_field = add_field(
-        &dialog,
-        &sizer,
-        "Target language (code or name)",
-        cfg.get_str("translation_target_language", "en"),
-        false,
-    );
-    let mut tr_fields: Vec<(TextCtrl, TextCtrl)> = Vec::new();
-    for (key, label) in blindrss_core::translate::PROVIDERS
-        .iter()
-        .zip(blindrss_core::translate::PROVIDER_LABELS.iter())
-    {
-        let key_field = add_field(
-            &dialog,
-            &sizer,
-            &format!("{label} API key"),
-            cfg.get_str(&format!("translation_{key}_api_key"), ""),
-            true,
-        );
-        let model_field = add_field(
-            &dialog,
-            &sizer,
-            &format!("{label} model (blank = defaults)"),
-            cfg.get_str(&format!("translation_{key}_model"), ""),
-            false,
-        );
-        tr_fields.push((key_field, model_field));
-    }
-
-    // Translation updates (OTA catalog channel).
-    add_heading(&dialog, &sizer, "Translation Updates");
+    // Translation updates (OTA catalog channel): Python groups
+    // these on General, directly under the language picker.
+    let tu_group = general.group(&crate::tr("Translation Updates"));
     let tu_enabled_cb = add_check(
-        &dialog,
-        &sizer,
+        &general.win,
+        &tu_group,
         "Update translations automatically",
         cfg.get_bool(blindrss_core::translation_updates::CFG_ENABLED, true),
     );
@@ -1041,21 +429,21 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
         })
         .unwrap_or(1);
     let tu_freq_choice = add_choice(
-        &dialog,
-        &sizer,
+        &general.win,
+        &tu_group,
         "Check for updates:",
         &["10 minutes", "Daily", "Weekly", "Monthly"],
         tu_freq_sel,
     );
-    let tu_status = StaticText::builder(&dialog).with_label("").build();
+    let tu_status = StaticText::builder(&general.win).with_label("").build();
     {
         let row = BoxSizer::builder(Orientation::Horizontal).build();
-        let check_btn = Button::builder(&dialog)
+        let check_btn = Button::builder(&general.win)
             .with_label(&crate::tr("Check for Updates"))
             .build();
         row.add(&check_btn, 0, SizerFlag::All, 4);
         row.add(&tu_status, 0, SizerFlag::All, 4);
-        sizer.add_sizer(&row, 0, SizerFlag::Expand | SizerFlag::All, 2);
+        tu_group.add_sizer(&row, 0, SizerFlag::Expand | SizerFlag::All, 2);
         let (txc, rxc) = std::sync::mpsc::channel::<String>();
         let rxc = std::rc::Rc::new(std::cell::RefCell::new(rxc));
         let timer = Box::leak(Box::new(Timer::new(&dialog)));
@@ -1120,7 +508,825 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
         });
     }
 
-    add_heading(&dialog, &sizer, "Advanced");
+    // Python's tree-state control is an expanded/collapsed choice;
+    // the Rust checkbox for the same key predates this restructure
+    // and keeps its form.
+    let expand_cb = add_check(
+        &general.win,
+        &general.sizer,
+        "Expand categories by default",
+        cfg.get_bool("category_tree_default_expanded", false),
+    );
+    // Article opening (Python issue #31): default browser or a
+    // custom command template with %1 for the URL.
+    let open_method_choice = add_choice(
+        &general.win,
+        &general.sizer,
+        "Article opening method:",
+        &["Default browser", "Custom command"],
+        if cfg
+            .get_str("article_open_method", "default")
+            .eq_ignore_ascii_case("custom")
+        {
+            1
+        } else {
+            0
+        },
+    );
+    let open_cmd_row = BoxSizer::builder(Orientation::Horizontal).build();
+    let open_cmd_label = StaticText::builder(&general.win)
+        .with_label("Custom command:")
+        .build();
+    let open_cmd_field = TextCtrl::builder(&general.win).build();
+    open_cmd_field.set_value(cfg.get_str("article_open_command", ""));
+    let open_cmd_test_btn = Button::builder(&general.win)
+        .with_label(&crate::tr("Test"))
+        .build();
+    open_cmd_row.add(&open_cmd_label, 0, SizerFlag::All, 4);
+    open_cmd_row.add(&open_cmd_field, 1, SizerFlag::Expand | SizerFlag::All, 4);
+    open_cmd_row.add(&open_cmd_test_btn, 0, SizerFlag::All, 4);
+    general
+        .sizer
+        .add_sizer(&open_cmd_row, 0, SizerFlag::Expand | SizerFlag::All, 2);
+    add_note(
+        &general.win,
+        &general.sizer,
+        &crate::tr("Use %1 for the article URL. Example: chrome --incognito %1"),
+    );
+
+    // Startup & Tray group (a group inside General in Python, not
+    // its own tab).
+    let startup_group = general.group(&crate::tr("Startup && Tray"));
+    let close_tray_cb = add_check(
+        &general.win,
+        &startup_group,
+        "Close to system tray",
+        cfg.get_bool("close_to_tray", false),
+    );
+    let minimize_tray_cb = add_check(
+        &general.win,
+        &startup_group,
+        "Minimize to system tray",
+        cfg.get_bool("minimize_to_tray", true),
+    );
+    let start_tray_cb = add_check(
+        &general.win,
+        &startup_group,
+        "Start BlindRSS in the system tray",
+        cfg.get_bool("start_in_system_tray", false),
+    );
+    let hotkey_field = add_field(
+        &general.win,
+        &startup_group,
+        "Show or hide BlindRSS from anywhere (hotkey, blank to turn off):",
+        cfg.get_str("global_show_hide_hotkey", "Ctrl+Alt+B"),
+        false,
+    );
+    let maximized_cb = add_check(
+        &general.win,
+        &startup_group,
+        "Always start maximized",
+        cfg.get_bool("start_maximized", false),
+    );
+    let auto_check_cb = add_check(
+        &general.win,
+        &startup_group,
+        "Check for updates on startup",
+        cfg.get_bool("auto_check_updates", true),
+    );
+    // Start at login (Python windows_integration): the checkbox
+    // mirrors the config key; saving applies the OS registration
+    // when the value changed. Disabled where unsupported.
+    let start_login_cb = add_check(
+        &general.win,
+        &startup_group,
+        crate::startup::setting_label(),
+        cfg.get_bool("start_on_windows_login", false),
+    );
+    if !crate::startup::supported() {
+        start_login_cb.enable(false);
+    }
+
+    // Backup group (inside General in Python).
+    let backup_group = general.group(&crate::tr("Backup"));
+    let auto_backup_cb = add_check(
+        &general.win,
+        &backup_group,
+        "Back up BlindRSS data automatically once a day (keeps the last 7)",
+        cfg.get_bool("auto_backup_enabled", false),
+    );
+    let auto_backup_dir_field = add_field(
+        &general.win,
+        &backup_group,
+        "Automatic backup folder (blank = Backups beside your data):",
+        cfg.get_str("auto_backup_dir", ""),
+        false,
+    );
+
+    // ---- Feeds & Articles page (Python's order) ----
+    // Refresh scheduling (Python keys: refresh_interval is in
+    // seconds, 300 default, 0 = off; Python picks from presets,
+    // the Rust field takes seconds directly, as before).
+    let interval_field = add_field(
+        &feeds.win,
+        &feeds.sizer,
+        "Refresh Interval (seconds, 0 = off):",
+        &cfg.get_i64("refresh_interval", 300).to_string(),
+        false,
+    );
+    // Refresh engine (Audit 3 keys).
+    let max_conc_field = add_field(
+        &feeds.win,
+        &feeds.sizer,
+        "Max Concurrent Refreshes:",
+        &cfg.get_i64("max_concurrent_refreshes", 16).to_string(),
+        false,
+    );
+    let per_host_field = add_field(
+        &feeds.win,
+        &feeds.sizer,
+        "Max Connections Per Host:",
+        &cfg.get_i64("per_host_max_connections", 4).to_string(),
+        false,
+    );
+    let timeout_field = add_field(
+        &feeds.win,
+        &feeds.sizer,
+        "Feed Timeout (seconds):",
+        &cfg.get_i64("feed_timeout_seconds", 15).to_string(),
+        false,
+    );
+    let retries_field = add_field(
+        &feeds.win,
+        &feeds.sizer,
+        "Feed Retry Attempts:",
+        &cfg.get_i64("feed_retry_attempts", 1).to_string(),
+        false,
+    );
+    let cache_full_text_cb = add_check(
+        &feeds.win,
+        &feeds.sizer,
+        "Prefer web extraction over cached provider full text",
+        cfg.get_bool("cache_full_text", false),
+    );
+    let retention_labels: Vec<String> = blindrss_core::retention::RETENTION_CHOICES
+        .iter()
+        .map(|(id, _)| blindrss_core::retention::retention_label(id))
+        .collect();
+    let retention_refs: Vec<&str> = retention_labels.iter().map(|s| s.as_str()).collect();
+    let art_ret_sel = blindrss_core::retention::RETENTION_CHOICES
+        .iter()
+        .position(|(id, _)| *id == cfg.get_str("article_retention", "unlimited"))
+        .unwrap_or(11);
+    let art_ret_choice = add_choice(
+        &feeds.win,
+        &feeds.sizer,
+        "Article Retention:",
+        &retention_refs,
+        art_ret_sel,
+    );
+    let refresh_startup_cb = add_check(
+        &feeds.win,
+        &feeds.sizer,
+        "Automatically refresh feeds upon start",
+        cfg.get_bool("refresh_on_startup", true),
+    );
+    let workload = cfg.get_str(
+        "automatic_feed_refresh_workload",
+        if cfg.get_bool("ignore_feed_cache", false) {
+            "always_full"
+        } else {
+            "startup_full"
+        },
+    );
+    let refresh_workload = add_choice(
+        &feeds.win,
+        &feeds.sizer,
+        "Local RSS automatic refresh workload:",
+        &[
+            "Use feed cache (fastest)",
+            "Fully refresh feeds at startup",
+            "Always fully refresh feeds",
+        ],
+        match workload {
+            "cached" => 0,
+            "always_full" => 2,
+            _ => 1,
+        },
+    );
+    add_note(
+        &feeds.win,
+        &feeds.sizer,
+        &crate::tr(
+            "Using the Local RSS feed cache lowers CPU and network use. Manual Refresh All always checks every feed.",
+        ),
+    );
+    add_note(
+        &feeds.win,
+        &feeds.sizer,
+        &crate::tr(
+            "Article formatting: preserve structure from the original page as spoken text markers. Applies to newly loaded articles and full text.",
+        ),
+    );
+    let structure_choices: Vec<(&str, CheckBox)> = [
+        (
+            "article_structure_tables",
+            "Describe tables (\"Table with 3 rows...\" and one line per row)",
+            true,
+        ),
+        (
+            "article_structure_headings",
+            "Announce headings (\"Heading level 2:\" before each heading)",
+            false,
+        ),
+        (
+            "article_structure_lists",
+            "Mark list items with bullets and numbers",
+            false,
+        ),
+        (
+            "article_structure_quotes",
+            "Mark quotations (\"Quote:\" before and \"End of quote.\" after)",
+            false,
+        ),
+        (
+            "article_structure_links",
+            "Show links as \"text (address)\" and open the link at the cursor with Enter",
+            false,
+        ),
+    ]
+    .into_iter()
+    .map(|(key, label, default)| {
+        (
+            key,
+            add_check(&feeds.win, &feeds.sizer, label, cfg.get_bool(key, default)),
+        )
+    })
+    .collect();
+    let rich_view_cb = add_check(
+        &feeds.win,
+        &feeds.sizer,
+        "Rich full-text view: show links, embedded videos, and tweets in a web view (instead of plain text). Falls back to plain text if unavailable.",
+        cfg.get_bool("full_text_rich_view", false),
+    );
+
+    // ---- YouTube page (Python's order) ----
+    add_note(
+        &youtube.win,
+        &youtube.sizer,
+        &crate::tr(
+            "Cookies are only needed for age-restricted, private, or members-only content. BlindRSS reads them automatically from your installed browsers (Firefox, Chrome, Edge, Brave, Opera, Vivaldi, Chromium and their beta/nightly variants). A cookies.txt export remains a manual fallback.",
+        ),
+    );
+    let cookies_file_field = add_field(
+        &youtube.win,
+        &youtube.sizer,
+        "yt-dlp cookies file path",
+        cfg.get_str("ytdlp_cookies_file", ""),
+        false,
+    );
+    let browser_cookie_import_cb = add_check(
+        &youtube.win,
+        &youtube.sizer,
+        "Read cookies directly from installed browsers (Firefox, Chrome, Edge, Brave, Opera, Vivaldi, Chromium and their beta/nightly variants). Chrome/Edge/Brave need a one-time Windows permission prompt.",
+        cfg.get_bool("installed_browser_cookie_import_enabled", false),
+    );
+    let dep_prompt_cb = add_check(
+        &youtube.win,
+        &youtube.sizer,
+        "Ask to install missing media dependencies on startup",
+        cfg.get_bool("prompt_missing_dependencies_on_startup", true),
+    );
+    let sponsor_cb = add_check(
+        &youtube.win,
+        &youtube.sizer,
+        "Skip SponsorBlock segments in YouTube videos (crowdsourced)",
+        cfg.get_bool("sponsorblock_enabled", true),
+    );
+    // Python picks the categories in a checklist; the Rust control
+    // is the comma-separated field it has always been.
+    let sponsor_cats_field = add_field(
+        &youtube.win,
+        &youtube.sizer,
+        "SponsorBlock categories (comma separated)",
+        &cfg.raw()
+            .get("sponsorblock_categories")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_else(|| "sponsor, selfpromo, interaction".to_string()),
+        false,
+    );
+    // YouTube account sign-in (its own dialog; Python reaches it
+    // from the Tools menu, the settings entry point is Rust's).
+    let youtube_btn = Button::builder(&youtube.win)
+        .with_label(&crate::tr("Connect YouTube Account..."))
+        .build();
+    youtube.sizer.add(&youtube_btn, 0, SizerFlag::All, 2);
+
+    // ---- Media Player page (Python's order) ----
+    let mut soundcards = vec![("System Default".to_string(), String::new())];
+    soundcards.extend(crate::media_backend::soundcards(&cfg));
+    let saved_soundcard = cfg.get_str("preferred_soundcard", "").to_string();
+    if !saved_soundcard.is_empty() && !soundcards.iter().any(|(_, id)| id == &saved_soundcard) {
+        soundcards.push((
+            format!("Saved device (currently unavailable): {saved_soundcard}"),
+            saved_soundcard.to_string(),
+        ));
+    }
+    let labels: Vec<&str> = soundcards.iter().map(|(label, _)| label.as_str()).collect();
+    let soundcard_choice = add_choice(
+        &media.win,
+        &media.sizer,
+        "Preferred Soundcard:",
+        &labels,
+        soundcards
+            .iter()
+            .position(|(_, id)| id == &saved_soundcard)
+            .unwrap_or(0),
+    );
+    let silence_cb = add_check(
+        &media.win,
+        &media.sizer,
+        "Skip Silence (Experimental)",
+        cfg.get_bool("skip_silence", true),
+    );
+    let speed_field = add_field(
+        &media.win,
+        &media.sizer,
+        "Default Playback Speed:",
+        &cfg.raw()
+            .get("playback_speed")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(1.0)
+            .to_string(),
+        false,
+    );
+    let show_player_cb = add_check(
+        &media.win,
+        &media.sizer,
+        "Show player window when starting playback",
+        cfg.get_bool("show_player_on_play", true),
+    );
+    let resume_cb = add_check(
+        &media.win,
+        &media.sizer,
+        "Resume playback from the saved position",
+        cfg.get_bool("resume_playback", true),
+    );
+    let playback_fields: Vec<(&str, TextCtrl, i64, i64)> = [
+        (
+            "vlc_network_caching_ms",
+            "Network Cache (ms):",
+            1000,
+            0,
+            60_000,
+        ),
+        (
+            "resume_save_interval_s",
+            "Save playback position every (seconds)",
+            15,
+            1,
+            3600,
+        ),
+        (
+            "resume_back_ms",
+            "Rewind on resume (milliseconds)",
+            10_000,
+            0,
+            600_000,
+        ),
+        (
+            "resume_min_ms",
+            "Minimum saved position to resume (milliseconds)",
+            0,
+            0,
+            3_600_000,
+        ),
+        (
+            "resume_complete_threshold_ms",
+            "Treat remaining playback as complete below (milliseconds)",
+            60_000,
+            0,
+            3_600_000,
+        ),
+        (
+            "vlc_local_proxy_network_caching_ms",
+            "VLC local proxy network buffer (milliseconds)",
+            1000,
+            0,
+            60_000,
+        ),
+        (
+            "vlc_local_proxy_file_caching_ms",
+            "VLC local proxy file buffer (milliseconds)",
+            1000,
+            0,
+            60_000,
+        ),
+    ]
+    .into_iter()
+    .map(|(key, label, default, lo, hi)| {
+        (
+            key,
+            add_field(
+                &media.win,
+                &media.sizer,
+                label,
+                &cfg.get_i64(key, default).to_string(),
+                false,
+            ),
+            lo,
+            hi,
+        )
+    })
+    .collect();
+    let seek_back_field = add_field(
+        &media.win,
+        &media.sizer,
+        "Seek back (milliseconds)",
+        &cfg.get_i64("seek_back_ms", 10_000).to_string(),
+        false,
+    );
+    let seek_fwd_field = add_field(
+        &media.win,
+        &media.sizer,
+        "Seek forward (milliseconds)",
+        &cfg.get_i64("seek_forward_ms", 10_000).to_string(),
+        false,
+    );
+    let vol_step_field = add_field(
+        &media.win,
+        &media.sizer,
+        "Volume step (percent)",
+        &cfg.get_i64("volume_step", 5).to_string(),
+        false,
+    );
+    let silence_db_field = add_field(
+        &media.win,
+        &media.sizer,
+        "Silence threshold (dB)",
+        &cfg.raw()
+            .get("silence_skip_threshold_db")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(-38.0)
+            .to_string(),
+        false,
+    );
+    let silence_ms_field = add_field(
+        &media.win,
+        &media.sizer,
+        "Minimum silence (milliseconds)",
+        &cfg.get_i64("silence_skip_min_ms", 700).to_string(),
+        false,
+    );
+    // Equalizer (its own dialog, opened via the intent mechanism
+    // like Article Columns).
+    let eq_btn = Button::builder(&media.win)
+        .with_label(&crate::tr("Equalizer..."))
+        .build();
+    media.sizer.add(&eq_btn, 0, SizerFlag::All, 2);
+
+    // Media tools group (Python's group on the Media Player page):
+    // user-chosen executable paths take the highest detection
+    // priority (blank = auto-detect).
+    let tools_group = media.group(&crate::tr("Media tools (ffmpeg, ffprobe, yt-dlp)"));
+    let ffmpeg_path_field = add_field(
+        &media.win,
+        &tools_group,
+        "FFmpeg path:",
+        cfg.get_str("custom_ffmpeg_path", ""),
+        false,
+    );
+    let ffprobe_path_field = add_field(
+        &media.win,
+        &tools_group,
+        "FFprobe path:",
+        cfg.get_str("custom_ffprobe_path", ""),
+        false,
+    );
+    let ytdlp_path_field = add_field(
+        &media.win,
+        &tools_group,
+        "yt-dlp path:",
+        cfg.get_str("custom_ytdlp_path", ""),
+        false,
+    );
+
+    // Downloads group: Python builds the Downloads panel eagerly
+    // and shows it inside the Media Player page under this group
+    // (it is not a notebook page of its own).
+    let downloads_group = media.group(&crate::tr("Downloads"));
+    let downloads_enabled_cb = add_check(
+        &media.win,
+        &downloads_group,
+        "Enable Downloads",
+        cfg.get_bool("downloads_enabled", false),
+    );
+    let dl_path = add_field(
+        &media.win,
+        &downloads_group,
+        "Download Path:",
+        &get_path(&cfg, "download_path"),
+        false,
+    );
+    let dl_ret_sel = blindrss_core::retention::RETENTION_CHOICES
+        .iter()
+        .position(|(id, _)| *id == cfg.get_str("download_retention", "unlimited"))
+        .unwrap_or(11);
+    let dl_ret_choice = add_choice(
+        &media.win,
+        &downloads_group,
+        "Retention Policy:",
+        &retention_refs,
+        dl_ret_sel,
+    );
+    let format_labels: Vec<&str> = blindrss_core::download::DOWNLOAD_FORMAT_IDS
+        .iter()
+        .map(|id| blindrss_core::download::download_format_label(id))
+        .collect();
+    let format_sel = blindrss_core::download::DOWNLOAD_FORMAT_IDS
+        .iter()
+        .position(|id| *id == cfg.get_str("download_format", "video_best"))
+        .unwrap_or(0);
+    let format_choice = add_choice(
+        &media.win,
+        &downloads_group,
+        "Default video download format:",
+        &format_labels,
+        format_sel,
+    );
+    let max_dl_field = add_field(
+        &media.win,
+        &downloads_group,
+        "Max downloads kept in the queue",
+        &cfg.get_i64("max_downloads", 32).to_string(),
+        false,
+    );
+
+    // Sounds group (inside Media Player in Python).
+    let sounds_group = media.group(&crate::tr("Sounds"));
+    let sounds_cb = add_check(
+        &media.win,
+        &sounds_group,
+        "Enable Sound Notifications",
+        cfg.get_bool("sounds_enabled", true),
+    );
+
+    // ---- Provider page (Python's order: active provider, then
+    // the per-provider panels in Python's panel order) ----
+    // Active provider (Python's Provider page + factory.py):
+    // the backend the whole UI reads/writes through.
+    let active_sel = blindrss_core::provider::PROVIDER_NAMES
+        .iter()
+        .position(|n| *n == cfg.get_str("active_provider", "local"))
+        .unwrap_or(0);
+    let active_choice = add_choice(
+        &provider.win,
+        &provider.sizer,
+        "Active Provider:",
+        &blindrss_core::provider::PROVIDER_LABELS,
+        active_sel,
+    );
+    let mini_url = add_field(
+        &provider.win,
+        &provider.sizer,
+        "Miniflux URL:",
+        &get_path(&cfg, "providers.miniflux.url"),
+        false,
+    );
+    let mini_key = add_field(
+        &provider.win,
+        &provider.sizer,
+        "Miniflux API Key:",
+        &get_path(&cfg, "providers.miniflux.api_key"),
+        true,
+    );
+    let tor_email = add_field(
+        &provider.win,
+        &provider.sizer,
+        "The Old Reader Email:",
+        &get_path(&cfg, "providers.theoldreader.email"),
+        false,
+    );
+    let tor_pass = add_field(
+        &provider.win,
+        &provider.sizer,
+        "The Old Reader Password:",
+        &get_path(&cfg, "providers.theoldreader.password"),
+        true,
+    );
+    let ino_id = add_field(
+        &provider.win,
+        &provider.sizer,
+        "Inoreader App ID:",
+        &get_path(&cfg, "providers.inoreader.app_id"),
+        false,
+    );
+    let ino_key = add_field(
+        &provider.win,
+        &provider.sizer,
+        "Inoreader App Key:",
+        &get_path(&cfg, "providers.inoreader.app_key"),
+        true,
+    );
+    let baz_email = add_field(
+        &provider.win,
+        &provider.sizer,
+        "BazQux Email:",
+        &get_path(&cfg, "providers.bazqux.email"),
+        false,
+    );
+    let baz_pass = add_field(
+        &provider.win,
+        &provider.sizer,
+        "BazQux Password:",
+        &get_path(&cfg, "providers.bazqux.password"),
+        true,
+    );
+    let provider_btn_row = BoxSizer::builder(Orientation::Horizontal).build();
+    let connect_btn = Button::builder(&provider.win)
+        .with_label(&crate::tr("Connect Inoreader..."))
+        .build();
+    let connect_listener_btn = Button::builder(&provider.win)
+        .with_label(&crate::tr("Connect Inoreader (browser sign-in)..."))
+        .build();
+    let test_miniflux_btn = Button::builder(&provider.win)
+        .with_label(&crate::tr("Test Miniflux Connection"))
+        .build();
+    provider_btn_row.add(&connect_btn, 0, SizerFlag::All, 4);
+    provider_btn_row.add(&connect_listener_btn, 0, SizerFlag::All, 4);
+    provider_btn_row.add(&test_miniflux_btn, 0, SizerFlag::All, 4);
+    provider
+        .sizer
+        .add_sizer(&provider_btn_row, 0, SizerFlag::All, 2);
+
+    // ---- Notifications page (Python's order, with the
+    // Announcements group it absorbs) ----
+    add_note(
+        &notifications.win,
+        &notifications.sizer,
+        &crate::tr("Windows toast notifications for new articles. Disabled by default."),
+    );
+    let notif_cb = add_check(
+        &notifications.win,
+        &notifications.sizer,
+        "Enable notifications for new articles",
+        cfg.get_bool("windows_notifications_enabled", false),
+    );
+    let notif_name_cb = add_check(
+        &notifications.win,
+        &notifications.sizer,
+        "Include feed name in notification text",
+        cfg.get_bool("windows_notifications_include_feed_name", true),
+    );
+    let notif_max_field = add_field(
+        &notifications.win,
+        &notifications.sizer,
+        "Max notifications per refresh (0 = no limit):",
+        &cfg.get_i64("windows_notifications_max_per_refresh", 0)
+            .to_string(),
+        false,
+    );
+    let notif_summary_cb = add_check(
+        &notifications.win,
+        &notifications.sizer,
+        "Show a summary notification when notification cap is reached",
+        cfg.get_bool("windows_notifications_show_summary_when_capped", true),
+    );
+    let notif_row = BoxSizer::builder(Orientation::Horizontal).build();
+    let test_notif_btn = Button::builder(&notifications.win)
+        .with_label(&crate::tr("Test Notification"))
+        .build();
+    let exclude_btn = Button::builder(&notifications.win)
+        .with_label(&crate::tr("Exclude Feeds..."))
+        .build();
+    notif_row.add(&test_notif_btn, 0, SizerFlag::All, 4);
+    notif_row.add(&exclude_btn, 0, SizerFlag::All, 4);
+    notifications
+        .sizer
+        .add_sizer(&notif_row, 0, SizerFlag::All, 2);
+
+    // Announcements group (PARITY 7.4): per-event speech/Braille
+    // mode, mirroring Python's announcements group on this page.
+    let announce_group = notifications.group(&crate::tr("Announcements"));
+    let current_modes = blindrss_core::announce::Announcements::from_config(&cfg);
+    let mut announce_choices: Vec<Choice> = Vec::new();
+    for ev in blindrss_core::announce::EVENTS.iter() {
+        let row = BoxSizer::builder(Orientation::Horizontal).build();
+        let lbl = StaticText::builder(&notifications.win)
+            .with_label(ev.label)
+            .build();
+        row.add(&lbl, 1, SizerFlag::All, 4);
+        let choice = Choice::builder(&notifications.win).build();
+        for label in blindrss_core::announce::MODE_LABELS {
+            choice.append(label);
+        }
+        choice.set_selection(current_modes.mode_index(ev.id) as u32);
+        row.add(&choice, 0, SizerFlag::All, 4);
+        announce_group.add_sizer(&row, 0, SizerFlag::Expand | SizerFlag::All, 2);
+        announce_choices.push(choice);
+    }
+    let announce_test_btn = Button::builder(&notifications.win)
+        .with_label(&crate::tr("Test Announcement"))
+        .build();
+    announce_group.add(&announce_test_btn, 0, SizerFlag::All, 4);
+
+    // ---- Translate page (six LLM providers, Python's order:
+    // model field before API key for each provider) ----
+    add_note(
+        &translate.win,
+        &translate.sizer,
+        &crate::tr(
+            "Configure automatic article translation. Your API key is stored locally in config.json.",
+        ),
+    );
+    let translation_cb = add_check(
+        &translate.win,
+        &translate.sizer,
+        "Enable automatic translation for article content",
+        cfg.get_bool("translation_enabled", false),
+    );
+    let tr_sel = blindrss_core::translate::PROVIDERS
+        .iter()
+        .position(|p| *p == cfg.get_str("translation_provider", "grok"))
+        .unwrap_or(0);
+    let tr_provider_choice = add_choice(
+        &translate.win,
+        &translate.sizer,
+        "Provider:",
+        &blindrss_core::translate::PROVIDER_LABELS,
+        tr_sel,
+    );
+    let tr_target_field = add_field(
+        &translate.win,
+        &translate.sizer,
+        "Target language:",
+        cfg.get_str("translation_target_language", "en"),
+        false,
+    );
+    let mut tr_fields: Vec<(TextCtrl, TextCtrl)> = Vec::new();
+    for (key, label) in blindrss_core::translate::PROVIDERS
+        .iter()
+        .zip(blindrss_core::translate::PROVIDER_LABELS.iter())
+    {
+        let model_field = add_field(
+            &translate.win,
+            &translate.sizer,
+            &format!("{label} model (optional):"),
+            cfg.get_str(&format!("translation_{key}_model"), ""),
+            false,
+        );
+        let key_field = add_field(
+            &translate.win,
+            &translate.sizer,
+            &format!("{label} API key:"),
+            cfg.get_str(&format!("translation_{key}_api_key"), ""),
+            true,
+        );
+        tr_fields.push((key_field, model_field));
+    }
+
+    // ---- List Headers page ----
+    // Python's page IS the ColumnLayoutPanel. The Rust column
+    // editor is the separate Article Columns dialog
+    // (dialogs::show_article_columns), which loads the layout
+    // from config and saves it on its own OK; embedding it here
+    // would duplicate that editor inside this file. The page
+    // therefore opens it through the existing "columns" intent,
+    // exactly as the old Article Columns... button did.
+    add_note(
+        &headers.win,
+        &headers.sizer,
+        &crate::tr(
+            "Choose which columns the article list shows, and in what order. The editor opens as its own dialog and saves when you choose OK there.",
+        ),
+    );
+    let columns_btn = Button::builder(&headers.win)
+        .with_label(&crate::tr("Article Columns..."))
+        .build();
+    headers.sizer.add(&columns_btn, 0, SizerFlag::All, 2);
+
+    // ---- Advanced page (Python's groups, in its order) ----
+    let storage_group = advanced.group(&crate::tr("Data Storage Location"));
+    let data_loc = StaticText::builder(&advanced.win)
+        .with_label(&format!("Data folder: {}", crate::data_dir().display()))
+        .build();
+    storage_group.add(&data_loc, 0, SizerFlag::All, 4);
+    let updates_group = advanced.group(&crate::tr("Updates"));
+    let auto_install_cb = add_check(
+        &advanced.win,
+        &updates_group,
+        "Automatically install updates without confirmation",
+        cfg.get_bool("install_updates_automatically", false),
+    );
+    // Browser identity (core user_agents): the User-Agent the
+    // app reports when fetching feeds and articles.
+    let ua_group = advanced.group(&crate::tr("Browser Identification"));
     let mut ua_options: Vec<(String, String)> =
         vec![("auto".into(), "Automatic (matches this computer)".into())];
     ua_options.extend(blindrss_core::user_agents::installed_choices());
@@ -1148,60 +1354,65 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
         .position(|(key, _)| key == &ua_mode0)
         .unwrap_or(0);
     let ua_items: Vec<&str> = ua_options.iter().map(|(_, label)| label.as_str()).collect();
-    let ua_choice = add_choice(
-        &dialog,
-        &sizer,
-        "Browser identity (User-Agent)",
-        &ua_items,
-        ua_sel,
-    );
+    let ua_choice = add_choice(&advanced.win, &ua_group, "Identify as:", &ua_items, ua_sel);
     let ua_custom_field = add_field(
-        &dialog,
-        &sizer,
-        "Custom User-Agent",
+        &advanced.win,
+        &ua_group,
+        "Custom User-Agent:",
         cfg.get_str("user_agent_custom", ""),
         false,
     );
-    let cookies_file_field = add_field(
-        &dialog,
-        &sizer,
-        "yt-dlp cookies file (optional)",
-        cfg.get_str("ytdlp_cookies_file", ""),
-        false,
-    );
-    let dep_prompt_cb = add_check(
-        &dialog,
-        &sizer,
-        "Prompt about missing tools (yt-dlp, ffmpeg) on startup",
-        cfg.get_bool("prompt_missing_dependencies_on_startup", true),
+
+    // ---- CAPTCHA Solving page (Python's order) ----
+    add_note(
+        &captcha_page.win,
+        &captcha_page.sizer,
+        &crate::tr(
+            "Optional paid CAPTCHA-solving service for sites whose Cloudflare challenge defeats every automated browser attempt. BlindRSS then sends only the challenge parameters to the service and injects the solved token. The service sees which blocked URL is being solved. Your API key is stored locally in config.json.",
+        ),
     );
     let captcha_cb = add_check(
-        &dialog,
-        &sizer,
-        "Captcha solver enabled (last-resort fallback)",
+        &captcha_page.win,
+        &captcha_page.sizer,
+        "Enable CAPTCHA solving service (last resort, per-solve fees apply)",
         cfg.get_bool("captcha_solver_enabled", false),
     );
+    // Python picks the service in a choice of 2captcha /
+    // SolveCaptcha; the Rust control is the free-text field it
+    // has always been.
     let captcha_provider_field = add_field(
-        &dialog,
-        &sizer,
-        "Captcha solver provider",
+        &captcha_page.win,
+        &captcha_page.sizer,
+        "Service:",
         cfg.get_str("captcha_solver_provider", ""),
         false,
     );
     let captcha_key_field = add_field(
-        &dialog,
-        &sizer,
-        "Captcha solver API key",
+        &captcha_page.win,
+        &captcha_page.sizer,
+        "API key:",
         cfg.get_str("captcha_solver_api_key", ""),
         true,
     );
-    let data_loc = StaticText::builder(&dialog)
-        .with_label(&format!("Data folder: {}", crate::data_dir().display()))
-        .build();
-    sizer.add(&data_loc, 0, SizerFlag::All, 4);
+
+    for page in [
+        &general,
+        &feeds,
+        &youtube,
+        &media,
+        &provider,
+        &notifications,
+        &translate,
+        &headers,
+        &advanced,
+        &captcha_page,
+    ] {
+        page.finish();
+    }
 
     // Maintenance actions (moved off the main window, Brandon
-    // 2026-10-30): each saves the fields, closes the dialog, and
+    // 2026-10-30): dialog-level, below the notebook like Python's
+    // OK/Cancel row. Each saves the fields, closes the dialog, and
     // reports its name back so the caller runs it on the main frame.
     let intent: std::rc::Rc<std::cell::RefCell<Option<&'static str>>> =
         std::rc::Rc::new(std::cell::RefCell::new(None));
@@ -1232,9 +1443,6 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
     let update_btn = Button::builder(&dialog)
         .with_label(&crate::tr("Check for Updates"))
         .build();
-    let columns_btn = Button::builder(&dialog)
-        .with_label(&crate::tr("Article Columns..."))
-        .build();
     maint_row1.add(&backup_btn, 0, SizerFlag::All, 4);
     maint_row1.add(&restore_btn, 0, SizerFlag::All, 4);
     maint_row1.add(&takeout_btn, 0, SizerFlag::All, 4);
@@ -1242,53 +1450,21 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
     maint_row2.add(&sync_btn, 0, SizerFlag::All, 4);
     maint_row2.add(&prune_btn, 0, SizerFlag::All, 4);
     maint_row2.add(&update_btn, 0, SizerFlag::All, 4);
-    maint_row2.add(&columns_btn, 0, SizerFlag::All, 4);
     sizer.add_sizer(&maint_row1, 0, SizerFlag::All, 2);
     sizer.add_sizer(&maint_row2, 0, SizerFlag::All, 2);
 
-    let btn_row2 = BoxSizer::builder(Orientation::Horizontal).build();
-    let connect_listener_btn = Button::builder(&dialog)
-        .with_label(&crate::tr("Connect Inoreader (browser sign-in)..."))
-        .build();
-    let test_miniflux_btn = Button::builder(&dialog)
-        .with_label(&crate::tr("Test Miniflux Connection"))
-        .build();
-    let youtube_btn = Button::builder(&dialog)
-        .with_label(&crate::tr("Connect YouTube Account..."))
-        .build();
-    btn_row2.add(&connect_listener_btn, 0, SizerFlag::All, 4);
-    btn_row2.add(&test_miniflux_btn, 0, SizerFlag::All, 4);
-    btn_row2.add(&youtube_btn, 0, SizerFlag::All, 4);
-    sizer.add_sizer(&btn_row2, 0, SizerFlag::All, 2);
-
     let btn_row = BoxSizer::builder(Orientation::Horizontal).build();
-    let connect_btn = Button::builder(&dialog)
-        .with_label(&crate::tr("Connect Inoreader..."))
-        .build();
     let save_btn = Button::builder(&dialog)
         .with_label(&crate::tr("Save"))
         .build();
     let cancel_btn = Button::builder(&dialog)
         .with_label(&crate::tr("Cancel"))
         .build();
-    btn_row.add(&connect_btn, 0, SizerFlag::All, 4);
     btn_row.add(&save_btn, 0, SizerFlag::All, 4);
     btn_row.add(&cancel_btn, 0, SizerFlag::All, 4);
     sizer.add_sizer(&btn_row, 0, SizerFlag::All, 4);
-    let browser_cookie_import_cb = add_check(
-        &dialog,
-        &sizer,
-        "Import signed-in cookies from installed browsers",
-        cfg.get_bool("installed_browser_cookie_import_enabled", false),
-    );
-    let cache_full_text_cb = add_check(
-        &dialog,
-        &sizer,
-        "Prefer web extraction over cached provider full text",
-        cfg.get_bool("cache_full_text", false),
-    );
     dialog.set_sizer(sizer, true);
-    dialog.set_size(Size::new(620, 1180));
+    dialog.set_size(Size::new(660, 780));
 
     let cfg_path_buf = config_path.to_path_buf();
     let cfg_path_connect = config_path.to_path_buf();
@@ -1371,9 +1547,8 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
                 modes.set_mode(ev.id, blindrss_core::announce::MODE_ORDER[idx.min(3)]);
             }
             cfg.set_path("announcements", modes.to_json());
-            // Batch 5 pages: refresh engine, reading, downloads,
-            // player, notifications/sounds, tray, backup,
-            // updates, advanced.
+            // Refresh engine, reading, downloads, player,
+            // notifications/sounds, tray, backup, updates, advanced.
             let num = |f: &TextCtrl, key: &str, lo: i64, hi: i64| {
                 if let Ok(v) = f.get_value().trim().parse::<i64>() {
                     Some((key.to_string(), v.clamp(lo, hi)))
@@ -1442,7 +1617,7 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
             );
             cfg.set_path(
                 "search_mode",
-                serde_json::json!(if search_mode_choice.get_selection() == Some(1) {
+                serde_json::json!(if search_mode_choice.get_selection() == Some(0) {
                     "title_only"
                 } else {
                     "title_content"
@@ -1602,8 +1777,8 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
                 "captcha_solver_api_key",
                 serde_json::json!(captcha_key_field.get_value()),
             );
-            // Audit 4 additions: reading (image alt, article
-            // opening), external tool paths, start at login.
+            // Reading (image alt, article opening), external tool
+            // paths, start at login.
             cfg.set_path(
                 "show_image_alt",
                 serde_json::json!(show_alt_cb.is_checked()),

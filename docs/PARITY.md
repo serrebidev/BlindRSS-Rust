@@ -1214,3 +1214,66 @@ clears them outright. Regression: batch39_slice
 (per-account paths incl. credential sensitivity and
 re-basing, full purge keeping local data, per-kind purge
 keeping the owning kind's rows and playback state).
+
+Batch 41b resolution (Audit 6 item G1.3): the settings
+dialog is now a Notebook matching Python's SettingsDialog
+(gui/dialogs.py) instead of one long single page. Pages in
+Python's fixed order: General, Feeds & Articles, YouTube,
+Media Player, Provider, Notifications, Translate, List
+Headers, Advanced, CAPTCHA Solving — future pages append
+at the end only, never mid-notebook. Every pre-existing
+Rust control survives with its config key, default and
+read/write behaviour unchanged (verified by diffing the
+set of config keys read and written before and after);
+what changed is placement, page/group assignment, control
+order within each page and labels, which now follow
+Python's per-page builders, including Python's absorbed
+groups: "Startup & Tray" and "Backup" inside General,
+"Translation Updates" inside General, "Media tools",
+"Downloads" and "Sounds" inside Media Player, and
+"Announcements" inside Notifications. The Downloads panel
+follows Python's current semantics: it is not a page of
+its own — Python builds it eagerly and shows it as the
+"Downloads" group inside Media Player, and the Rust
+dialog does the same. Pages are scrolled windows (Python
+scrolls its longest page, Notifications, the same way) in
+a 660x780 dialog. Deliberate equivalents, recorded here:
+the List Headers page opens the existing Article Columns
+dialog through the established "columns" intent instead
+of embedding an editor, because dialogs.rs's
+show_article_columns loads the layout from config and
+saves it on its own OK — embedding it would duplicate
+that editor and split its save semantics; Python controls
+whose form differs in Rust keep the Rust form (refresh
+interval and playback speed stay free fields where Python
+uses preset choices, the category-tree state stays a
+checkbox where Python uses an expanded/collapsed choice,
+SponsorBlock categories stay a comma field where Python
+uses a checklist, the CAPTCHA service stays a text field
+where Python offers 2captcha/SolveCaptcha, and the tree
+of per-provider fields stays fully visible where Python
+shows only the active provider's panel). Rust-only
+controls with no Python settings counterpart (resume
+timing fields, seek/volume steps, silence threshold
+fields, max downloads kept, the Equalizer... entry and
+the maintenance action row, which stays dialog-level
+below the notebook) sit on their closest matching page.
+Python settings controls with no Rust counterpart are NOT
+invented here and remain unported settings surface: the
+interface-language picker (`language`), Debug mode
+(`debug_mode`), Max Cached Views (`max_cached_views`),
+sound file pickers (`sound_refresh_complete` /
+`sound_refresh_error`, honoured by the app but not
+editable), Groups.io API key (`groups_io_api_key`) and
+GitHub token (`github_token`) groups on Provider, the
+Inoreader Redirect URI field, YouTube's auto-import
+cookies.txt toggle (`auto_import_browser_cookies`),
+play-via-download (`youtube_play_via_download`) and
+playback cache folder/size (`youtube_play_cache_dir` /
+`youtube_play_cache_max_mb`), the range-cache debug toggle
+(`range_cache_debug`), the storage-location picker
+(`data_location`; the Advanced page shows the current
+data folder, as before) and Video Search's adult-sites
+toggle (`enable_adult_search`). Several of those keys are
+already read by core/app code; only the settings UI is
+missing, which is a separate batch from this restructure.
