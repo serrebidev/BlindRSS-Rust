@@ -72,3 +72,12 @@ jobs:
 
       - name: Test
         run: cargo test --workspace
+
+      # The VLC smoke test is ignored by default because most
+      # machines have no libVLC; Linux CI installs it and runs
+      # the test for real (owner-approved 2026-11-02).
+      - name: VLC smoke test (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get install -y vlc
+          cargo test -p blindrss installed_vlc_plays_and_seeks_a_silent_wave -- --ignored

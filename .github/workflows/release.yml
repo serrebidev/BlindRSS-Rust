@@ -40,7 +40,8 @@ jobs:
             libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
             libgstreamer-plugins-bad1.0-dev libwebkit2gtk-4.1-dev \
             libsecret-1-dev libnotify-dev libsdl2-dev \
-            gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-libav gstreamer1.0-x
+            gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-libav gstreamer1.0-x \
+            vlc
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -67,6 +68,33 @@ jobs:
 
       - name: Build release binary
         run: cargo build --release --locked -p blindrss
+
+      # Bundle libVLC in the layout the loader searches
+      # (app/src/media_backend/vlc.rs, mirroring Python's
+      # portable layout): libraries under vlc/lib (Linux,
+      # macOS) or vlc (Windows), plugins under vlc/plugins.
+      # Approved by the owner 2026-11-02 (gap 11 follow-up).
+      - name: Bundle libVLC
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            mkdir -p dist/BlindRSS/vlc/lib dist/BlindRSS/vlc/plugins
+            cp -L /usr/lib/x86_64-linux-gnu/libvlc.so.5 /usr/lib/x86_64-linux-gnu/libvlccore.so.8 dist/BlindRSS/vlc/lib/
+            cp -r /usr/lib/x86_64-linux-gnu/vlc/plugins/. dist/BlindRSS/vlc/plugins/
+          elif [ "$RUNNER_OS" = "Windows" ]; then
+            curl -fL -o vlc-win.zip https://download.videolan.org/pub/videolan/vlc/3.0.21/win64/vlc-3.0.21-win64.zip
+            7z x vlc-win.zip -ovlc-win > /dev/null
+            mkdir -p dist/BlindRSS/vlc/plugins
+            cp vlc-win/vlc-3.0.21/libvlc.dll vlc-win/vlc-3.0.21/libvlccore.dll dist/BlindRSS/vlc/
+            cp -r vlc-win/vlc-3.0.21/plugins/. dist/BlindRSS/vlc/plugins/
+          elif [ "$RUNNER_OS" = "macOS" ]; then
+            curl -fL -o vlc.dmg https://download.videolan.org/pub/videolan/vlc/3.0.21/macosx/vlc-3.0.21.dmg
+            hdiutil attach vlc.dmg -mountpoint "$RUNNER_TEMP/vlc-mnt" -nobrowse
+            mkdir -p dist/BlindRSS/vlc/lib dist/BlindRSS/vlc/plugins
+            cp -a "$RUNNER_TEMP/vlc-mnt/VLC.app/Contents/MacOS/lib/"libvlc*.dylib "$RUNNER_TEMP/vlc-mnt/VLC.app/Contents/MacOS/lib/"libvlccore*.dylib dist/BlindRSS/vlc/lib/
+            cp -r "$RUNNER_TEMP/vlc-mnt/VLC.app/Contents/MacOS/plugins/." dist/BlindRSS/vlc/plugins/
+            hdiutil detach "$RUNNER_TEMP/vlc-mnt"
+          fi
 
       - name: Package (zip)
         shell: bash
