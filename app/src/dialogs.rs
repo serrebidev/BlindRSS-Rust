@@ -2440,3 +2440,66 @@ pub fn show_equalizer(frame: &Frame, config_path: &Path) {
     }
     dialog.destroy();
 }
+
+/// Add Shortcuts (Python's AddShortcutsDialog +
+/// `mainframe.on_add_shortcuts`, Batch 42 / Audit 6 G2): choose
+/// Desktop / Start Menu / Taskbar, create the shortcuts through
+/// core's PowerShell/WScript.Shell port, then report each result
+/// in one message box (warning icon when anything failed).
+/// Reachable via the File menu item the parent wires to this
+/// function; Python shows that item on every platform except
+/// macOS and disables the checkboxes off Windows.
+pub fn show_add_shortcuts(frame: &Frame) {
+    use blindrss_core::windows_shortcuts::{self, ShortcutSelection};
+    let dialog = Dialog::builder(frame, &crate::tr("Add BlindRSS Shortcuts")).build();
+    bind_f1(frame, &dialog, "AddShortcutsDialog");
+    let sizer = BoxSizer::builder(Orientation::Vertical).build();
+    let intro = StaticText::builder(&dialog)
+        .with_label(&crate::tr(
+            "Choose where to add BlindRSS shortcuts.\nTaskbar pinning may be limited by your Windows version/policies.",
+        ))
+        .build();
+    sizer.add(&intro, 0, SizerFlag::All, 10);
+    let mk_check = |label: &str, on: bool| {
+        let cb = CheckBox::builder(&dialog)
+            .with_label(&crate::tr(label))
+            .build();
+        cb.set_value(on);
+        if !windows_shortcuts::is_windows() {
+            cb.enable(false);
+        }
+        sizer.add(&cb, 0, SizerFlag::All, 4);
+        cb
+    };
+    let desktop_cb = mk_check("Desktop", true);
+    let start_menu_cb = mk_check("Start Menu", true);
+    let taskbar_cb = mk_check("Taskbar", false);
+    ok_cancel(&dialog, &sizer);
+    dialog.set_sizer(sizer, true);
+    dialog.set_size(Size::new(460, 280));
+    if dialog.show_modal() != 5100 {
+        dialog.destroy();
+        return;
+    }
+    let selection = ShortcutSelection {
+        desktop: desktop_cb.get_value(),
+        start_menu: start_menu_cb.get_value(),
+        taskbar: taskbar_cb.get_value(),
+    };
+    dialog.destroy();
+    if !selection.any() {
+        return;
+    }
+    let results = windows_shortcuts::create_shortcuts(selection, windows_shortcuts::APP_NAME);
+    let (text, failed) = windows_shortcuts::format_results(&results);
+    let style = if failed {
+        MessageDialogStyle::OK | MessageDialogStyle::IconWarning
+    } else {
+        MessageDialogStyle::OK | MessageDialogStyle::IconInformation
+    };
+    let md = MessageDialog::builder(frame, &text, &crate::tr("Shortcuts"))
+        .with_style(style)
+        .build();
+    md.show_modal();
+    md.destroy();
+}

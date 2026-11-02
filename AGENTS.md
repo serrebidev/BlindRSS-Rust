@@ -246,7 +246,9 @@ Python `core/casting.py`, in that order.
   `archive.rs` (podcast archive recovery), `enrich.rs` (page-metadata
   enrichment — fills only empty author fields, unions tags, never
   issues its own network requests), `shortcuts.rs` (the pure,
-  GUI-free shortcut registry), `single_instance.rs`, `startup.rs`
+  GUI-free shortcut registry), `windows_shortcuts.rs` (the
+  PowerShell/WScript.Shell `.lnk` creation port behind the
+  Add Shortcuts dialog), `single_instance.rs`, `startup.rs`
   helpers, `announce.rs`, `help.rs`/`help_topics.rs`: ports of the
   same-named Python responsibilities; the Python module is the spec
   for each.

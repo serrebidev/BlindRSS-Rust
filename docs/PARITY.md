@@ -1214,3 +1214,50 @@ clears them outright. Regression: batch39_slice
 (per-account paths incl. credential sensitivity and
 re-basing, full purge keeping local data, per-kind purge
 keeping the owning kind's rows and playback state).
+
+Batch 42 resolution (Audit 6 G2): the Windows Add Shortcuts
+dialog is ported. Core (`crates/core/src/windows_shortcuts.rs`,
+GUI-free): a line-for-line port of Python
+`core/windows_integration.py`'s shortcut family. Python does
+NOT use a raw COM IShellLink path — `_create_shortcut` runs
+PowerShell (`-NoProfile -NonInteractive -ExecutionPolicy
+Bypass -EncodedCommand <base64 UTF-16LE>`) driving
+`WScript.Shell.CreateShortcut` with TargetPath / Arguments /
+WorkingDirectory / IconLocation taken from `get_launch_parts`
+and Description "BlindRSS"; Save overwrites an existing `.lnk`
+silently. The Rust build is a compiled executable, so the
+"frozen" launch tuple applies (target = the exe, no arguments,
+working dir = the exe's folder, icon = the exe). No new
+dependency was added: the `windows` crate is only a transitive
+dependency of other crates, not a direct one, and none was
+needed — the port spawns powershell exactly as Python does,
+with the same 20 s / 10 s timeouts. Desktop: the known-folder
+path via `[Environment]::GetFolderPath(DesktopDirectory)`
+(with the WScript.Shell SpecialFolders fallback inside the
+same script), else Python's OneDrive / OneDriveConsumer /
+~/Desktop candidate chain. Start Menu:
+`%APPDATA%\Microsoft\Windows\Start Menu\Programs\BlindRSS.lnk`.
+Taskbar: exactly Python's best-effort flow — create a temp
+`.lnk`, invoke the Shell.Application "Pin to taskbar" verb
+("already-pinned" counts as success), and when the verb is
+unavailable fall back to writing the `.lnk` into
+`%APPDATA%\Microsoft\Internet Explorer\Quick Launch\User
+Pinned\TaskBar` with Python's "pin verb unavailable" success
+message; no pinning API was invented. Off Windows every
+requested kind fails with "Shortcuts are only supported on
+Windows.", as in Python. App (`dialogs::show_add_shortcuts`):
+Python's AddShortcutsDialog verbatim — title "Add BlindRSS
+Shortcuts", the two-line intro (including the taskbar-pinning
+warning), Desktop and Start Menu checked, Taskbar unchecked,
+all three checkboxes disabled off Windows, 460x280 — followed
+by Python `on_add_shortcuts`' result message box ("Desktop:
+OK: ..." lines, warning icon when any kind failed, silent
+return when nothing is checked). Menu visibility follows
+Python `should_show_add_shortcuts`: shown everywhere except
+macOS (the brief's "Windows-only" phrasing was narrowed
+against the Python spec; the parent wires the File-menu item
+per the placement spec in the batch report). Regression:
+batch42_slice (PowerShell literal quoting, create/pin script
+shapes, EncodedCommand base64 round-trip, Start Menu/taskbar
+paths, Desktop fallback chain, launch tuple, off-Windows
+results, result-line formatting).
