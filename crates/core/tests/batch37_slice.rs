@@ -184,6 +184,64 @@ fn body_arbitration_feed_fallback_after_web_failure_not_cached() {
 }
 
 #[test]
+fn articles_page_views_and_totals() {
+    use blindrss_core::db::{Article, Db, Feed};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let dir = std::env::temp_dir().join(format!("blindrss-b37-{}-{nanos}-{n}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = Db::open_or_create(&dir.join("rss.db")).unwrap();
+    let feed = Feed {
+        id: "feed-1".into(),
+        url: "https://example.com/rss".into(),
+        title: "Feed One".into(),
+        title_is_custom: false,
+        category: Some("Tech".into()),
+        icon_url: None,
+    };
+    db.insert_feed_if_missing(&feed).unwrap();
+    let mk = |id: &str, date: &str, read: bool, fav: bool| Article {
+        id: id.into(),
+        feed_id: "feed-1".into(),
+        title: format!("Article {id}"),
+        url: format!("https://example.com/{id}"),
+        content: Some("<p>Body</p>".into()),
+        description: None,
+        date: Some(date.into()),
+        author: None,
+        is_read: read,
+        is_favorite: fav,
+        media_url: None,
+        media_type: None,
+    };
+    db.insert_article_if_new(&mk("a1", "2026-10-30T00:00:00Z", false, false)).unwrap();
+    db.insert_article_if_new(&mk("a2", "2026-10-31T00:00:00Z", true, true)).unwrap();
+    db.insert_article_if_new(&mk("a3", "2026-11-01T00:00:00Z", false, true)).unwrap();
+
+    let (page, total) = db.articles_page("all", 0, 2).unwrap();
+    assert_eq!(total, 3);
+    assert_eq!(page.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(), vec!["a3", "a2"]);
+    let (page, total) = db.articles_page("all", 2, 2).unwrap();
+    assert_eq!((page.len(), total), (1, 3));
+    let (page, total) = db.articles_page("unread:all", 0, 10).unwrap();
+    assert_eq!(total, 2);
+    assert!(page.iter().all(|a| !a.is_read));
+    let (_page, total) = db.articles_page("favorites:all", 0, 10).unwrap();
+    assert_eq!(total, 2);
+    let (page, total) = db.articles_page("feed-1", 0, 10).unwrap();
+    assert_eq!((page.len(), total), (3, 3));
+    let (page, total) = db.articles_page("category:Tech", 0, 10).unwrap();
+    assert_eq!((page.len(), total), (3, 3));
+    let (_page, total) = db.articles_page("category:Missing", 0, 10).unwrap();
+    assert_eq!(total, 0);
+}
+
+#[test]
 fn extractable_url_shapes() {
     assert!(is_extractable_fulltext_url("https://example.com/story"));
     assert!(is_extractable_fulltext_url("https://example.com/ep.mp3"));

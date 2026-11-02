@@ -466,6 +466,95 @@ impl Db {
         )
     }
 
+    /// One page of articles for an Accessible Browser view id
+    /// (Python provider `get_articles_page`): "all",
+    /// "unread:all", "read:all", "favorites:all",
+    /// "category:<path>", or a bare feed id. Returns the page
+    /// (date DESC, id DESC) and the view's total count.
+    pub fn articles_page(
+        &self,
+        view_id: &str,
+        offset: usize,
+        limit: usize,
+    ) -> rusqlite::Result<(Vec<Article>, i64)> {
+        let (filter, base) = match view_id.split_once(':') {
+            Some(("unread", rest)) => (" AND is_read = 0", rest),
+            Some(("read", rest)) => (" AND is_read = 1", rest),
+            Some(("favorites", rest)) => (" AND is_favorite = 1", rest),
+            _ => ("", view_id),
+        };
+        if let Some(path) = base.strip_prefix("category:") {
+            // Category membership carries override/label rules;
+            // reuse the full query and slice the page from it.
+            let all = self.articles_for_category(path, usize::MAX / 2)?;
+            let filtered: Vec<Article> = all
+                .into_iter()
+                .filter(|a| {
+                    filter.is_empty()
+                        || (filter.contains("is_read = 0") && !a.is_read)
+                        || (filter.contains("is_read = 1") && a.is_read)
+                        || (filter.contains("is_favorite") && a.is_favorite)
+                })
+                .collect();
+            let total = filtered.len() as i64;
+            let page = filtered
+                .into_iter()
+                .skip(offset)
+                .take(limit)
+                .collect();
+            return Ok((page, total));
+        }
+        let feed_clause = if base == "all" || base.is_empty() {
+            String::new()
+        } else {
+            " AND feed_id = ?1".to_string()
+        };
+        let total: i64 = if feed_clause.is_empty() {
+            self.conn.query_row(
+                &format!("SELECT COUNT(*) FROM articles WHERE 1 = 1{filter}"),
+                [],
+                |r| r.get(0),
+            )?
+        } else {
+            self.conn.query_row(
+                &format!("SELECT COUNT(*) FROM articles WHERE 1 = 1{filter}{feed_clause}"),
+                params![base],
+                |r| r.get(0),
+            )?
+        };
+        let sql = format!(
+            "SELECT id, feed_id, title, url, content, description, date, \
+             author, is_read, is_favorite, media_url, media_type \
+             FROM articles WHERE 1 = 1{filter}{feed_clause} \
+             ORDER BY date DESC, id DESC LIMIT ? OFFSET ?"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let map_row = |r: &rusqlite::Row| {
+            Ok(Article {
+                id: r.get(0)?,
+                feed_id: r.get(1)?,
+                title: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                url: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                content: r.get(4)?,
+                description: r.get(5)?,
+                date: r.get(6)?,
+                author: r.get(7)?,
+                is_read: r.get::<_, i64>(8)? != 0,
+                is_favorite: r.get::<_, i64>(9)? != 0,
+                media_url: r.get(10)?,
+                media_type: r.get(11)?,
+            })
+        };
+        let rows = if feed_clause.is_empty() {
+            stmt.query_map(params![limit as i64, offset as i64], map_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        } else {
+            stmt.query_map(params![base, limit as i64, offset as i64], map_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        Ok((rows, total))
+    }
+
     /// One article by id (provider `get_article_by_id`).
     pub fn article_by_id(&self, article_id: &str) -> rusqlite::Result<Option<Article>> {
         let mut stmt = self.conn.prepare(
