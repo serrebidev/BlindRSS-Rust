@@ -1380,7 +1380,7 @@ fire-and-forget cast_to_device); main.rs is outside this
 batch's files and carries Batch 40's edits, so routing
 the remaining kinds through casting::open — which now
 handles them — is a one-line follow-up there.
-Batch 42 resolution (Audit 6 G2): the Windows Add Shortcuts
+Batch 42 resolution (v0.1.43; Audit 6 G2): the Windows Add Shortcuts
 dialog is ported. Core (`crates/core/src/windows_shortcuts.rs`,
 GUI-free): a line-for-line port of Python
 `core/windows_integration.py`'s shortcut family. Python does
