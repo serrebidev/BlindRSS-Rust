@@ -129,13 +129,17 @@ fn library_candidates() -> Vec<PathBuf> {
 /// `None` on platforms whose loader finds it unaided. A libvlc dropped
 /// next to the executable (the bundled layout) has its core beside it,
 /// not on the system search path, on every platform — not just Windows.
-fn core_library_name() -> &'static str {
+fn core_library_names() -> &'static [&'static str] {
     if cfg!(windows) {
-        "libvlccore.dll"
+        &["libvlccore.dll"]
     } else if cfg!(target_os = "macos") {
-        "libvlccore.dylib"
+        &["libvlccore.dylib"]
     } else {
-        "libvlccore.so.8"
+        // VLC 3.0.x ships libvlccore.so.8 (VideoLAN builds)
+        // or libvlccore.so.9 (Debian/Ubuntu builds); a
+        // bundled copy must preload whichever sits beside
+        // libvlc, so try both, then the bare name.
+        &["libvlccore.so.9", "libvlccore.so.8", "libvlccore.so"]
     }
 }
 
@@ -177,7 +181,11 @@ fn load_api() -> Result<(Api, PathBuf), String> {
         let core = path
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
-            .and_then(|p| unsafe { Library::new(p.join(core_library_name())) }.ok());
+            .and_then(|p| {
+                core_library_names()
+                    .iter()
+                    .find_map(|name| unsafe { Library::new(p.join(name)) }.ok())
+            });
         match unsafe { Library::new(&path) }
             .map_err(|e| e.to_string())
             .and_then(|lib| unsafe { Api::from_library(lib, core) })

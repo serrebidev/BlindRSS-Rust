@@ -1488,7 +1488,7 @@ data folder, as before) and Video Search's adult-sites
 toggle (`enable_adult_search`). Several of those keys are
 already read by core/app code; only the settings UI is
 missing, which is a separate batch from this restructure.
-VLC platform resolution (v0.1.45; PARITY-2026-11-01 gap 11,
+VLC platform resolution (v0.1.46; PARITY-2026-11-01 gap 11,
 platform acceptance for the libVLC backend): the audit first
 corrected the premise. Python's player is audio-only end to
 end: `core/vlc_instance.py` creates its shared instance with

@@ -79,7 +79,7 @@ jobs:
         run: |
           if [ "$RUNNER_OS" = "Linux" ]; then
             mkdir -p dist/BlindRSS/vlc/lib dist/BlindRSS/vlc/plugins
-            cp -L /usr/lib/x86_64-linux-gnu/libvlc.so.5 /usr/lib/x86_64-linux-gnu/libvlccore.so.8 dist/BlindRSS/vlc/lib/
+            cp -L /usr/lib/x86_64-linux-gnu/libvlc.so.5 /usr/lib/x86_64-linux-gnu/libvlccore.so.* dist/BlindRSS/vlc/lib/
             cp -r /usr/lib/x86_64-linux-gnu/vlc/plugins/. dist/BlindRSS/vlc/plugins/
           elif [ "$RUNNER_OS" = "Windows" ]; then
             curl -fL -o vlc-win.zip https://download.videolan.org/pub/videolan/vlc/3.0.21/win64/vlc-3.0.21-win64.zip
@@ -88,7 +88,7 @@ jobs:
             cp vlc-win/vlc-3.0.21/libvlc.dll vlc-win/vlc-3.0.21/libvlccore.dll dist/BlindRSS/vlc/
             cp -r vlc-win/vlc-3.0.21/plugins/. dist/BlindRSS/vlc/plugins/
           elif [ "$RUNNER_OS" = "macOS" ]; then
-            curl -fL -o vlc.dmg https://download.videolan.org/pub/videolan/vlc/3.0.21/macosx/vlc-3.0.21.dmg
+            curl -fL -o vlc.dmg https://download.videolan.org/pub/videolan/vlc/3.0.21/macosx/vlc-3.0.21-arm64.dmg
             hdiutil attach vlc.dmg -mountpoint "$RUNNER_TEMP/vlc-mnt" -nobrowse
             mkdir -p dist/BlindRSS/vlc/lib dist/BlindRSS/vlc/plugins
             cp -a "$RUNNER_TEMP/vlc-mnt/VLC.app/Contents/MacOS/lib/"libvlc*.dylib "$RUNNER_TEMP/vlc-mnt/VLC.app/Contents/MacOS/lib/"libvlccore*.dylib dist/BlindRSS/vlc/lib/
