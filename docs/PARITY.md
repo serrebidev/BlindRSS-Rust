@@ -1214,3 +1214,72 @@ clears them outright. Regression: batch39_slice
 (per-account paths incl. credential sensitivity and
 re-basing, full purge keeping local data, per-kind purge
 keeping the owning kind's rows and playback state).
+
+Batch 40+vlc-platform resolution (PARITY-2026-11-01 gap 11,
+platform acceptance for the libVLC backend): the audit first
+corrected the premise. Python's player is audio-only end to
+end: `core/vlc_instance.py` creates its shared instance with
+`--no-video` and no window handle is ever passed on any
+platform. The Rust backend deliberately diverges — it owns a
+video surface (`app/src/media_backend.rs`) and already
+embedded it on Windows (set_hwnd) and macOS (set_nsobject);
+Linux was the hole, falling back to libVLC's own video
+output. (1) Linux embedding is now implemented:
+`attach_video` resolves the wxGTK panel handle to an X11
+window id through dynamically loaded GTK/GDK
+(`gtk_widget_get_window` → display type-name check for
+`GdkX11Display` → `gdk_x11_window_get_xid`) and calls
+`libvlc_media_player_set_xwindow`. Every step fails closed
+to no embedding (unrealized widget, Wayland-only session,
+missing GTK/GDK) rather than handing libVLC a foreign
+window, and `MediaBackend::load_uri` re-attaches on every
+load because the XID does not exist until the widget is
+realized. (2) Instance creation now mirrors
+`core/vlc_instance.py::_build_args` +
+`core/vlc_options.py::build_vlc_instance_args` option by
+option through pure, tested builders: `--no-plugins-cache`
+first with dedup, `--input-fast-seek`, instance-level
+`--network-caching` (config key, 500 fallback, clamped ≥ 0)
+and `--file-caching` (max 500), `--http-reconnect`, and —
+Windows only, exactly as Python gates them — `--aout=
+mmdevice` with `--directx-volume`/`--mmdevice-volume`
+seeded from the saved volume. The one deliberate divergence
+is `--no-video` itself (see above). When libvlc_new()
+returns NULL the backend retries once with Python's exact
+minimal set (`--no-plugins-cache --no-video`) before
+falling back to wx MediaCtrl, instead of giving up on the
+first rejection. (3) Media-option caching now follows
+Python's player.py gate exactly: the local caching keys
+apply only to range-cache `/media?id=` URLs, not to every
+loopback URL (the /stream and /play transcoders take the
+normal keys). (4) Release-build validation: Python BUNDLES
+VLC on every platform (Windows installer plugins, macOS
+VLC 3.0.23 libs+plugins, Linux portable `vlc/lib` +
+`vlc/plugins` from the distro packages), while the Rust
+release zips bundle nothing and neither CI nor release
+installs libVLC — the release default is therefore an
+installed VLC 3 when present and wx MediaCtrl otherwise.
+The code side now supports the Python bundle layout if one
+is ever packaged: candidates cover `<exe>/vlc/lib/<lib>`
+and the Linux system directories Python's portable spec
+searches, the sibling libvlccore is preloaded on all
+platforms (a bundled copy's core is not on the system
+search path; this was Windows-only), and a bundled copy
+gets `--plugin-path=<exe>/vlc/plugins`. The packaging
+side — installing/bundling libVLC in ci.yml/release.yml
+and running the ignored libVLC smoke test in CI — needs a
+workflow change and the owner's direct OK; it is recorded
+here as the remaining gap-11 item, not done. Verification
+limits, stated plainly: this VM has no display and no
+libVLC installed, so the X11 attach and live playback
+could not be exercised here; what is verified is the
+absence path (backend construction fails cleanly to
+MediaCtrl), the GTK/GDK symbol surface present in the
+system libraries, and the option/handle logic by unit
+tests ported from Python's own test_media_player_config.py
+(wasapi seeding, off-Windows option gating, plugin-cache
+dedup, caching clamps, bundle layout, fail-closed XID).
+Owner-side acceptance on a real Linux desktop (X11 and
+Wayland sessions, a video podcast) remains. Regression:
+media_backend::vlc tests (10 non-ignored, incl. the ported
+Python config tests).
