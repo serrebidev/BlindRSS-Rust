@@ -1314,3 +1314,69 @@ XenForo fixture, Google Groups + Support rebuilds,
 history-state due rules incl. the legacy-column repair,
 feedsearch details) plus threads.rs discourse unit
 tests.
+Batch casting-depth resolution (PARITY-2026-11-01 gap 8):
+the cross-protocol cast session depth is ported. Audit
+against Python core/casting.py found Chromecast already at
+depth (CASTv2 session with play/pause/stop/seek/volume/
+status and the persistent controls window) while every
+other protocol was play-only in Rust: castupnp could start
+DLNA/Sonos/Roku/Kodi playback but had no transport control,
+status, seek or volume at all; AirPlay streamed with no
+pause, position or live volume; no protocol but Chromecast
+could resume, and nothing advanced a queue on a receiver.
+Now: (1) Unified sessions — core/cast.rs gains Python's
+protocol-neutral layer (CastStatus in get_status's shape,
+CastClock porting _clock_set/_clock_position, format/parse
+_hms, the per-protocol seek/volume capability table where
+Roku has neither, CastDevice display_name/unique_id), and
+castupnp.rs gains the full per-kind control dispatch
+(pause/resume/stop/seek/set_volume/status): AVTransport
+Pause/Play/Stop/Seek REL_TIME plus RenderingControl
+SetVolume (URL derived by Python's service-name swap) and
+GetPositionInfo/GetTransportInfo status for DLNA and Sonos,
+Kodi JSON-RPC PlayPause/Stop/Seek/Application.SetVolume/
+GetProperties through a shared rpc helper that treats a
+JSON-RPC error as a refusal, and Roku's Play-keypress
+toggle gated by the caller's clock state with Home as
+stop, exactly Python's gates. Chromecast answers the same
+surface through castsession's MediaStatus::to_unified.
+(2) Seek/resume — Chromecast loads carry currentTime
+(load_media_at) with Python's one corrective seek when a
+receiver reports more than 5 s short of a start over 5 s;
+DLNA/Sonos and Kodi plays poll for the playing state (8 s,
+Python's window) and then seek, since renderers take no
+start position with the URL; RAOP resumes by decoding
+from the offset. The controls window persists cast
+positions into playback_state under a per-item cast key
+through the shared ResumePolicy (same back-off, minimum
+and completion rules as local playback), so a later cast
+of the same item resumes where the last cast left off.
+(3) Queue advancement — core CastQueue ports the local
+player's media-finished advance for cast sessions: an
+idle/stopped status after the item was seen live is the
+finish event (an idle report before anything played is
+not), and the unified controls window loads the next
+item — the window now serves every protocol, appends the
+configured play_queue after the current item, adds a Next
+button, and saves each finished item as completed.
+AirPlay joins the same session shape through raop's new
+RaopHandle (Python's _AirSession): pause holds the RTSP
+session open and freezes the streamed-frame position
+clock, volume rides SET_PARAMETER mid-stream, a seek
+reopens the source at the target as Python's pending
+seek does, and natural end-of-source raises the finished
+flag the queue advance consumes. Verified by
+crates/core/tests/cast_depth.rs against fake receivers
+on loopback (a recording UPnP renderer, Kodi JSON-RPC
+and Roku ECP server, plus clock/queue/HMS unit tests) —
+8 tests, including the resume-seek ordering and Roku's
+clock-gated toggle. Not live-tested: multicast discovery
+is blocked from this VM (the sandbox refuses multicast
+sends), so "RB Room" was not discoverable and no physical
+device was exercised, per the device rule. One wiring
+note: app/src/main.rs still routes only Chromecast into
+the controls window (its other kinds go through the
+fire-and-forget cast_to_device); main.rs is outside this
+batch's files and carries Batch 40's edits, so routing
+the remaining kinds through casting::open — which now
+handles them — is a one-line follow-up there.

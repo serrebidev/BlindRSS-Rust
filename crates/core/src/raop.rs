@@ -23,7 +23,7 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpStream, UdpSocket};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use aes::cipher::{BlockEncryptMut, KeyIvInit, block_padding::Pkcs7};
@@ -364,6 +364,71 @@ pub struct RaopCast {
     pub stop: Arc<AtomicBool>,
 }
 
+/// The shared control surface of one RAOP session (Python's
+/// `_AirSession`, shared between its runner and the controls):
+/// pause freezes the stream in place (the session and its
+/// position stay), volume rides SET_PARAMETER, and the
+/// position is the streamed-frame count over the start
+/// offset — a RAOP receiver reports no position of its own.
+/// A seek is a new stream from the target offset (the app
+/// restarts its ffmpeg decode there), exactly as Python's
+/// seek reopens its source at the pending seek.
+#[derive(Debug)]
+pub struct RaopHandle {
+    pub stop: Arc<AtomicBool>,
+    paused: AtomicBool,
+    volume_percent: AtomicU8,
+    position_ms: AtomicU64,
+    finished: AtomicBool,
+}
+
+impl RaopHandle {
+    pub fn new(volume_percent: u8) -> Arc<Self> {
+        Arc::new(RaopHandle {
+            stop: Arc::new(AtomicBool::new(false)),
+            paused: AtomicBool::new(false),
+            volume_percent: AtomicU8::new(volume_percent.min(100)),
+            position_ms: AtomicU64::new(0),
+            finished: AtomicBool::new(false),
+        })
+    }
+
+    pub fn pause(&self) {
+        self.paused.store(true, Ordering::Relaxed);
+    }
+
+    pub fn resume(&self) {
+        self.paused.store(false, Ordering::Relaxed);
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::Relaxed)
+    }
+
+    pub fn set_volume(&self, percent: u8) {
+        self.volume_percent
+            .store(percent.min(100), Ordering::Relaxed);
+    }
+
+    pub fn volume(&self) -> u8 {
+        self.volume_percent.load(Ordering::Relaxed)
+    }
+
+    /// Position by the clock (start offset + frames streamed).
+    pub fn position_seconds(&self) -> f64 {
+        self.position_ms.load(Ordering::Relaxed) as f64 / 1000.0
+    }
+
+    /// The source played to its end (not a stop or an error).
+    pub fn is_finished(&self) -> bool {
+        self.finished.load(Ordering::Relaxed)
+    }
+
+    pub fn request_stop(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
 /// Stream PCM (s16le, 44.1 kHz, stereo) from `pcm` to the
 /// device at host:port until EOF or `stop`. Blocking; run on a
 /// worker thread. `volume_percent` follows the same 0-100
@@ -376,6 +441,35 @@ pub fn stream_pcm(
     volume_percent: u8,
     stop: Arc<AtomicBool>,
 ) -> Result<u64, String> {
+    let handle = Arc::new(RaopHandle {
+        stop,
+        paused: AtomicBool::new(false),
+        volume_percent: AtomicU8::new(volume_percent.min(100)),
+        position_ms: AtomicU64::new(0),
+        finished: AtomicBool::new(false),
+    });
+    stream_pcm_with_handle(host, port, pcm, eq, &handle, 0.0)
+}
+
+/// Stream PCM under a shared `RaopHandle` (pause / volume /
+/// position / finished for the unified cast controls), with
+/// the source already decoded from `start_offset_seconds`
+/// (a resume or a seek: the caller seeks its decoder, the
+/// handle's clock starts at the offset).
+pub fn stream_pcm_with_handle(
+    host: &str,
+    port: u16,
+    pcm: &mut dyn Read,
+    eq: Option<&EqConfig>,
+    handle: &Arc<RaopHandle>,
+    start_offset_seconds: f64,
+) -> Result<u64, String> {
+    let stop = handle.stop.clone();
+    let volume_percent = handle.volume();
+    handle.position_ms.store(
+        (start_offset_seconds.max(0.0) * 1000.0) as u64,
+        Ordering::Relaxed,
+    );
     let mut rtsp = Rtsp::connect(host, port)?;
     rtsp.request("OPTIONS", Some("*"), &[], None)?;
 
@@ -510,9 +604,38 @@ pub fn stream_pcm(
     let mut last_keepalive = Instant::now();
     let mut read_err: Option<String> = None;
 
+    let mut sent_volume = volume_percent;
     'stream: loop {
         if stop.load(Ordering::Relaxed) {
             break;
+        }
+        // Pause: hold the session open (keepalive OPTIONS so
+        // the receiver keeps it) and freeze — no PCM is read
+        // or sent, so the position clock stands still, as in
+        // Python's pause. Play resumes right here.
+        while handle.is_paused() && !stop.load(Ordering::Relaxed) {
+            if last_keepalive.elapsed() >= Duration::from_secs(5) {
+                let _ = rtsp.request("OPTIONS", Some("*"), &[], None);
+                last_keepalive = Instant::now();
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        // A volume change rides SET_PARAMETER (Python's
+        // AirPlay volume), applied on this thread which owns
+        // the RTSP connection.
+        let wanted_volume = handle.volume();
+        if wanted_volume != sent_volume {
+            sent_volume = wanted_volume;
+            let db = volume_db(sent_volume);
+            let _ = rtsp.request(
+                "SET_PARAMETER",
+                None,
+                &[],
+                Some(("text/parameters", &format!("volume: {db:.1}\r\n"))),
+            );
         }
         // Fill one chunk; a short read at EOF is zero-padded,
         // then the loop ends after sending it.
@@ -533,6 +656,9 @@ pub fn stream_pcm(
             }
         }
         if filled == 0 && eof {
+            if read_err.is_none() {
+                handle.finished.store(true, Ordering::Relaxed);
+            }
             break;
         }
         for b in &mut pcm_buf[filled..] {
@@ -578,6 +704,11 @@ pub fn stream_pcm(
         packets_sent += 1;
         head_ts += FRAMES_PER_PACKET as u64;
         frames_sent += FRAMES_PER_PACKET as u64;
+        handle.position_ms.store(
+            (start_offset_seconds.max(0.0) * 1000.0) as u64
+                + frames_sent * 1000 / SAMPLE_RATE as u64,
+            Ordering::Relaxed,
+        );
 
         // Control channel: sync every second, retransmits and
         // timing answers as they arrive.
@@ -616,6 +747,9 @@ pub fn stream_pcm(
         }
 
         if eof {
+            if read_err.is_none() {
+                handle.finished.store(true, Ordering::Relaxed);
+            }
             break;
         }
         // Pace to real time: packet N is due at
