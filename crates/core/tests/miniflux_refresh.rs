@@ -204,7 +204,12 @@ fn scheduled_refresh_only_recovers_overdue_feeds_with_fifteen_feed_budget() {
 
 #[test]
 fn worker_configuration_has_a_hard_cap_of_thirty_two() {
-    let (base, _, peak) = server_with_feeds(204, Duration::from_millis(50), 40);
+    // 500 ms (was 50): the peak is only observable while all
+    // 32 workers are inside the delay together; at 50 ms the
+    // entry ramp on a loaded machine can miss the overlap
+    // and the observed peak lands at 27-31 (flake seen on
+    // this VM and on GitHub's Windows runner, 2026-11-02).
+    let (base, _, peak) = server_with_feeds(204, Duration::from_millis(500), 40);
     let mut cfg = config();
     cfg.set_path("miniflux_targeted_refresh_workers", serde_json::json!(128));
     MinifluxClient::new(&base, "secret")
@@ -269,7 +274,16 @@ fn stragglers_sync_and_report_into_the_original_account_cache() {
         Db,
         provider::{active_db_path, get_provider},
     };
-    let (base, _, _) = server(204, Duration::from_millis(300));
+    // 2 s PUT delay (was 300 ms): the mock serves a feed's
+    // entry only after that feed's PUT completes, so the
+    // first (synchronous) sync must finish before the first
+    // PUT lands. At 300 ms a slow machine lets later entry
+    // fetches cross the line and the "still empty" assert
+    // fails (flake seen on this VM and on GitHub's Windows
+    // runner, 2026-11-02). All 8 PUTs run in one wave
+    // (workers = 8), so the background completion still
+    // lands well inside the 5 s callback budget.
+    let (base, _, _) = server(204, Duration::from_secs(2));
     let path = std::env::temp_dir().join(format!("blindrss-late-{}.db", uuid::Uuid::new_v4()));
     let mut cfg = config();
     cfg.set_path("active_provider", serde_json::json!("miniflux"));
@@ -305,7 +319,12 @@ fn stragglers_sync_and_report_into_the_original_account_cache() {
     let other = get_provider(&cfg, path);
     assert!(other.feeds().unwrap().is_empty());
     assert!(
-        rx.recv_timeout(Duration::from_secs(5))
+        // 20 s (was 5): with the 2 s PUT delay the pool's
+        // probing waves (3-wide until first success) plus the
+        // background re-sync legitimately take ~4-6 s; the
+        // property under test is WHERE the stragglers land,
+        // not the wall-clock budget.
+        rx.recv_timeout(Duration::from_secs(20))
             .unwrap()
             .unwrap()
             .contains("7 new article")
