@@ -67,6 +67,7 @@ pub mod translate;
 pub mod translation_updates;
 pub mod user_agents;
 pub mod videosearch;
+pub mod windows_shortcuts;
 pub mod youtube_account;
 pub mod ytfull;
 
