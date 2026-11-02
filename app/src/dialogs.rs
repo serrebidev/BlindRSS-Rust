@@ -1445,79 +1445,819 @@ pub fn show_persistent_searches(frame: &Frame, config_path: &Path) -> Option<Str
     chosen.borrow().clone()
 }
 
-/// Podcast archive manager (Python's PodcastArchiveDialog):
-/// lists feeds that carry media with their episode counts and
-/// lets the user pick one to rescan against the Wayback
-/// Machine. Returns the chosen feed; the caller runs the
-/// rescan on a worker (it does network I/O).
+/// Messages from the archive dialog's worker threads (scan,
+/// batch downloads, find-and-add), drained by its timer.
+enum PodcastArchiveMsg {
+    ScanProgress(String),
+    /// Ok(Some(summary)) finished, Ok(None) was canceled,
+    /// Err(message) failed.
+    ScanDone(Result<Option<String>, String>),
+    DownloadProgress(String),
+    DownloadDone {
+        downloaded: usize,
+        skipped: usize,
+        failed: usize,
+        canceled: bool,
+    },
+    /// Ok(new feed id when known) reloads the feed list.
+    FeedAdded(Result<Option<String>, String>),
+}
+
+/// Podcast archive manager (Python's PodcastArchiveDialog): a
+/// feed picker over every subscribed feed, the feed's playable
+/// episodes (live articles merged with the hosted sidecar when a
+/// hosted provider is active) with a text filter and a
+/// Downloaded / Available online column, the persistent archive
+/// state as the status line, Play (opens the episode window;
+/// in-player playback needs a main-window callback and stays an
+/// integration follow-up), batch downloads with progress and
+/// cancel, and an in-dialog archive rescan that reports scan
+/// progress and can be canceled. Recovery state lives in
+/// core::archive_store under the active provider's scope, in the
+/// active store's own database file. The dialog does its own
+/// work on workers and always returns None; the main window's
+/// separate Rescan Archive action keeps the old one-shot flow.
 pub fn show_podcast_archive(frame: &Frame, db: &Db) -> Option<blindrss_core::Feed> {
-    let feeds = db.feeds().ok()?;
-    let all = db.articles(None, 100_000).ok()?;
-    let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
-    for a in &all {
-        if a.media_url.is_some() {
-            *counts.entry(a.feed_id.as_str()).or_default() += 1;
-        }
-    }
-    let podcasts: Vec<&blindrss_core::Feed> = feeds
-        .iter()
-        .filter(|f| counts.contains_key(f.id.as_str()))
-        .collect();
-    if podcasts.is_empty() {
-        let md = MessageDialog::builder(
-            frame,
-            "No feeds with media episodes were found.",
-            "Podcast Archive",
-        )
-        .with_style(MessageDialogStyle::OK)
-        .build();
+    use blindrss_core::archive_store::ArchiveSettings;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let db_path = crate::db_path();
+    let config_path = crate::config_path();
+    let cfg = Config::load(&config_path).unwrap_or_default();
+    let scope = blindrss_core::archive_store::scope_for_config(&cfg);
+    let settings = std::sync::Arc::new(ArchiveSettings::from_config(&cfg));
+    let feeds: Rc<RefCell<Vec<blindrss_core::Feed>>> =
+        Rc::new(RefCell::new(db.feeds().unwrap_or_default()));
+    if feeds.borrow().is_empty() {
+        let md =
+            MessageDialog::builder(frame, "No subscribed feeds were found.", "Podcast Archive")
+                .with_style(MessageDialogStyle::OK)
+                .build();
         md.show_modal();
         md.destroy();
         return None;
     }
+
     let dialog = Dialog::builder(frame, "Podcast Archive").build();
     bind_f1(frame, &dialog, "PodcastArchiveDialog");
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
-    let list = ListBox::builder(&dialog).build();
-    for f in &podcasts {
-        list.append(&format!(
-            "{} ({} episodes)",
-            f.title,
-            counts.get(f.id.as_str()).copied().unwrap_or(0)
-        ));
-    }
-    list.set_selection(0, true);
-    sizer.add(&list, 1, SizerFlag::Expand | SizerFlag::All, 4);
-    let row = BoxSizer::builder(Orientation::Horizontal).build();
+    let feed_row = BoxSizer::builder(Orientation::Horizontal).build();
+    let feed_label = StaticText::builder(&dialog)
+        .with_label(&crate::tr("Podcast:"))
+        .build();
+    feed_row.add(&feed_label, 0, SizerFlag::All, 4);
+    let feed_choice = Choice::builder(&dialog).build();
+    feed_choice.set_name("Podcast feed");
+    feed_row.add(&feed_choice, 1, SizerFlag::Expand | SizerFlag::All, 4);
+    let find_btn = Button::builder(&dialog)
+        .with_label(&crate::tr("Find or add podcast..."))
+        .build();
+    feed_row.add(&find_btn, 0, SizerFlag::All, 4);
     let rescan_btn = Button::builder(&dialog)
-        .with_label(&crate::tr("Rescan Archive"))
+        .with_label(&crate::tr("Rescan archive"))
         .build();
-    let close_btn = Button::builder(&dialog)
-        .with_label(&crate::tr("Close"))
+    feed_row.add(&rescan_btn, 0, SizerFlag::All, 4);
+    sizer.add_sizer(&feed_row, 0, SizerFlag::Expand | SizerFlag::All, 2);
+    let filter_row = BoxSizer::builder(Orientation::Horizontal).build();
+    let filter_label = StaticText::builder(&dialog)
+        .with_label(&crate::tr("Filter episodes:"))
         .build();
-    row.add(&rescan_btn, 0, SizerFlag::All, 4);
-    row.add(&close_btn, 0, SizerFlag::All, 4);
-    sizer.add_sizer(&row, 0, SizerFlag::Expand | SizerFlag::All, 2);
-    let chosen: Rc<RefCell<Option<usize>>> = Rc::new(RefCell::new(None));
+    filter_row.add(&filter_label, 0, SizerFlag::All, 4);
+    let filter_ctrl = TextCtrl::builder(&dialog).build();
+    filter_ctrl.set_name("Filter podcast episodes");
+    filter_row.add(&filter_ctrl, 1, SizerFlag::Expand | SizerFlag::All, 4);
+    sizer.add_sizer(&filter_row, 0, SizerFlag::Expand | SizerFlag::All, 2);
+    let status = StaticText::builder(&dialog)
+        .with_label(&crate::tr("Choose a subscribed podcast."))
+        .build();
+    status.set_name("Podcast archive status");
+    sizer.add(&status, 0, SizerFlag::Expand | SizerFlag::All, 4);
+    let episodes = ListCtrl::builder(&dialog)
+        .with_style(ListCtrlStyle::Report)
+        .build();
+    episodes.set_name("Podcast episodes");
+    episodes.insert_column(0, "Title", ListColumnFormat::Left, 500);
+    episodes.insert_column(1, "Date", ListColumnFormat::Left, 170);
+    episodes.insert_column(2, "Media", ListColumnFormat::Left, 180);
+    sizer.add(&episodes, 1, SizerFlag::Expand | SizerFlag::All, 4);
+    let btn_row = BoxSizer::builder(Orientation::Horizontal).build();
+    let mk = |label: &str| {
+        let b = Button::builder(&dialog).with_label(label).build();
+        btn_row.add(&b, 0, SizerFlag::All, 4);
+        b
+    };
+    let play_btn = mk(&crate::tr("Play"));
+    let dl_selected_btn = mk(&crate::tr("Download selected"));
+    let dl_all_btn = mk(&crate::tr("Download all"));
+    let cancel_btn = mk(&crate::tr("Cancel downloads"));
+    let close_btn = mk(&crate::tr("Close"));
+    sizer.add_sizer(&btn_row, 0, SizerFlag::Expand | SizerFlag::All, 2);
+
+    let all_articles: Rc<RefCell<Vec<blindrss_core::Article>>> = Rc::new(RefCell::new(Vec::new()));
+    let visible: Rc<RefCell<Vec<blindrss_core::Article>>> = Rc::new(RefCell::new(Vec::new()));
+    let scan_cancel = std::sync::Arc::new(AtomicBool::new(false));
+    let download_cancel = std::sync::Arc::new(AtomicBool::new(false));
+    let scan_running = Rc::new(std::cell::Cell::new(false));
+    let download_running = Rc::new(std::cell::Cell::new(false));
+    let close_when_idle = Rc::new(std::cell::Cell::new(false));
+    let (tx, rx) = std::sync::mpsc::channel::<PodcastArchiveMsg>();
+    let tx_download = tx.clone();
+    let tx_scan = tx.clone();
+    let tx_find = tx;
+    let rx = Rc::new(rx);
+
+    let selected_feed: Rc<dyn Fn() -> Option<blindrss_core::Feed>> = {
+        let feeds = feeds.clone();
+        Rc::new(move || {
+            let index = feed_choice.get_selection().unwrap_or(0) as usize;
+            feeds.borrow().get(index).cloned()
+        })
+    };
+    let update_action_state: Rc<dyn Fn()> = {
+        let visible = visible.clone();
+        let all_articles = all_articles.clone();
+        let scan_running = scan_running.clone();
+        let download_running = download_running.clone();
+        let selected_feed = selected_feed.clone();
+        Rc::new(move || {
+            let busy = scan_running.get() || download_running.get();
+            let has_rows = !visible.borrow().is_empty();
+            play_btn.enable(has_rows && !busy);
+            dl_selected_btn.enable(has_rows && !busy);
+            dl_all_btn.enable(!all_articles.borrow().is_empty() && !busy);
+            cancel_btn.enable(scan_running.get() || download_running.get());
+            rescan_btn.enable(selected_feed().is_some() && !busy);
+            feed_choice.enable(!busy);
+        })
+    };
+    let apply_filter: Rc<dyn Fn()> = {
+        let visible = visible.clone();
+        let all_articles = all_articles.clone();
+        let update_action_state = update_action_state.clone();
+        let config_path = config_path.clone();
+        Rc::new(move || {
+            let needle = filter_ctrl.get_value().trim().to_lowercase();
+            let filtered: Vec<blindrss_core::Article> = all_articles
+                .borrow()
+                .iter()
+                .filter(|article| {
+                    needle.is_empty()
+                        || article.title.to_lowercase().contains(&needle)
+                        || article
+                            .author
+                            .as_deref()
+                            .unwrap_or("")
+                            .to_lowercase()
+                            .contains(&needle)
+                        || article
+                            .date
+                            .as_deref()
+                            .unwrap_or("")
+                            .to_lowercase()
+                            .contains(&needle)
+                })
+                .cloned()
+                .collect();
+            let cfg = Config::load(&config_path).unwrap_or_default();
+            episodes.delete_all_items();
+            for (index, article) in filtered.iter().enumerate() {
+                let title = if article.title.is_empty() {
+                    "Untitled episode"
+                } else {
+                    &article.title
+                };
+                episodes.insert_item(index as i64, title, None);
+                episodes.set_item_text_by_column(
+                    index as i64,
+                    1,
+                    article.date.as_deref().unwrap_or(""),
+                );
+                let downloaded =
+                    blindrss_core::download::downloaded_media_path(&cfg, article).is_some();
+                episodes.set_item_text_by_column(
+                    index as i64,
+                    2,
+                    if downloaded {
+                        "Downloaded"
+                    } else {
+                        "Available online"
+                    },
+                );
+            }
+            *visible.borrow_mut() = filtered;
+            update_action_state();
+        })
+    };
+    let show_state: Rc<dyn Fn()> = {
+        let all_articles = all_articles.clone();
+        let selected_feed = selected_feed.clone();
+        let db_path = db_path.clone();
+        let scope = scope.clone();
+        Rc::new(move || {
+            let Some(feed) = selected_feed() else {
+                status.set_label("Choose a subscribed podcast.");
+                return;
+            };
+            let count = all_articles.borrow().len();
+            let noun = if count == 1 { "episode" } else { "episodes" };
+            let state = blindrss_core::archive_store::state(&db_path, &scope, &feed.id).unwrap_or(
+                blindrss_core::archive_store::ArchiveState {
+                    feed_id: feed.id.clone(),
+                    feed_url: String::new(),
+                    status: "never".into(),
+                    last_attempt: None,
+                    last_success: None,
+                    snapshot_count: 0,
+                    episode_count: 0,
+                    error: String::new(),
+                },
+            );
+            let text = match state.status.as_str() {
+                "complete" => format!(
+                    "{count} playable {noun}; archive scanned snapshots: {}.",
+                    state.snapshot_count
+                ),
+                "scanning" => format!(
+                    "Archive scan is running. {count} playable {noun} is currently available."
+                ),
+                "error" => format!(
+                    "Archive scan needs retrying: {}. {count} playable {noun} is available.",
+                    if state.error.is_empty() {
+                        "unknown error"
+                    } else {
+                        &state.error
+                    }
+                ),
+                _ => format!(
+                    "Archive scan is pending. {count} playable {noun} is currently available."
+                ),
+            };
+            status.set_label(&text);
+        })
+    };
+    let load_feed: Rc<dyn Fn()> = {
+        let all_articles = all_articles.clone();
+        let apply_filter = apply_filter.clone();
+        let show_state = show_state.clone();
+        let selected_feed = selected_feed.clone();
+        let db_path = db_path.clone();
+        let scope = scope.clone();
+        Rc::new(move || {
+            let mut articles = Vec::new();
+            if let Some(feed) = selected_feed()
+                && let Ok(fresh) = Db::open(&db_path)
+                && let Ok(mut rows) = fresh.articles(Some(&feed.id), 100_000)
+            {
+                rows.retain(|a| a.media_url.as_deref().is_some_and(|m| !m.is_empty()));
+                articles = rows;
+                if !scope.is_empty() {
+                    // Hosted view: merge the account's sidecar
+                    // episodes into the feed's article list.
+                    if let Ok(merged) = blindrss_core::archive_store::merge_articles(
+                        &db_path,
+                        &scope,
+                        &feed.id,
+                        articles.clone(),
+                    ) {
+                        articles = merged;
+                    }
+                }
+            }
+            *all_articles.borrow_mut() = articles;
+            apply_filter();
+            show_state();
+        })
+    };
+    let fill_feeds = {
+        let feeds = feeds.clone();
+        let load_feed = load_feed.clone();
+        Rc::new(move |select_id: Option<&str>| {
+            feed_choice.clear();
+            for feed in feeds.borrow().iter() {
+                feed_choice.append(if feed.title.is_empty() {
+                    &feed.url
+                } else {
+                    &feed.title
+                });
+            }
+            let index = select_id
+                .and_then(|id| feeds.borrow().iter().position(|f| f.id == id))
+                .unwrap_or(0);
+            if !feeds.borrow().is_empty() {
+                feed_choice.set_selection(index as u32);
+            }
+            load_feed();
+        })
+    };
+    let selected_articles: Rc<dyn Fn() -> Vec<blindrss_core::Article>> = {
+        let visible = visible.clone();
+        Rc::new(move || {
+            let mut picked = Vec::new();
+            let mut index = episodes.get_first_selected_item();
+            while index >= 0 {
+                if let Some(article) = visible.borrow().get(index as usize) {
+                    picked.push(article.clone());
+                }
+                index = episodes.get_next_item(
+                    index as i64,
+                    ListNextItemFlag::All,
+                    ListItemState::Selected,
+                );
+            }
+            picked
+        })
+    };
+
+    // Batch download (Python's _start_batch_download and worker):
+    // confirm, then download on a worker with per-episode
+    // progress and a cancel flag.
+    let start_download: Rc<dyn Fn(Vec<blindrss_core::Article>)> = {
+        let download_running = download_running.clone();
+        let download_cancel = download_cancel.clone();
+        let update_action_state = update_action_state.clone();
+        let selected_feed = selected_feed.clone();
+        let config_path = config_path.clone();
+        let frame2 = *frame;
+        Rc::new(move |articles: Vec<blindrss_core::Article>| {
+            if articles.is_empty() || download_running.get() {
+                return;
+            }
+            let cfg = Config::load(&config_path).unwrap_or_default();
+            if !cfg.get_bool("downloads_enabled", false) {
+                let md = MessageDialog::builder(
+                    &frame2,
+                    "Downloads are disabled. Enable them in Settings > Downloads.",
+                    "Downloads disabled",
+                )
+                .with_style(MessageDialogStyle::OK | MessageDialogStyle::IconInformation)
+                .build();
+                md.show_modal();
+                md.destroy();
+                return;
+            }
+            let count = articles.len();
+            let md = MessageDialog::builder(
+                &frame2,
+                &format!(
+                    "Download {count} episode{}?",
+                    if count == 1 { "" } else { "s" }
+                ),
+                "Podcast Archive",
+            )
+            .with_style(MessageDialogStyle::YesNo | MessageDialogStyle::IconQuestion)
+            .build();
+            let answer = md.show_modal();
+            md.destroy();
+            if answer != ID_YES {
+                return;
+            }
+            download_cancel.store(false, Ordering::Relaxed);
+            download_running.set(true);
+            update_action_state();
+            let feed_title = selected_feed().map(|f| f.title).unwrap_or_default();
+            let tx = tx_download.clone();
+            let cancel = download_cancel.clone();
+            let config_path = config_path.clone();
+            std::thread::spawn(move || {
+                let cfg = Config::load(&config_path).unwrap_or_default();
+                let base = {
+                    let dir = cfg.get_str("download_path", "");
+                    if dir.is_empty() {
+                        crate::home_dir().join("Downloads").join("BlindRSS")
+                    } else {
+                        std::path::PathBuf::from(dir)
+                    }
+                };
+                let folder = base.join(blindrss_core::download::sanitize_filename(
+                    if feed_title.is_empty() {
+                        "Podcast Archive"
+                    } else {
+                        &feed_title
+                    },
+                ));
+                let _ = std::fs::create_dir_all(&folder);
+                let format = cfg.get_str("download_format", "video_best").to_string();
+                let total = articles.len();
+                let (mut downloaded, mut skipped, mut failed) = (0usize, 0usize, 0usize);
+                for (index, article) in articles.iter().enumerate() {
+                    if cancel.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let _ = tx.send(PodcastArchiveMsg::DownloadProgress(format!(
+                        "Downloading episode {} of {total}: {}",
+                        index + 1,
+                        if article.title.is_empty() {
+                            "Untitled episode"
+                        } else {
+                            &article.title
+                        }
+                    )));
+                    if blindrss_core::download::downloaded_media_path(&cfg, article).is_some() {
+                        skipped += 1;
+                        continue;
+                    }
+                    let result = podcast_archive_download_one(article, &folder, &format);
+                    match result {
+                        Ok(path) => {
+                            let mut cfg = Config::load(&config_path).unwrap_or_default();
+                            if blindrss_core::download::record_article_download(
+                                &mut cfg, article, &path,
+                            )
+                            .is_ok()
+                            {
+                                let _ = cfg.save(&config_path);
+                            }
+                            downloaded += 1;
+                        }
+                        Err(_) => failed += 1,
+                    }
+                }
+                let _ = tx.send(PodcastArchiveMsg::DownloadDone {
+                    downloaded,
+                    skipped,
+                    failed,
+                    canceled: cancel.load(Ordering::Relaxed),
+                });
+            });
+        })
+    };
+
     {
-        let chosen = chosen.clone();
-        let d = dialog;
-        rescan_btn.on_click(move |_| {
-            *chosen.borrow_mut() = list.get_selection().map(|s| s as usize);
-            d.end_modal(5100);
+        let load_feed = load_feed.clone();
+        feed_choice.on_selection_changed(move |_| load_feed());
+    }
+    {
+        let apply_filter = apply_filter.clone();
+        filter_ctrl.on_text_updated(move |_| apply_filter());
+    }
+    let play_selected: Rc<dyn Fn()> = {
+        let selected_articles = selected_articles.clone();
+        let visible = visible.clone();
+        Rc::new(move || {
+            let mut picked = selected_articles();
+            if picked.is_empty()
+                && let Some(first) = visible.borrow().first().cloned()
+            {
+                picked.push(first);
+            }
+            if let Some(article) = picked.into_iter().next() {
+                let body = article
+                    .content
+                    .as_deref()
+                    .filter(|text| !text.trim().is_empty())
+                    .or(article.description.as_deref())
+                    .unwrap_or("");
+                let body = blindrss_core::extract::html_to_text_opts(body, false);
+                let body = match article.media_url.as_deref() {
+                    Some(media) if !media.is_empty() => format!("{body}\n\nMedia: {media}"),
+                    _ => body,
+                };
+                crate::article_window::open(&article.title, &body, Some(&article.url));
+            }
+        })
+    };
+    {
+        let play_selected = play_selected.clone();
+        play_btn.on_click(move |_| play_selected());
+    }
+    {
+        let play_selected = play_selected.clone();
+        episodes.on_item_activated(move |_| play_selected());
+    }
+    {
+        let start_download = start_download.clone();
+        let selected_articles = selected_articles.clone();
+        let frame2 = *frame;
+        dl_selected_btn.on_click(move |_| {
+            let picked = selected_articles();
+            if picked.is_empty() {
+                let md = MessageDialog::builder(
+                    &frame2,
+                    "Select one or more episodes first.",
+                    "Podcast Archive",
+                )
+                .with_style(MessageDialogStyle::OK | MessageDialogStyle::IconInformation)
+                .build();
+                md.show_modal();
+                md.destroy();
+                return;
+            }
+            start_download(picked);
         });
     }
-    let d = dialog;
-    close_btn.on_click(move |_| d.end_modal(5101));
+    {
+        let start_download = start_download.clone();
+        let all_articles = all_articles.clone();
+        dl_all_btn.on_click(move |_| start_download(all_articles.borrow().clone()));
+    }
+    {
+        let scan_cancel = scan_cancel.clone();
+        let download_cancel = download_cancel.clone();
+        cancel_btn.on_click(move |_| {
+            scan_cancel.store(true, Ordering::Relaxed);
+            download_cancel.store(true, Ordering::Relaxed);
+        });
+    }
+    {
+        let scan_running = scan_running.clone();
+        let scan_cancel = scan_cancel.clone();
+        let update_action_state = update_action_state.clone();
+        let selected_feed = selected_feed.clone();
+        let db_path = db_path.clone();
+        let scope = scope.clone();
+        let settings = settings.clone();
+        rescan_btn.on_click(move |_| {
+            let Some(feed) = selected_feed() else { return };
+            if scan_running.get() {
+                return;
+            }
+            scan_running.set(true);
+            scan_cancel.store(false, Ordering::Relaxed);
+            status.set_label("Starting archive rescan...");
+            update_action_state();
+            let tx = tx_scan.clone();
+            let cancel = scan_cancel.clone();
+            let db_path = db_path.clone();
+            let scope = scope.clone();
+            let settings = settings.clone();
+            std::thread::spawn(move || {
+                let progress = {
+                    let tx = tx.clone();
+                    move |p: blindrss_core::archive::ScanProgress| {
+                        let label = match p.stage {
+                            "current" => format!(
+                                "Reading the current feed... {} episodes found",
+                                p.episodes_found
+                            ),
+                            "index" => "Asking the Wayback Machine for snapshots...".to_string(),
+                            "snapshot" => format!(
+                                "Loading snapshots: {} of {} loaded, {} episodes found",
+                                p.snapshots_loaded, p.snapshots_found, p.episodes_found
+                            ),
+                            _ => format!("{} episodes found", p.episodes_found),
+                        };
+                        let _ = tx.send(PodcastArchiveMsg::ScanProgress(label));
+                    }
+                };
+                let result: Result<Option<String>, String> = if scope.is_empty() {
+                    match blindrss_core::archive::perform_local_scan(
+                        &db_path,
+                        &feed,
+                        &settings,
+                        blindrss_core::archive::Claim::Force,
+                        &cancel,
+                        progress,
+                    ) {
+                        Ok(outcome) => match outcome.kind {
+                            blindrss_core::archive::LocalScanKind::Stored => Ok(Some(format!(
+                                "Archive rescan complete: {} recovered episode(s) added.",
+                                outcome.recovered
+                            ))),
+                            blindrss_core::archive::LocalScanKind::NotPodcast => Ok(Some(
+                                "That feed has no podcast episodes to archive.".to_string(),
+                            )),
+                            blindrss_core::archive::LocalScanKind::NotDue => {
+                                Ok(Some("Archive scan is not due yet.".to_string()))
+                            }
+                            blindrss_core::archive::LocalScanKind::Canceled => Ok(None),
+                        },
+                        Err(error) => Err(error),
+                    }
+                } else {
+                    use blindrss_core::archive_store as store;
+                    let claimed = store::reset(&db_path, &scope, &feed.id).is_ok()
+                        && matches!(
+                            store::claim(
+                                &db_path,
+                                &scope,
+                                &feed.id,
+                                &feed.url,
+                                settings.hosted_rescan_seconds(),
+                                true,
+                                store::now_seconds(),
+                            ),
+                            Ok(true)
+                        );
+                    if !claimed {
+                        Err("Could not claim the archive scan.".to_string())
+                    } else {
+                        let outcome = blindrss_core::archive::run_hosted_scan(
+                            &db_path, &scope, &feed.id, &feed.url, &settings, &cancel, progress,
+                        );
+                        match outcome.kind {
+                            blindrss_core::archive::HostedScanKind::Stored => Ok(Some(format!(
+                                "Archive rescan complete: {} recovered episode(s) in the archive.",
+                                outcome.recovered
+                            ))),
+                            blindrss_core::archive::HostedScanKind::Cleared => Ok(Some(
+                                "That feed has no podcast episodes to archive.".to_string(),
+                            )),
+                            blindrss_core::archive::HostedScanKind::Canceled => Ok(None),
+                            blindrss_core::archive::HostedScanKind::Failed => Err(outcome.error),
+                        }
+                    }
+                };
+                let _ = tx.send(PodcastArchiveMsg::ScanDone(result));
+            });
+        });
+    }
+    {
+        let frame2 = *frame;
+        let db_path = db_path.clone();
+        find_btn.on_click(move |_| {
+            let Some(url) = show_feed_search(&frame2) else {
+                return;
+            };
+            status.set_label(&format!("Adding {url}..."));
+            let tx = tx_find.clone();
+            let db_path = db_path.clone();
+            std::thread::spawn(move || {
+                let cfg = Config::load(&crate::config_path()).unwrap_or_default();
+                let result = if blindrss_core::provider::active_name(&cfg) != "local" {
+                    let provider = blindrss_core::provider::get_provider(&cfg, crate::db_path());
+                    provider.add_feed(&url).map(|_| None)
+                } else {
+                    (|| -> Result<Option<String>, String> {
+                        let (feed_url, parsed) =
+                            blindrss_core::discovery::resolve_subscribe_url(&url)?;
+                        let db = Db::open(&db_path).map_err(|e| e.to_string())?;
+                        if db.feed_url_exists(&feed_url).unwrap_or(false) {
+                            return Ok(None);
+                        }
+                        let feed = db
+                            .add_feed(&feed_url, &parsed.title, None)
+                            .map_err(|e| e.to_string())?;
+                        blindrss_core::refresh::store_parsed(&db, &feed, &parsed)?;
+                        Ok(Some(feed.id))
+                    })()
+                };
+                let _ = tx.send(PodcastArchiveMsg::FeedAdded(result));
+            });
+        });
+    }
+    {
+        let scan_running = scan_running.clone();
+        let download_running = download_running.clone();
+        let close_when_idle = close_when_idle.clone();
+        let scan_cancel = scan_cancel.clone();
+        let download_cancel = download_cancel.clone();
+        let frame2 = *frame;
+        let d = dialog;
+        close_btn.on_click(move |_| {
+            if scan_running.get() || download_running.get() {
+                let md = MessageDialog::builder(
+                    &frame2,
+                    "Stop the active work and close this window when it is safe?",
+                    "Podcast Archive",
+                )
+                .with_style(MessageDialogStyle::YesNo | MessageDialogStyle::IconQuestion)
+                .build();
+                let answer = md.show_modal();
+                md.destroy();
+                if answer != ID_YES {
+                    return;
+                }
+                scan_cancel.store(true, Ordering::Relaxed);
+                download_cancel.store(true, Ordering::Relaxed);
+                close_when_idle.set(true);
+                status.set_label("Stopping; this window will close when the active work finishes.");
+                return;
+            }
+            d.end_modal(5101);
+        });
+    }
+
+    fill_feeds(None);
+
+    // Drain worker results while the dialog is open.
+    let timer = Timer::new(&dialog);
+    {
+        let rx = rx.clone();
+        let feeds = feeds.clone();
+        let fill_feeds = fill_feeds.clone();
+        let load_feed = load_feed.clone();
+        let apply_filter = apply_filter.clone();
+        let scan_running = scan_running.clone();
+        let download_running = download_running.clone();
+        let close_when_idle = close_when_idle.clone();
+        let update_action_state = update_action_state.clone();
+        let frame2 = *frame;
+        let d = dialog;
+        timer.on_tick(move |_| {
+            while let Ok(msg) = rx.try_recv() {
+                match msg {
+                    PodcastArchiveMsg::ScanProgress(label) => status.set_label(&label),
+                    PodcastArchiveMsg::ScanDone(result) => {
+                        scan_running.set(false);
+                        load_feed();
+                        update_action_state();
+                        if close_when_idle.get() {
+                            d.end_modal(5101);
+                            continue;
+                        }
+                        match result {
+                            Ok(Some(summary)) => status.set_label(&summary),
+                            Ok(None) => status.set_label("Archive scan canceled."),
+                            Err(error) => {
+                                let md = MessageDialog::builder(
+                                    &frame2,
+                                    &format!("Archive rescan failed: {error}"),
+                                    "Podcast Archive",
+                                )
+                                .with_style(
+                                    MessageDialogStyle::OK | MessageDialogStyle::IconError,
+                                )
+                                .build();
+                                md.show_modal();
+                                md.destroy();
+                            }
+                        }
+                    }
+                    PodcastArchiveMsg::DownloadProgress(label) => status.set_label(&label),
+                    PodcastArchiveMsg::DownloadDone {
+                        downloaded,
+                        skipped,
+                        failed,
+                        canceled,
+                    } => {
+                        download_running.set(false);
+                        apply_filter();
+                        update_action_state();
+                        let summary = format!(
+                            "{}Downloaded: {downloaded}; already present: {skipped}; failed: {failed}.",
+                            if canceled { "Canceled. " } else { "" }
+                        );
+                        if close_when_idle.get() {
+                            d.end_modal(5101);
+                            continue;
+                        }
+                        status.set_label(&summary);
+                        let md = MessageDialog::builder(&frame2, &summary, "Podcast Archive")
+                            .with_style(
+                                MessageDialogStyle::OK | MessageDialogStyle::IconInformation,
+                            )
+                            .build();
+                        md.show_modal();
+                        md.destroy();
+                    }
+                    PodcastArchiveMsg::FeedAdded(result) => match result {
+                        Ok(new_id) => {
+                            if let Ok(fresh) = Db::open(&crate::db_path())
+                                && let Ok(list) = fresh.feeds()
+                            {
+                                *feeds.borrow_mut() = list;
+                            }
+                            fill_feeds(new_id.as_deref());
+                        }
+                        Err(error) => {
+                            status.set_label(&format!("Could not add podcast: {error}"))
+                        }
+                    },
+                }
+            }
+        });
+    }
+    timer.start(150, false);
     dialog.set_sizer(sizer, true);
-    dialog.set_size(Size::new(560, 420));
-    let idx = if dialog.show_modal() == 5100 {
-        *chosen.borrow()
-    } else {
-        None
-    };
+    dialog.set_size(Size::new(980, 680));
+    dialog.show_modal();
+    timer.stop();
     dialog.destroy();
-    idx.and_then(|i| podcasts.get(i).map(|f| (*f).clone()))
+    None
+}
+
+/// One episode download for the archive manager's batch worker:
+/// direct media when it is a plain playable file, otherwise the
+/// same resolve-then-download chain as the main window's
+/// Download action.
+fn podcast_archive_download_one(
+    article: &blindrss_core::Article,
+    dir: &Path,
+    format: &str,
+) -> Result<std::path::PathBuf, String> {
+    if let Some(media) = article.media_url.as_deref().filter(|url| {
+        !url.is_empty()
+            && blindrss_core::media::is_playable_media(url, article.media_type.as_deref())
+            && !blindrss_core::media::is_ytdlp_supported(url)
+    }) {
+        return blindrss_core::download::download_direct(media, dir, &article.title);
+    }
+    if article.url.is_empty() {
+        return Err("Article has nothing to download".to_string());
+    }
+    match blindrss_core::media::resolve_for_play(
+        article.media_url.as_deref(),
+        article.media_type.as_deref(),
+        &article.url,
+        article.content.as_deref(),
+    ) {
+        Ok(resolved) if resolved.via_ytdlp => {
+            blindrss_core::download::download_with_ytdlp(&article.url, dir, format)
+        }
+        Ok(resolved) => {
+            blindrss_core::download::download_direct(&resolved.url, dir, &article.title)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// Load the persisted play queue (config "play_queue": entry

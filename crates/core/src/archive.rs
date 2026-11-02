@@ -1,9 +1,17 @@
-//! Podcast archive rescan (scoped port of `core/podcast_archive.py`).
+//! Podcast archive recovery (port of `core/podcast_archive.py`).
 //!
 //! Python's archive follows feed lineage through Wayback snapshots
 //! to recover episodes the live feed document no longer carries.
 //! Current documents take precedence over older snapshots. Feed migrations
 //! are followed with bounded lineage, snapshot count, and document sizes.
+//! Fetches retry transient Archive.org failures with Python's bounded
+//! backoff, scans report progress and honour cancellation, and archive
+//! walks process-wide are serialized through one background job queue
+//! (Python's `AUTOMATIC_SCAN_LOCK` + `enqueue_archive_job`). The
+//! scan-and-persist orchestrations for local feeds (recovered episodes
+//! fold into the ordinary articles table) and hosted feeds (recovered
+//! episodes land in the account-scoped sidecar) live at the bottom of
+//! this module, over the state store in `archive_store`.
 
 use crate::db::{Db, Feed};
 use crate::feeds::{ParsedEntry, ParsedFeed};
@@ -20,17 +28,57 @@ pub struct ArchiveEpisode {
 }
 
 impl ArchiveEpisode {
+    /// The hosted sidecar episode key (Python
+    /// `_podcast_archive_episode_key`, duplicated identically in the
+    /// hosted mixin and Miniflux): SHA-256 of the sorted identity
+    /// keys joined by newlines, or of the
+    /// `guid|media|page|title|published` tuple when the episode
+    /// carries no identity keys.
     pub fn key(&self) -> String {
         use sha2::Digest;
-        let seed = if !self.entry.id.is_empty() {
-            &self.entry.id
+        let seed = if self.identity_keys.is_empty() {
+            format!(
+                "{}|{}|{}|{}|{}",
+                self.entry.id,
+                self.entry.media_url.as_deref().unwrap_or(""),
+                self.entry.url,
+                self.entry.title,
+                self.entry.date.as_deref().unwrap_or("")
+            )
         } else {
-            self.entry.media_url.as_ref().unwrap_or(&self.entry.url)
+            let mut keys: Vec<&str> = self.identity_keys.iter().map(String::as_str).collect();
+            keys.sort_unstable();
+            keys.join("\n")
         };
         sha2::Sha256::digest(seed.as_bytes())
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect()
+    }
+
+    /// Python `ArchiveEpisode.stable_id`: the id assigned to a
+    /// recovered entry whose feed gave it no GUID — the media URL,
+    /// then the page URL, seed the digest.
+    pub fn stable_id(&self) -> String {
+        use sha2::Digest;
+        let seed = if !self.entry.id.is_empty() {
+            self.entry.id.clone()
+        } else if let Some(media) = self.entry.media_url.as_deref().filter(|m| !m.is_empty()) {
+            media.to_string()
+        } else if !self.entry.url.is_empty() {
+            self.entry.url.clone()
+        } else {
+            format!(
+                "{}|{}|",
+                self.entry.title,
+                self.entry.date.as_deref().unwrap_or("")
+            )
+        };
+        let digest: String = sha2::Sha256::digest(seed.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        format!("podcast-archive:{digest}")
     }
 }
 
@@ -41,10 +89,15 @@ pub struct ArchiveDocument {
     pub lineage: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ScanOptions {
     pub max_snapshots: usize,
     pub include_without_media: bool,
+    /// The already-fetched live document for the first seed feed
+    /// (Python's `current_document`): refresh pipelines that just
+    /// downloaded the feed hand it over instead of paying a second
+    /// request. Consumed by the first feed the scan processes.
+    pub current_document: Option<Vec<u8>>,
 }
 
 impl Default for ScanOptions {
@@ -52,6 +105,7 @@ impl Default for ScanOptions {
         Self {
             max_snapshots: 5000,
             include_without_media: false,
+            current_document: None,
         }
     }
 }
@@ -72,11 +126,160 @@ pub struct ScanResult {
     documents: Vec<ParsedFeed>,
 }
 
+/// One progress report (Python's progress dict): the stage plus
+/// running counts. `episodes_found` counts episodes whose identity
+/// keys are all new so far — a deduplicated estimate that matches
+/// the final count unless a later episode bridges two earlier
+/// ones into a single merged episode.
 #[derive(Debug, Clone)]
 pub struct ScanProgress {
     pub stage: &'static str,
+    pub feed_urls: usize,
     pub snapshots_found: usize,
     pub snapshots_loaded: usize,
+    pub episodes_found: usize,
+}
+
+/// True when a parsed feed carries at least one playable
+/// enclosure (Python `feed_has_podcast_media`) — the gate that
+/// decides whether a feed pays for a Wayback walk at all.
+pub fn feed_has_podcast_media(entries: &[ParsedEntry]) -> bool {
+    entries.iter().any(|entry| {
+        entry
+            .media_url
+            .as_deref()
+            .is_some_and(|url| !url.is_empty())
+    })
+}
+
+/// The error a finished scan records when it loaded nothing
+/// (Python `_podcast_archive_result_error`, shared by the local
+/// provider and both hosted implementations): the first warning,
+/// or the generic snapshot failure when snapshots existed but
+/// none loaded. Empty when the scan loaded at least one snapshot
+/// or found nothing to load.
+pub fn result_error(result: &ScanResult) -> String {
+    if result.snapshots_loaded == 0 {
+        if let Some(warning) = result.warnings.first() {
+            return warning.clone();
+        }
+        if result.snapshots_found > 0 {
+            return "The Wayback Machine snapshots could not be loaded.".into();
+        }
+    }
+    String::new()
+}
+
+/// Whether a fetch failure looks like one of Archive.org's
+/// transient responses (HTTP 429/5xx, timeouts, connection
+/// trouble) that Python's `_fetch_with_retry` retries.
+fn is_transient_error(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    ["429", "500", "502", "503", "504"]
+        .iter()
+        .any(|code| lower.contains(code))
+        || [
+            "timed out",
+            "timeout",
+            "connection",
+            "temporar",
+            "reset by peer",
+            "broken pipe",
+            "unexpected eof",
+        ]
+        .iter()
+        .any(|word| lower.contains(word))
+}
+
+fn sleep_cancelable(cancel: &AtomicBool, seconds: f64) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs_f64(seconds);
+    while std::time::Instant::now() < deadline {
+        if cancel.load(Ordering::Relaxed) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// Python `_fetch_with_retry`: three attempts, doubling backoff
+/// (1 s, 2 s), only for transient failures; cancellation between
+/// attempts reports the scan as canceled.
+fn fetch_with_retry(
+    fetch: &mut impl FnMut(&str) -> Result<(Vec<u8>, String), String>,
+    url: &str,
+    cancel: &AtomicBool,
+) -> Result<(Vec<u8>, String), String> {
+    let mut last_error = String::new();
+    for attempt in 0..3 {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("Podcast archive scan canceled.".into());
+        }
+        match fetch(url) {
+            Ok(value) => return Ok(value),
+            Err(error) => {
+                let transient = is_transient_error(&error);
+                last_error = error;
+                if !transient || attempt == 2 {
+                    break;
+                }
+                sleep_cancelable(cancel, f64::from(1u32 << attempt));
+            }
+        }
+    }
+    if cancel.load(Ordering::Relaxed) {
+        return Err("Podcast archive scan canceled.".into());
+    }
+    Err(last_error)
+}
+
+/// Process-wide serialization for archive walks (Python's
+/// `AUTOMATIC_SCAN_LOCK`): a refresh may have dozens of feed
+/// workers, but archive.org should see only one history walk at
+/// a time.
+static SCAN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+pub fn automatic_scan_lock() -> &'static std::sync::Mutex<()> {
+    &SCAN_LOCK
+}
+
+/// Enqueue a job on the single background archive worker
+/// (Python's `enqueue_archive_job`): jobs run serially on one
+/// daemon thread, so queueing never delays a feed refresh, and a
+/// failing job is logged by the caller's own error handling
+/// without killing the worker.
+pub fn enqueue_archive_job(job: impl FnOnce() + Send + 'static) {
+    static SENDER: std::sync::OnceLock<std::sync::mpsc::Sender<Box<dyn FnOnce() + Send>>> =
+        std::sync::OnceLock::new();
+    let sender = SENDER.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<Box<dyn FnOnce() + Send>>();
+        let _ = std::thread::Builder::new()
+            .name("PodcastArchiveWorker".into())
+            .spawn(move || {
+                while let Ok(job) = rx.recv() {
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+                }
+            });
+        tx
+    });
+    let _ = sender.send(Box::new(job));
+}
+
+/// The archive scanner's network fetch (the shared HTTP agent,
+/// bounded to Python's 10 MiB document cap). Returns the body
+/// and the final URL after redirects.
+pub fn http_fetch(url: &str) -> Result<(Vec<u8>, String), String> {
+    let mut response = crate::http::agent()
+        .get(url)
+        .call()
+        .map_err(|e| e.to_string())?;
+    let final_url = response.get_uri().to_string();
+    let bytes = response
+        .body_mut()
+        .with_config()
+        .limit(10 * 1024 * 1024)
+        .read_to_vec()
+        .map_err(|e| e.to_string())?;
+    Ok((bytes, final_url))
 }
 
 fn unwrap_wayback(value: &str) -> &str {
@@ -155,19 +358,33 @@ pub fn canonical_url(value: &str, media: bool) -> String {
     url.into()
 }
 
-fn identity_keys(
+/// Python `_episode_identity_keys`. An episode earns a GUID key
+/// (canonicalized only when the GUID is a URL, as Python does), a
+/// media key and a page key (both canonical, so rotating signed
+/// media tokens still match), and a title key: `title-date` when a
+/// real publication day exists, else `title-duration` — Python's
+/// fallback for undated episodes. Keys whose value part is empty
+/// are dropped, as in Python. `duration` is Python's
+/// itunes:duration; the Rust feed parser does not retain it yet,
+/// so callers pass None and the duration branch stays inert until
+/// the parser carries it.
+pub fn episode_identity_keys(
     id: &str,
     page: &str,
     media: Option<&str>,
     title: &str,
     date: Option<&str>,
+    duration: Option<&str>,
 ) -> HashSet<String> {
     let mut keys = HashSet::new();
-    if !id.trim().is_empty() {
-        keys.insert(format!(
-            "guid:{}",
-            canonical_url(id.trim(), false).to_lowercase()
-        ));
+    let guid = id.trim();
+    if !guid.is_empty() {
+        let guid = if guid.contains("://") {
+            canonical_url(guid, false)
+        } else {
+            guid.to_string()
+        };
+        keys.insert(format!("guid:{}", guid.to_lowercase()));
     }
     if !page.trim().is_empty() {
         keys.insert(format!("page:{}", canonical_url(page, false)));
@@ -176,28 +393,64 @@ fn identity_keys(
         keys.insert(format!("media:{}", canonical_url(media, true)));
     }
     let title = title
-        .to_ascii_lowercase()
+        .to_lowercase()
         .split(|c: char| !c.is_ascii_alphanumeric())
         .filter(|word| !word.is_empty())
         .collect::<Vec<_>>()
         .join(" ");
-    if let Some(day) = date
+    let day = date
         .and_then(|date| date.get(..10))
-        .filter(|day| !day.starts_with("0001-"))
-        && !title.is_empty()
-    {
-        keys.insert(format!("title-date:{title}|{day}"));
+        .filter(|day| !day.starts_with("0001-"));
+    if !title.is_empty() {
+        if let Some(day) = day {
+            keys.insert(format!("title-date:{title}|{day}"));
+        } else if let Some(duration) = duration.filter(|d| !d.trim().is_empty()) {
+            keys.insert(format!("title-duration:{title}|{}", duration.trim()));
+        }
     }
+    keys.retain(|key| {
+        key.rsplit(':')
+            .next()
+            .is_some_and(|value| !value.is_empty())
+    });
     keys
 }
 
+/// Identity keys for one parsed feed entry. feed-rs invents a
+/// random UUID id for entries with no guid, and feeds.rs mirrors
+/// it into the entry URL when the entry also has no link (the
+/// archive base join then turns it into "<feed dir>/<uuid>").
+/// Python's feedparser leaves both empty, so the invented values
+/// must not contribute guid/page identity: the random id changes
+/// on every parse, which would make the episode's key unstable
+/// and reconciliation across snapshots impossible. (A real
+/// UUID-shaped guid WITH a link keeps its keys; the only loss is
+/// a UUID guid with no link, no media and no date, which
+/// feedparser would key by guid alone.)
+fn entry_identity_keys(entry: &ParsedEntry) -> HashSet<String> {
+    let id = entry.id.as_str();
+    let url = entry.url.as_str();
+    let synthesized =
+        uuid::Uuid::parse_str(id).is_ok() && (url == id || url.ends_with(&format!("/{id}")));
+    let (id, url) = if synthesized { ("", "") } else { (id, url) };
+    episode_identity_keys(
+        id,
+        url,
+        entry.media_url.as_deref(),
+        &entry.title,
+        entry.date.as_deref(),
+        None,
+    )
+}
+
 pub fn article_identity_keys(article: &crate::Article) -> HashSet<String> {
-    identity_keys(
+    episode_identity_keys(
         &article.id,
         &article.url,
         article.media_url.as_deref(),
         &article.title,
         article.date.as_deref(),
+        None,
     )
 }
 
@@ -214,7 +467,7 @@ pub fn parse_document(
     let episodes = feed
         .entries
         .into_iter()
-        .map(|mut entry| {
+        .filter_map(|mut entry| {
             if let Some(base) = &base {
                 if !entry.url.is_empty()
                     && let Ok(url) = base.join(unwrap_wayback(&entry.url))
@@ -227,19 +480,19 @@ pub fn parse_document(
                     entry.media_url = Some(url.into());
                 }
             }
-            let identity_keys = identity_keys(
-                &entry.id,
-                &entry.url,
-                entry.media_url.as_deref(),
-                &entry.title,
-                entry.date.as_deref(),
-            );
-            ArchiveEpisode {
+            let identity_keys = entry_identity_keys(&entry);
+            // Python keeps only episodes that carry at least one
+            // identity key; a keyless entry can never be reconciled
+            // against another snapshot and is dropped.
+            if identity_keys.is_empty() {
+                return None;
+            }
+            Some(ArchiveEpisode {
                 entry,
                 source_feed_url: source_url.into(),
                 snapshot_timestamp: timestamp.into(),
                 identity_keys,
-            }
+            })
         })
         .collect();
     Ok(ArchiveDocument {
@@ -286,13 +539,7 @@ fn merge_episode(preferred: &mut ArchiveEpisode, other: ArchiveEpisode) {
     fill(&mut preferred.source_feed_url, other.source_feed_url);
     fill(&mut preferred.snapshot_timestamp, other.snapshot_timestamp);
     preferred.identity_keys.extend(other.identity_keys);
-    preferred.identity_keys.extend(identity_keys(
-        &current.id,
-        &current.url,
-        current.media_url.as_deref(),
-        &current.title,
-        current.date.as_deref(),
-    ));
+    preferred.identity_keys.extend(entry_identity_keys(current));
 }
 
 pub fn deduplicate_episodes(
@@ -302,13 +549,7 @@ pub fn deduplicate_episodes(
     let mut by_key: HashMap<String, usize> = HashMap::new();
     for mut episode in episodes {
         if episode.identity_keys.is_empty() {
-            episode.identity_keys = identity_keys(
-                &episode.entry.id,
-                &episode.entry.url,
-                episode.entry.media_url.as_deref(),
-                &episode.entry.title,
-                episode.entry.date.as_deref(),
-            );
+            episode.identity_keys = entry_identity_keys(&episode.entry);
         }
         let matches: std::collections::BTreeSet<_> = episode
             .identity_keys
@@ -488,27 +729,51 @@ pub fn scan_with_fetch(
     }
     let mut result = ScanResult::default();
     let mut remaining = options.max_snapshots.clamp(1, 5000);
-    let emit = |stage, result: &ScanResult, progress: &mut dyn FnMut(ScanProgress)| {
+    let mut current_document = options.current_document;
+    let mut seen_episode_keys: HashSet<String> = HashSet::new();
+    let mut episodes_found = 0usize;
+    let emit = |stage,
+                result: &ScanResult,
+                episodes_found: usize,
+                progress: &mut dyn FnMut(ScanProgress)| {
         progress(ScanProgress {
             stage,
+            feed_urls: result.feed_urls.len(),
             snapshots_found: result.snapshots_found,
             snapshots_loaded: result.snapshots_loaded,
+            episodes_found,
         });
     };
+    // Fold one parsed document into the running progress estimate.
+    macro_rules! note_document {
+        ($document:expr) => {
+            for episode in &$document.episodes {
+                if episode.identity_keys.is_disjoint(&seen_episode_keys) {
+                    episodes_found += 1;
+                }
+                seen_episode_keys.extend(episode.identity_keys.iter().cloned());
+            }
+        };
+    }
     let mut documents = Vec::new();
     while let Some(feed_url) = pending.pop_front() {
         if cancel.load(Ordering::Relaxed) {
             break;
         }
         result.feed_urls.push(feed_url.clone());
-        emit("current", &result, &mut progress);
+        emit("current", &result, episodes_found, &mut progress);
         if cancel.load(Ordering::Relaxed) {
             break;
         }
-        match fetch(&feed_url).and_then(|(bytes, final_url)| {
-            let final_url = public_url(&final_url).unwrap_or_else(|| feed_url.clone());
-            parse_document(&bytes, &final_url, "").map(|document| (document, final_url))
-        }) {
+        let live = if let Some(bytes) = current_document.take() {
+            parse_document(&bytes, &feed_url, "").map(|document| (document, feed_url.clone()))
+        } else {
+            fetch_with_retry(&mut fetch, &feed_url, cancel).and_then(|(bytes, final_url)| {
+                let final_url = public_url(&final_url).unwrap_or_else(|| feed_url.clone());
+                parse_document(&bytes, &final_url, "").map(|document| (document, final_url))
+            })
+        };
+        match live {
             Ok((mut document, final_url)) => {
                 document.lineage.insert(0, final_url);
                 for candidate in &document.lineage {
@@ -516,9 +781,15 @@ pub fn scan_with_fetch(
                         pending.push_back(candidate.clone());
                     }
                 }
+                note_document!(document);
                 documents.push(document);
             }
-            Err(error) => result.warnings.push(error),
+            Err(error) => {
+                if cancel.load(Ordering::Relaxed) {
+                    break;
+                }
+                result.warnings.push(error);
+            }
         }
         if cancel.load(Ordering::Relaxed) {
             break;
@@ -527,7 +798,7 @@ pub fn scan_with_fetch(
             result.truncated = true;
             continue;
         }
-        emit("index", &result, &mut progress);
+        emit("index", &result, episodes_found, &mut progress);
         if cancel.load(Ordering::Relaxed) {
             break;
         }
@@ -540,7 +811,7 @@ pub fn scan_with_fetch(
             .append_pair("collapse", "digest")
             .append_pair("filter", "!mimetype:warc/revisit")
             .append_pair("limit", &(remaining + 1).to_string());
-        match fetch(index.as_str()) {
+        match fetch_with_retry(&mut fetch, index.as_str(), cancel) {
             Ok((bytes, _)) => {
                 let mut snapshots = snapshot_rows(&bytes, remaining + 1);
                 result.truncated |= snapshots.len() > remaining;
@@ -551,12 +822,12 @@ pub fn scan_with_fetch(
                     if cancel.load(Ordering::Relaxed) {
                         break;
                     }
-                    emit("snapshot", &result, &mut progress);
+                    emit("snapshot", &result, episodes_found, &mut progress);
                     if cancel.load(Ordering::Relaxed) {
                         break;
                     }
                     let snapshot = format!("https://web.archive.org/web/{timestamp}id_/{original}");
-                    match fetch(&snapshot)
+                    match fetch_with_retry(&mut fetch, &snapshot, cancel)
                         .and_then(|(bytes, _)| parse_document(&bytes, &original, &timestamp))
                     {
                         Ok(document) => {
@@ -568,16 +839,25 @@ pub fn scan_with_fetch(
                                 }
                             }
                             result.snapshots_loaded += 1;
+                            note_document!(document);
                             documents.push(document);
                         }
                         Err(error) => {
+                            if cancel.load(Ordering::Relaxed) {
+                                break;
+                            }
                             result.failed_snapshots += 1;
                             result.warnings.push(error);
                         }
                     }
                 }
             }
-            Err(error) => result.warnings.push(error),
+            Err(error) => {
+                if cancel.load(Ordering::Relaxed) {
+                    break;
+                }
+                result.warnings.push(error);
+            }
         }
     }
     // All current documents precede snapshots, including migrated feeds.
@@ -618,7 +898,7 @@ pub fn scan_with_fetch(
         })
     });
     result.canceled = cancel.load(Ordering::Relaxed);
-    emit("complete", &result, &mut progress);
+    emit("complete", &result, result.episodes.len(), &mut progress);
     Ok(result)
 }
 
@@ -633,6 +913,7 @@ fn scan(
         ScanOptions {
             max_snapshots: limit,
             include_without_media: true,
+            current_document: None,
         },
         &AtomicBool::new(false),
         |_| {},
@@ -647,12 +928,13 @@ fn scan(
         .into_iter()
         .map(|mut document| {
             document.entries.retain(|entry| {
-                let keys = identity_keys(
+                let keys = episode_identity_keys(
                     &entry.id,
                     &entry.url,
                     entry.media_url.as_deref(),
                     &entry.title,
                     entry.date.as_deref(),
+                    None,
                 );
                 let fresh = keys.is_disjoint(&seen);
                 seen.extend(keys);
@@ -664,27 +946,19 @@ fn scan(
 }
 
 /// Rescan the live document, archived snapshots and migrated feed URLs.
-/// Returns the number of newly stored articles.
+/// Returns the number of newly stored articles. This is the main
+/// window's entry point: it stores the scan's full episode set
+/// (current + recovered) through the ordinary store path. Callers
+/// that need the archive state store updated alongside (the
+/// Podcast Archive dialog, the background queues) use
+/// [`perform_local_scan`] with the database path instead.
 pub fn rescan_archive(db: &Db, feed: &Feed) -> Result<usize, String> {
     let result = scan_with_fetch(
         std::slice::from_ref(&feed.url),
         ScanOptions::default(),
         &AtomicBool::new(false),
         |_| {},
-        |url| {
-            let mut response = crate::http::agent()
-                .get(url)
-                .call()
-                .map_err(|e| e.to_string())?;
-            let final_url = response.get_uri().to_string();
-            let bytes = response
-                .body_mut()
-                .with_config()
-                .limit(10 * 1024 * 1024)
-                .read_to_vec()
-                .map_err(|e| e.to_string())?;
-            Ok((bytes, final_url))
-        },
+        http_fetch,
     )?;
     if result.readable_documents == 0 {
         return Err(result
@@ -704,6 +978,388 @@ pub fn rescan_archive(db: &Db, feed: &Feed) -> Result<usize, String> {
                 .map(|episode| episode.entry)
                 .collect(),
         },
+    )
+}
+
+/// How a local scan's state-store claim is taken (Python's three
+/// call shapes): a user-requested scan claims with force, an
+/// automatic scan claims only when due, and a queued job whose
+/// claim was taken before enqueueing runs already holding it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Claim {
+    Force,
+    Due,
+    AlreadyHeld,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalScanKind {
+    /// The scan ran; recovered episodes were stored.
+    Stored,
+    /// The current document carries no podcast media, so no scan
+    /// was claimed or run (Python only scans media feeds).
+    NotPodcast,
+    /// The state store says the feed is not due yet.
+    NotDue,
+    /// The scan was canceled; the claim was reset so the feed is
+    /// due again immediately, exactly as Python resets it.
+    Canceled,
+}
+
+#[derive(Debug, Clone)]
+pub struct LocalScanOutcome {
+    pub kind: LocalScanKind,
+    /// Archive-only episodes newly stored as articles.
+    pub recovered: usize,
+    pub snapshots_loaded: usize,
+    /// Total episodes the scan reconciled (Python records this
+    /// as the state's episode_count).
+    pub episodes: usize,
+    /// The recorded scan error (Python's result error), empty on
+    /// a clean scan. Recovered episodes are still stored when
+    /// this is set, matching Python's deferred completion.
+    pub error: String,
+}
+
+impl LocalScanOutcome {
+    fn simple(kind: LocalScanKind) -> Self {
+        Self {
+            kind,
+            recovered: 0,
+            snapshots_loaded: 0,
+            episodes: 0,
+            error: String::new(),
+        }
+    }
+}
+
+/// The local scan-and-store orchestration (Python
+/// `LocalProvider`'s archive flow, with its two-pass pending
+/// result dance collapsed into one pass: `store_parsed` applies
+/// the same tombstone and filter-rule pipeline the second
+/// refresh applied in Python). The current document is fetched
+/// (or supplied by a refresh that just downloaded it); only a
+/// media-bearing document claims and scans. State transitions
+/// mirror Python: canceled → claim reset, otherwise finish with
+/// the snapshot/episode counts or the result error.
+#[allow(clippy::too_many_arguments)]
+pub fn perform_local_scan_with_fetch(
+    db_path: &std::path::Path,
+    feed: &Feed,
+    settings: &crate::archive_store::ArchiveSettings,
+    claim: Claim,
+    current_document: Option<Vec<u8>>,
+    cancel: &AtomicBool,
+    progress: impl FnMut(ScanProgress),
+    mut fetch: impl FnMut(&str) -> Result<(Vec<u8>, String), String>,
+) -> Result<LocalScanOutcome, String> {
+    use crate::archive_store as store;
+    let (bytes, final_url) = match current_document {
+        Some(bytes) => (bytes, feed.url.clone()),
+        None => fetch(&feed.url)?,
+    };
+    let current = parse_document(&bytes, &final_url, "")?;
+    if !feed_has_podcast_media(
+        &current
+            .episodes
+            .iter()
+            .map(|episode| episode.entry.clone())
+            .collect::<Vec<_>>(),
+    ) {
+        return Ok(LocalScanOutcome::simple(LocalScanKind::NotPodcast));
+    }
+    let claimed = match claim {
+        Claim::AlreadyHeld => true,
+        Claim::Force | Claim::Due => store::claim(
+            db_path,
+            "",
+            &feed.id,
+            &feed.url,
+            settings.local_rescan_seconds(),
+            claim == Claim::Force,
+            store::now_seconds(),
+        )?,
+    };
+    if !claimed {
+        return Ok(LocalScanOutcome::simple(LocalScanKind::NotDue));
+    }
+    let result = {
+        let _guard = automatic_scan_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        scan_with_fetch(
+            std::slice::from_ref(&feed.url),
+            ScanOptions {
+                max_snapshots: settings.max_snapshots,
+                include_without_media: true,
+                current_document: Some(bytes.clone()),
+            },
+            cancel,
+            progress,
+            &mut fetch,
+        )?
+    };
+    if result.canceled {
+        let _ = store::reset(db_path, "", &feed.id);
+        return Ok(LocalScanOutcome::simple(LocalScanKind::Canceled));
+    }
+    let recovered_episodes = archive_only_episodes(&result, &bytes)?;
+    let db = Db::open(db_path).map_err(|e| e.to_string())?;
+    let recovered = crate::refresh::store_parsed(
+        &db,
+        feed,
+        &ParsedFeed {
+            title: result.feed_title.clone(),
+            entries: recovered_episodes
+                .into_iter()
+                .map(|episode| episode.entry)
+                .collect(),
+        },
+    )?;
+    let error = result_error(&result);
+    store::finish(
+        db_path,
+        "",
+        &feed.id,
+        result.snapshots_loaded,
+        result.episodes.len(),
+        &error,
+        store::now_seconds(),
+    )?;
+    Ok(LocalScanOutcome {
+        kind: LocalScanKind::Stored,
+        recovered,
+        snapshots_loaded: result.snapshots_loaded,
+        episodes: result.episodes.len(),
+        error,
+    })
+}
+
+/// [`perform_local_scan_with_fetch`] over the real network.
+pub fn perform_local_scan(
+    db_path: &std::path::Path,
+    feed: &Feed,
+    settings: &crate::archive_store::ArchiveSettings,
+    claim: Claim,
+    cancel: &AtomicBool,
+    progress: impl FnMut(ScanProgress),
+) -> Result<LocalScanOutcome, String> {
+    perform_local_scan_with_fetch(
+        db_path, feed, settings, claim, None, cancel, progress, http_fetch,
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostedScanKind {
+    /// Recovered episodes replaced the feed's sidecar rows.
+    Stored,
+    /// The current document carries no podcast media: Python
+    /// clears the sidecar rows and finishes the scan complete.
+    Cleared,
+    /// Canceled; the claim was reset so the feed is due again.
+    Canceled,
+    /// The scan recorded an error; earlier sidecar rows survive.
+    Failed,
+}
+
+#[derive(Debug, Clone)]
+pub struct HostedScanOutcome {
+    pub kind: HostedScanKind,
+    /// Archive-only episodes now held in the sidecar.
+    pub recovered: usize,
+    pub error: String,
+}
+
+/// The hosted scan-and-store orchestration (Python
+/// `HostedPodcastArchiveMixin._run_podcast_archive_scan`, also
+/// Miniflux's copy). Assumes the caller already holds the claim
+/// (the queue job claims inside the job; the manual path resets
+/// and force-claims — see [`refresh_hosted_archive`]). All state
+/// and entries are written under `scope` in the account's own
+/// database file, never the local store or another account's.
+#[allow(clippy::too_many_arguments)]
+pub fn run_hosted_scan_with_fetch(
+    db_path: &std::path::Path,
+    scope: &str,
+    feed_id: &str,
+    feed_url: &str,
+    settings: &crate::archive_store::ArchiveSettings,
+    cancel: &AtomicBool,
+    progress: impl FnMut(ScanProgress),
+    mut fetch: impl FnMut(&str) -> Result<(Vec<u8>, String), String>,
+) -> HostedScanOutcome {
+    use crate::archive_store as store;
+    let failed = |error: String| HostedScanOutcome {
+        kind: HostedScanKind::Failed,
+        recovered: 0,
+        error,
+    };
+    let (bytes, final_url) = match fetch(feed_url) {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = store::finish(db_path, scope, feed_id, 0, 0, &error, store::now_seconds());
+            return failed(error);
+        }
+    };
+    let current = match parse_document(&bytes, &final_url, "") {
+        Ok(document) => document,
+        Err(error) => {
+            let _ = store::finish(db_path, scope, feed_id, 0, 0, &error, store::now_seconds());
+            return failed(error);
+        }
+    };
+    if !current.episodes.iter().any(|episode| {
+        episode
+            .entry
+            .media_url
+            .as_deref()
+            .is_some_and(|m| !m.is_empty())
+    }) {
+        let _ = store::replace_entries(db_path, scope, feed_id, &[]);
+        let _ = store::finish(db_path, scope, feed_id, 0, 0, "", store::now_seconds());
+        return HostedScanOutcome {
+            kind: HostedScanKind::Cleared,
+            recovered: 0,
+            error: String::new(),
+        };
+    }
+    let scan = {
+        let _guard = automatic_scan_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        scan_with_fetch(
+            &[feed_url.to_string()],
+            ScanOptions {
+                max_snapshots: settings.max_snapshots,
+                include_without_media: true,
+                current_document: Some(bytes.clone()),
+            },
+            cancel,
+            progress,
+            &mut fetch,
+        )
+    };
+    let result = match scan {
+        Ok(result) => result,
+        Err(error) => {
+            let _ = store::finish(db_path, scope, feed_id, 0, 0, &error, store::now_seconds());
+            return failed(error);
+        }
+    };
+    if result.canceled {
+        let _ = store::reset(db_path, scope, feed_id);
+        return HostedScanOutcome {
+            kind: HostedScanKind::Canceled,
+            recovered: 0,
+            error: String::new(),
+        };
+    }
+    let error = result_error(&result);
+    if !error.is_empty() {
+        // A transient archive outage must not erase history an
+        // earlier successful scan recovered.
+        let _ = store::finish(
+            db_path,
+            scope,
+            feed_id,
+            result.snapshots_loaded,
+            result.episodes.len(),
+            &error,
+            store::now_seconds(),
+        );
+        return failed(error);
+    }
+    let recovered = match archive_only_episodes(&result, &bytes) {
+        Ok(episodes) => episodes
+            .into_iter()
+            .filter(|episode| {
+                episode
+                    .entry
+                    .media_url
+                    .as_deref()
+                    .is_some_and(|m| !m.is_empty())
+            })
+            .collect::<Vec<_>>(),
+        Err(error) => {
+            let _ = store::finish(db_path, scope, feed_id, 0, 0, &error, store::now_seconds());
+            return failed(error);
+        }
+    };
+    let count = recovered.len();
+    if let Err(error) = store::replace_entries(db_path, scope, feed_id, &recovered) {
+        let _ = store::finish(db_path, scope, feed_id, 0, 0, &error, store::now_seconds());
+        return failed(error);
+    }
+    let _ = store::finish(
+        db_path,
+        scope,
+        feed_id,
+        result.snapshots_loaded,
+        result.episodes.len(),
+        "",
+        store::now_seconds(),
+    );
+    HostedScanOutcome {
+        kind: HostedScanKind::Stored,
+        recovered: count,
+        error: String::new(),
+    }
+}
+
+/// [`run_hosted_scan_with_fetch`] over the real network.
+#[allow(clippy::too_many_arguments)]
+pub fn run_hosted_scan(
+    db_path: &std::path::Path,
+    scope: &str,
+    feed_id: &str,
+    feed_url: &str,
+    settings: &crate::archive_store::ArchiveSettings,
+    cancel: &AtomicBool,
+    progress: impl FnMut(ScanProgress),
+) -> HostedScanOutcome {
+    run_hosted_scan_with_fetch(
+        db_path, scope, feed_id, feed_url, settings, cancel, progress, http_fetch,
+    )
+}
+
+/// The manual hosted rescan (Python `refresh_podcast_archive`):
+/// reset the state, force-claim, then run the scan. Returns
+/// false when the scan did not complete (canceled or failed).
+#[allow(clippy::too_many_arguments)]
+pub fn refresh_hosted_archive(
+    db_path: &std::path::Path,
+    scope: &str,
+    feed_id: &str,
+    feed_url: &str,
+    settings: &crate::archive_store::ArchiveSettings,
+    cancel: &AtomicBool,
+    progress: impl FnMut(ScanProgress),
+) -> bool {
+    use crate::archive_store as store;
+    if feed_id.is_empty() || feed_url.is_empty() {
+        return false;
+    }
+    if store::reset(db_path, scope, feed_id).is_err() {
+        return false;
+    }
+    match store::claim(
+        db_path,
+        scope,
+        feed_id,
+        feed_url,
+        settings.hosted_rescan_seconds(),
+        true,
+        store::now_seconds(),
+    ) {
+        Ok(true) => {}
+        _ => return false,
+    }
+    matches!(
+        run_hosted_scan(
+            db_path, scope, feed_id, feed_url, settings, cancel, progress
+        )
+        .kind,
+        HostedScanKind::Stored | HostedScanKind::Cleared
     )
 }
 
