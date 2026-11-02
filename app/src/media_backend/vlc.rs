@@ -16,9 +16,9 @@ struct AudioDevice {
 }
 
 macro_rules! vlc_api {
-    ($($name:ident: $ty:ty),+ $(,)?) => {
+    ($($(#[$meta:meta])* $name:ident: $ty:ty),+ $(,)?) => {
         struct Api {
-            $($name: $ty,)+
+            $($(#[$meta])* $name: $ty,)+
             _library: Library,
             _core: Option<Library>,
         }
@@ -63,6 +63,9 @@ vlc_api! {
     media_player_set_rate: unsafe extern "C" fn(Handle, f32) -> i32,
     audio_get_volume: unsafe extern "C" fn(Handle) -> i32,
     audio_set_volume: unsafe extern "C" fn(Handle, i32) -> i32,
+    // Windows switches to the mmdevice module before choosing a soundcard;
+    // other platforms keep libVLC's default module, so this entry is unread there.
+    #[cfg_attr(not(windows), allow(dead_code))]
     audio_output_set: unsafe extern "C" fn(Handle, *const c_char) -> i32,
     audio_output_device_set: unsafe extern "C" fn(Handle, *const c_char, *const c_char),
     audio_output_device_list_get: unsafe extern "C" fn(Handle, *const c_char) -> *mut AudioDevice,
