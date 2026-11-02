@@ -1214,3 +1214,79 @@ clears them outright. Regression: batch39_slice
 (per-account paths incl. credential sensitivity and
 re-basing, full purge keeping local data, per-kind purge
 keeping the owning kind's rows and playback state).
+
+Playback-residuals resolution (PARITY-2026-11-01 gap 7,
+playback half): the three remaining playback items are
+closed; the range-cache item of the same gap was already
+closed by Batch 36, and the WebRTC VAD position stays the
+documented substitute (the RMS detector below is Python's
+own fallback path, now ported in full). (1) Cancellation:
+core playback.rs gains LoadGate/LoadToken — Python's
+`_active_load_seq` plus the silence scan's abort event as
+one primitive. Beginning a load supersedes every earlier
+token; cancel_current aborts the in-flight one. The player
+begins a load at open and at every queue advance, and the
+workers honour it: the silence scan kills its ffmpeg, the
+SponsorBlock and chapter workers drop stale results, and
+the queue-advance yt-dlp resolution runs through
+`resolve_cancellable` so a stop/close/supersede discards
+its result silently (Python's stale-seq drop; the
+subprocess itself cannot be killed from the wrapper, so a
+cancelled resolve detaches and finishes unheard). Stop
+additionally clears the skip ranges and any pending queue
+load, and close cancels the gate — Python's on_stop /
+shutdown `_cancel_silence_scan` behaviour. The main
+window's pre-open resolution still has no token (it lives
+in main.rs, outside this batch); its result is already
+dropped when the pending article no longer matches.
+(2) Incremental silence: silence.rs ports Python's
+StreamingSilenceDetector (windowed RMS over decoded PCM,
+feed/finalize, ranges published while the source is still
+growing), detect_silence_ranges_from_pcm, the merge /
+merge-with-gap helpers, and scan_audio_for_silence's RMS
+scan as scan_silence_incremental: ffmpeg decodes to s16le
+PCM, progress callbacks publish the merged ranges-so-far
+every 5 s of scanned audio, the player's publish transform
+(pad + merge-with-gap) replaces the silence set wholesale
+on each publish, the scan paces itself to
+silence_scan_lead_seconds (default 300 s) ahead of the
+tick's lock-free position snapshot — never a media-control
+call from a worker — and cancellation kills ffmpeg while
+keeping already-published ranges. Python's player
+remote-stream adjustments are ported (8 kHz scan rate,
+threshold at most -52 dB, minimum silence at least
+1200 ms, merge gap at most 200 ms, one ffmpeg thread;
+local files 16 kHz / two threads). Not ported: the scan's
+low-priority process knob (no portable nice in the tree)
+and the VAD detector itself (documented substitute,
+above). The whole-file silencedetect path remains for
+compatibility. (3) Fast InnerTube chapters: playback.rs
+ports youtube_fulltext.extract_chapters' fast path —
+one watch-next POST (player-bar chapter markers, then
+the key-moments panel), the description-timestamp
+fallback validated against the length from one extra
+`player` POST, yt-dlp's late-first-chapter fill, and the
+None (unsettled — fall back to yt-dlp) vs Some(empty)
+(settled, no chapters) distinction. The player spawns it
+when a YouTube article opens (or a queue entry advances)
+with no chapters yet; stored/yt-dlp chapters win, results
+are persisted to the chapters table, and Python's
+per-video memo is not ported (the chapters table is the
+cache). Regression: playback.rs unit tests (gate
+supersede/cancel, cancellable resolve, watch-next
+player-bar and key-moments fixtures, description
+validation), silence.rs unit tests (RMS/dBFS formulas,
+chunked-vs-whole detector equivalence, snapshot
+publishing, merge/publish transforms, remote
+adjustments), and crates/core/tests/playback_residuals.rs
+(real-ffmpeg incremental scan, cancellation, pacing;
+skips without ffmpeg).
+Addendum (from Batch 41a): the rebuilt Player menu and
+tray dispatch `player.rewind`, `player.forward`,
+`player.volume_up` and `player.volume_down` through
+player::dispatch_command, which had no arms for them;
+the four arms now run the same transport closures as the
+player's own buttons, with Python's config steps
+(seek_back_ms default 10 s, seek_forward_ms defaulting
+to seek_back_ms, volume_step default 5 percent, volume
+persisted on change).

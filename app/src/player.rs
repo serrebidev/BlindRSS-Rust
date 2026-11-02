@@ -9,7 +9,9 @@
 
 use crate::media_backend::MediaBackend;
 use blindrss_core::db::Chapter;
-use blindrss_core::playback::{ResumePolicy, saved_state};
+use blindrss_core::playback::{
+    LoadGate, LoadToken, ResumePolicy, resolve_cancellable, saved_state,
+};
 use blindrss_core::{Article, Db, PlaybackState};
 use std::cell::RefCell;
 use std::collections::HashSet;
@@ -40,6 +42,17 @@ struct SkipRange {
     label: String,
 }
 
+/// Worker results on the skip channel. SponsorBlock ranges
+/// accumulate (each segment is reported once); silence ranges
+/// REPLACE the previous set — the incremental scan publishes
+/// its merged ranges-so-far as it goes, exactly like Python's
+/// `_publish` rebinding `_silence_ranges` on every progress
+/// callback, never appending to them.
+enum SkipMsg {
+    Sponsor(Vec<SkipRange>),
+    Silence(Vec<SkipRange>),
+}
+
 struct PlayerState {
     article_id: String,
     title: String,
@@ -52,7 +65,17 @@ struct PlayerState {
     /// Skip ranges delivered by the SponsorBlock / silence
     /// workers on `skip_rx`, drained by the tick.
     skips: Vec<SkipRange>,
-    skip_rx: std::sync::mpsc::Receiver<Vec<SkipRange>>,
+    /// The latest published set from the incremental silence
+    /// scan (replaced wholesale on each progress publish).
+    silence_skips: Vec<SkipRange>,
+    skip_rx: std::sync::mpsc::Receiver<SkipMsg>,
+    /// Load-cancellation gate (Python's `_active_load_seq` +
+    /// abort event): beginning a load supersedes the previous
+    /// load's workers; stop/close cancel the current one.
+    load_gate: LoadGate,
+    /// Fast InnerTube chapter results for this load, drained
+    /// by the tick (empty when chapters were already known).
+    chapter_rx: std::sync::mpsc::Receiver<Vec<Chapter>>,
     /// Range starts already skipped (Python's already-skipped
     /// guard: never skip the same range twice in a session).
     skipped: HashSet<i64>,
@@ -221,15 +244,68 @@ fn chapter_label(chapters: &[Chapter], idx: usize) -> String {
         .unwrap_or_else(|| format!("Chapter {}", idx + 1))
 }
 
+/// Spawn the fast InnerTube chapter worker for a YouTube
+/// article whose chapters are not already known, returning
+/// the channel its result arrives on. Python's player gets
+/// YouTube chapters through `extract_chapters`, which tries
+/// one watch-next request (~0.7 s) before the yt-dlp CLI
+/// (3-4 s); core's `fast_youtube_chapters` is that fast path.
+/// When it cannot settle the chapters it returns None and the
+/// player simply keeps having none — the slow path already
+/// ran before the player opened (the main window's info
+/// fetch) and is not repeated here. A cancelled/superseded
+/// load drops its result.
+fn spawn_chapter_worker(
+    article: &Article,
+    token: LoadToken,
+) -> std::sync::mpsc::Receiver<Vec<Chapter>> {
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<Chapter>>();
+    let target = if blindrss_core::ytfull::is_youtube_video_url(&article.url) {
+        Some(article.url.clone())
+    } else {
+        article
+            .media_url
+            .clone()
+            .filter(|u| blindrss_core::ytfull::is_youtube_video_url(u))
+    };
+    if let Some(target) = target {
+        std::thread::spawn(move || {
+            if token.is_cancelled() {
+                return;
+            }
+            if let Some(chapters) = blindrss_core::playback::fast_youtube_chapters(&target, 20)
+                && !chapters.is_empty()
+                && token.is_current()
+            {
+                let _ = tx.send(chapters);
+            }
+        });
+    }
+    rx
+}
+
+/// An idle chapter channel (chapters were already known, or
+/// the article is not a YouTube video).
+fn no_chapter_worker() -> std::sync::mpsc::Receiver<Vec<Chapter>> {
+    let (_tx, rx) = std::sync::mpsc::channel::<Vec<Chapter>>();
+    rx
+}
+
 /// Spawn the SponsorBlock and silence workers for one article
 /// and return the channel their skip ranges arrive on. Called
-/// at open and again on every queue advance.
+/// at open and again on every queue advance. Both workers
+/// carry the load's token: a stop, switch or close cancels
+/// them (Python sets the silence scan's abort event and drops
+/// stale-sequence results the same way).
 fn spawn_skip_workers(
     cfg: &blindrss_core::config::Config,
     article: &Article,
     stream_url: &str,
-) -> std::sync::mpsc::Receiver<Vec<SkipRange>> {
-    let (skip_tx, skip_rx) = std::sync::mpsc::channel::<Vec<SkipRange>>();
+    headers: &[(String, String)],
+    token: LoadToken,
+    position: std::sync::Arc<std::sync::atomic::AtomicI64>,
+) -> std::sync::mpsc::Receiver<SkipMsg> {
+    let (skip_tx, skip_rx) = std::sync::mpsc::channel::<SkipMsg>();
     if cfg.get_bool("sponsorblock_enabled", true) {
         let cats: Vec<String> = cfg
             .raw()
@@ -254,8 +330,11 @@ fn spawn_skip_workers(
         });
         if let Some(vid) = vid {
             let tx = skip_tx.clone();
+            let token = token.clone();
             std::thread::spawn(move || {
-                if let Ok(segs) = blindrss_core::sponsorblock::fetch_segments(&vid, &cats) {
+                if let Ok(segs) = blindrss_core::sponsorblock::fetch_segments(&vid, &cats)
+                    && token.is_current()
+                {
                     let ranges = segs
                         .iter()
                         .map(|s| SkipRange {
@@ -264,28 +343,63 @@ fn spawn_skip_workers(
                             label: format!("Skipped {}", s.category),
                         })
                         .collect();
-                    let _ = tx.send(ranges);
+                    let _ = tx.send(SkipMsg::Sponsor(ranges));
                 }
             });
         }
     }
-    if cfg.get_bool("skip_silence", true) && blindrss_core::silence::find_ffmpeg().is_some() {
-        let threshold = cfg_f64(cfg, "silence_skip_threshold_db", -38.0);
-        let min_silence = cfg.get_i64("silence_skip_min_ms", 700) as f64 / 1000.0;
+    if cfg.get_bool("skip_silence", true)
+        && let Some(ffmpeg) = blindrss_core::silence::find_ffmpeg()
+    {
+        // Incremental scan (Python's player silence worker):
+        // paced to stay `silence_scan_lead_seconds` ahead of
+        // the listener, publishing ranges as it goes. The
+        // position comes from the tick's lock-free snapshot —
+        // never from the media control on a worker thread.
+        let pad_ms = cfg.get_i64("silence_skip_padding_ms", 60);
+        let mut options = blindrss_core::silence::SilenceScanOptions {
+            window_ms: cfg.get_i64("silence_skip_window_ms", 25),
+            min_silence_ms: cfg.get_i64("silence_skip_min_ms", 700),
+            threshold_db: cfg_f64(cfg, "silence_skip_threshold_db", -38.0),
+            merge_gap_ms: cfg.get_i64("silence_skip_merge_gap_ms", 260),
+            lead_ms: cfg.get_i64("silence_scan_lead_seconds", 300) * 1000,
+            ..Default::default()
+        };
+        options = options.for_remote(blindrss_core::silence::is_remote_source(stream_url));
+        let merge_gap_ms = options.merge_gap_ms;
         let url = stream_url.to_string();
+        let headers_vec: Vec<(String, String)> = headers.to_vec();
         let tx = skip_tx.clone();
         std::thread::spawn(move || {
-            if let Ok(ranges) = blindrss_core::silence::detect_silence(&url, threshold, min_silence)
-            {
-                let ranges = ranges
+            let publish = |ranges_ms: Vec<(i64, i64)>| -> Vec<SkipRange> {
+                blindrss_core::silence::publish_ranges_ms(&ranges_ms, pad_ms, merge_gap_ms)
                     .iter()
                     .map(|(s, e)| SkipRange {
-                        start_ms: (s * 1000.0) as i64,
-                        end_ms: (e * 1000.0) as i64,
+                        start_ms: *s,
+                        end_ms: *e,
                         label: "Skipped silence".to_string(),
                     })
-                    .collect();
-                let _ = tx.send(ranges);
+                    .collect()
+            };
+            let progress_tx = tx.clone();
+            let progress = move |ranges_ms: Vec<(i64, i64)>| {
+                let _ = progress_tx.send(SkipMsg::Silence(publish(ranges_ms)));
+            };
+            // A failed or cancelled scan keeps whatever its
+            // progress callbacks already published (Python
+            // keeps the published ranges on a mid-scan drop);
+            // only a clean finish replaces them with the
+            // final set.
+            if let Ok(ranges) = blindrss_core::silence::scan_silence_incremental(
+                &url,
+                &ffmpeg,
+                &options,
+                &headers_vec,
+                &token,
+                Some(&position),
+                &progress,
+            ) {
+                let _ = tx.send(SkipMsg::Silence(publish(ranges)));
             }
         });
     }
@@ -541,10 +655,27 @@ fn open_player_impl(
     frame.create_status_bar(1, 0, -1, "player status");
     frame.set_status_text(&article.title, 0);
 
-    // Skip-range workers: SponsorBlock (YouTube) and ffmpeg
-    // silence detection report ranges over one channel; the tick
-    // drains and applies them.
-    let skip_rx = spawn_skip_workers(&cfg, &article, &stream_url);
+    // Skip-range workers: SponsorBlock (YouTube) and the
+    // incremental ffmpeg silence scan report ranges over one
+    // channel; the tick drains and applies them. This open is
+    // the window's first load: its token governs every worker
+    // until a queue advance supersedes it or stop/close
+    // cancels it.
+    let load_gate = LoadGate::new();
+    let load_token = load_gate.begin();
+    let skip_rx = spawn_skip_workers(
+        &cfg,
+        &article,
+        &stream_url,
+        &headers,
+        load_token.clone(),
+        seek_pos.clone(),
+    );
+    let chapter_rx = if chapters.is_empty() {
+        spawn_chapter_worker(&article, load_token)
+    } else {
+        no_chapter_worker()
+    };
 
     let state = Rc::new(RefCell::new(PlayerState {
         article_id: article.id.clone(),
@@ -556,7 +687,10 @@ fn open_player_impl(
         seeked: saved <= 0,
         saved_position_ms: saved,
         skips: Vec::new(),
+        silence_skips: Vec::new(),
         skip_rx,
+        load_gate,
+        chapter_rx,
         skipped: HashSet::new(),
         last_chapter: None,
         slider_guard: false,
@@ -649,18 +783,28 @@ fn open_player_impl(
             let entry = q.entries[next].clone();
             let tx = q.tx.clone();
             let path = s.db_path.clone();
+            // The advance is a new load: it supersedes the
+            // finished entry's workers, and a stop/close (or a
+            // newer advance) cancels this resolve — its result
+            // is then dropped, like Python's stale load seq.
+            let token = s.load_gate.begin();
             drop(s);
             std::thread::spawn(move || {
-                let cfg =
-                    blindrss_core::config::Config::load(&crate::config_path()).unwrap_or_default();
-                let result =
+                let result = resolve_cancellable(&token, move || {
+                    let cfg = blindrss_core::config::Config::load(&crate::config_path())
+                        .unwrap_or_default();
                     blindrss_core::media::resolve_article_for_play(&cfg, &entry).map(|r| {
                         let headers = crate::playback_headers_for(&entry, &r.url, &path);
                         (
                             crate::maybe_cache_youtube(&entry, &r.url, r.via_ytdlp),
                             headers,
                         )
-                    });
+                    })
+                });
+                let result = match result {
+                    Some(result) => result,
+                    None => Err("cancelled".to_string()),
+                };
                 let _ = tx.send((next, result));
             });
         });
@@ -688,38 +832,80 @@ fn open_player_impl(
     let stop: Rc<dyn Fn()> = Rc::new(move || {
         save_position(&st.borrow(), &m, false);
         m.stop();
-        st.borrow_mut().autoplay_active = false;
+        // Stop cancels the in-flight load's workers (the
+        // silence scan's ffmpeg, a pending queue resolve) and
+        // drops their ranges, like Python's on_stop calling
+        // _cancel_silence_scan. A later queue advance begins
+        // a fresh load on the gate.
+        let mut s = st.borrow_mut();
+        s.autoplay_active = false;
+        s.load_gate.cancel_current();
+        s.skips.clear();
+        s.silence_skips.clear();
+        s.skipped.clear();
+        if let Some(q) = s.queue.as_mut() {
+            q.loading = false;
+        }
     });
     let stop_click = stop.clone();
     stop_btn.on_click(move |_| stop_click());
-    let m = media;
-    back_btn.on_click(move |_| {
-        m.seek(-seek_back_ms, SeekMode::FromCurrent);
-    });
-    let m = media;
-    fwd_btn.on_click(move |_| {
-        m.seek(seek_fwd_ms, SeekMode::FromCurrent);
-    });
-    let m = media;
-    vdown_btn.on_click(move |_| {
-        let v = (m.get_volume() - volume_step).max(0.0);
-        m.set_volume(v);
-        persist_volume(v);
-        crate::announce(
-            "general",
-            &format!("Volume {}%", (v * 100.0).round() as i64),
-        );
-    });
-    let m = media;
-    vup_btn.on_click(move |_| {
-        let v = (m.get_volume() + volume_step).min(1.0);
-        m.set_volume(v);
-        persist_volume(v);
-        crate::announce(
-            "general",
-            &format!("Volume {}%", (v * 100.0).round() as i64),
-        );
-    });
+    // Transport closures shared by the buttons and the
+    // main-window/tray dispatch (`player.rewind` and friends,
+    // Batch 41a addendum): one implementation, Python's steps
+    // from config (seek_back_ms / seek_forward_ms /
+    // volume_step, read at the top of this function).
+    let rewind: Rc<dyn Fn()> = {
+        let m = media;
+        Rc::new(move || {
+            m.seek(-seek_back_ms, SeekMode::FromCurrent);
+        })
+    };
+    let forward: Rc<dyn Fn()> = {
+        let m = media;
+        Rc::new(move || {
+            m.seek(seek_fwd_ms, SeekMode::FromCurrent);
+        })
+    };
+    let volume_down: Rc<dyn Fn()> = {
+        let m = media;
+        Rc::new(move || {
+            let v = (m.get_volume() - volume_step).max(0.0);
+            m.set_volume(v);
+            persist_volume(v);
+            crate::announce(
+                "general",
+                &format!("Volume {}%", (v * 100.0).round() as i64),
+            );
+        })
+    };
+    let volume_up: Rc<dyn Fn()> = {
+        let m = media;
+        Rc::new(move || {
+            let v = (m.get_volume() + volume_step).min(1.0);
+            m.set_volume(v);
+            persist_volume(v);
+            crate::announce(
+                "general",
+                &format!("Volume {}%", (v * 100.0).round() as i64),
+            );
+        })
+    };
+    {
+        let action = rewind.clone();
+        back_btn.on_click(move |_| action());
+    }
+    {
+        let action = forward.clone();
+        fwd_btn.on_click(move |_| action());
+    }
+    {
+        let action = volume_down.clone();
+        vdown_btn.on_click(move |_| action());
+    }
+    {
+        let action = volume_up.clone();
+        vup_btn.on_click(move |_| action());
+    }
     // Speed stepping through the standard ladder, announced.
     let change_speed: Rc<dyn Fn(i32)> = {
         let m = media;
@@ -955,6 +1141,7 @@ fn open_player_impl(
         let mut seek_to: Option<(i64, String)> = None;
         let mut queue_load = None;
         let mut queue_error: Option<String> = None;
+        let mut chapter_apply = None;
         {
             let mut s = st.borrow_mut();
             // Queue advance: a resolved next entry switches the
@@ -979,6 +1166,7 @@ fn open_player_impl(
                             s.article_url = entry.url.clone();
                             s.title = entry.title.clone();
                             s.skips.clear();
+                            s.silence_skips.clear();
                             s.skipped.clear();
                             s.last_chapter = None;
                             let cfg2 = blindrss_core::config::Config::load(&crate::config_path())
@@ -986,7 +1174,19 @@ fn open_player_impl(
                             s.resume = ResumePolicy::from_config(&cfg2);
                             s.last_save = std::time::Instant::now();
                             s.last_saved_pos = -1;
-                            s.skip_rx = spawn_skip_workers(&cfg2, &entry, &stream);
+                            // The resolve's token is still the
+                            // current load (a stop would have
+                            // cancelled the result away), so the
+                            // new entry's workers inherit it.
+                            let token = s.load_gate.current();
+                            s.skip_rx = spawn_skip_workers(
+                                &cfg2,
+                                &entry,
+                                &stream,
+                                &headers,
+                                token.clone(),
+                                seek_pos_t.clone(),
+                            );
                             s.saved_position_ms = Db::open(&s.db_path)
                                 .ok()
                                 .and_then(|db| {
@@ -1010,7 +1210,13 @@ fn open_player_impl(
                                     chapter.title.as_deref().unwrap_or("Chapter")
                                 ));
                             }
+                            let entry_has_chapters = !chapters.is_empty();
                             *chapters_tick.borrow_mut() = (chapters, starts);
+                            s.chapter_rx = if entry_has_chapters {
+                                no_chapter_worker()
+                            } else {
+                                spawn_chapter_worker(&entry, token)
+                            };
                             set_queue_index(idx as i64);
                             let wrapped = if m.uses_vlc() {
                                 stream.clone()
@@ -1019,13 +1225,28 @@ fn open_player_impl(
                             };
                             queue_load = Some((wrapped, stream, entry.title.clone(), headers));
                         }
+                        // A cancelled resolve is silent: the
+                        // user stopped or switched on purpose.
+                        Err(e) if e == "cancelled" => {}
                         Err(e) => queue_error = Some(e),
                     }
                 }
                 s.queue = Some(q);
             }
-            while let Ok(ranges) = s.skip_rx.try_recv() {
-                s.skips.extend(ranges);
+            while let Ok(msg) = s.skip_rx.try_recv() {
+                match msg {
+                    SkipMsg::Sponsor(ranges) => s.skips.extend(ranges),
+                    SkipMsg::Silence(ranges) => s.silence_skips = ranges,
+                }
+            }
+            // Fast InnerTube chapters: applied only while the
+            // load still has none (stored/yt-dlp chapters win),
+            // then persisted to the chapters table like the
+            // main window's info path does.
+            while let Ok(chapters) = s.chapter_rx.try_recv() {
+                if !chapters.is_empty() && chapters_tick.borrow().0.is_empty() {
+                    chapter_apply = Some((s.article_id.clone(), s.db_path.clone(), chapters));
+                }
             }
             if !s.seeked && len > 0 && s.saved_position_ms > 0 {
                 m.seek(s.saved_position_ms, SeekMode::FromStart);
@@ -1034,6 +1255,7 @@ fn open_player_impl(
             let hit = s
                 .skips
                 .iter()
+                .chain(s.silence_skips.iter())
                 .find(|r| {
                     pos >= r.start_ms && pos < r.end_ms - 250 && !s.skipped.contains(&r.start_ms)
                 })
@@ -1093,6 +1315,22 @@ fn open_player_impl(
         if let Some(e) = queue_error {
             frame_tick.set_status_text(&format!("Queue: {e}"), 0);
             crate::announce("general", &format!("Queue: {e}"));
+        }
+        if let Some((article_id, db_path, mut chapters)) = chapter_apply {
+            chapters.sort_by(|a, b| a.start.total_cmp(&b.start));
+            if let Ok(db) = Db::open(&db_path) {
+                let _ = db.replace_chapters(&article_id, &chapters);
+            }
+            let starts: Vec<i64> = chapters.iter().map(|c| (c.start * 1000.0) as i64).collect();
+            chapter_list.clear();
+            for chapter in &chapters {
+                chapter_list.append(&format!(
+                    "{} - {}",
+                    fmt_ms((chapter.start * 1000.0) as i64),
+                    chapter.title.as_deref().unwrap_or("Chapter")
+                ));
+            }
+            *chapters_tick.borrow_mut() = (chapters, starts);
         }
         let playing_now = m.get_state() == MediaState::Playing;
         // Autoplay watchdog (see PlayerState): re-play a load
@@ -1184,6 +1422,14 @@ fn open_player_impl(
                 match id {
                     "player.play_pause" => play_pause(),
                     "player.stop" => stop(),
+                    // Batch 41a addendum: the rebuilt Player
+                    // menu and tray dispatch these four names;
+                    // they run the same transport closures as
+                    // the player's own buttons.
+                    "player.rewind" => rewind(),
+                    "player.forward" => forward(),
+                    "player.volume_up" => volume_up(),
+                    "player.volume_down" => volume_down(),
                     "player.show_hide" => {
                         let show = !frame.is_shown();
                         frame.show(show);
@@ -1218,6 +1464,11 @@ fn open_player_impl(
     frame.on_close(move |event| {
         timer.stop();
         save_position(&closing_state.borrow(), &media, false);
+        // Closing cancels the load's workers: the silence
+        // scan's ffmpeg is killed and a pending queue resolve
+        // or chapter fetch drops its result (Python's
+        // shutdown path cancels the scan the same way).
+        closing_state.borrow().load_gate.cancel_current();
         media.close();
         PLAYERS.with(|players| players.borrow_mut().retain(|(key, _)| *key != player_key));
         event.skip(true);
