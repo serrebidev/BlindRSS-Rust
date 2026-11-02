@@ -662,6 +662,98 @@ pub fn show_category_picker(
     result
 }
 
+/// Categories that may become the parent of `path` (Python's
+/// `_eligible_parent_categories`): every stored category except
+/// the category itself and its own descendants, which cannot
+/// become their own ancestors.
+fn category_parent_choices(path: &str, all: &[String]) -> Vec<String> {
+    let descendant_prefix = format!("{path}/");
+    all.iter()
+        .filter(|c| c.as_str() != path && !c.starts_with(&descendant_prefix))
+        .cloned()
+        .collect()
+}
+
+/// The full path for a category after a Category Properties
+/// edit: the (sanitized) leaf under the chosen parent, or the
+/// leaf alone at top level. Path segments are joined with "/",
+/// the separator Rust storage uses (see Db::rename_category).
+fn category_edited_path(leaf: &str, parent: Option<&str>) -> String {
+    let leaf = leaf.trim().replace('/', " ").trim().to_string();
+    match parent.map(str::trim).filter(|p| !p.is_empty()) {
+        Some(p) => format!("{p}/{leaf}"),
+        None => leaf,
+    }
+}
+
+/// Split a stored category path into (leaf, parent path).
+fn category_leaf_parent(path: &str) -> (String, Option<String>) {
+    match path.rsplit_once('/') {
+        Some((parent, leaf)) => (leaf.trim().to_string(), Some(parent.trim().to_string())),
+        None => (path.trim().to_string(), None),
+    }
+}
+
+/// Category Properties (Python's CategoryPropertiesDialog,
+/// Batch 41a / Audit 6 G1.6): rename the leaf plus a
+/// parent-category picker whose first entry is
+/// "(None - Top Level)". Returns the new full path on OK
+/// (which may equal the old path), None on cancel. Applying
+/// the rename/move is the caller's job (Db::rename_category
+/// moves the whole subtree, which covers both edits).
+pub fn show_category_properties(frame: &Frame, db: &Db, category_path: &str) -> Option<String> {
+    let dialog = Dialog::builder(frame, "Category Properties").build();
+    bind_f1(frame, &dialog, "CategoryPropertiesDialog");
+    let sizer = BoxSizer::builder(Orientation::Vertical).build();
+    let (leaf, current_parent) = category_leaf_parent(category_path);
+    let name_ctrl = name_row(&dialog, &sizer, "Name:", &leaf);
+    let parents: Vec<String> = db
+        .categories()
+        .map(|cats| {
+            category_parent_choices(
+                category_path,
+                &cats.into_iter().map(|c| c.title).collect::<Vec<_>>(),
+            )
+        })
+        .unwrap_or_default();
+    let parent_label = StaticText::builder(&dialog).with_label("Category:").build();
+    sizer.add(&parent_label, 0, SizerFlag::All, 4);
+    let parent_choice = Choice::builder(&dialog).build();
+    parent_choice.append("(None - Top Level)");
+    for p in &parents {
+        parent_choice.append(p);
+    }
+    let initial = current_parent
+        .as_ref()
+        .and_then(|cur| parents.iter().position(|p| p == cur))
+        .map(|pos| pos + 1)
+        .unwrap_or(0);
+    parent_choice.set_selection(initial as u32);
+    sizer.add(&parent_choice, 0, SizerFlag::Expand | SizerFlag::All, 4);
+    ok_cancel(&dialog, &sizer);
+    dialog.set_sizer(sizer, true);
+    dialog.set_size(Size::new(460, 220));
+    if dialog.show_modal() != 5100 {
+        dialog.destroy();
+        return None;
+    }
+    let name = name_ctrl.get_value();
+    let leaf = if name.trim().is_empty() {
+        leaf
+    } else {
+        name.trim().to_string()
+    };
+    let sel = parent_choice.get_selection().unwrap_or(0) as usize;
+    let parent = if sel > 0 {
+        parents.get(sel - 1).map(|s| s.as_str())
+    } else {
+        None
+    };
+    let new_path = category_edited_path(&leaf, parent);
+    dialog.destroy();
+    Some(new_path)
+}
+
 pub fn show_feed_properties(frame: &Frame, db: &Db, feed: &blindrss_core::Feed) -> bool {
     let dialog = Dialog::builder(frame, "Feed Properties").build();
     bind_f1(frame, &dialog, "FeedPropertiesDialog");
@@ -2439,4 +2531,44 @@ pub fn show_equalizer(frame: &Frame, config_path: &Path) {
         let _ = cfg.save(config_path);
     }
     dialog.destroy();
+}
+
+#[cfg(test)]
+mod category_properties_tests {
+    use super::{category_edited_path, category_leaf_parent, category_parent_choices};
+
+    #[test]
+    fn parent_choices_exclude_self_and_descendants() {
+        let all: Vec<String> = ["News", "News/Tech", "News/Tech/AI", "Sports"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            category_parent_choices("News/Tech", &all),
+            vec!["News".to_string(), "Sports".to_string()]
+        );
+        // A top-level category can move under anything but itself.
+        assert_eq!(category_parent_choices("Sports", &all).len(), 3);
+    }
+
+    #[test]
+    fn edited_path_joins_leaf_under_parent() {
+        assert_eq!(category_edited_path("Tech", None), "Tech");
+        assert_eq!(category_edited_path("Tech", Some("News")), "News/Tech");
+        assert_eq!(
+            category_edited_path("  Tech  ", Some(" News ")),
+            "News/Tech"
+        );
+        // A separator typed into the leaf cannot corrupt the path.
+        assert!(!category_edited_path("A/B", None).contains('/'));
+    }
+
+    #[test]
+    fn leaf_parent_split_matches_storage_paths() {
+        assert_eq!(
+            category_leaf_parent("News/Tech"),
+            ("Tech".to_string(), Some("News".to_string()))
+        );
+        assert_eq!(category_leaf_parent("News"), ("News".to_string(), None));
+    }
 }

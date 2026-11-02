@@ -1214,3 +1214,92 @@ clears them outright. Regression: batch39_slice
 (per-account paths incl. credential sensitivity and
 re-basing, full purge keeping local data, per-kind purge
 keeping the owning kind's rows and playback state).
+
+Batch 41a resolution (GUI parity, Audit 6 G1.1/G1.2/G1.4/
+G1.5/G1.6): the main-window menu bar is rebuilt to
+Python's exact map (gui/mainframe.py init_menus +
+gui/menu_mnemonics.py): File / Feeds / Edit / View /
+Player / Tools / Help, item for item and label for
+label — File gains Open Article..., Open Media URL...,
+Mark All Items as Read, Add/Remove Category, Back Up
+Data.../Restore Data... (renamed from Backup.../
+Restore...) and Configure Persistent Search...; Feeds
+is Python's nine items; View carries Show Search Field
+and Rich Full-Text View checks, the Article Filter
+submenu (read-status and media radio groups), the
+Accessible Browser item (unchanged here; Batch 40
+removes it on rebase), Show/Hide Player, and the Sort
+By submenu (six radio keys plus the Ascending check);
+Player is new — Show/Hide Player, Play/Pause, Stop,
+Play Queue..., Play Next/Previous in Queue, a Playback
+Speed submenu (Increase/Decrease/Normal (1x)), Equal-
+izer..., Rewind/Fast Forward/Volume Up/Volume Down
+with Python's in-label shortcut text, and a Chapters
+submenu; Tools and Help match Python, with Check for
+Updates... and Announce Version now in Help and a
+YouTube Account... item wired to the existing sign-in
+dialog. The Rust-only Article menu is gone: its actions
+live where Python puts them (context menus and the
+shortcut registry); every pre-existing handler remains
+in the menu_actions table and reachable (Sync Providers
+in the All-Feeds tree context menu, Prune Old Articles
+via Settings, Deleted Articles... in the list context
+menu, Find via the reader's Ctrl+F/F3 handling).
+Tree context menus now vary by node kind as Python's
+do (category / feed / smart root / smart folder), with
+Python's labels (Edit Category, Delete Category and
+Feeds, Export Category to OPML..., Reset Title to Feed
+Default — with a new main-window handler that re-fetches
+and resets — and the Image Alt Text submenu with
+Python's item labels). The article list context menu is
+selection-aware: Mark {count} as Read/Unread and Delete
+{count} Articles carry counts, queue items read Add/
+Remove {count} to/from Play Queue (new selection-wide
+queue actions), and it carries Open Article, Open in
+Default Browser, Copy Link(s), Copy Text, View Feed
+Description..., Copy Media Link (direct media only),
+Download/Download As... or Detect Audio when the item
+has no media (new handler: page scan on a worker,
+persisted through a new RefreshMsg::AudioDetected),
+Copy Image Link (new handler, first <img> in content),
+Open Play Queue..., a Chapter Links submenu fed from
+the chapters table's hrefs (fixed id slots dispatching
+to the stored URLs), Toggle Favorite and View
+History... when the article has versions. The reader
+content context menu is Copy / Select All only, via the
+stock ids, as in Python. The article window's menus are
+Python's File / Edit / View (Open in Browser, Reload,
+Close Window; Copy Text, Copy Link; HTML View check) on
+the existing handler ids. The tray menu is Python's
+set: a disabled "Unread: {count}" label (kept current
+by the drain tick), Restore, Show/Hide Player, Refresh
+Feeds, Play/Pause (falling back to playing the selected
+article when no player is open), Stop, Rewind, Fast
+Forward, Volume Up, Volume Down, Exit. Category
+Properties (G1.6) is a real dialog in dialogs.rs —
+rename the leaf plus a parent picker headed by
+"(None - Top Level)", excluding the category itself and
+its descendants — applied through Db::rename_category;
+Edit Category (tree context and feeds.edit_selected)
+opens it, and the pure path helpers carry unit tests in
+dialogs.rs. Recorded gaps: "Add Shortcuts..." is
+absent, not dead — it is Batch 42 (Audit 6 G2), and
+Python itself only offers it on Windows. Player-menu
+and tray Rewind/Fast Forward/Volume dispatch through
+player::dispatch_command under the names player.rewind,
+player.forward, player.volume_up, player.volume_down,
+which have no arms in player.rs yet (outside this
+batch's files); until that follow-up lands they report
+"no player is open" style status text, while Show/Hide,
+Play/Pause, Stop, Speed and Chapters dispatch to the
+player's existing arms. Python's Chapters submenu also
+lists the current track's chapters and its speed
+submenu offers preset rates; both need player state the
+main window cannot see in the Rust architecture, so the
+submenus carry the static entries only (Show
+Chapters...; Increase/Decrease/Normal). Python's
+category context menu offers Add Subcategory only when
+the provider supports subcategories; the local Rust
+provider does, so the item is unconditional here.
+Regression: dialogs.rs category-properties unit tests;
+full workspace gate at the batch commit.

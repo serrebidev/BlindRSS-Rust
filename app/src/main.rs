@@ -1318,6 +1318,10 @@ enum RefreshMsg {
     MediaReady(String, Result<MediaResolution, String>),
     /// A finished download: description of what landed where.
     DownloadDone(Article, Result<PathBuf, String>),
+    /// Detect Audio finished for an article: the detected
+    /// (media URL, media type), or None when no audio was found
+    /// on the article's page (Python's on_detect_audio).
+    AudioDetected(String, Option<(String, Option<String>)>),
     /// YouTube full text for an article.
     YoutubeText(
         blindrss_core::reader_cache::ReaderRequest,
@@ -1452,6 +1456,38 @@ const M_OPEN_BROWSER: i32 = 2219;
 const M_DOWNLOAD_AS: i32 = 2220;
 const M_EDIT_SELECTED: i32 = 2221;
 const M_ACCESSIBLE_BROWSER: i32 = 2222;
+// Batch 41a (Audit 6 G1): ids added for the Python-shaped
+// menus. Player transport ids dispatch through
+// player::dispatch_command; the seek/volume command names
+// still need their arms in player.rs (see PARITY Batch 41a).
+const M_MARK_READ_SEL: i32 = 2223;
+const M_MARK_UNREAD_SEL: i32 = 2224;
+const M_QUEUE_ADD_SEL: i32 = 2225;
+const M_QUEUE_REMOVE_SEL: i32 = 2226;
+const M_DETECT_AUDIO: i32 = 2227;
+const M_COPY_IMAGE: i32 = 2228;
+const M_ACTIVATE: i32 = 2229;
+const M_PLAYER_SHOW_HIDE: i32 = 2230;
+const M_PLAYER_PLAY_PAUSE: i32 = 2231;
+const M_PLAYER_STOP: i32 = 2232;
+const M_PLAYER_REWIND: i32 = 2233;
+const M_PLAYER_FF: i32 = 2234;
+const M_PLAYER_VOL_UP: i32 = 2235;
+const M_PLAYER_VOL_DOWN: i32 = 2236;
+const M_SPEED_UP: i32 = 2237;
+const M_SPEED_DOWN: i32 = 2238;
+const M_SPEED_RESET: i32 = 2239;
+const M_PLAYER_CHAPTERS: i32 = 2240;
+const M_YOUTUBE_ACCOUNT: i32 = 2241;
+const M_ANNOUNCE_VERSION: i32 = 2242;
+const M_RESET_TITLE: i32 = 2243;
+const M_EDIT_CAT: i32 = 2244;
+const M_EQUALIZER: i32 = 2245;
+/// Chapter Links submenu slots (Batch 41a): the article list
+/// context menu fills `chapter_link_urls` with the selected
+/// article's chapter hrefs and appends up to this many items.
+const M_CHAPTER_LINK_BASE: i32 = 2900;
+const M_CHAPTER_LINK_SLOTS: i32 = 16;
 
 /// Route remappable commands through the same actions as native menus.
 fn shortcut_menu_id(command: &str) -> Option<i32> {
@@ -1513,6 +1549,8 @@ fn shortcut_menu_id(command: &str) -> Option<i32> {
         "tools.settings" => M_SETTINGS,
         "tools.check_updates" => M_UPDATE,
         "tools.import_site_cookies" => M_IMPORT_COOKIES,
+        "tools.youtube_account" => M_YOUTUBE_ACCOUNT,
+        "player.equalizer" => M_EQUALIZER,
         "help.user_guide" => M_HELP,
         _ => return None,
     })
@@ -1537,6 +1575,40 @@ fn has_direct_media_link(article: &Article) -> bool {
     article.media_url.as_deref().is_some_and(|u| {
         !u.trim().is_empty() && u != article.url && !blindrss_core::media::is_ytdlp_supported(u)
     })
+}
+
+/// First `<img src>` in article HTML (Python's
+/// utils.first_image_url, for Copy Image Link).
+fn first_image_url(content: Option<&str>) -> Option<String> {
+    let html = content?;
+    let lower = html.to_ascii_lowercase();
+    let mut search = 0;
+    while let Some(pos) = lower[search..].find("<img") {
+        let tag_start = search + pos;
+        let tag_end = lower[tag_start..]
+            .find('>')
+            .map(|e| tag_start + e)
+            .unwrap_or(lower.len());
+        let tag = &html[tag_start..tag_end];
+        let tag_lower = &lower[tag_start..tag_end];
+        if let Some(sp) = tag_lower.find("src=") {
+            let rest = tag[sp + 4..].trim_start();
+            let value = if let Some(stripped) = rest.strip_prefix('"') {
+                stripped.split('"').next().unwrap_or("")
+            } else if let Some(stripped) = rest.strip_prefix('\'') {
+                stripped.split('\'').next().unwrap_or("")
+            } else {
+                rest.split(|c: char| c.is_whitespace() || c == '>')
+                    .next()
+                    .unwrap_or("")
+            };
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+        search = tag_end;
+    }
+    None
 }
 
 fn article_copy_url(article: &Article) -> &str {
@@ -2308,17 +2380,47 @@ fn main() {
         const TRAY_SHOW: i32 = 2301;
         const TRAY_REFRESH: i32 = 2302;
         const TRAY_EXIT: i32 = 2303;
+        const TRAY_UNREAD: i32 = 2304;
+        const TRAY_PLAYER_TOGGLE: i32 = 2305;
+        const TRAY_PLAY_PAUSE: i32 = 2306;
+        const TRAY_STOP: i32 = 2307;
+        const TRAY_REWIND: i32 = 2308;
+        const TRAY_FF: i32 = 2309;
+        const TRAY_VOL_UP: i32 = 2310;
+        const TRAY_VOL_DOWN: i32 = 2311;
+        // Tray menu matches Python's gui/tray.py (Batch 41a /
+        // Audit 6 G1.4): an "Unread: {count}" label, Restore,
+        // Show/Hide Player, Refresh Feeds, then the player
+        // transport set. The unread label is refreshed by the
+        // drain tick below whenever the total changes.
+        let tray_unread0 = Db::open(&db_path())
+            .ok()
+            .and_then(|db| db.unread_count(None).ok())
+            .unwrap_or(0);
         let mut tray_menu = Menu::builder()
-            .append_item(TRAY_SHOW, "Show BlindRSS", "")
-            .append_item(TRAY_REFRESH, "Refresh All", "")
+            .append_item(TRAY_UNREAD, &format!("Unread: {tray_unread0}"), "")
+            .append_item(TRAY_SHOW, "&Restore", "")
+            .append_item(TRAY_PLAYER_TOGGLE, "Show/Hide &Player", "")
             .append_separator()
-            .append_item(TRAY_EXIT, "Exit", "")
+            .append_item(TRAY_REFRESH, "Refresh &Feeds", "")
+            .append_separator()
+            .append_item(TRAY_PLAY_PAUSE, "Play/Pause", "")
+            .append_item(TRAY_STOP, "Stop", "")
+            .append_item(TRAY_REWIND, "Rewind", "")
+            .append_item(TRAY_FF, "Fast Forward", "")
+            .append_item(TRAY_VOL_UP, "Volume Up", "")
+            .append_item(TRAY_VOL_DOWN, "Volume Down", "")
+            .append_separator()
+            .append_item(TRAY_EXIT, "E&xit", "")
             .build();
+        tray_menu.enable_item(TRAY_UNREAD, false);
         tray.set_popup_menu(&mut tray_menu);
+        let tray_menu = Rc::new(RefCell::new(tray_menu));
         // Set once the real actions exist (below); the tray menu
         // and close handler consult these slots.
         type ActionSlot = Rc<RefCell<Option<Rc<dyn Fn()>>>>;
         let tray_refresh_slot: ActionSlot = Rc::new(RefCell::new(None));
+        let tray_play_slot: ActionSlot = Rc::new(RefCell::new(None));
         let quit_flag = Rc::new(std::cell::Cell::new(false));
         {
             // wx has no taskbar mouse events on macOS; the tray
@@ -2336,6 +2438,7 @@ fn main() {
         {
             let frame_tray = frame;
             let slot = tray_refresh_slot.clone();
+            let play_slot = tray_play_slot.clone();
             let quit = quit_flag.clone();
             tray.on_menu(move |ev| match ev.get_id() {
                 x if x == TRAY_SHOW => {
@@ -2347,6 +2450,31 @@ fn main() {
                     if let Some(action) = slot.borrow().as_ref() {
                         action();
                     }
+                }
+                x if x == TRAY_PLAYER_TOGGLE => {
+                    player::dispatch_command("player.show_hide");
+                }
+                x if x == TRAY_PLAY_PAUSE => {
+                    if !player::dispatch_command("player.play_pause")
+                        && let Some(action) = play_slot.borrow().as_ref()
+                    {
+                        action();
+                    }
+                }
+                x if x == TRAY_STOP => {
+                    player::dispatch_command("player.stop");
+                }
+                x if x == TRAY_REWIND => {
+                    player::dispatch_command("player.rewind");
+                }
+                x if x == TRAY_FF => {
+                    player::dispatch_command("player.forward");
+                }
+                x if x == TRAY_VOL_UP => {
+                    player::dispatch_command("player.volume_up");
+                }
+                x if x == TRAY_VOL_DOWN => {
+                    player::dispatch_command("player.volume_down");
                 }
                 x if x == TRAY_EXIT => {
                     quit.set(true);
@@ -3889,6 +4017,58 @@ fn main() {
             rename_cat_btn.on_click(move |_| a());
         }
 
+        // Edit Category (tree context / feeds.edit_selected):
+        // Python's CategoryPropertiesDialog (Batch 41a) — rename
+        // the leaf and/or move under another category. One
+        // Db::rename_category call moves the whole subtree, so
+        // it covers Python's move-then-rename sequence.
+        let state_ec = state.clone();
+        let frame_ec = frame;
+        let tree_ec = tree;
+        let list_ec = list;
+        let tx_ec = tx.clone();
+        let act_edit_category: Rc<dyn Fn()> = Rc::new(move || {
+            let (category, db_ok) = {
+                let st = state_ec.borrow();
+                (selected_category(&st), st.db.is_some())
+            };
+            let Some(category) = category else {
+                frame_ec.set_status_text("Select a category in the tree first", 0);
+                return;
+            };
+            if is_uncategorized_cat(Some(&category)) {
+                frame_ec.set_status_text("The Uncategorized folder cannot be renamed or moved.", 0);
+                return;
+            }
+            if !db_ok {
+                return;
+            }
+            let new_path = {
+                let st = state_ec.borrow();
+                let Some(db) = st.db.as_ref() else { return };
+                dialogs::show_category_properties(&frame_ec, db, &category)
+            };
+            restore_focus(&state_ec.borrow(), &tree_ec, &list_ec);
+            let Some(new_path) = new_path else { return };
+            if new_path == category {
+                return;
+            }
+            let mut st = state_ec.borrow_mut();
+            if let Some(db) = &st.db {
+                if let Some((parent, _)) = new_path.rsplit_once('/') {
+                    let _ = db.ensure_category_path(parent);
+                }
+                let _ = db.rename_category(&category, &new_path);
+                st.feeds = db.feeds().unwrap_or_default();
+            }
+            drop(st);
+            mirror_miniflux_category(&tx_ec, Some((category.clone(), new_path.clone())), None);
+            let mut st = state_ec.borrow_mut();
+            rebuild_tree(&mut st, &tree_ec);
+            refill_articles(&mut st, &list_ec);
+            frame_ec.set_status_text("Category updated", 0);
+        });
+
         // Set Feed Category: prompt (blank = uncategorized); a new
         // name creates the category.
         let state_sc = state.clone();
@@ -3991,6 +4171,7 @@ fn main() {
             let a = act_play.clone();
             play_btn.on_click(move |_| a());
         }
+        *tray_play_slot.borrow_mut() = Some(act_play.clone());
 
         // Article activation (Enter or double-click in the
         // article list — Python's on_article_activate): an
@@ -5445,7 +5626,7 @@ fn main() {
         let act_edit_selected: Rc<dyn Fn()> = {
             let state = state.clone();
             let feed = act_edit_feed.clone();
-            let category = act_rename_cat.clone();
+            let category = act_edit_category.clone();
             let smart = act_edit_sf.clone();
             Rc::new(move || {
                 let selected = state.borrow().selected_feed.clone().unwrap_or_default();
@@ -6191,28 +6372,317 @@ fn main() {
             })
         };
 
+        // Batch 41a actions for the Python-shaped menus.
+        // Player-menu transport routes through the player
+        // window's command dispatch, exactly like the shortcut
+        // handler; Play/Pause falls back to playing the selected
+        // article when no player is open (the shortcut path's
+        // behaviour). The seek/volume command names still need
+        // arms in player.rs — dispatch returns false until then
+        // and the status line says so.
+        let frame_pc = frame;
+        let player_cmd = move |cmd: &'static str, label: &'static str| -> Rc<dyn Fn()> {
+            Rc::new(move || {
+                if !player::dispatch_command(cmd) {
+                    frame_pc.set_status_text(&format!("{label}: no player is open"), 0);
+                }
+            })
+        };
+        let act_player_show_hide = player_cmd("player.show_hide", "Show/Hide Player");
+        let act_player_stop = player_cmd("player.stop", "Stop");
+        let act_player_rewind = player_cmd("player.rewind", "Rewind");
+        let act_player_ff = player_cmd("player.forward", "Fast Forward");
+        let act_player_vol_up = player_cmd("player.volume_up", "Volume Up");
+        let act_player_vol_down = player_cmd("player.volume_down", "Volume Down");
+        let act_speed_up = player_cmd("speed.up", "Increase Speed");
+        let act_speed_down = player_cmd("speed.down", "Decrease Speed");
+        let act_speed_reset = player_cmd("speed.reset", "Normal Speed (1x)");
+        let act_player_chapters = player_cmd("player.chapters", "Chapters");
+        let act_player_play_pause: Rc<dyn Fn()> = {
+            let play = act_play.clone();
+            Rc::new(move || {
+                if !player::dispatch_command("player.play_pause") {
+                    play();
+                }
+            })
+        };
+        let act_announce_version: Rc<dyn Fn()> = Rc::new(move || {
+            announce(
+                "general",
+                &format!("BlindRSS {}", env!("CARGO_PKG_VERSION")),
+            );
+        });
+        let act_youtube_account: Rc<dyn Fn()> = {
+            let state_ya = state.clone();
+            let frame_ya = frame;
+            let tree_ya = tree;
+            let list_ya = list;
+            Rc::new(move || {
+                dialogs::show_youtube_signin(&frame_ya, &config_path());
+                restore_focus(&state_ya.borrow(), &tree_ya, &list_ya);
+            })
+        };
+        // Selection-aware mark read/unread (Python's list
+        // context menu): set, not toggle.
+        let mark_sel = |read: bool| -> Rc<dyn Fn()> {
+            let state_ms = state.clone();
+            let frame_ms = frame;
+            let list_ms = list;
+            Rc::new(move || {
+                let mut st = state_ms.borrow_mut();
+                let indices = selected_article_indices(&list_ms, &st);
+                if indices.is_empty() {
+                    frame_ms.set_status_text("No article selected", 0);
+                    return;
+                }
+                let articles: Vec<Article> =
+                    indices.iter().map(|&i| st.articles[i].clone()).collect();
+                for (i, article) in indices.iter().zip(&articles) {
+                    if let Some(db) = &st.db {
+                        mark_article_read(db, article, read);
+                    }
+                    st.articles[*i].is_read = read;
+                }
+                refill_articles(&mut st, &list_ms);
+                frame_ms.set_status_text(
+                    &format!(
+                        "Marked {} article(s) {}",
+                        articles.len(),
+                        if read { "read" } else { "unread" }
+                    ),
+                    0,
+                );
+                drop(st);
+                for article in articles {
+                    propagate_read_state(&article, read);
+                }
+            })
+        };
+        let act_mark_read_sel = mark_sel(true);
+        let act_mark_unread_sel = mark_sel(false);
+        // Selection-aware play-queue add/remove (Python's list
+        // context menu): playable selections only, mirroring
+        // act_toggle_queue's entry shape.
+        let queue_sel = |add: bool| -> Rc<dyn Fn()> {
+            let state_qs = state.clone();
+            let frame_qs = frame;
+            let list_qs = list;
+            Rc::new(move || {
+                let st = state_qs.borrow();
+                let indices = selected_article_indices(&list_qs, &st);
+                let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+                let mut entries = dialogs::load_queue(&config_path());
+                let mut changed = 0usize;
+                for i in indices {
+                    let article = &st.articles[i];
+                    let playable = blindrss_core::download::downloaded_media_path(&cfg, article)
+                        .is_some()
+                        || article.media_url.as_deref().is_some_and(|u| {
+                            !u.is_empty()
+                                && blindrss_core::media::is_playable_media(
+                                    u,
+                                    article.media_type.as_deref(),
+                                )
+                        })
+                        || blindrss_core::media::is_ytdlp_supported(&article.url);
+                    if !playable {
+                        continue;
+                    }
+                    let pos = entries.iter().position(|e| {
+                        e.get("article_id").and_then(|v| v.as_str()) == Some(article.id.as_str())
+                    });
+                    if add && pos.is_none() {
+                        let feed_title = st
+                            .feeds
+                            .iter()
+                            .find(|f| f.id == article.feed_id)
+                            .map(|f| f.title.clone())
+                            .unwrap_or_default();
+                        entries.push(serde_json::json!({
+                            "article_id": article.id,
+                            "media_url": article.media_url.clone().unwrap_or_else(|| article.url.clone()),
+                            "use_ytdlp": article.media_url.is_none(),
+                            "title": article.title,
+                            "media_type": article.media_type.clone().unwrap_or_default(),
+                            "feed_id": article.feed_id,
+                            "feed_title": feed_title,
+                        }));
+                        changed += 1;
+                    } else if !add && let Some(pos) = pos {
+                        entries.remove(pos);
+                        changed += 1;
+                    }
+                }
+                if changed > 0 {
+                    dialogs::save_queue(&config_path(), &entries);
+                }
+                frame_qs.set_status_text(
+                    &format!(
+                        "{} {changed} article(s) {} the play queue",
+                        if add { "Added" } else { "Removed" },
+                        if add { "to" } else { "from" }
+                    ),
+                    0,
+                );
+            })
+        };
+        let act_queue_add_sel = queue_sel(true);
+        let act_queue_remove_sel = queue_sel(false);
+        // Detect Audio (Python's on_detect_audio): scan the
+        // selected article's page on a worker; the drain
+        // persists the hit via RefreshMsg::AudioDetected.
+        let act_detect_audio: Rc<dyn Fn()> = {
+            let state_da = state.clone();
+            let frame_da = frame;
+            let tx_da = tx.clone();
+            Rc::new(move || {
+                let article = {
+                    let st = state_da.borrow();
+                    st.selected_article
+                        .and_then(|i| st.articles.get(i))
+                        .cloned()
+                };
+                let Some(article) = article else {
+                    frame_da.set_status_text("No article selected", 0);
+                    return;
+                };
+                if article.media_url.as_deref().is_some_and(|u| !u.is_empty()) {
+                    frame_da.set_status_text("Article already has media", 0);
+                    return;
+                }
+                if article.url.is_empty() {
+                    frame_da.set_status_text("Article has no link to scan", 0);
+                    return;
+                }
+                frame_da.set_status_text("Scanning for audio...", 0);
+                let tx = tx_da.clone();
+                std::thread::spawn(move || {
+                    let found = blindrss_core::extract::fetch_html(&article.url)
+                        .ok()
+                        .and_then(|html| {
+                            blindrss_core::media::detect_media_in_page(&html, &article.url)
+                        });
+                    let _ = tx.send(RefreshMsg::AudioDetected(article.id.clone(), found));
+                });
+            })
+        };
+        // Copy Image Link (Python's on_copy_image_link): the
+        // first image URL in the selected article's content.
+        let act_copy_image: Rc<dyn Fn()> = {
+            let state_ci = state.clone();
+            let frame_ci = frame;
+            Rc::new(move || {
+                let st = state_ci.borrow();
+                let Some(article) = st.selected_article.and_then(|i| st.articles.get(i)) else {
+                    frame_ci.set_status_text("No article selected", 0);
+                    return;
+                };
+                match first_image_url(article.content.as_deref()) {
+                    Some(url) => {
+                        let ok = Clipboard::get().set_text(&url);
+                        frame_ci.set_status_text(
+                            if ok {
+                                "Image link copied"
+                            } else {
+                                "Copy failed"
+                            },
+                            0,
+                        );
+                    }
+                    None => frame_ci.set_status_text("No image in this article", 0),
+                }
+            })
+        };
+        // Reset Title to Feed Default (Python's tree context
+        // item): re-fetch the feed document and restore its own
+        // title, clearing the custom flag.
+        let act_reset_title: Rc<dyn Fn()> = {
+            let state_rt = state.clone();
+            let frame_rt = frame;
+            let tree_rt = tree;
+            Rc::new(move || {
+                let feed = {
+                    let st = state_rt.borrow();
+                    st.selected_feed
+                        .as_ref()
+                        .and_then(|id| st.feeds.iter().find(|f| &f.id == id).cloned())
+                };
+                let Some(feed) = feed else {
+                    frame_rt.set_status_text("Select a feed in the tree first", 0);
+                    return;
+                };
+                match blindrss_core::feeds::fetch_and_parse(&feed.url) {
+                    Ok(parsed) => {
+                        let mut st = state_rt.borrow_mut();
+                        if let Some(db) = &st.db {
+                            let _ = db.reset_feed_title(&feed.id, &parsed.title);
+                            st.feeds = db.feeds().unwrap_or_default();
+                        }
+                        rebuild_tree(&mut st, &tree_rt);
+                        frame_rt.set_status_text("Feed title reset", 0);
+                    }
+                    Err(e) => frame_rt.set_status_text(&format!("Reset title: {e}"), 0),
+                }
+            })
+        };
+        // Chapter Links submenu slots: the list context menu
+        // stores the selected article's chapter hrefs here.
+        let chapter_link_urls: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        let act_chapter_links: Vec<Rc<dyn Fn()>> = (0..M_CHAPTER_LINK_SLOTS)
+            .map(|slot| {
+                let urls = chapter_link_urls.clone();
+                Rc::new(move || {
+                    if let Some(url) = urls.borrow().get(slot as usize).cloned() {
+                        open_article_link(&frame, &url);
+                    }
+                }) as Rc<dyn Fn()>
+            })
+            .collect();
+
+        // Menu bar rebuilt to Python's exact map (Batch 41a /
+        // Audit 6 G1.1; authority gui/mainframe.py init_menus +
+        // gui/menu_mnemonics.py labels): File / Feeds / Edit /
+        // View / Player / Tools / Help, item for item. Actions
+        // Python keeps out of the bar (feed/category editing,
+        // article operations) live in the context menus below,
+        // as in Python; their handlers are unchanged.
         let file_menu = Menu::builder()
-            .append_item(M_ADD_FEED, "&Add Feed...", "Subscribe to a feed")
             .append_item(
-                M_IMPORT_OPML,
-                "&Import OPML...",
-                "Import feeds from an OPML file",
+                M_OPEN_ARTICLE,
+                "&Open Article...",
+                "Fetch and read a web article by URL",
             )
             .append_item(
-                M_EXPORT_OPML,
-                "&Export OPML...",
-                "Export feeds to an OPML file",
+                M_OPEN_MEDIA,
+                "Open Media &URL...",
+                "Play a media URL in the player",
             )
             .append_item(
-                M_TAKEOUT,
-                "Import &YouTube Takeout...",
-                "Import subscriptions from a Takeout ZIP",
+                M_MARKALL,
+                "Mark All Items as &Read",
+                "Mark every shown article read",
             )
             .append_separator()
-            .append_item(M_BACKUP, "&Backup...", "Save a backup ZIP")
-            .append_item(M_RESTORE, "&Restore...", "Restore from a backup ZIP")
+            .append_item(M_ADD_CAT, "Add &Category", "Add a new category")
+            .append_item(
+                M_DEL_CAT,
+                "Remove C&ategory",
+                "Remove the selected category (feeds move up)",
+            )
             .append_separator()
-            .append_item(M_EXIT, "E&xit", "Close BlindRSS")
+            .append_item(M_BACKUP, "&Back Up Data...", "Save a backup ZIP")
+            .append_item(M_RESTORE, "&Restore Data...", "Restore from a backup ZIP")
+            .append_separator()
+            .append_item(
+                M_PERSISTENT,
+                "Configure &Persistent Search...",
+                "Saved searches across all articles",
+            )
+            // "Add Shortcuts..." (Windows only) has no Rust
+            // handler yet — it is Batch 42 (Audit 6 G2), so the
+            // item is deliberately absent rather than dead.
+            .append_separator()
+            .append_item(M_EXIT, "E&xit", "Exit application")
             .build();
         let edit_menu = Menu::builder()
             .append_item(5031, "Cu&t\tCtrl+X", "Cut the selection")
@@ -6221,266 +6691,207 @@ fn main() {
             .append_item(5037, "Select &All\tCtrl+A", "Select all")
             .build();
         let feeds_menu = Menu::builder()
-            .append_item(M_REFRESH, "&Refresh All", "Refresh every feed")
-            .append_item(M_REFRESH_FEED, "Refresh &Feed", "Refresh the selected feed")
+            .append_item(M_ADD_FEED, "&Add Feed", "Add a new RSS feed")
             .append_item(
-                M_REFRESH_CAT,
-                "Refresh &Category",
-                "Refresh every feed in the selected category",
+                M_FEED_SEARCH,
+                "Detect Feeds on &Page...",
+                "Find feeds on a web page",
             )
-            .append_item(M_STOP_REFRESH, "S&top Refresh", "Stop the running refresh")
-            .append_item(M_SYNC, "S&ync Providers", "Sync hosted providers")
+            .append_item(M_REMOVE_FEED, "&Remove Feed", "Remove selected feed")
+            .append_item(M_REFRESH, "&Refresh Feeds", "Refresh all feeds")
+            .append_item(M_STOP_REFRESH, "S&top Refresh", "Stop refreshing")
             .append_item(
-                M_COPY_FEED_URL,
-                "Copy Feed &URL",
-                "Copy the selected feed's URL",
-            )
-            .append_separator()
-            .append_item(M_REMOVE_FEED, "Re&move Feed", "Remove the selected feed")
-            .append_item(
-                M_EDIT_FEED,
-                "&Edit Feed...",
-                "Edit the selected feed's title and URL",
-            )
-            .append_item(
-                M_FEED_PROPS,
-                "Feed &Properties...",
-                "Title, URL and category for the selected feed",
-            )
-            .append_item(
-                M_RENAME_CAT,
-                "Rename &Category...",
-                "Rename the selected feed's category",
-            )
-            .append_item(
-                M_SET_CAT,
-                "Set Feed Categor&y...",
-                "Move the selected feed to a category",
+                M_FEED_ERRORS,
+                "View Feed &Errors...",
+                "Feeds whose latest refresh failed",
             )
             .append_separator()
-            .append_item(M_ADD_CAT, "New Category...", "Create a category")
+            .append_item(M_IMPORT_OPML, "&Import OPML...", "Import feeds from OPML")
             .append_item(
-                M_DEL_CAT,
-                "Delete Category",
-                "Delete the selected category (feeds move up)",
+                M_TAKEOUT,
+                "Import &YouTube Takeout...",
+                "Import subscriptions from a Takeout ZIP",
             )
-            .append_item(
-                M_IMPORT_HERE,
-                "Import OPML Here...",
-                "Import OPML into the selected category",
-            )
-            .append_item(
-                M_EXPORT_CAT,
-                "Export Category OPML...",
-                "Export the selected category's feeds",
-            )
-            .append_separator()
-            .append_item(M_NEW_SF, "&New Smart Folder...", "Create a smart folder")
-            .append_item(
-                M_DEL_SF,
-                "&Delete Smart Folder",
-                "Delete the selected smart folder",
-            )
-            .append_item(
-                M_ARCHIVE,
-                "Rescan &Archive",
-                "Rescan the selected feed's podcast archive",
-            )
+            .append_item(M_EXPORT_OPML, "E&xport OPML...", "Export feeds to OPML")
             .build();
-        let article_menu = Menu::builder()
-            .append_item(
-                M_TOGGLE_READ,
-                "Toggle &Read",
-                "Mark the selected article read or unread",
-            )
-            .append_item(
-                M_FULLTEXT,
-                "Read &Full Text",
-                "Fetch and extract the full article",
-            )
-            .append_item(
-                M_FAVORITE,
-                "Toggle &Favorite",
-                "Favorite or unfavorite the selected article",
-            )
-            .append_item(
-                M_ARTICLE_WINDOW,
-                "Open in Article &Window",
-                "Show the selected article in its own window",
-            )
-            .append_item(
-                M_HISTORY,
-                "View &History...",
-                "Show the article's recorded change history",
-            )
-            .append_item(
-                M_TRANSLATE,
-                "&Translate Article",
-                "Translate the article with the configured provider",
-            )
-            .append_item(
-                M_QUEUE_TOGGLE,
-                "Add to Play &Queue",
-                "Add or remove the selected article from the play queue",
-            )
-            .append_item(
-                M_QUEUE_OPEN,
-                "Play &Queue...",
-                "View and edit the play queue",
-            )
-            .append_item(M_QUEUE_NEXT, "Queue &Next", "Play the next queue entry")
-            .append_item(
-                M_QUEUE_PREV,
-                "Queue Pre&vious",
-                "Play the previous queue entry",
-            )
-            .append_separator()
-            .append_item(M_MARKALL, "Mark All Read", "Mark every shown article read")
-            .append_item(
-                M_DELETE_ARTICLE,
-                "&Delete Article",
-                "Delete the selected article",
-            )
-            .append_item(
-                M_DELETED,
-                "De&leted Articles...",
-                "View and restore deleted articles",
-            )
-            .append_separator()
-            .append_item(M_PLAY, "&Play Media", "Play the selected article's media")
-            .append_item(
-                M_DOWNLOAD,
-                "Down&load",
-                "Download the selected article's media",
-            )
-            .append_item(M_CAST, "&Cast...", "Cast to a Chromecast")
-            .append_item(
-                M_STOP_CAST,
-                "Stop &AirPlay Cast",
-                "Stop the running AirPlay cast",
-            )
-            .append_separator()
-            .append_item(
-                M_OPEN_BROWSER,
-                "Open in &Browser",
-                "Open the selected article",
-            )
-            .append_item(
-                M_COPY_TEXT,
-                "Copy &Text",
-                "Copy selected articles as readable text",
-            )
-            .append_item(M_DOWNLOAD_AS, "Download &As...", "Choose a download format")
-            .append_item(M_COPY_URL, "Copy Article &URL", "Copy the article's link")
-            .append_item(
-                M_COPY_MEDIA,
-                "Copy &Media URL",
-                "Copy the article's media link",
-            )
-            .append_item(M_SEARCH, "&Search", "Search with the current search text")
-            .build();
+        // View menu (Python): Show Search Field, Rich
+        // Full-Text View, Article Filter submenu, the
+        // Accessible Browser item (kept verbatim; Batch 40
+        // removes it on rebase), Show/Hide Player, Sort By
+        // submenu. Submenus are appended after the builder
+        // items so the Python order is preserved exactly.
         let view_menu = Menu::builder()
-            .append_check_item(
-                M_RICH_VIEW,
-                "&Rich Full-Text View",
-                "Switch between plain text and HTML",
-            )
             .append_check_item(
                 M_TOGGLE_SEARCH,
                 "Show &Search Field",
                 "Show or hide the search field",
             )
-            .append_item(M_FILTER_ALL, "&All Articles", "Show all articles")
-            .append_item(M_FILTER_UNREAD, "&Unread Only", "Show unread articles")
-            .append_item(M_FILTER_READ, "&Read Only", "Show read articles")
-            .append_separator()
-            .append_item(
-                M_MEDIA_ALL,
-                "Media and &Non-media",
-                "Show articles with and without media",
+            .append_check_item(
+                M_RICH_VIEW,
+                "&Rich Full-Text View",
+                "Switch the reader between plain full text and the rich HTML view",
             )
-            .append_item(M_MEDIA_WITH, "&With Media Only", "Show articles with media")
-            .append_item(
-                M_MEDIA_WITHOUT,
-                "Wit&hout Media Only",
-                "Show articles without media",
-            )
-            .append_separator()
-            .append_item(M_SORT_DATE, "Sort by &Date", "Sort articles by date")
-            .append_item(M_SORT_NAME, "Sort by &Name", "Sort articles by title")
-            .append_item(M_SORT_AUTHOR, "Sort by &Author", "Sort articles by author")
-            .append_item(
-                M_SORT_DESC,
-                "Sort by D&escription",
-                "Sort articles by description",
-            )
-            .append_item(
-                M_SORT_STATUS,
-                "Sort by &Status",
-                "Sort articles by read status",
-            )
-            .append_item(M_SORT_FEED, "Sort by &Feed", "Sort articles by feed")
-            .append_item(
-                M_SORT_DIR,
-                "Toggle &Ascending Sort",
-                "Reverse the sort direction",
-            )
-            .append_separator()
-            .append_separator()
-            .append_item(
-                M_ACCESSIBLE_BROWSER,
-                "Open &Accessible Browser",
-                "Open the Accessible Browser window",
-            )
-            .append_item(M_FIND, "&Find in Article...", "Search the article text")
-            .append_item(M_FIND_NEXT, "Find &Next", "Repeat the last find")
             .build();
+        {
+            let filter_menu = Menu::builder()
+                .append_radio_item(
+                    M_FILTER_ALL,
+                    "&All Articles",
+                    "Show read and unread articles in all views",
+                )
+                .append_radio_item(
+                    M_FILTER_UNREAD,
+                    "&Unread Only",
+                    "Show only unread articles in all views",
+                )
+                .append_radio_item(
+                    M_FILTER_READ,
+                    "&Read Only",
+                    "Show only read articles in all views",
+                )
+                .append_separator()
+                .append_radio_item(
+                    M_MEDIA_ALL,
+                    "Media and &Non-media",
+                    "Show articles whether or not they have media",
+                )
+                .append_radio_item(
+                    M_MEDIA_WITH,
+                    "With &Media Only",
+                    "Show only articles that have playable media",
+                )
+                .append_radio_item(
+                    M_MEDIA_WITHOUT,
+                    "Wit&hout Media Only",
+                    "Show only articles that have no playable media",
+                )
+                .build();
+            view_menu.append_submenu(
+                filter_menu,
+                "Article &Filter",
+                "Filter all views by read status and media",
+            );
+        }
+        view_menu.append(
+            M_ACCESSIBLE_BROWSER,
+            "Open &Accessible Browser",
+            "Open the Accessible Browser window",
+            ItemKind::Normal,
+        );
+        view_menu.append(
+            M_PLAYER_SHOW_HIDE,
+            "Show/Hide &Player",
+            "Show or hide the media player window",
+            ItemKind::Normal,
+        );
+        view_menu.append_separator();
+        {
+            let sort_menu = Menu::builder()
+                .append_radio_item(M_SORT_DATE, "&Date", "Sort articles by date")
+                .append_radio_item(M_SORT_NAME, "&Name", "Sort articles by name")
+                .append_radio_item(M_SORT_AUTHOR, "A&uthor", "Sort articles by author")
+                .append_radio_item(M_SORT_DESC, "De&scription", "Sort articles by description")
+                .append_radio_item(M_SORT_FEED, "&Feed", "Sort articles by feed")
+                .append_radio_item(M_SORT_STATUS, "S&tatus", "Sort articles by status")
+                .append_separator()
+                .append_check_item(
+                    M_SORT_DIR,
+                    "&Ascending",
+                    "Sort in ascending order (default is descending by date)",
+                )
+                .build();
+            view_menu.append_submenu(sort_menu, "Sort &By", "");
+        }
+        // Player menu (Python): transport for the player
+        // window, Play Queue, speed submenu, Equalizer,
+        // seek/volume with their shortcut text in the label
+        // (Python deliberately uses no \t accelerators here),
+        // and a Chapters submenu whose only static entry is
+        // Show Chapters... — Python fills the rest with the
+        // current track's chapters, which live in the player
+        // window in Rust and cannot be listed from here.
+        let player_menu = Menu::builder()
+            .append_item(
+                M_PLAYER_SHOW_HIDE,
+                "Show/Hide Player",
+                "Show or hide the media player window",
+            )
+            .append_separator()
+            .append_item(M_PLAYER_PLAY_PAUSE, "Play/Pause", "Toggle play/pause")
+            .append_item(M_PLAYER_STOP, "Stop", "Stop playback")
+            .append_separator()
+            .append_item(
+                M_QUEUE_OPEN,
+                "Play &Queue...",
+                "View and edit the play queue",
+            )
+            .append_item(
+                M_QUEUE_NEXT,
+                "Play Next in Queue",
+                "Play the next queue entry",
+            )
+            .append_item(
+                M_QUEUE_PREV,
+                "Play Previous in Queue",
+                "Play the previous queue entry",
+            )
+            .append_separator()
+            .build();
+        {
+            let speed_menu = Menu::builder()
+                .append_item(M_SPEED_UP, "Increase Speed", "Play faster")
+                .append_item(M_SPEED_DOWN, "Decrease Speed", "Play slower")
+                .append_item(M_SPEED_RESET, "Normal Speed (1x)", "Reset to normal speed")
+                .build();
+            player_menu.append_submenu(speed_menu, "Playback &Speed", "");
+        }
+        player_menu.append(
+            M_EQUALIZER,
+            "&Equalizer...",
+            "Adjust the equalizer",
+            ItemKind::Normal,
+        );
+        player_menu.append_separator();
+        player_menu.append(
+            M_PLAYER_REWIND,
+            "Rewind (Ctrl+Left)",
+            "Rewind",
+            ItemKind::Normal,
+        );
+        player_menu.append(
+            M_PLAYER_FF,
+            "Fast Forward (Ctrl+Right)",
+            "Fast forward",
+            ItemKind::Normal,
+        );
+        player_menu.append_separator();
+        player_menu.append(
+            M_PLAYER_VOL_UP,
+            "Volume Up (Ctrl+Up)",
+            "Increase volume",
+            ItemKind::Normal,
+        );
+        player_menu.append(
+            M_PLAYER_VOL_DOWN,
+            "Volume Down (Ctrl+Down)",
+            "Decrease volume",
+            ItemKind::Normal,
+        );
+        player_menu.append_separator();
+        {
+            let chapters_menu = Menu::builder()
+                .append_item(M_PLAYER_CHAPTERS, "Show Chapters...", "Show chapter list")
+                .build();
+            player_menu.append_submenu(chapters_menu, "Chapters", "");
+        }
+        // (The pre-41a View menu's Find items stay available
+        // through the reader's Ctrl+F / F3 handling, as in
+        // Python, which has no Find entries in its View menu.)
         let tools_menu = Menu::builder()
-            .append_item(M_SETTINGS, "&Settings...", "Provider accounts and options")
             .append_item(
-                M_KEYS,
-                "&Keyboard Shortcuts...",
-                "View and edit keyboard shortcuts",
-            )
-            .append_item(
-                M_PRUNE,
-                "Pr&une Old Articles",
-                "Delete read articles older than 30 days",
-            )
-            .append_item(
-                M_UPDATE,
-                "Check for &Updates",
-                "Check GitHub for a newer release",
-            )
-            .append_item(
-                M_FEED_ERRORS,
-                "Feed &Errors...",
-                "Feeds whose latest refresh failed",
-            )
-            .append_item(
-                M_FILTER_RULES,
-                "Filter &Rules...",
-                "Rules that act on new articles",
-            )
-            .append_item(
-                M_PERSISTENT,
-                "&Persistent Search...",
-                "Saved searches across all articles",
-            )
-            .append_item(
-                M_OPEN_ARTICLE,
-                "Open &Article from URL...",
-                "Fetch and read a web article by URL",
-            )
-            .append_item(
-                M_OPEN_MEDIA,
-                "Open &Media URL...",
-                "Play a media URL in the player",
-            )
-            .append_item(
-                M_VIDEO_SEARCH,
-                "&Video Search...",
-                "Search videos across sites with yt-dlp",
+                M_FEED_SEARCH,
+                "Find a &Podcast or RSS Feed...",
+                "Search for a podcast or RSS feed to subscribe to",
             )
             .append_item(
                 M_PODCAST_ARCHIVE,
@@ -6488,26 +6899,55 @@ fn main() {
                 "Recover old podcast episodes from the Wayback Machine",
             )
             .append_item(
-                M_FEED_SEARCH,
-                "&Find Feeds...",
-                "Search a site for feeds to subscribe to",
+                M_VIDEO_SEARCH,
+                "&Video Search...",
+                "Search videos across sites with yt-dlp",
+            )
+            .append_separator()
+            .append_item(
+                M_FILTER_RULES,
+                "Filter &Rules...",
+                "Rules that act on new articles",
             )
             .append_item(
                 M_IMPORT_COOKIES,
                 "Import Site &Cookies...",
                 "Import browser cookies so challenge-protected sites can be read",
             )
+            .append_item(
+                M_YOUTUBE_ACCOUNT,
+                "YouTube &Account...",
+                "Sign in to a YouTube account",
+            )
+            .append_separator()
+            .append_item(
+                M_KEYS,
+                "&Keyboard Shortcuts...",
+                "View and edit keyboard shortcuts",
+            )
+            .append_item(M_SETTINGS, "&Settings...", "Configure application")
             .build();
         let help_menu = Menu::builder()
             .append_item(M_HELP, "&User Guide", "Open the BlindRSS user guide")
-            .append_item(M_ABOUT, "&About BlindRSS", "About this program")
+            .append_separator()
+            .append_item(
+                M_UPDATE,
+                "Check for &Updates...",
+                "Check GitHub for a newer release",
+            )
+            .append_item(
+                M_ANNOUNCE_VERSION,
+                "Announce &Version",
+                "Announce the version",
+            )
+            .append_item(M_ABOUT, "&About", "About BlindRSS")
             .build();
         let menu_bar = MenuBar::builder()
             .append(file_menu, "&File")
+            .append(feeds_menu, "Fee&ds")
             .append(edit_menu, "&Edit")
-            .append(feeds_menu, "&Feeds")
-            .append(article_menu, "&Article")
             .append(view_menu, "&View")
+            .append(player_menu, "&Player")
             .append(tools_menu, "&Tools")
             .append(help_menu, "&Help")
             .build();
@@ -6517,6 +6957,37 @@ fn main() {
             if let Some(bar) = frame.get_menu_bar() {
                 bar.check_item(M_TOGGLE_SEARCH, cfg.get_bool("show_search_field", true));
                 bar.check_item(M_RICH_VIEW, cfg.get_bool("full_text_rich_view", false));
+                // Filter/sort radio + check state (Python checks
+                // the current modes when the bar is built; the
+                // Rust state starts at the defaults, matching a
+                // fresh Python start).
+                bar.check_item(M_FILTER_ALL, true);
+                bar.check_item(M_MEDIA_ALL, true);
+                bar.check_item(
+                    M_SORT_DATE,
+                    cfg.get_str("article_sort_by", "date") == "date",
+                );
+                bar.check_item(
+                    M_SORT_NAME,
+                    cfg.get_str("article_sort_by", "date") == "name",
+                );
+                bar.check_item(
+                    M_SORT_AUTHOR,
+                    cfg.get_str("article_sort_by", "date") == "author",
+                );
+                bar.check_item(
+                    M_SORT_DESC,
+                    cfg.get_str("article_sort_by", "date") == "description",
+                );
+                bar.check_item(
+                    M_SORT_FEED,
+                    cfg.get_str("article_sort_by", "date") == "feed",
+                );
+                bar.check_item(
+                    M_SORT_STATUS,
+                    cfg.get_str("article_sort_by", "date") == "status",
+                );
+                bar.check_item(M_SORT_DIR, cfg.get_bool("article_sort_ascending", false));
             }
         }
         // Accessible Browser (Python's AccessibleBrowserFrame):
@@ -6755,7 +7226,37 @@ fn main() {
             (M_COPY_MEDIA, act_copy_media.clone()),
             (M_COPY_FEED_URL, act_copy_feed_url.clone()),
             (M_ACCESSIBLE_BROWSER, act_accessible_browser.clone()),
+            // Batch 41a additions.
+            (M_PLAYER_SHOW_HIDE, act_player_show_hide.clone()),
+            (M_PLAYER_PLAY_PAUSE, act_player_play_pause.clone()),
+            (M_PLAYER_STOP, act_player_stop.clone()),
+            (M_PLAYER_REWIND, act_player_rewind.clone()),
+            (M_PLAYER_FF, act_player_ff.clone()),
+            (M_PLAYER_VOL_UP, act_player_vol_up.clone()),
+            (M_PLAYER_VOL_DOWN, act_player_vol_down.clone()),
+            (M_SPEED_UP, act_speed_up.clone()),
+            (M_SPEED_DOWN, act_speed_down.clone()),
+            (M_SPEED_RESET, act_speed_reset.clone()),
+            (M_PLAYER_CHAPTERS, act_player_chapters.clone()),
+            (M_EQUALIZER, act_equalizer.clone()),
+            (M_ANNOUNCE_VERSION, act_announce_version.clone()),
+            (M_YOUTUBE_ACCOUNT, act_youtube_account.clone()),
+            (M_MARK_READ_SEL, act_mark_read_sel.clone()),
+            (M_MARK_UNREAD_SEL, act_mark_unread_sel.clone()),
+            (M_QUEUE_ADD_SEL, act_queue_add_sel.clone()),
+            (M_QUEUE_REMOVE_SEL, act_queue_remove_sel.clone()),
+            (M_DETECT_AUDIO, act_detect_audio.clone()),
+            (M_COPY_IMAGE, act_copy_image.clone()),
+            (M_ACTIVATE, act_activate.clone()),
+            (M_RESET_TITLE, act_reset_title.clone()),
+            (M_EDIT_CAT, act_edit_category.clone()),
         ];
+        // Chapter Links slots (Batch 41a): ids are a contiguous
+        // range, appended after the fixed table.
+        let mut menu_actions = menu_actions;
+        for (slot, action) in act_chapter_links.into_iter().enumerate() {
+            menu_actions.push((M_CHAPTER_LINK_BASE + slot as i32, action));
+        }
         let frame_menu = frame;
         let quit_menu = quit_flag.clone();
         frame.on_menu(move |ev| {
@@ -6779,31 +7280,67 @@ fn main() {
         let state_ctx_tree = state.clone();
         tree.bind_internal(EventType::CONTEXT_MENU, move |ev| {
             ev.skip(false);
-            let mut menu = Menu::builder()
-                .append_item(M_REFRESH_FEED, "Refresh &Feed", "")
-                .append_item(M_REFRESH_CAT, "Refresh &Category", "")
-                .append_item(M_REFRESH, "&Refresh All", "")
-                .append_item(M_STOP_REFRESH, "S&top Refresh", "")
-                .append_separator()
-                .append_item(M_ADD_CAT, "New &Category...", "")
-                .append_item(M_DEL_CAT, "&Delete Category", "")
-                .append_item(M_DEL_CAT_FEEDS, "Delete Category and Its &Feeds", "")
-                .append_item(M_IMPORT_HERE, "Import OPML &Here...", "")
-                .append_item(M_EXPORT_CAT, "&Export Category OPML...", "")
-                .append_separator()
-                .append_item(M_EDIT_FEED, "&Edit Feed...", "")
-                .append_item(M_FEED_PROPS, "Feed &Properties...", "")
-                .append_item(M_EDIT_SF, "Edit Smart &Folder...", "")
-                .append_item(M_REMOVE_FEED, "Re&move Feed", "")
-                .append_item(M_RENAME_CAT, "Rename &Category...", "")
-                .append_item(M_SET_CAT, "Set Feed Categor&y...", "")
-                .append_item(M_ARCHIVE, "Rescan &Archive", "")
-                .append_item(M_COPY_FEED_URL, "Copy Feed &URL", "")
-                .append_check_item(M_FEED_NOTIF, "&Notifications for This Feed", "")
-                .append_separator()
-                .append_item(M_NEW_SF, "&New Smart Folder...", "")
-                .append_item(M_DEL_SF, "&Delete Smart Folder", "")
-                .build();
+            // Tree context menu varies by node kind, matching
+            // Python's on_tree_context_menu (Batch 41a / Audit 6
+            // G1.2). Rust-only extras Python keeps elsewhere
+            // (Feed Properties, Set Feed Category, Rescan
+            // Archive, Sync Providers) stay at the end of the
+            // relevant variant so no handler loses its surface.
+            let selected = state_ctx_tree.borrow().selected_feed.clone();
+            let kind = match selected.as_deref() {
+                Some(s) if s.starts_with("cat:") => "category",
+                Some("smart:") => "smart_root",
+                Some(s) if s.starts_with("smart:") => "smart",
+                Some(_) => "feed",
+                None => "all",
+            };
+            let mut builder = Menu::builder();
+            match kind {
+                "category" => {
+                    builder = builder
+                        .append_item(M_REFRESH_CAT, "Refresh Category", "")
+                        .append_item(M_MARKALL, "Mark All Items as Read", "")
+                        .append_item(M_ADD_CAT, "Add Subcategory", "")
+                        .append_item(M_EDIT_CAT, "Edit Category", "")
+                        .append_item(M_DEL_CAT, "Remove Category", "")
+                        .append_item(M_DEL_CAT_FEEDS, "Delete Category and Feeds", "")
+                        .append_item(M_IMPORT_HERE, "Import OPML Here...", "")
+                        .append_item(M_EXPORT_CAT, "Export Category to OPML...", "");
+                }
+                "feed" => {
+                    builder = builder
+                        .append_item(M_REFRESH_FEED, "Refresh Feed", "")
+                        .append_item(M_MARKALL, "Mark All Items as Read", "")
+                        .append_item(M_EDIT_FEED, "Edit Feed...", "")
+                        .append_item(M_RESET_TITLE, "Reset Title to Feed Default", "")
+                        .append_item(M_COPY_FEED_URL, "Copy Feed URL", "")
+                        .append_check_item(M_FEED_NOTIF, "Notifications for This Feed", "")
+                        .append_item(M_REMOVE_FEED, "Remove Feed", "")
+                        .append_separator()
+                        .append_item(M_FEED_PROPS, "Feed Properties...", "")
+                        .append_item(M_SET_CAT, "Set Feed Category...", "")
+                        .append_item(M_ARCHIVE, "Rescan Archive", "");
+                }
+                "smart_root" => {
+                    builder = builder.append_item(M_NEW_SF, "New Smart Folder...", "");
+                }
+                "smart" => {
+                    builder = builder
+                        .append_item(M_EDIT_SF, "Edit Smart Folder...", "")
+                        .append_item(M_DEL_SF, "Delete Smart Folder", "")
+                        .append_item(M_NEW_SF, "New Smart Folder...", "");
+                }
+                _ => {
+                    builder = builder
+                        .append_item(M_REFRESH, "Refresh Feeds", "")
+                        .append_item(M_STOP_REFRESH, "Stop Refresh", "")
+                        .append_item(M_SYNC, "Sync Providers", "")
+                        .append_separator()
+                        .append_item(M_ADD_CAT, "Add Category", "")
+                        .append_item(M_NEW_SF, "New Smart Folder...", "");
+                }
+            }
+            let mut menu = builder.build();
             // Reflect the selection: the Notifications check
             // (checked = notifications ON for the selected feed)
             // and the Image Alt Text radio state.
@@ -6811,7 +7348,9 @@ fn main() {
                 let st = state_ctx_tree.borrow();
                 (st.selected_feed.clone(), st.db.is_some())
             };
-            if let Some(fid) = &feed_id {
+            if kind == "feed"
+                && let Some(fid) = &feed_id
+            {
                 let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
                 let excluded = notification_excluded_ids(&cfg).contains(fid);
                 menu.check_item(M_FEED_NOTIF, !excluded);
@@ -6826,9 +7365,9 @@ fn main() {
                     None
                 };
                 let sub = Menu::builder()
-                    .append_radio_item(M_IMGALT_DEFAULT, "Use &Default", "")
-                    .append_radio_item(M_IMGALT_ALWAYS, "&Always", "")
-                    .append_radio_item(M_IMGALT_NEVER, "&Never", "")
+                    .append_radio_item(M_IMGALT_DEFAULT, "Use &Default Setting", "")
+                    .append_radio_item(M_IMGALT_ALWAYS, "&Always Show Image Alt Text", "")
+                    .append_radio_item(M_IMGALT_NEVER, "&Never Show Image Alt Text", "")
                     .build();
                 sub.check_item(
                     match mode {
@@ -6842,29 +7381,204 @@ fn main() {
             }
             tree.popup_menu(&mut menu, None);
         });
+        let state_ctx_list = state.clone();
+        let chapter_urls_ctx = chapter_link_urls.clone();
         list.bind_internal(EventType::CONTEXT_MENU, move |ev| {
             ev.skip(false);
-            let mut menu = Menu::builder()
-                .append_item(M_TOGGLE_READ, "Toggle &Read", "")
-                .append_item(M_FULLTEXT, "Read &Full Text", "")
-                .append_item(M_VIEW_DESC, "View &Description...", "")
-                .append_item(M_HISTORY, "View &History...", "")
-                .append_item(M_FAVORITE, "Toggle &Favorite", "")
-                .append_separator()
-                .append_item(M_PLAY, "&Play Media", "")
-                .append_item(M_DOWNLOAD, "Down&load", "")
-                .append_item(M_CAST, "&Cast...", "")
-                .append_separator()
-                .append_item(M_OPEN_BROWSER, "Open in &Browser", "")
-                .append_item(M_COPY_TEXT, "Copy &Text", "")
-                .append_item(M_DOWNLOAD_AS, "Download &As...", "")
-                .append_item(M_COPY_URL, "Copy Article &URL", "")
-                .append_item(M_COPY_MEDIA, "Copy &Media URL", "")
-                .append_separator()
-                .append_item(M_DELETE_ARTICLE, "&Delete Article", "")
-                .append_item(M_MARKALL, "Mark All Read", "")
-                .build();
+            // Article list context menu, aligned to Python's
+            // on_list_context_menu (Batch 41a / Audit 6 G1.2):
+            // selection-aware count labels, conditional media /
+            // image / chapter items. Rust-only actions Python
+            // keeps in its (removed) Article menu stay after a
+            // separator at the end.
+            let (count, article, chapter_hrefs, has_history) = {
+                let st = state_ctx_list.borrow();
+                let indices = selected_article_indices(&list, &st);
+                let article = st
+                    .selected_article
+                    .and_then(|i| st.articles.get(i))
+                    .cloned();
+                let mut hrefs: Vec<(String, String)> = Vec::new();
+                let mut has_history = false;
+                if let (Some(a), Some(db)) = (&article, &st.db) {
+                    has_history = db.count_article_versions(&a.id).unwrap_or(0) > 0;
+                    if let Ok(chapters) = db.chapters(&a.id) {
+                        for ch in chapters {
+                            let Some(href) = ch.href.as_deref().filter(|h| !h.trim().is_empty())
+                            else {
+                                continue;
+                            };
+                            let resolved =
+                                if href.starts_with("http://") || href.starts_with("https://") {
+                                    href.to_string()
+                                } else if let Some(rest) = href.strip_prefix('/') {
+                                    match a.url.split_once("://") {
+                                        Some((scheme, after)) => format!(
+                                            "{scheme}://{}/{}",
+                                            after.split('/').next().unwrap_or(""),
+                                            rest
+                                        ),
+                                        None => continue,
+                                    }
+                                } else {
+                                    match a.url.rsplit_once('/') {
+                                        Some((base, _)) => format!("{base}/{href}"),
+                                        None => continue,
+                                    }
+                                };
+                            let label = ch
+                                .title
+                                .as_deref()
+                                .filter(|t| !t.trim().is_empty())
+                                .map(|t| t.to_string())
+                                .unwrap_or_else(|| resolved.clone());
+                            hrefs.push((label, resolved));
+                            if hrefs.len() >= M_CHAPTER_LINK_SLOTS as usize {
+                                break;
+                            }
+                        }
+                    }
+                }
+                (indices.len(), article, hrefs, has_history)
+            };
+            *chapter_urls_ctx.borrow_mut() = chapter_hrefs.iter().map(|(_, u)| u.clone()).collect();
+            let multi = count > 1;
+            let has_media = article
+                .as_ref()
+                .is_some_and(|a| a.media_url.as_deref().is_some_and(|u| !u.is_empty()));
+            let direct_media = article.as_ref().is_some_and(has_direct_media_link);
+            let has_image = article
+                .as_ref()
+                .is_some_and(|a| first_image_url(a.content.as_deref()).is_some());
+            let in_queue = article.as_ref().is_some_and(|a| {
+                dialogs::load_queue(&config_path())
+                    .iter()
+                    .any(|e| e.get("article_id").and_then(|v| v.as_str()) == Some(a.id.as_str()))
+            });
+            let mut builder = Menu::builder()
+                .append_item(M_ACTIVATE, "Open Article", "")
+                .append_item(M_OPEN_BROWSER, "Open in Default Browser", "")
+                .append_separator();
+            if multi {
+                builder = builder
+                    .append_item(M_MARK_READ_SEL, &format!("Mark {count} as &Read"), "")
+                    .append_item(M_MARK_UNREAD_SEL, &format!("Mark {count} as &Unread"), "")
+                    .append_item(
+                        M_DELETE_ARTICLE,
+                        &format!("Delete {count} Articles\tDel"),
+                        "",
+                    );
+            } else {
+                builder = builder
+                    .append_item(M_MARK_READ_SEL, "Mark as &Read", "")
+                    .append_item(M_MARK_UNREAD_SEL, "Mark as &Unread", "")
+                    .append_item(M_DELETE_ARTICLE, "Delete Article\tDel", "");
+            }
+            builder = builder.append_separator().append_item(
+                M_COPY_URL,
+                if multi { "Copy Links" } else { "Copy Link" },
+                "",
+            );
+            if article.is_some() {
+                builder = builder.append_item(
+                    M_COPY_TEXT,
+                    &if multi {
+                        format!("Copy Text ({count} articles)")
+                    } else {
+                        "Copy Text".to_string()
+                    },
+                    "",
+                );
+                builder = builder.append_item(M_VIEW_DESC, "View Feed Description...", "");
+                if direct_media {
+                    builder = builder.append_item(M_COPY_MEDIA, "Copy Media Link", "");
+                }
+                if has_media {
+                    builder = builder.append_item(M_DOWNLOAD, "Download", "").append_item(
+                        M_DOWNLOAD_AS,
+                        "Download As...",
+                        "",
+                    );
+                } else {
+                    builder = builder.append_item(M_DETECT_AUDIO, "Detect Audio", "");
+                }
+                if has_image {
+                    builder = builder.append_item(M_COPY_IMAGE, "Copy Image Link", "");
+                }
+                builder = builder.append_separator();
+                if multi {
+                    builder = builder
+                        .append_item(M_QUEUE_ADD_SEL, &format!("Add {count} to Play Queue"), "")
+                        .append_item(
+                            M_QUEUE_REMOVE_SEL,
+                            &format!("Remove {count} from Play Queue"),
+                            "",
+                        );
+                } else if in_queue {
+                    builder = builder.append_item(M_QUEUE_REMOVE_SEL, "Remove from Play Queue", "");
+                } else {
+                    builder = builder.append_item(M_QUEUE_ADD_SEL, "Add to Play Queue", "");
+                }
+                builder = builder.append_item(M_QUEUE_OPEN, "Open Play Queue...", "");
+            }
+            let mut menu = builder.build();
+            if !chapter_hrefs.is_empty() {
+                let mut sub = Menu::builder();
+                for (slot, (label, _url)) in chapter_hrefs.iter().enumerate() {
+                    sub = sub.append_item(
+                        M_CHAPTER_LINK_BASE + slot as i32,
+                        &format!("Open {label}"),
+                        "",
+                    );
+                }
+                menu.append_submenu(sub.build(), "Chapter Links", "");
+            }
+            if article.is_some() {
+                menu.append(M_FAVORITE, "Toggle &Favorite", "", ItemKind::Normal);
+                if has_history {
+                    menu.append(M_HISTORY, "View &History...", "", ItemKind::Normal);
+                }
+                menu.append_separator();
+                menu.append(M_FULLTEXT, "Read &Full Text", "", ItemKind::Normal);
+                menu.append(M_PLAY, "&Play Media", "", ItemKind::Normal);
+                menu.append(M_CAST, "&Cast...", "", ItemKind::Normal);
+                menu.append(M_STOP_CAST, "Stop &AirPlay Cast", "", ItemKind::Normal);
+                menu.append(M_TRANSLATE, "&Translate Article", "", ItemKind::Normal);
+                menu.append(
+                    M_ARTICLE_WINDOW,
+                    "Open in Article &Window",
+                    "",
+                    ItemKind::Normal,
+                );
+                menu.append(M_DELETED, "De&leted Articles...", "", ItemKind::Normal);
+            } else {
+                // Python keeps the article actions visible but
+                // disabled with no target article.
+                for id in [
+                    M_ACTIVATE,
+                    M_OPEN_BROWSER,
+                    M_MARK_READ_SEL,
+                    M_MARK_UNREAD_SEL,
+                    M_COPY_URL,
+                ] {
+                    menu.enable_item(id, false);
+                }
+            }
             list.popup_menu(&mut menu, None);
+        });
+        // Reader content context menu (Python's
+        // _show_content_context_menu): Copy / Select All only.
+        // The stock ids fall through the frame menu handler to
+        // wx's default text-control handling, like the Edit
+        // menu's items.
+        reader.bind_internal(EventType::CONTEXT_MENU, move |ev| {
+            ev.skip(false);
+            let mut menu = Menu::builder()
+                .append_item(5032, "&Copy\tCtrl+C", "")
+                .append_separator()
+                .append_item(5037, "Select &All\tCtrl+A", "")
+                .build();
+            reader.popup_menu(&mut menu, None);
         });
 
         // Enter (item activation): play when the article has
@@ -7079,6 +7793,8 @@ fn main() {
         watch_timer.start(45_000, false);
 
         let timer = Box::leak(Box::new(Timer::new(&frame)));
+        let tray_menu_tick = tray_menu.clone();
+        let tray_unread_last = Rc::new(std::cell::Cell::new(tray_unread0));
         let state_tick = state.clone();
         let frame_tick = frame;
         let act_ab_vo = act_accessible_browser.clone();
@@ -7114,6 +7830,22 @@ fn main() {
                 if st.refill_pending {
                     st.refill_pending = false;
                     refill_articles(&mut st, &list);
+                }
+            }
+            // Tray "Unread: {count}" label (Batch 41a): refresh
+            // when the total changes.
+            {
+                let total = state_tick
+                    .borrow()
+                    .db
+                    .as_ref()
+                    .and_then(|db| db.unread_count(None).ok())
+                    .unwrap_or(0);
+                if tray_unread_last.get() != total {
+                    tray_unread_last.set(total);
+                    if let Some(item) = tray_menu_tick.borrow().find_item(TRAY_UNREAD) {
+                        item.set_label(&format!("Unread: {total}"));
+                    }
                 }
             }
             let mut new_total = 0usize;
@@ -7513,6 +8245,33 @@ fn main() {
                         }
                         Err(e) => frame_tick.set_status_text(&format!("Download: {e}"), 0),
                     },
+                    Ok(RefreshMsg::AudioDetected(article_id, found)) => {
+                        let mut st = state_tick.borrow_mut();
+                        match found {
+                            Some((media_url, media_type)) => {
+                                if let Some(db) = st.db.as_ref() {
+                                    let _ = db.update_article_media(
+                                        &article_id,
+                                        &media_url,
+                                        media_type.as_deref(),
+                                    );
+                                }
+                                if let Some(row) =
+                                    st.articles.iter_mut().find(|a| a.id == article_id)
+                                {
+                                    row.media_url = Some(media_url);
+                                    row.media_type = media_type;
+                                }
+                                refill_articles(&mut st, &list);
+                                frame_tick.set_status_text("Audio detected and added", 0);
+                                announce("general", "Audio detected and added");
+                            }
+                            None => {
+                                frame_tick.set_status_text("Detect Audio: no audio found", 0);
+                                announce("general", "No audio found");
+                            }
+                        }
+                    }
                     Ok(RefreshMsg::YoutubeText(request, result)) => {
                         let mut st = state_tick.borrow_mut();
                         if let Ok(text) = &result {
