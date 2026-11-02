@@ -1601,3 +1601,46 @@ feed refill searches by the feed index, light loads skip
 bodies while full loads and content search keep working).
 Owner-side acceptance: cold-start time and podcast list
 responsiveness on the owner's machine and library.
+
+**Audit 7 resolution (2026-11-02).** A fresh sweep of Python
+v2.5.5 against the Rust tree (config keys, modules, dialogs,
+provider surface; interim files under the migration reports)
+found one user-visible miss plus one ignored tuning pair.
+Finding A: Python pages the article list at 400 rows behind a
+"Load more items (Enter)" placeholder row; the Rust list
+hard-capped feed views at 300 and category views at 500 with
+no way to browse older articles (a 1,000-episode podcast lost
+everything past the newest 300 to browsing). The standard
+view (feed / category / all-articles, date sort newest-first,
+no read or media filter — the configuration where SQL page
+order is display order) now loads the first 400 light rows
+plus a total count (`Db::articles_count` /
+`articles_for_category_count`, with OFFSET pages via
+`articles_light_page` / `articles_for_category_light_page`),
+shows the placeholder while rows remain, and appends the
+next page when the placeholder is activated, landing on the
+first new row. The category query gained the feed query's
+`id DESC` tiebreak so page order is total (episodes share
+dates; unstable order would repeat or skip rows across
+pages). Python's background auto-append thread is
+deliberately not ported (rows materialising under a screen
+reader mid-browse is worse than an explicit Enter; the
+placeholder is Python's own accessible affordance).
+Filtered or non-date-sorted views keep their capped loads;
+paging them is the recorded follow-up. Also fixed: the
+silence skipper hardcoded Python's merge-gap/padding
+defaults (260 / 60 ms) and ignored the
+`silence_skip_merge_gap_ms` / `silence_skip_padding_ms`
+config keys — `detect_silence_tuned` now takes them from the
+player's config reads. The remaining Audit 7 verdicts were
+non-gaps: `max_cached_views` caps Python's per-view list
+cache, which Rust does not need (views re-query cheaply and
+stay fresh); the other silence keys belong to Python's
+WebRTC-VAD incremental scanner, of which the port ships the
+documented ffmpeg fallback position; dead Python keys
+(`auto_download_podcasts`, `auto_download_period`) are dead
+on both sides. Tests: `audit7_slice.rs` (feed pages tile the
+view without overlap, category pages/count cover the
+subtree, finalize honours tuned values and the shipped
+defaults equal Python's). Owner-side acceptance: browsing
+past episode 400 of a large podcast via the placeholder.

@@ -272,11 +272,20 @@ fn spawn_skip_workers(
     if cfg.get_bool("skip_silence", true) && blindrss_core::silence::find_ffmpeg().is_some() {
         let threshold = cfg_f64(cfg, "silence_skip_threshold_db", -38.0);
         let min_silence = cfg.get_i64("silence_skip_min_ms", 700) as f64 / 1000.0;
+        // Python's merge/pad tunables (defaults 260 / 60 ms,
+        // matching core's DEFAULT_* constants).
+        let merge_gap = cfg.get_i64("silence_skip_merge_gap_ms", 260) as f64 / 1000.0;
+        let padding = cfg.get_i64("silence_skip_padding_ms", 60) as f64 / 1000.0;
         let url = stream_url.to_string();
         let tx = skip_tx.clone();
         std::thread::spawn(move || {
-            if let Ok(ranges) = blindrss_core::silence::detect_silence(&url, threshold, min_silence)
-            {
+            if let Ok(ranges) = blindrss_core::silence::detect_silence_tuned(
+                &url,
+                threshold,
+                min_silence,
+                merge_gap,
+                padding,
+            ) {
                 let ranges = ranges
                     .iter()
                     .map(|(s, e)| SkipRange {

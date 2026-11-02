@@ -81,14 +81,40 @@ pub fn finalize_ranges(
         .collect()
 }
 
-/// Run ffmpeg silencedetect over a local path or an http(s) URL.
-/// `threshold_db` is negative (Python default -38.0);
-/// `min_silence` is the shortest silence that counts, in seconds
-/// (Python default 0.7).
+/// Python's config defaults for the two finalize tunables
+/// (`silence_skip_merge_gap_ms` / `silence_skip_padding_ms`,
+/// core/config.py): 260 ms merge gap, 60 ms padding.
+pub const DEFAULT_MERGE_GAP_S: f64 = 0.26;
+pub const DEFAULT_PADDING_S: f64 = 0.06;
+
+/// Run ffmpeg silencedetect over a local path or an http(s) URL,
+/// with Python's default merge/padding. `threshold_db` is
+/// negative (Python default -38.0); `min_silence` is the shortest
+/// silence that counts, in seconds (Python default 0.7).
 pub fn detect_silence(
     media: &str,
     threshold_db: f64,
     min_silence: f64,
+) -> Result<Vec<(f64, f64)>, String> {
+    detect_silence_tuned(
+        media,
+        threshold_db,
+        min_silence,
+        DEFAULT_MERGE_GAP_S,
+        DEFAULT_PADDING_S,
+    )
+}
+
+/// `detect_silence` with caller-supplied finalize tunables (the
+/// `silence_skip_merge_gap_ms` / `silence_skip_padding_ms` config
+/// keys, in seconds). Audit 7: the values used to be hardcoded,
+/// so tuning saved by Python's settings was silently ignored.
+pub fn detect_silence_tuned(
+    media: &str,
+    threshold_db: f64,
+    min_silence: f64,
+    merge_gap: f64,
+    padding: f64,
 ) -> Result<Vec<(f64, f64)>, String> {
     let ffmpeg = find_ffmpeg().ok_or_else(|| "ffmpeg not found".to_string())?;
     let filter = format!("silencedetect=noise={threshold_db}dB:d={min_silence}");
@@ -107,5 +133,5 @@ pub fn detect_silence(
         .map_err(|e| format!("ffmpeg run: {e}"))?;
     let stderr = String::from_utf8_lossy(&output.stderr);
     let raw = parse_silencedetect(&stderr);
-    Ok(finalize_ranges(raw, 0.26, 0.06))
+    Ok(finalize_ranges(raw, merge_gap, padding))
 }

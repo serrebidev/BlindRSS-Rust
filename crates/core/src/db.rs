@@ -495,7 +495,7 @@ impl Db {
     }
 
     pub fn articles(&self, feed_id: Option<&str>, limit: usize) -> rusqlite::Result<Vec<Article>> {
-        self.articles_impl(feed_id, limit, false)
+        self.articles_impl(feed_id, limit, 0, false)
     }
 
     /// List rows WITHOUT article bodies (`content` is `None`).
@@ -510,13 +510,43 @@ impl Db {
         feed_id: Option<&str>,
         limit: usize,
     ) -> rusqlite::Result<Vec<Article>> {
-        self.articles_impl(feed_id, limit, true)
+        self.articles_impl(feed_id, limit, 0, true)
+    }
+
+    /// One page of light list rows (Audit 7 Finding A): the
+    /// article list pages through a view 400 at a time behind
+    /// Python's "Load more items (Enter)" placeholder instead of
+    /// hard-capping the view. Pages are windows over the same
+    /// date-DESC, id-DESC order as `articles_light`.
+    pub fn articles_light_page(
+        &self,
+        feed_id: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> rusqlite::Result<Vec<Article>> {
+        self.articles_impl(feed_id, limit, offset, true)
+    }
+
+    /// Total rows a feed (or the whole library) view can page
+    /// through; pairs with `articles_light_page`.
+    pub fn articles_count(&self, feed_id: Option<&str>) -> rusqlite::Result<i64> {
+        match feed_id {
+            Some(feed) => self.conn.query_row(
+                "SELECT COUNT(*) FROM articles WHERE feed_id = ?1",
+                params![feed],
+                |r| r.get(0),
+            ),
+            None => self
+                .conn
+                .query_row("SELECT COUNT(*) FROM articles", [], |r| r.get(0)),
+        }
     }
 
     fn articles_impl(
         &self,
         feed_id: Option<&str>,
         limit: usize,
+        offset: usize,
         light: bool,
     ) -> rusqlite::Result<Vec<Article>> {
         let content_col = if light { "NULL" } else { "content" };
@@ -530,23 +560,24 @@ impl Db {
                 "SELECT id, feed_id, title, url, {content_col}, description, date, \
                  author, is_read, is_favorite, media_url, media_type \
                  FROM articles WHERE feed_id = ?1 \
-                 ORDER BY date DESC, id DESC LIMIT ?2"
+                 ORDER BY date DESC, id DESC LIMIT ?2 OFFSET ?3"
             ),
             None => format!(
                 "SELECT id, feed_id, title, url, {content_col}, description, date, \
                  author, is_read, is_favorite, media_url, media_type \
                  FROM articles \
-                 ORDER BY date DESC, id DESC LIMIT ?1"
+                 ORDER BY date DESC, id DESC LIMIT ?1 OFFSET ?2"
             ),
         };
         let mut stmt = self.conn.prepare(&sql)?;
         match feed_id {
             Some(feed) => {
-                let rows = stmt.query_map(params![feed, limit as i64], article_row)?;
+                let rows =
+                    stmt.query_map(params![feed, limit as i64, offset as i64], article_row)?;
                 rows.collect()
             }
             None => {
-                let rows = stmt.query_map(params![limit as i64], article_row)?;
+                let rows = stmt.query_map(params![limit as i64, offset as i64], article_row)?;
                 rows.collect()
             }
         }
@@ -1482,7 +1513,7 @@ impl Db {
         path: &str,
         limit: usize,
     ) -> rusqlite::Result<Vec<Article>> {
-        self.articles_for_category_impl(path, limit, false)
+        self.articles_for_category_impl(path, limit, 0, false)
     }
 
     /// `articles_for_category` without article bodies; see
@@ -1492,16 +1523,44 @@ impl Db {
         path: &str,
         limit: usize,
     ) -> rusqlite::Result<Vec<Article>> {
-        self.articles_for_category_impl(path, limit, true)
+        self.articles_for_category_impl(path, limit, 0, true)
     }
 
-    fn articles_for_category_impl(
+    /// One page of light category rows; see `articles_light_page`.
+    pub fn articles_for_category_light_page(
         &self,
         path: &str,
         limit: usize,
-        light: bool,
+        offset: usize,
     ) -> rusqlite::Result<Vec<Article>> {
-        let content_col = if light { "NULL" } else { "a.content" };
+        self.articles_for_category_impl(path, limit, offset, true)
+    }
+
+    /// Total rows a category view can page through; pairs with
+    /// `articles_for_category_light_page`.
+    pub fn articles_for_category_count(&self, path: &str) -> rusqlite::Result<i64> {
+        let (where_sql, names, uncat) = self.category_membership(path)?;
+        let sql = format!(
+            "SELECT COUNT(*) FROM articles a JOIN feeds f ON f.id = a.feed_id WHERE {where_sql}"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut params: Vec<&dyn rusqlite::ToSql> = Vec::new();
+        if !uncat {
+            for _ in 0..3 {
+                for n in &names {
+                    params.push(n as &dyn rusqlite::ToSql);
+                }
+            }
+        }
+        stmt.query_row(params.as_slice(), |r| r.get(0))
+    }
+
+    /// The category membership clause (Python
+    /// `providers/local.py::_category_membership_clause`) as a
+    /// WHERE body over aliases `a` (articles) and `f` (feeds),
+    /// plus the subtree name set to bind (three times, unless the
+    /// Uncategorized bucket, which binds nothing).
+    fn category_membership(&self, path: &str) -> rusqlite::Result<(String, Vec<String>, bool)> {
         // The subtree name set: the path plus every descendant path
         // known to the categories table or carried by a feed.
         let mut names: Vec<String> = vec![path.to_string()];
@@ -1544,13 +1603,32 @@ impl Db {
                 ),
             )
         };
+        let where_sql = format!(
+            "((a.category_override IS NULL AND {feed_match}) \
+             OR {override_match} OR {label_match})"
+        );
+        Ok((where_sql, names, uncat))
+    }
+
+    fn articles_for_category_impl(
+        &self,
+        path: &str,
+        limit: usize,
+        offset: usize,
+        light: bool,
+    ) -> rusqlite::Result<Vec<Article>> {
+        let content_col = if light { "NULL" } else { "a.content" };
+        let (where_sql, names, uncat) = self.category_membership(path)?;
+        // The id DESC tiebreak (the feed query has one too) makes
+        // the order total, which OFFSET paging requires: podcast
+        // episodes routinely share a date, and an unstable order
+        // would repeat or skip rows across pages.
         let sql = format!(
             "SELECT a.id, a.feed_id, a.title, a.url, {content_col}, a.description, a.date, \
              a.author, a.is_read, a.is_favorite, a.media_url, a.media_type \
              FROM articles a JOIN feeds f ON f.id = a.feed_id \
-             WHERE ((a.category_override IS NULL AND {feed_match}) \
-             OR {override_match} OR {label_match}) \
-             ORDER BY COALESCE(a.date, '') DESC LIMIT ?"
+             WHERE {where_sql} \
+             ORDER BY COALESCE(a.date, '') DESC, a.id DESC LIMIT ? OFFSET ?"
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let mut params: Vec<&dyn rusqlite::ToSql> = Vec::new();
@@ -1563,7 +1641,9 @@ impl Db {
             }
         }
         let limit_i = limit as i64;
+        let offset_i = offset as i64;
         params.push(&limit_i);
+        params.push(&offset_i);
         let rows = stmt.query_map(params.as_slice(), article_row)?;
         rows.collect()
     }

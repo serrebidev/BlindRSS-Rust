@@ -1137,6 +1137,12 @@ struct State {
     /// Article sort (config article_sort_by / article_sort_ascending).
     sort_by: String,
     sort_ascending: bool,
+    /// Article-list paging (Audit 7 Finding A): total rows in
+    /// the current view when the view pages, -1 when it does
+    /// not. While `articles.len() < view_total` the list carries
+    /// one extra trailing row, Python's "Load more items
+    /// (Enter)" placeholder, at index `articles.len()`.
+    view_total: i64,
     /// Last find-in-article query (Ctrl+F / F3 repeat it).
     find_query: String,
     /// True while the search text box has keyboard focus; the
@@ -1828,6 +1834,93 @@ fn article_cell(
     }
 }
 
+/// Article-list page size (Python's `article_page_size`).
+const ARTICLE_PAGE: usize = 400;
+
+/// Whether the current view pages (Audit 7 Finding A): SQL
+/// pages line up with display rows only when the in-memory
+/// sort/filter pipeline in `finish_refill` is a no-op, so
+/// paging applies to the default view — date sort, newest
+/// first, no read or media filter. Other views keep the
+/// capped loads they have today.
+fn view_pages(state: &State) -> bool {
+    state.read_filter == 0
+        && state.media_filter == 0
+        && state.sort_by == "date"
+        && !state.sort_ascending
+}
+
+/// Insert list rows for `rows` starting at display index
+/// `start` (shared by the refill fill and Load More appends).
+fn insert_article_rows(
+    list: &ListCtrl,
+    rows: &[Article],
+    start: usize,
+    feed_titles: &std::collections::HashMap<&str, &str>,
+    visible: &[&blindrss_core::article_columns::ColumnLayout],
+) {
+    for (j, a) in rows.iter().enumerate() {
+        let i = (start + j) as i64;
+        list.insert_item(i, &a.title, None);
+        for (col_idx, col) in visible.iter().enumerate().skip(1) {
+            let cell = article_cell(a, &col.key, feed_titles);
+            list.set_item_text_by_column(i, col_idx as i32, &cell);
+        }
+    }
+}
+
+/// Append the next page of the current view (activation of
+/// the "Load more items (Enter)" placeholder row).
+fn load_more_articles(state: &mut State, list: &ListCtrl) {
+    let offset = state.articles.len();
+    if state.view_total <= offset as i64 {
+        return;
+    }
+    let Some(db) = state.db.as_ref() else { return };
+    let filter = state.selected_feed.clone().unwrap_or_default();
+    let page = if let Some(path) = filter.strip_prefix("cat:") {
+        db.articles_for_category_light_page(path, ARTICLE_PAGE, offset)
+    } else if filter.is_empty() {
+        db.articles_light_page(None, ARTICLE_PAGE, offset)
+    } else {
+        db.articles_light_page(Some(&filter), ARTICLE_PAGE, offset)
+    }
+    .unwrap_or_default();
+    list.freeze();
+    // The placeholder row sits at `offset`; it goes first.
+    list.delete_item(offset as i64);
+    if page.is_empty() {
+        // The library shrank under the view (deletions since
+        // the count was taken): stop offering more.
+        state.view_total = offset as i64;
+        list.thaw();
+        return;
+    }
+    let feed_titles: std::collections::HashMap<&str, &str> = state
+        .feeds
+        .iter()
+        .map(|f| (f.id.as_str(), f.title.as_str()))
+        .collect();
+    let layout = blindrss_core::article_columns::layout_from_config(
+        &blindrss_core::config::Config::load(&config_path()).unwrap_or_default(),
+    );
+    let visible = blindrss_core::article_columns::visible_columns(&layout);
+    insert_article_rows(list, &page, offset, &feed_titles, &visible);
+    state.articles.extend(page);
+    if state.view_total > state.articles.len() as i64 {
+        let at = state.articles.len() as i64;
+        list.insert_item(at, &tr("Load more items (Enter)"), None);
+    }
+    list.thaw();
+    // Land the user on the first new row.
+    list.set_item_state(
+        offset as i64,
+        ListItemState::Selected | ListItemState::Focused,
+        ListItemState::Selected | ListItemState::Focused,
+    );
+    list.ensure_visible(offset as i64);
+}
+
 fn refill_articles(state: &mut State, list: &ListCtrl) {
     state.reader_generation = state.reader_generation.wrapping_add(1);
     state.pending_fulltext = None;
@@ -1859,6 +1952,9 @@ fn refill_inner(state: &mut State, list: &ListCtrl) {
         list.delete_all_items();
     }
     state.articles.clear();
+    // Paging state belongs to the view being built; only the
+    // standard feed / category paths below re-arm it.
+    state.view_total = -1;
     let Some(db) = state.db.as_ref() else { return };
     let filter = state.selected_feed.as_deref();
     let mut loaded: Vec<Article> = Vec::new();
@@ -1916,8 +2012,22 @@ fn refill_inner(state: &mut State, list: &ListCtrl) {
     // feeds, minus articles moved elsewhere, plus articles moved
     // or labeled into the subtree.
     if let Some(path) = filter.and_then(|f| f.strip_prefix("cat:")) {
+        if view_pages(state) {
+            state.view_total = db.articles_for_category_count(path).unwrap_or(-1);
+            let loaded = db
+                .articles_for_category_light_page(path, ARTICLE_PAGE, 0)
+                .unwrap_or_default();
+            return finish_refill(state, list, loaded);
+        }
         let loaded = db
             .articles_for_category_light(path, 500)
+            .unwrap_or_default();
+        return finish_refill(state, list, loaded);
+    }
+    if view_pages(state) {
+        state.view_total = db.articles_count(filter).unwrap_or(-1);
+        let loaded = db
+            .articles_light_page(filter, ARTICLE_PAGE, 0)
             .unwrap_or_default();
         return finish_refill(state, list, loaded);
     }
@@ -1974,14 +2084,16 @@ fn finish_refill(state: &mut State, list: &ListCtrl, mut loaded: Vec<Article>) {
         &blindrss_core::config::Config::load(&config_path()).unwrap_or_default(),
     );
     let visible = blindrss_core::article_columns::visible_columns(&layout);
-    for (i, a) in loaded.iter().enumerate() {
-        list.insert_item(i as i64, &a.title, None);
-        for (col_idx, col) in visible.iter().enumerate().skip(1) {
-            let cell = article_cell(a, &col.key, &feed_titles);
-            list.set_item_text_by_column(i as i64, col_idx as i32, &cell);
-        }
-    }
+    insert_article_rows(list, &loaded, 0, &feed_titles, &visible);
     state.articles = loaded;
+    // Paged view with rows still unloaded: Python's trailing
+    // placeholder row. It is a display row only — selection
+    // plumbing resolves articles through `articles`, where the
+    // placeholder index simply has no entry.
+    if state.view_total > state.articles.len() as i64 {
+        let at = state.articles.len() as i64;
+        list.insert_item(at, &tr("Load more items (Enter)"), None);
+    }
 }
 
 /// UI language: config `language` ("auto"/missing = OS locale),
@@ -2438,6 +2550,7 @@ fn main() {
             media_filter: 0,
             sort_by: "date".to_string(),
             sort_ascending: false,
+            view_total: -1,
             find_query: String::new(),
             pending_play: None,
             pending_queue: None,
@@ -3203,6 +3316,7 @@ fn main() {
                     list.thaw();
                     let n = results.len();
                     st.articles = results;
+                    st.view_total = -1;
                     st.selected_article = None;
                     frame_s.set_status_text(&format!("{n} matches"), 0);
                 }
@@ -3917,9 +4031,19 @@ fn main() {
         // marked read either way, as Python does.
         let state_act = state.clone();
         let frame_act = frame;
+        let list_act = list;
         let act_play_for_act = act_play.clone();
         let act_activate: Rc<dyn Fn()> = Rc::new(move || {
             let mut st = state_act.borrow_mut();
+            // The trailing placeholder row of a paged view:
+            // Enter loads the next page (Python's "Load more
+            // items (Enter)").
+            if st.selected_article == Some(st.articles.len())
+                && st.view_total > st.articles.len() as i64
+            {
+                load_more_articles(&mut st, &list_act);
+                return;
+            }
             let Some(mut article) = st
                 .selected_article
                 .and_then(|i| st.articles.get(i))
@@ -4987,6 +5111,7 @@ fn main() {
                 st.db = None;
                 st.feeds.clear();
                 st.articles.clear();
+                st.view_total = -1;
                 st.selected_feed = None;
                 st.selected_article = None;
                 st.pending_play = None;
