@@ -1452,7 +1452,9 @@ pub fn show_persistent_searches(frame: &Frame, config_path: &Path) -> Option<Str
 /// rescan on a worker (it does network I/O).
 pub fn show_podcast_archive(frame: &Frame, db: &Db) -> Option<blindrss_core::Feed> {
     let feeds = db.feeds().ok()?;
-    let all = db.articles(None, 100_000).ok()?;
+    // Only feed ids and media presence are counted here; the
+    // light load skips hauling every episode body (perf audit).
+    let all = db.articles_light(None, 100_000).ok()?;
     let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
     for a in &all {
         if a.media_url.is_some() {

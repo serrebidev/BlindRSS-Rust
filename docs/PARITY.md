@@ -1556,3 +1556,48 @@ Owner-side acceptance on a real Linux desktop (X11 and
 Wayland sessions, a video podcast) remains. Regression:
 media_backend::vlc tests (10 non-ignored, incl. the ported
 Python config tests).
+
+## 8. Performance audit resolution (2026-11-02; owner-reported)
+
+The owner reported ~30 s startup and article-list lag when
+entering podcasts. Audit (reports/perf-audit-2026-11-02.md,
+with a 150-feed / 60,000-article benchmark) found three root
+causes, all parity misses against Python rather than new
+design: (1) the Rust SCHEMA never created Python's article
+indexes — Python `core/db.py::init_db` creates six indexes
+on articles plus the deleted_articles and chapters indexes
+on every init, so a Rust-created database had none and every
+list/count query was a full table scan; (2) `rebuild_tree`
+ran `Db::unread_count` per feed — once per category node and
+again per feed label — where Python runs one grouped
+`SELECT feed_id, COUNT(*) ... GROUP BY feed_id`
+(`providers/local.py`); per-feed counting measured 11.61 s
+at benchmark scale, one grouped query 0.014 s; (3) the list
+queries selected the full `content` of 300-500 rows the list
+never displays (podcast bodies are the largest text in the
+library), through a `(?1 IS NULL OR feed_id = ?1)` shape
+that defeats the feed index even when it exists. Fixes: the
+SCHEMA now carries Python's full index set (IF NOT EXISTS,
+created in the same BEGIN IMMEDIATE schema init, so existing
+index-less databases gain them at first open; Python's
+idx_articles_id_unique is deliberately skipped — it only
+duplicates the primary key); `Db::unread_counts()` returns
+the grouped map and the tree build reads it; `Db::articles`
+uses two direct-predicate shapes that take
+idx_articles_feed_id_date_id / idx_articles_date_id; new
+light list variants (`articles_light`,
+`articles_for_category_light`, `search_articles_mode_light`)
+return rows with `content = None`, and the GUI resolves a
+body on demand through `article_by_id` at the points that
+read one (reader selection, full text, play, activation,
+download, copy-text, description view), caching it back into
+the row. Bulk consumers that process bodies (smart folders,
+refresh, providers) keep the full loads. The search-results
+insert loop now gets the same Freeze/Thaw batching the
+refill path already had. Regression: crates/core/tests/
+perf_slice.rs (index presence on a fresh database, grouped
+counts equal per-feed counts, EXPLAIN QUERY PLAN proves the
+feed refill searches by the feed index, light loads skip
+bodies while full loads and content search keep working).
+Owner-side acceptance: cold-start time and podcast list
+responsiveness on the owner's machine and library.

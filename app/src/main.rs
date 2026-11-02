@@ -1548,10 +1548,23 @@ fn find_in_text(text: &str, query: &str, from: usize) -> Option<(i64, i64)> {
     None
 }
 
-fn feed_label(db: &Db, feed: &Feed) -> String {
-    match db.unread_count(Some(&feed.id)) {
-        Ok(n) if n > 0 => format!("{} ({n})", feed.title),
+fn feed_label(counts: &std::collections::HashMap<String, i64>, feed: &Feed) -> String {
+    match counts.get(&feed.id) {
+        Some(&n) if n > 0 => format!("{} ({n})", feed.title),
         _ => feed.title.clone(),
+    }
+}
+
+/// Fill a list row's missing article body from the database.
+/// The list loads are light (`Db::articles_light`: no bodies);
+/// anything that actually reads a body resolves it here, once,
+/// through the primary-key lookup.
+fn ensure_content(db: Option<&Db>, a: &mut Article) {
+    if a.content.is_none()
+        && let Some(db) = db
+        && let Ok(Some(full)) = db.article_by_id(&a.id)
+    {
+        a.content = full.content;
     }
 }
 
@@ -1594,6 +1607,12 @@ fn rebuild_tree(state: &mut State, tree: &TreeCtrl) {
     // the reliable way to identify the selected item.)
     tree.set_custom_data_direct(&root, String::new());
     let Some(db) = state.db.as_ref() else { return };
+    // One grouped count query for the whole tree (Python's
+    // shape). Per-feed COUNTs here were the ~30 s startup on
+    // large libraries: every feed was counted once for its
+    // category node, again for its own label, and the counts
+    // ran as full table scans (2026-11-02 perf audit).
+    let counts = db.unread_counts().unwrap_or_default();
     let feeds = state.feeds.clone();
     // Category grouping (Python parity): a node per category path
     // ("News", "News/Tech"), feeds under their category node,
@@ -1630,7 +1649,7 @@ fn rebuild_tree(state: &mut State, tree: &TreeCtrl) {
     if !uncat_feeds.is_empty() {
         let unread: i64 = uncat_feeds
             .iter()
-            .map(|f| db.unread_count(Some(&f.id)).unwrap_or(0))
+            .map(|f| counts.get(&f.id).copied().unwrap_or(0))
             .sum();
         let label = if unread > 0 {
             format!("Uncategorized ({unread})")
@@ -1667,7 +1686,7 @@ fn rebuild_tree(state: &mut State, tree: &TreeCtrl) {
                                 .as_deref()
                                 .is_some_and(|c| c.starts_with(&prefix))
                     })
-                    .map(|f| db.unread_count(Some(&f.id)).unwrap_or(0))
+                    .map(|f| counts.get(&f.id).copied().unwrap_or(0))
                     .sum();
                 let label = if unread > 0 {
                     format!("{} ({unread})", seg.trim())
@@ -1683,7 +1702,7 @@ fn rebuild_tree(state: &mut State, tree: &TreeCtrl) {
         }
     }
     for f in &feeds {
-        let label = feed_label(db, f);
+        let label = feed_label(&counts, f);
         let parent = if is_uncategorized_cat(f.category.as_deref()) {
             cat_items
                 .get("Uncategorized")
@@ -1897,10 +1916,12 @@ fn refill_inner(state: &mut State, list: &ListCtrl) {
     // feeds, minus articles moved elsewhere, plus articles moved
     // or labeled into the subtree.
     if let Some(path) = filter.and_then(|f| f.strip_prefix("cat:")) {
-        let loaded = db.articles_for_category(path, 500).unwrap_or_default();
+        let loaded = db
+            .articles_for_category_light(path, 500)
+            .unwrap_or_default();
         return finish_refill(state, list, loaded);
     }
-    let loaded = db.articles(filter, 300).unwrap_or_default();
+    let loaded = db.articles_light(filter, 300).unwrap_or_default();
     finish_refill(state, list, loaded);
 }
 
@@ -2577,9 +2598,16 @@ fn main() {
             st.pending_fulltext = None;
             st.selected_article = Some(idx as usize);
             st.focus_list = true;
-            let Some(a) = st.articles.get(idx as usize).cloned() else {
+            let Some(mut a) = st.articles.get(idx as usize).cloned() else {
                 return;
             };
+            // List rows are light (no bodies): resolve this
+            // article's body once and cache it back into the row
+            // so re-selecting it is free.
+            ensure_content(st.db.as_ref(), &mut a);
+            if let Some(row) = st.articles.get_mut(idx as usize) {
+                row.content = a.content.clone();
+            }
             if let Some(db) = st.db.as_ref() {
                 let _ = db.mark_opened(&a.id);
             }
@@ -3150,7 +3178,7 @@ fn main() {
             let title_only = blindrss_core::config::Config::load(&config_path())
                 .map(|c| c.get_str("search_mode", "title_content") == "title_only")
                 .unwrap_or(false);
-            match db.search_articles_mode(query.trim(), 300, title_only) {
+            match db.search_articles_mode_light(query.trim(), 300, title_only) {
                 Ok(results) => {
                     setup_article_columns(&list);
                     let feed_titles: std::collections::HashMap<&str, &str> = st
@@ -3162,6 +3190,9 @@ fn main() {
                         &blindrss_core::config::Config::load(&config_path()).unwrap_or_default(),
                     );
                     let visible = blindrss_core::article_columns::visible_columns(&layout);
+                    // Same Freeze/Thaw batching as refill_articles:
+                    // unbatched inserts repaint per row.
+                    list.freeze();
                     for (i, a) in results.iter().enumerate() {
                         list.insert_item(i as i64, &a.title, None);
                         for (col_idx, col) in visible.iter().enumerate().skip(1) {
@@ -3169,6 +3200,7 @@ fn main() {
                             list.set_item_text_by_column(i as i64, col_idx as i32, &cell);
                         }
                     }
+                    list.thaw();
                     let n = results.len();
                     st.articles = results;
                     st.selected_article = None;
@@ -3434,7 +3466,7 @@ fn main() {
         let rich_view_ft = rich_view.clone();
         let act_fulltext: Rc<dyn Fn()> = Rc::new(move || {
             let mut st = state_ft.borrow_mut();
-            let Some(article) = st
+            let Some(mut article) = st
                 .selected_article
                 .and_then(|i| st.articles.get(i))
                 .cloned()
@@ -3446,6 +3478,10 @@ fn main() {
                 frame_ft.set_status_text("Article has no link", 0);
                 return;
             }
+            // The stored body is the extraction fallback and
+            // feeds the reader cache key: resolve it (list rows
+            // are light) before either is computed.
+            ensure_content(st.db.as_ref(), &mut article);
             let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
             let keep_alt = show_image_alt_for(&cfg, st.db.as_ref(), &article.feed_id);
             let cache_key = reader_cache_key(&article, keep_alt);
@@ -3828,7 +3864,7 @@ fn main() {
         let tx_pm = tx.clone();
         let act_play: Rc<dyn Fn()> = Rc::new(move || {
             let st = state_pm.borrow();
-            let Some(article) = st
+            let Some(mut article) = st
                 .selected_article
                 .and_then(|i| st.articles.get(i))
                 .cloned()
@@ -3836,6 +3872,9 @@ fn main() {
                 frame_pm.set_status_text("No article selected", 0);
                 return;
             };
+            // Media detection scans the body for embedded
+            // media; list rows are light, so resolve it first.
+            ensure_content(st.db.as_ref(), &mut article);
             drop(st);
             state_pm.borrow_mut().pending_play = Some(article.clone());
             frame_pm.set_status_text("Finding playable media...", 0);
@@ -3881,7 +3920,7 @@ fn main() {
         let act_play_for_act = act_play.clone();
         let act_activate: Rc<dyn Fn()> = Rc::new(move || {
             let mut st = state_act.borrow_mut();
-            let Some(article) = st
+            let Some(mut article) = st
                 .selected_article
                 .and_then(|i| st.articles.get(i))
                 .cloned()
@@ -3889,6 +3928,9 @@ fn main() {
                 frame_act.set_status_text("No article selected", 0);
                 return;
             };
+            // The activation decision's last step detects media
+            // in the body; list rows are light, so resolve it.
+            ensure_content(st.db.as_ref(), &mut article);
             let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
             let playable = blindrss_core::download::downloaded_media_path(&cfg, &article).is_some()
                 || article.media_url.as_deref().is_some_and(|u| {
@@ -4508,7 +4550,13 @@ fn main() {
                     let st = state.borrow();
                     selected_article_indices(&list, &st)
                         .into_iter()
-                        .map(|i| st.articles[i].clone())
+                        .map(|i| {
+                            // Download resolution scans bodies
+                            // for media; list rows are light.
+                            let mut a = st.articles[i].clone();
+                            ensure_content(st.db.as_ref(), &mut a);
+                            a
+                        })
                         .collect()
                 };
                 if articles.is_empty() {
@@ -5271,7 +5319,13 @@ fn main() {
                 let parts: Vec<String> = indices
                     .iter()
                     .filter_map(|&i| {
-                        let article = &st.articles[i];
+                        // Copy Text needs bodies; list rows are
+                        // light, so resolve this row's body first.
+                        let mut owned = st.articles[i].clone();
+                        if kind == "text" {
+                            ensure_content(st.db.as_ref(), &mut owned);
+                        }
+                        let article = &owned;
                         let text = match kind {
                             "url" => article_copy_url(article).to_string(),
                             "media" if has_direct_media_link(article) => {
@@ -5774,7 +5828,7 @@ fn main() {
             let frame_vd = frame;
             Rc::new(move || {
                 let st = state_vd.borrow();
-                let Some(a) = st
+                let Some(mut a) = st
                     .selected_article
                     .and_then(|i| st.articles.get(i))
                     .cloned()
@@ -5782,6 +5836,9 @@ fn main() {
                     frame_vd.set_status_text("No article selected", 0);
                     return;
                 };
+                // The description view falls back to the body;
+                // list rows are light, so resolve it.
+                ensure_content(st.db.as_ref(), &mut a);
                 let raw = a
                     .description
                     .clone()

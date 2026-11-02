@@ -120,6 +120,20 @@ CREATE TABLE IF NOT EXISTS youtube_history_state (
 CREATE TABLE IF NOT EXISTS hosted_article_media (
     cache_key TEXT PRIMARY KEY, media_url TEXT, media_type TEXT,
     checked_at INTEGER NOT NULL DEFAULT 0);
+CREATE INDEX IF NOT EXISTS idx_articles_feed_id ON articles (feed_id);
+CREATE INDEX IF NOT EXISTS idx_articles_is_read ON articles (is_read);
+CREATE INDEX IF NOT EXISTS idx_articles_date ON articles (date);
+CREATE INDEX IF NOT EXISTS idx_articles_is_read_feed_id
+    ON articles (is_read, feed_id);
+CREATE INDEX IF NOT EXISTS idx_articles_date_id ON articles (date, id);
+CREATE INDEX IF NOT EXISTS idx_articles_feed_id_date_id
+    ON articles (feed_id, date, id);
+CREATE INDEX IF NOT EXISTS idx_deleted_articles_feed_id
+    ON deleted_articles (feed_id);
+CREATE INDEX IF NOT EXISTS idx_deleted_articles_feed_url
+    ON deleted_articles (feed_id, url);
+CREATE INDEX IF NOT EXISTS idx_chapters_article_id_start
+    ON chapters (article_id, start);
 ";
 
 /// Columns Python added to existing tables by migration; older
@@ -185,6 +199,27 @@ pub struct Db {
 }
 
 pub type CachedFeed = (Option<String>, Option<String>, Vec<u8>);
+
+/// The shared row shape of the article list queries:
+/// (id, feed_id, title, url, content, description, date, author,
+/// is_read, is_favorite, media_url, media_type). `content` may be
+/// SQL NULL in the light list variants, hence the Option field.
+fn article_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Article> {
+    Ok(Article {
+        id: r.get(0)?,
+        feed_id: r.get(1)?,
+        title: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+        url: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+        content: r.get(4)?,
+        description: r.get(5)?,
+        date: r.get(6)?,
+        author: r.get(7)?,
+        is_read: r.get::<_, i64>(8)? != 0,
+        is_favorite: r.get::<_, i64>(9)? != 0,
+        media_url: r.get(10)?,
+        media_type: r.get(11)?,
+    })
+}
 
 impl Db {
     pub fn cached_feed(&self, url: &str) -> rusqlite::Result<Option<CachedFeed>> {
@@ -460,29 +495,61 @@ impl Db {
     }
 
     pub fn articles(&self, feed_id: Option<&str>, limit: usize) -> rusqlite::Result<Vec<Article>> {
-        let sql = "SELECT id, feed_id, title, url, content, description, date, \
-                   author, is_read, is_favorite, media_url, media_type \
-                   FROM articles \
-                   WHERE (?1 IS NULL OR feed_id = ?1) \
-                   ORDER BY date DESC, id DESC LIMIT ?2";
-        let mut stmt = self.conn.prepare(sql)?;
-        let rows = stmt.query_map(params![feed_id, limit as i64], |r| {
-            Ok(Article {
-                id: r.get(0)?,
-                feed_id: r.get(1)?,
-                title: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
-                url: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
-                content: r.get(4)?,
-                description: r.get(5)?,
-                date: r.get(6)?,
-                author: r.get(7)?,
-                is_read: r.get::<_, i64>(8)? != 0,
-                is_favorite: r.get::<_, i64>(9)? != 0,
-                media_url: r.get(10)?,
-                media_type: r.get(11)?,
-            })
-        })?;
-        rows.collect()
+        self.articles_impl(feed_id, limit, false)
+    }
+
+    /// List rows WITHOUT article bodies (`content` is `None`).
+    /// The article list never displays bodies, and podcast episode
+    /// bodies are the largest text in the library: hauling 300-500
+    /// of them per refill was the podcast list lag (2026-11-02
+    /// perf audit). Callers that need a body load it on demand
+    /// through `article_by_id`. Bulk consumers that process bodies
+    /// (smart folders, refresh, providers) keep `articles`.
+    pub fn articles_light(
+        &self,
+        feed_id: Option<&str>,
+        limit: usize,
+    ) -> rusqlite::Result<Vec<Article>> {
+        self.articles_impl(feed_id, limit, true)
+    }
+
+    fn articles_impl(
+        &self,
+        feed_id: Option<&str>,
+        limit: usize,
+        light: bool,
+    ) -> rusqlite::Result<Vec<Article>> {
+        let content_col = if light { "NULL" } else { "content" };
+        // Two shapes, not one parameterised OR: `(?1 IS NULL OR
+        // feed_id = ?1)` defeats the feed index even when it
+        // exists (the planner falls back to a date-order scan and
+        // filters row by row). The direct shapes use
+        // idx_articles_feed_id_date_id / idx_articles_date_id.
+        let sql = match feed_id {
+            Some(_) => format!(
+                "SELECT id, feed_id, title, url, {content_col}, description, date, \
+                 author, is_read, is_favorite, media_url, media_type \
+                 FROM articles WHERE feed_id = ?1 \
+                 ORDER BY date DESC, id DESC LIMIT ?2"
+            ),
+            None => format!(
+                "SELECT id, feed_id, title, url, {content_col}, description, date, \
+                 author, is_read, is_favorite, media_url, media_type \
+                 FROM articles \
+                 ORDER BY date DESC, id DESC LIMIT ?1"
+            ),
+        };
+        let mut stmt = self.conn.prepare(&sql)?;
+        match feed_id {
+            Some(feed) => {
+                let rows = stmt.query_map(params![feed, limit as i64], article_row)?;
+                rows.collect()
+            }
+            None => {
+                let rows = stmt.query_map(params![limit as i64], article_row)?;
+                rows.collect()
+            }
+        }
     }
 
     pub fn unread_count(&self, feed_id: Option<&str>) -> rusqlite::Result<i64> {
@@ -492,6 +559,20 @@ impl Db {
             params![feed_id],
             |r| r.get(0),
         )
+    }
+
+    /// Unread counts for every feed in ONE grouped query
+    /// (Python `providers/local.py` does the same). The tree
+    /// build used to run `unread_count` per feed — 2-3 times per
+    /// feed per rebuild once category totals and labels are
+    /// counted — which on an index-less database was the ~30 s
+    /// startup (2026-11-02 perf audit).
+    pub fn unread_counts(&self) -> rusqlite::Result<std::collections::HashMap<String, i64>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT feed_id, COUNT(*) FROM articles WHERE is_read = 0 GROUP BY feed_id")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+        rows.collect()
     }
 
     pub fn article_by_id(&self, article_id: &str) -> rusqlite::Result<Option<Article>> {
@@ -1385,22 +1466,7 @@ impl Db {
             .collect();
         let limit_i = limit as i64;
         params.push(&limit_i);
-        let rows = stmt.query_map(params.as_slice(), |r| {
-            Ok(Article {
-                id: r.get(0)?,
-                feed_id: r.get(1)?,
-                title: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
-                url: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
-                content: r.get(4)?,
-                description: r.get(5)?,
-                date: r.get(6)?,
-                author: r.get(7)?,
-                is_read: r.get::<_, i64>(8)? != 0,
-                is_favorite: r.get::<_, i64>(9)? != 0,
-                media_url: r.get(10)?,
-                media_type: r.get(11)?,
-            })
-        })?;
+        let rows = stmt.query_map(params.as_slice(), article_row)?;
         rows.collect()
     }
 
@@ -1416,6 +1482,26 @@ impl Db {
         path: &str,
         limit: usize,
     ) -> rusqlite::Result<Vec<Article>> {
+        self.articles_for_category_impl(path, limit, false)
+    }
+
+    /// `articles_for_category` without article bodies; see
+    /// `articles_light` for why the list path uses this.
+    pub fn articles_for_category_light(
+        &self,
+        path: &str,
+        limit: usize,
+    ) -> rusqlite::Result<Vec<Article>> {
+        self.articles_for_category_impl(path, limit, true)
+    }
+
+    fn articles_for_category_impl(
+        &self,
+        path: &str,
+        limit: usize,
+        light: bool,
+    ) -> rusqlite::Result<Vec<Article>> {
+        let content_col = if light { "NULL" } else { "a.content" };
         // The subtree name set: the path plus every descendant path
         // known to the categories table or carried by a feed.
         let mut names: Vec<String> = vec![path.to_string()];
@@ -1459,7 +1545,7 @@ impl Db {
             )
         };
         let sql = format!(
-            "SELECT a.id, a.feed_id, a.title, a.url, a.content, a.description, a.date, \
+            "SELECT a.id, a.feed_id, a.title, a.url, {content_col}, a.description, a.date, \
              a.author, a.is_read, a.is_favorite, a.media_url, a.media_type \
              FROM articles a JOIN feeds f ON f.id = a.feed_id \
              WHERE ((a.category_override IS NULL AND {feed_match}) \
@@ -1478,22 +1564,7 @@ impl Db {
         }
         let limit_i = limit as i64;
         params.push(&limit_i);
-        let rows = stmt.query_map(params.as_slice(), |r| {
-            Ok(Article {
-                id: r.get(0)?,
-                feed_id: r.get(1)?,
-                title: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
-                url: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
-                content: r.get(4)?,
-                description: r.get(5)?,
-                date: r.get(6)?,
-                author: r.get(7)?,
-                is_read: r.get::<_, i64>(8)? != 0,
-                is_favorite: r.get::<_, i64>(9)? != 0,
-                media_url: r.get(10)?,
-                media_type: r.get(11)?,
-            })
-        })?;
+        let rows = stmt.query_map(params.as_slice(), article_row)?;
         rows.collect()
     }
 
@@ -1826,33 +1897,40 @@ impl Db {
         limit: usize,
         title_only: bool,
     ) -> rusqlite::Result<Vec<Article>> {
+        self.search_articles_mode_impl(query, limit, title_only, false)
+    }
+
+    /// `search_articles_mode` without article bodies in the
+    /// result rows; see `articles_light`.
+    pub fn search_articles_mode_light(
+        &self,
+        query: &str,
+        limit: usize,
+        title_only: bool,
+    ) -> rusqlite::Result<Vec<Article>> {
+        self.search_articles_mode_impl(query, limit, title_only, true)
+    }
+
+    fn search_articles_mode_impl(
+        &self,
+        query: &str,
+        limit: usize,
+        title_only: bool,
+        light: bool,
+    ) -> rusqlite::Result<Vec<Article>> {
         if !title_only {
-            return self.search_articles(query, limit);
+            return self.search_articles_impl(query, limit, light);
         }
+        let content_col = if light { "NULL" } else { "content" };
         let like = format!("%{}%", query.replace('%', "\\%").replace('_', "\\_"));
-        let mut stmt = self.conn.prepare(
-            "SELECT id, feed_id, title, url, content, description, date, \
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT id, feed_id, title, url, {content_col}, description, date, \
              author, is_read, is_favorite, media_url, media_type \
              FROM articles \
              WHERE title LIKE ?1 ESCAPE '\\' \
-             ORDER BY date DESC, id DESC LIMIT ?2",
-        )?;
-        let rows = stmt.query_map(params![like, limit as i64], |r| {
-            Ok(Article {
-                id: r.get(0)?,
-                feed_id: r.get(1)?,
-                title: r.get(2)?,
-                url: r.get(3)?,
-                content: r.get(4)?,
-                description: r.get(5)?,
-                date: r.get(6)?,
-                author: r.get(7)?,
-                is_read: r.get(8)?,
-                is_favorite: r.get(9)?,
-                media_url: r.get(10)?,
-                media_type: r.get(11)?,
-            })
-        })?;
+             ORDER BY date DESC, id DESC LIMIT ?2"
+        ))?;
+        let rows = stmt.query_map(params![like, limit as i64], article_row)?;
         rows.collect()
     }
 
@@ -1953,31 +2031,28 @@ impl Db {
     /// (case-insensitive via LIKE). Python's full search has more
     /// ranking rules; this is the portable core of it.
     pub fn search_articles(&self, query: &str, limit: usize) -> rusqlite::Result<Vec<Article>> {
+        self.search_articles_impl(query, limit, false)
+    }
+
+    fn search_articles_impl(
+        &self,
+        query: &str,
+        limit: usize,
+        light: bool,
+    ) -> rusqlite::Result<Vec<Article>> {
+        // The match still runs against the stored body; only the
+        // returned rows skip hauling it (see articles_light).
+        let content_col = if light { "NULL" } else { "content" };
         let like = format!("%{}%", query.replace('%', "\\%").replace('_', "\\_"));
-        let mut stmt = self.conn.prepare(
-            "SELECT id, feed_id, title, url, content, description, date, \
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT id, feed_id, title, url, {content_col}, description, date, \
              author, is_read, is_favorite, media_url, media_type \
              FROM articles \
              WHERE title LIKE ?1 ESCAPE '\\' OR content LIKE ?1 ESCAPE '\\' \
                 OR description LIKE ?1 ESCAPE '\\' \
-             ORDER BY date DESC, id DESC LIMIT ?2",
-        )?;
-        let rows = stmt.query_map(params![like, limit as i64], |r| {
-            Ok(Article {
-                id: r.get(0)?,
-                feed_id: r.get(1)?,
-                title: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
-                url: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
-                content: r.get(4)?,
-                description: r.get(5)?,
-                date: r.get(6)?,
-                author: r.get(7)?,
-                is_read: r.get::<_, i64>(8)? != 0,
-                is_favorite: r.get::<_, i64>(9)? != 0,
-                media_url: r.get(10)?,
-                media_type: r.get(11)?,
-            })
-        })?;
+             ORDER BY date DESC, id DESC LIMIT ?2"
+        ))?;
+        let rows = stmt.query_map(params![like, limit as i64], article_row)?;
         rows.collect()
     }
 
