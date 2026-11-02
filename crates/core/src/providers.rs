@@ -690,6 +690,36 @@ impl GReaderClient {
         Ok(())
     }
 
+    /// Rename a label (category) on the server
+    /// (POST /rename-tag; Python's GReader-family
+    /// rename_category). Labels are flat: the full local
+    /// category path is the label title.
+    pub fn rename_label_remote(&self, old_title: &str, new_title: &str) -> Result<(), String> {
+        let source = format!("user/-/label/{old_title}");
+        let dest = format!("user/-/label/{new_title}");
+        crate::http::agent()
+            .post(&format!("{}/rename-tag", self.api_base))
+            .header("Authorization", &self.auth_header()?)
+            .send_form([("s", source.as_str()), ("dest", dest.as_str())])
+            .map_err(|e| format!("rename-tag failed: {e}"))?;
+        self.invalidate_caches();
+        Ok(())
+    }
+
+    /// Remove a label (category) from every subscription on
+    /// the server (POST /disable-tag; Python's GReader-family
+    /// delete_category). The subscriptions themselves stay.
+    pub fn disable_label_remote(&self, title: &str) -> Result<(), String> {
+        let tag = format!("user/-/label/{title}");
+        crate::http::agent()
+            .post(&format!("{}/disable-tag", self.api_base))
+            .header("Authorization", &self.auth_header()?)
+            .send_form([("s", tag.as_str())])
+            .map_err(|e| format!("disable-tag failed: {e}"))?;
+        self.invalidate_caches();
+        Ok(())
+    }
+
     pub fn mark_all_read_remote(&self, feed_id: Option<&str>) -> Result<(), String> {
         let mut token = crate::http::agent()
             .get(&format!("{}/token", self.api_base))
