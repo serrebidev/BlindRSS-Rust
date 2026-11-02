@@ -89,10 +89,38 @@ fn match_group(group: &Value, art: &RuleArticle) -> bool {
         return !any;
     }
     if any {
-        conds.iter().any(|c| match_node(c, art))
+        conds
+            .iter()
+            .filter(|c| known_node(c))
+            .any(|c| match_node(c, art))
     } else {
-        conds.iter().all(|c| match_node(c, art))
+        conds
+            .iter()
+            .filter(|c| known_node(c))
+            .all(|c| match_node(c, art))
     }
+}
+
+fn known_node(node: &Value) -> bool {
+    is_group(node)
+        || matches!(
+            node.get("field")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_lowercase()
+                .as_str(),
+            "read"
+                | "favorite"
+                | "opened"
+                | "updated"
+                | "title"
+                | "content"
+                | "description"
+                | "author"
+                | "feed"
+                | "url"
+                | "tag"
+        )
 }
 
 fn match_node(node: &Value, art: &RuleArticle) -> bool {

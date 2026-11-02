@@ -67,3 +67,58 @@ fn html_alternate_discovery() {
         ]
     );
 }
+
+#[test]
+fn youtube_user_and_playlist_links_resolve_without_page_fetch() {
+    assert_eq!(
+        social_feed_url("https://www.youtube.com/user/TestUser").as_deref(),
+        Some("https://www.youtube.com/feeds/videos.xml?user=TestUser")
+    );
+    assert_eq!(
+        social_feed_url("https://www.youtube.com/watch?v=abc&list=PL123abc").as_deref(),
+        Some("https://www.youtube.com/feeds/videos.xml?playlist_id=PL123abc")
+    );
+    assert_eq!(
+        social_feed_url("https://notyoutube.com/channel/UC123"),
+        None
+    );
+    assert_eq!(social_feed_url("https://notbsky.app/profile/alice"), None);
+}
+
+#[test]
+fn alternate_links_honor_attribute_boundaries_and_url_resolution() {
+    let html = r#"İ<LINK REL = 'alternate' TYPE = 'application/rss+xml' HREF = '../rss?x=1&amp;y=2'>
+      <link rel='alternate' type='application/atom+xml' data-href='/wrong' href='?feed=atom'>
+      <link rel='alternate' type='application/rss+xml' href='javascript:alert(1)'>
+      <link rel='notalternate' type='application/rss+xml' href='/also-wrong'>
+      <linkage rel='alternate' type='application/rss+xml' href='/fake-tag'>"#;
+    assert_eq!(
+        discover_in_html(html, "https://example.com/blog/article"),
+        vec![
+            "https://example.com/rss?x=1&y=2",
+            "https://example.com/blog/article?feed=atom"
+        ]
+    );
+}
+
+#[test]
+fn website_scan_probes_common_feed_paths_at_page_and_site_root() {
+    let candidates =
+        blindrss_core::discovery::common_feed_candidates("https://example.com/blog?sort=new#top");
+    assert!(candidates.contains(&"https://example.com/blog/backend.xml".to_string()));
+    assert!(candidates.contains(&"https://example.com/backend.xml".to_string()));
+    assert!(candidates.contains(&"https://example.com/blog?feed=rss2".to_string()));
+    assert!(
+        !candidates
+            .iter()
+            .any(|url| url.contains("sort=new") || url.contains('#'))
+    );
+    assert_eq!(
+        candidates
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        candidates.len()
+    );
+    assert!(blindrss_core::discovery::common_feed_candidates("file:///tmp/test").is_empty());
+}

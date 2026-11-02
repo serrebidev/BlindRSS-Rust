@@ -46,6 +46,7 @@ fn state() -> std::sync::MutexGuard<'static, Option<HttpState>> {
 /// user_agent_mode / user_agent_custom / feed_timeout_seconds /
 /// ignore_feed_ssl_errors.
 pub fn init_from_config(cfg: &crate::config::Config) {
+    crate::extract::configure_text_structure(cfg);
     let ua = crate::user_agents::resolve_from_config(cfg);
     let timeout = cfg.get_i64("feed_timeout_seconds", 15).max(1) as u64;
     // Python default is True (issue #42): broken-cert feeds still

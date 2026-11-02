@@ -67,8 +67,9 @@ pub struct GReaderClient {
 }
 
 /// Process-wide Inoreader caches (see GReaderClient's TTLs).
-static INOREADER_META_CACHE: std::sync::Mutex<Option<(std::time::Instant, Vec<RemoteFeed>)>> =
-    std::sync::Mutex::new(None);
+static INOREADER_META_CACHE: std::sync::Mutex<
+    Option<(String, std::time::Instant, Vec<RemoteFeed>)>,
+> = std::sync::Mutex::new(None);
 type ArticleCacheMap = std::collections::HashMap<String, (std::time::Instant, Vec<Article>)>;
 
 static INOREADER_ARTICLE_CACHE: std::sync::OnceLock<std::sync::Mutex<ArticleCacheMap>> =
@@ -116,6 +117,8 @@ struct SubCategory {
 struct StreamContents {
     #[serde(default)]
     items: Vec<StreamItem>,
+    #[serde(default)]
+    continuation: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -136,6 +139,8 @@ struct StreamItem {
     origin: Option<Origin>,
     #[serde(default)]
     enclosure: Vec<LinkHref>,
+    #[serde(default)]
+    categories: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -247,10 +252,25 @@ impl GReaderClient {
         if self.service != GReaderService::Inoreader {
             return;
         }
-        *INOREADER_META_CACHE
+        let scope = self.cache_scope();
+        let mut metadata = INOREADER_META_CACHE
             .lock()
-            .unwrap_or_else(|p| p.into_inner()) = None;
-        article_cache().clear();
+            .unwrap_or_else(|p| p.into_inner());
+        if metadata.as_ref().is_some_and(|(key, _, _)| key == &scope) {
+            *metadata = None;
+        }
+        article_cache().retain(|key, _| !key.starts_with(&format!("{scope}|")));
+    }
+
+    fn cache_scope(&self) -> String {
+        use sha2::Digest;
+        // Never retain raw credentials in process-wide cache keys.
+        let identity =
+            serde_json::json!([self.api_base, self.email, self.oauth_token, self.password]);
+        sha2::Sha256::digest(identity.to_string().as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
     }
 
     fn login(&self) -> Result<String, String> {
@@ -336,7 +356,8 @@ impl GReaderClient {
             let cache = INOREADER_META_CACHE
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
-            if let Some((at, feeds)) = &*cache
+            if let Some((scope, at, feeds)) = &*cache
+                && scope == &self.cache_scope()
                 && at.elapsed() < self.meta_ttl
             {
                 return Ok(feeds.clone());
@@ -363,7 +384,7 @@ impl GReaderClient {
             *INOREADER_META_CACHE
                 .lock()
                 .unwrap_or_else(|p| p.into_inner()) =
-                Some((std::time::Instant::now(), feeds.clone()));
+                Some((self.cache_scope(), std::time::Instant::now(), feeds.clone()));
         }
         Ok(feeds)
     }
@@ -373,7 +394,7 @@ impl GReaderClient {
     pub fn stream_articles(&self, stream_id: &str, count: usize) -> Result<Vec<Article>, String> {
         let count = self.effective_count(count);
         if self.service == GReaderService::Inoreader {
-            let key = format!("{stream_id}|{count}");
+            let key = format!("{}|{stream_id}|{count}", self.cache_scope());
             {
                 let cache = article_cache();
                 if let Some((at, articles)) = cache.get(&key)
@@ -397,9 +418,29 @@ impl GReaderClient {
             .replace('?', "%3F")
             .replace('&', "%26");
         let path = format!("/stream/contents/{encoded}?output=json&n={count}");
-        let contents: StreamContents = self.get_json(&path)?;
-        Ok(contents
-            .items
+        let mut items = Vec::new();
+        let mut continuation: Option<String> = None;
+        let mut seen = std::collections::HashSet::new();
+        loop {
+            let page_path = match &continuation {
+                Some(token) => format!(
+                    "{path}&c={}",
+                    url::form_urlencoded::byte_serialize(token.as_bytes()).collect::<String>()
+                ),
+                None => path.clone(),
+            };
+            let contents: StreamContents = self.get_json(&page_path)?;
+            let empty = contents.items.is_empty();
+            items.extend(contents.items);
+            let Some(token) = contents.continuation.filter(|t| !t.is_empty()) else {
+                break;
+            };
+            if empty || !seen.insert(token.clone()) {
+                break;
+            }
+            continuation = Some(token);
+        }
+        Ok(items
             .into_iter()
             .map(|item| {
                 let body = item
@@ -437,8 +478,14 @@ impl GReaderClient {
                     } else {
                         Some(item.author)
                     },
-                    is_read: false,
-                    is_favorite: false,
+                    is_read: item
+                        .categories
+                        .iter()
+                        .any(|s| s.ends_with("/state/com.google/read")),
+                    is_favorite: item
+                        .categories
+                        .iter()
+                        .any(|s| s.ends_with("/state/com.google/starred")),
                     // Hosted podcast media (the hosted
                     // article-media mixin): prefer the first
                     // audio/video enclosure.
@@ -541,7 +588,7 @@ impl GReaderClient {
         if let Ok(subs) = self.subscriptions()
             && let Some(sub) = subs.iter().find(|s| s.stream_id == stream_id)
         {
-            db.insert_feed_if_missing(&Feed {
+            db.upsert_hosted_feed(&Feed {
                 id: sub.stream_id.clone(),
                 url: sub.feed_url.clone(),
                 title: sub.title.clone(),
@@ -558,7 +605,7 @@ impl GReaderClient {
                 continue;
             }
             if db
-                .insert_article_if_new(a)
+                .upsert_hosted_article(a)
                 .map_err(|e| format!("article store failed: {e}"))?
             {
                 new += 1;
@@ -612,7 +659,7 @@ impl GReaderClient {
     pub fn sync(&self, db: &Db, per_feed_items: usize) -> Result<(usize, usize), String> {
         let subs = self.subscriptions()?;
         for sub in &subs {
-            db.insert_feed_if_missing(&Feed {
+            db.upsert_hosted_feed(&Feed {
                 id: sub.stream_id.clone(),
                 url: sub.feed_url.clone(),
                 title: sub.title.clone(),
@@ -631,7 +678,7 @@ impl GReaderClient {
                     continue;
                 }
                 if db
-                    .insert_article_if_new(a)
+                    .upsert_hosted_article(a)
                     .map_err(|e| format!("article store failed: {e}"))?
                 {
                     new_articles += 1;
@@ -697,6 +744,8 @@ pub struct MfCategory {
 struct MfEntries {
     #[serde(default)]
     entries: Vec<MfEntry>,
+    #[serde(default)]
+    total: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -714,6 +763,8 @@ pub struct MfEntry {
     published_at: String,
     #[serde(default)]
     status: String,
+    #[serde(default)]
+    starred: bool,
     #[serde(default)]
     enclosures: Vec<MfEnclosure>,
 }
@@ -756,11 +807,32 @@ impl MinifluxClient {
     }
 
     pub fn entries(&self, feed_id: i64, limit: usize) -> Result<Vec<MfEntry>, String> {
-        let path = format!(
-            "/v1/entries?feed_id={feed_id}&status=unread&order=published_at&direction=desc&limit={limit}"
-        );
-        let resp: MfEntries = self.get_json(&path)?;
-        Ok(resp.entries)
+        let limit = limit.clamp(1, 1000);
+        let mut entries = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut offset = 0;
+        loop {
+            let path = format!(
+                "/v1/entries?feed_id={feed_id}&order=published_at&direction=desc&limit={limit}&offset={offset}"
+            );
+            let resp: MfEntries = self.get_json(&path)?;
+            let count = resp.entries.len();
+            if count == 0 {
+                break;
+            }
+            let previous = entries.len();
+            entries.extend(resp.entries.into_iter().filter(|e| seen.insert(e.id)));
+            if entries.len() == previous {
+                return Err("Miniflux repeated an entries page; sync was stopped".to_string());
+            }
+            offset += count;
+            if resp.total.is_some_and(|total| offset >= total)
+                || (resp.total.is_none() && count < limit)
+            {
+                break;
+            }
+        }
+        Ok(entries)
     }
 
     pub fn mark_read_remote(&self, entry_ids: &[i64]) -> Result<(), String> {
@@ -807,18 +879,11 @@ impl MinifluxClient {
     /// multipart form with the file part, built by hand —
     /// ureq's multipart feature is not enabled).
     pub fn opml_import(&self, opml_xml: &str) -> Result<(), String> {
-        let boundary = "blindrss-opml-boundary-7f3a";
-        let body = format!(
-            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"subscriptions.opml\"\r\nContent-Type: text/xml\r\n\r\n{opml_xml}\r\n--{boundary}--\r\n"
-        );
         crate::http::agent()
             .post(&format!("{}/v1/import", self.base_url))
             .header("X-Auth-Token", &self.api_key)
-            .header(
-                "Content-Type",
-                &format!("multipart/form-data; boundary={boundary}"),
-            )
-            .send(body)
+            .header("Content-Type", "application/xml; charset=utf-8")
+            .send(opml_xml)
             .map_err(|e| format!("OPML import failed: {e}"))?;
         Ok(())
     }
@@ -890,6 +955,67 @@ impl MinifluxClient {
             .map(|(id, _)| id))
     }
 
+    /// Create a server category; Miniflux categories are flat.
+    pub fn create_category_remote(&self, title: &str) -> Result<i64, String> {
+        let mut response = crate::http::agent()
+            .post(&format!("{}/v1/categories", self.base_url))
+            .header("X-Auth-Token", &self.api_key)
+            .header("Content-Type", "application/json")
+            .send(serde_json::json!({"title":title}).to_string())
+            .map_err(|e| format!("create category failed: {e}"))?;
+        let text = response
+            .body_mut()
+            .read_to_string()
+            .map_err(|e| format!("read failed: {e}"))?;
+        let category: serde_json::Value =
+            serde_json::from_str(&text).map_err(|e| format!("bad JSON: {e}"))?;
+        category
+            .get("id")
+            .and_then(|v| v.as_i64())
+            .ok_or_else(|| "no category id in create response".to_string())
+    }
+
+    /// Edit a server feed, resolving or creating the requested category title.
+    pub fn update_feed_remote(
+        &self,
+        feed_id: i64,
+        title: Option<&str>,
+        url: Option<&str>,
+        category: Option<&str>,
+    ) -> Result<(), String> {
+        let mut body = serde_json::Map::new();
+        if let Some(title) = title {
+            body.insert("title".to_string(), serde_json::json!(title));
+        }
+        if let Some(url) = url {
+            body.insert("feed_url".to_string(), serde_json::json!(url));
+        }
+        if let Some(category) = category {
+            let existing = self
+                .categories_remote()?
+                .into_iter()
+                .find(|(_, title)| title.eq_ignore_ascii_case(category));
+            let id = match existing {
+                Some((id, _)) => Some(id),
+                None if !category.is_empty() => Some(self.create_category_remote(category)?),
+                None => None,
+            };
+            if let Some(id) = id {
+                body.insert("category_id".to_string(), serde_json::json!(id));
+            }
+        }
+        if body.is_empty() {
+            return Ok(());
+        }
+        crate::http::agent()
+            .put(&format!("{}/v1/feeds/{feed_id}", self.base_url))
+            .header("X-Auth-Token", &self.api_key)
+            .header("Content-Type", "application/json")
+            .send(serde_json::Value::Object(body).to_string())
+            .map_err(|e| format!("update feed failed: {e}"))?;
+        Ok(())
+    }
+
     /// Rename a category on the server (Python's
     /// MinifluxProvider.rename_category). False when the title
     /// is not a server category.
@@ -936,6 +1062,15 @@ impl MinifluxClient {
         Ok(())
     }
 
+    /// Miniflux only exposes a toggle, so read the authoritative state first.
+    pub fn set_bookmark_remote(&self, entry_id: i64, favorite: bool) -> Result<(), String> {
+        let entry: MfEntry = self.get_json(&format!("/v1/entries/{entry_id}"))?;
+        if entry.starred != favorite {
+            self.toggle_bookmark_remote(entry_id)?;
+        }
+        Ok(())
+    }
+
     /// Refresh ONE feed's entries into the database (per-feed
     /// refresh for hosted feeds). Returns how many were new.
     pub fn refresh_feed(&self, db: &Db, mf_id: i64) -> Result<usize, String> {
@@ -965,7 +1100,7 @@ impl MinifluxClient {
                     Some(e.author)
                 },
                 is_read: e.status == "read",
-                is_favorite: false,
+                is_favorite: e.starred,
                 media_url: e
                     .enclosures
                     .iter()
@@ -988,7 +1123,7 @@ impl MinifluxClient {
                 continue;
             }
             if db
-                .insert_article_if_new(&article)
+                .upsert_hosted_article(&article)
                 .map_err(|e| format!("article store failed: {e}"))?
             {
                 new += 1;
@@ -997,14 +1132,14 @@ impl MinifluxClient {
         Ok(new)
     }
 
-    /// Sync feeds + unread entries into the local database.
+    /// Sync feeds and all paginated entries, including read history and bookmarks.
     pub fn sync(&self, db: &Db, per_feed_items: usize) -> Result<(usize, usize), String> {
         let feeds = self.feeds()?;
         let tombstones = db.deleted_article_ids().unwrap_or_default();
         let mut new_articles = 0;
         for f in &feeds {
             let local_id = format!("miniflux:{}", f.id);
-            db.insert_feed_if_missing(&Feed {
+            db.upsert_hosted_feed(&Feed {
                 id: local_id.clone(),
                 url: f.feed_url.clone(),
                 title: f.title.clone(),
@@ -1036,7 +1171,7 @@ impl MinifluxClient {
                         Some(e.author)
                     },
                     is_read: e.status == "read",
-                    is_favorite: false,
+                    is_favorite: e.starred,
                     media_url: e
                         .enclosures
                         .iter()
@@ -1061,7 +1196,7 @@ impl MinifluxClient {
                     continue;
                 }
                 if db
-                    .insert_article_if_new(&article)
+                    .upsert_hosted_article(&article)
                     .map_err(|e| format!("article store failed: {e}"))?
                 {
                     new_articles += 1;

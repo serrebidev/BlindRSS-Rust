@@ -8,7 +8,7 @@
 //! path stores an empty body and fills content through later paths.
 
 use crate::db::{Article, Db, Feed};
-use crate::feeds::{ParsedEntry, fetch_and_parse};
+use crate::feeds::ParsedEntry;
 
 fn entry_to_article(feed_id: &str, e: &ParsedEntry) -> Article {
     let content = if !e.content_text.trim().is_empty() {
@@ -61,6 +61,7 @@ pub fn store_parsed(
             .map_err(|e| format!("store failed: {e}"))?
         {
             inserted += 1;
+<<<<<<< Updated upstream
             // NPR / Sky media attach (Python's generic parse path):
             // those program feeds ship no enclosure, so resolve the
             // audio for media-less new articles at store time.
@@ -79,9 +80,31 @@ pub fn store_parsed(
                 if let Some((mu, mt)) = attach {
                     let _ = db.update_article_media(&article.id, &mu, Some(&mt));
                 }
+=======
+            if !entry.tags.is_empty() {
+                db.apply_enrichment(
+                    &article.id,
+                    &crate::enrich::EnrichMeta {
+                        tags: entry.tags.clone(),
+                        ..Default::default()
+                    },
+                )
+                .map_err(|e| format!("store tags failed: {e}"))?;
+>>>>>>> Stashed changes
             }
             if !rules.is_empty() {
-                apply_filter_pipeline(db, &rules, &article, &parsed.title);
+                let view = crate::rules::RuleArticle {
+                    article: &article,
+                    feed_title: &parsed.title,
+                    opened: false,
+                    updated: false,
+                    tags: &entry.tags,
+                };
+                apply_filter_pipeline(
+                    db,
+                    &crate::rules::evaluate_pipeline(&rules, &view),
+                    &article,
+                );
             }
         }
     }
@@ -89,20 +112,7 @@ pub fn store_parsed(
 }
 
 /// Apply the filter-rule pipeline to one freshly stored article.
-fn apply_filter_pipeline(
-    db: &Db,
-    rules: &[crate::rules::FilterRule],
-    article: &Article,
-    feed_title: &str,
-) {
-    let view = crate::rules::RuleArticle {
-        article,
-        feed_title,
-        opened: false,
-        updated: false,
-        tags: &[],
-    };
-    let eff = crate::rules::evaluate_pipeline(rules, &view);
+fn apply_filter_pipeline(db: &Db, eff: &crate::rules::EffectiveActions, article: &Article) {
     if eff.mark_read {
         let _ = db.mark_read(&article.id, true);
     }
@@ -122,6 +132,7 @@ fn apply_filter_pipeline(
 
 /// Refresh one feed; returns how many new articles were stored.
 pub fn refresh_feed(db: &Db, feed: &Feed) -> Result<usize, String> {
+<<<<<<< Updated upstream
     // Listing sources (Batch 35): subscriptions with no native RSS
     // are enumerated by their source fetcher, mirroring the branch
     // order of Python `providers/local.py::_refresh_single_feed`.
@@ -232,6 +243,10 @@ fn youtube_history_backfill(db: &Db, feed: &Feed, channel_id: &str) {
             let _ = db.set_youtube_history_state(&feed.id, 1, now);
         }
     }
+=======
+    let parsed = crate::feeds::fetch_with_cache(db, &feed.url, false)?;
+    store_parsed(db, feed, &parsed)
+>>>>>>> Stashed changes
 }
 
 /// Refresh every feed, collecting per-feed results. One feed failing
@@ -263,6 +278,10 @@ pub fn apply_rules_to_existing(db: &Db) -> Result<usize, String> {
         .collect();
     let articles = db.articles(None, 100_000).map_err(|e| format!("{e}"))?;
     let mut changed = 0usize;
+    let tags = db.all_article_tags().map_err(|e| format!("{e}"))?;
+    let opened = db.opened_article_ids().map_err(|e| format!("{e}"))?;
+    let updated = db.updated_article_ids().map_err(|e| format!("{e}"))?;
+    let empty_tags = Vec::new();
     for article in &articles {
         let view = crate::rules::RuleArticle {
             article,
@@ -270,9 +289,9 @@ pub fn apply_rules_to_existing(db: &Db) -> Result<usize, String> {
                 .get(&article.feed_id)
                 .map(|s| s.as_str())
                 .unwrap_or(""),
-            opened: false,
-            updated: false,
-            tags: &[],
+            opened: opened.contains(&article.id),
+            updated: updated.contains(&article.id),
+            tags: tags.get(&article.id).unwrap_or(&empty_tags),
         };
         let eff = crate::rules::evaluate_pipeline(&rules, &view);
         if eff.mark_read
@@ -282,7 +301,7 @@ pub fn apply_rules_to_existing(db: &Db) -> Result<usize, String> {
             || !eff.labels.is_empty()
         {
             changed += 1;
-            apply_filter_pipeline(db, &rules, article, view.feed_title);
+            apply_filter_pipeline(db, &eff, article);
         }
     }
     Ok(changed)

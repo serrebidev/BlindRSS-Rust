@@ -9,7 +9,7 @@ pub fn help_dir() -> Option<PathBuf> {
         return Some(PathBuf::from(p));
     }
     let candidates = [
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../blindrss-work/docs/help"),
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../docs/help"),
         std::env::current_exe()
             .ok()
             .and_then(|e| e.parent().map(|p| p.join("docs/help")))

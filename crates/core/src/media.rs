@@ -128,6 +128,27 @@ pub fn info(url: &str) -> Result<MediaInfo, String> {
     parse_info(&json)
 }
 
+/// Full YouTube article metadata includes subtitle tracks and public discussion.
+pub fn youtube_article_info(url: &str) -> Result<serde_json::Value, String> {
+    let json = run_ytdlp(&[
+        "-J",
+        "--ignore-config",
+        "--no-warnings",
+        "--no-playlist",
+        "--skip-download",
+        "--socket-timeout",
+        "20",
+        "--retries",
+        "2",
+        "--write-comments",
+        "--extractor-args",
+        "youtube:max_comments=all,all,all,all,all",
+        "--",
+        url,
+    ])?;
+    serde_json::from_str(&json).map_err(|e| format!("YouTube metadata: {e}"))
+}
+
 /// Resolve a direct stream URL (best audio first — BlindRSS is an
 /// audio-first reader; video falls back to best combined).
 pub fn stream_url(url: &str) -> Result<String, String> {
@@ -419,6 +440,35 @@ pub struct ResolvedMedia {
     pub via_ytdlp: bool,
 }
 
+/// Encode a local path for either native media backend.
+pub fn local_media_url(path: &std::path::Path) -> Result<String, String> {
+    url::Url::from_file_path(path)
+        .map(|url| url.to_string())
+        .map_err(|_| "Invalid local media path".into())
+}
+
+/// Prefer completed downloads, including files indexed by the Python app.
+pub fn resolve_article_for_play(
+    cfg: &crate::config::Config,
+    article: &crate::Article,
+) -> Result<ResolvedMedia, String> {
+    if let Some(path) = crate::download::downloaded_media_path(cfg, article) {
+        let url = local_media_url(&path)?;
+        return Ok(ResolvedMedia {
+            media_type: media_type_for_url(&url),
+            url,
+            detected: false,
+            via_ytdlp: false,
+        });
+    }
+    resolve_for_play(
+        article.media_url.as_deref(),
+        article.media_type.as_deref(),
+        &article.url,
+        article.content.as_deref(),
+    )
+}
+
 /// The full play-resolution chain, in Python's order. Runs on a
 /// worker thread: it may fetch the article page and run yt-dlp.
 pub fn resolve_for_play(
@@ -427,6 +477,17 @@ pub fn resolve_for_play(
     page_url: &str,
     stored_html: Option<&str>,
 ) -> Result<ResolvedMedia, String> {
+    if let Some(path) = media_url.and_then(crate::download::existing_local_media_path) {
+        let url = url::Url::from_file_path(&path)
+            .map_err(|_| "Invalid local media path")?
+            .to_string();
+        return Ok(ResolvedMedia {
+            media_type: media_type_for_url(&url),
+            url,
+            detected: false,
+            via_ytdlp: false,
+        });
+    }
     if let Some(m) = media_url.filter(|u| !u.is_empty())
         && is_playable_media(m, media_type)
     {

@@ -805,19 +805,7 @@ pub fn show_about(frame: &Frame) {
 /// A standalone article window (Python's ArticleWindow): the
 /// article text in its own frame, non-modal.
 pub fn show_article_window(title: &str, body: &str) {
-    let frame = Frame::builder()
-        .with_title(&format!("BlindRSS - {title}"))
-        .with_size(Size::new(760, 560))
-        .build();
-    let sizer = BoxSizer::builder(Orientation::Vertical).build();
-    let reader = TextCtrl::builder(&frame)
-        .with_style(TextCtrlStyle::MultiLine | TextCtrlStyle::ReadOnly)
-        .build();
-    reader.set_value(body);
-    sizer.add(&reader, 1, SizerFlag::Expand | SizerFlag::All, 4);
-    frame.set_sizer(sizer, true);
-    frame.show(true);
-    reader.set_focus();
+    crate::article_window::open(title, body, None);
 }
 
 /// Article window with a rich (HTML) view (Python's ArticleWindow):
@@ -1785,7 +1773,18 @@ pub fn show_feed_search(frame: &Frame) -> Option<String> {
     let dialog = Dialog::builder(frame, "Find Feeds").build();
     bind_f1(frame, &dialog, "FeedSearchDialog");
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
-    let url_ctrl = name_row(&dialog, &sizer, "Site or feed URL:", "");
+    let url_ctrl = name_row(&dialog, &sizer, "Search terms or site/feed URL:", "");
+    let label = StaticText::builder(&dialog)
+        .with_label("Search provider:")
+        .build();
+    sizer.add(&label, 0, SizerFlag::All, 4);
+    let provider = Choice::builder(&dialog).build();
+    provider.append("All directories");
+    for (_, label) in blindrss_core::feedsearch::SEARCH_PROVIDERS {
+        provider.append(label);
+    }
+    provider.set_selection(0);
+    sizer.add(&provider, 0, SizerFlag::Expand | SizerFlag::All, 4);
     let list = ListBox::builder(&dialog).build();
     sizer.add(&list, 1, SizerFlag::Expand | SizerFlag::All, 4);
     let status = StaticText::builder(&dialog).with_label("").build();
@@ -1801,8 +1800,10 @@ pub fn show_feed_search(frame: &Frame) -> Option<String> {
     let close_btn = mk("Close");
     sizer.add_sizer(&row, 0, SizerFlag::Expand | SizerFlag::All, 2);
 
-    let candidates: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
-    let (tx, rx) = std::sync::mpsc::channel::<Result<Vec<String>, String>>();
+    let candidates: Rc<RefCell<Vec<blindrss_core::feedsearch::FeedResult>>> =
+        Rc::new(RefCell::new(Vec::new()));
+    let (tx, rx) =
+        std::sync::mpsc::channel::<Result<Vec<blindrss_core::feedsearch::FeedResult>, String>>();
     let rx = Rc::new(rx);
     {
         let tx = tx.clone();
@@ -1814,14 +1815,28 @@ pub fn show_feed_search(frame: &Frame) -> Option<String> {
                 return;
             }
             status2.set_label("Searching...");
+            let source = provider.get_selection().unwrap_or(0) as usize;
             let tx = tx.clone();
             std::thread::spawn(move || {
-                let result = blindrss_core::discovery::resolve_subscribe_url(&url)
-                    .map(|(feed_url, _)| vec![feed_url])
-                    .or_else(|_| {
-                        blindrss_core::extract::fetch_html(&url)
-                            .map(|html| blindrss_core::discovery::discover_in_html(&html, &url))
-                    });
+                let result = if url.starts_with("http://") || url.starts_with("https://") {
+                    blindrss_core::discovery::discover_feed_urls(&url).map(|urls| {
+                        urls.into_iter()
+                            .map(|url| blindrss_core::feedsearch::FeedResult {
+                                title: url.clone(),
+                                url,
+                                description: String::new(),
+                            })
+                            .collect()
+                    })
+                } else if source == 0 {
+                    blindrss_core::feedsearch::search_all(&url, 50)
+                } else {
+                    blindrss_core::feedsearch::search(
+                        blindrss_core::feedsearch::SEARCH_PROVIDERS[source - 1].0,
+                        &url,
+                        50,
+                    )
+                };
                 let _ = tx.send(result);
             });
         });
@@ -1833,7 +1848,7 @@ pub fn show_feed_search(frame: &Frame) -> Option<String> {
         let d = dialog;
         sub_btn.on_click(move |_| {
             if let Some(sel) = list.get_selection() {
-                *chosen.borrow_mut() = candidates.borrow().get(sel as usize).cloned();
+                *chosen.borrow_mut() = candidates.borrow().get(sel as usize).map(|r| r.url.clone());
             }
             if chosen.borrow().is_some() {
                 d.end_modal(5100);
@@ -1855,8 +1870,11 @@ pub fn show_feed_search(frame: &Frame) -> Option<String> {
                 match result {
                     Ok(urls) => {
                         list2.clear();
-                        for u in &urls {
-                            list2.append(u);
+                        for result in &urls {
+                            list2.append(&format!("{} — {}", result.title, result.url));
+                        }
+                        if !urls.is_empty() {
+                            list2.set_selection(0, true);
                         }
                         status3.set_label(&format!("{} feed(s) found", urls.len()));
                         *candidates.borrow_mut() = urls;

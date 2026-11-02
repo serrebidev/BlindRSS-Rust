@@ -75,6 +75,8 @@ CREATE TABLE IF NOT EXISTS feeds (id TEXT PRIMARY KEY, url TEXT, title TEXT,
     title_is_custom INTEGER DEFAULT 0, category TEXT, icon_url TEXT,
     last_error TEXT, last_error_at REAL, last_success_at REAL,
     consecutive_failures INTEGER DEFAULT 0);
+CREATE TABLE IF NOT EXISTS rust_feed_http_cache (
+    url TEXT PRIMARY KEY, etag TEXT, modified TEXT, body BLOB NOT NULL);
 CREATE TABLE IF NOT EXISTS articles (id TEXT PRIMARY KEY, feed_id TEXT,
     title TEXT, url TEXT, content TEXT, description TEXT, date TEXT,
     author TEXT, is_read INTEGER DEFAULT 0, is_favorite INTEGER DEFAULT 0,
@@ -181,7 +183,32 @@ pub struct Db {
     conn: Connection,
 }
 
+pub type CachedFeed = (Option<String>, Option<String>, Vec<u8>);
+
 impl Db {
+    pub fn cached_feed(&self, url: &str) -> rusqlite::Result<Option<CachedFeed>> {
+        use rusqlite::OptionalExtension;
+        self.conn
+            .query_row(
+                "SELECT etag, modified, body FROM rust_feed_http_cache WHERE url = ?1",
+                [url],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+    }
+
+    pub fn cache_feed(
+        &self,
+        url: &str,
+        etag: Option<&str>,
+        modified: Option<&str>,
+        body: &[u8],
+    ) -> rusqlite::Result<()> {
+        self.conn.execute("INSERT INTO rust_feed_http_cache (url, etag, modified, body) VALUES (?1, ?2, ?3, ?4) \
+            ON CONFLICT(url) DO UPDATE SET etag = excluded.etag, modified = excluded.modified, body = excluded.body",
+            params![url, etag, modified, body])?;
+        Ok(())
+    }
     /// Open an existing BlindRSS database. Fails if the file is missing:
     /// silently creating an empty database would hide a wrong path and
     /// look like data loss to the user.
@@ -620,6 +647,19 @@ impl Db {
                 feed.category,
                 feed.icon_url
             ],
+        )?;
+        Ok(())
+    }
+
+    /// Refresh server-owned feed metadata while keeping a user's custom title.
+    pub fn upsert_hosted_feed(&self, feed: &Feed) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT INTO feeds (id, url, title, title_is_custom, category, icon_url) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(id) DO UPDATE SET \
+             url = excluded.url, category = excluded.category, \
+             title = CASE WHEN feeds.title_is_custom != 0 THEN feeds.title ELSE excluded.title END, \
+             icon_url = COALESCE(excluded.icon_url, feeds.icon_url)",
+            params![feed.id, feed.url, feed.title, feed.title_is_custom as i64, feed.category, feed.icon_url],
         )?;
         Ok(())
     }
@@ -1572,7 +1612,7 @@ impl Db {
         rows.collect()
     }
 
-    /// An article's enrichment tags (articles.tags JSON list).
+    /// An article's tags: Python newline text or earlier Rust JSON lists.
     pub fn article_tags(&self, article_id: &str) -> rusqlite::Result<Vec<String>> {
         let mut stmt = self
             .conn
@@ -1581,9 +1621,7 @@ impl Db {
         match rows.next()? {
             Some(row) => {
                 let raw: Option<String> = row.get(0)?;
-                Ok(raw
-                    .and_then(|t| serde_json::from_str::<Vec<String>>(&t).ok())
-                    .unwrap_or_default())
+                Ok(raw.map(|t| decode_tags(&t)).unwrap_or_default())
             }
             None => Ok(Vec::new()),
         }
@@ -1603,7 +1641,7 @@ impl Db {
         let mut out = std::collections::HashMap::new();
         for row in rows {
             let (id, raw) = row?;
-            if let Some(tags) = raw.and_then(|t| serde_json::from_str::<Vec<String>>(&t).ok()) {
+            if let Some(tags) = raw.map(|t| decode_tags(&t)) {
                 out.insert(id, tags);
             }
         }
@@ -1629,7 +1667,7 @@ impl Db {
             let merged = crate::enrich::merge_tags(existing, &meta.tags);
             self.conn.execute(
                 "UPDATE articles SET tags = ?2 WHERE id = ?1",
-                params![article_id, serde_json::json!(merged).to_string()],
+                params![article_id, merged.join("\n")],
             )?;
         }
         Ok(())
@@ -1828,6 +1866,32 @@ impl Db {
         Ok(n > 0)
     }
 
+    /// Sync server-owned article fields without replacing local history, tags, or labels.
+    pub fn upsert_hosted_article(&self, a: &Article) -> rusqlite::Result<bool> {
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let changed = tx.execute(
+            "UPDATE articles SET feed_id = ?2, title = ?3, url = ?4, content = ?5, \
+             description = ?6, date = ?7, author = ?8, is_read = ?9, is_favorite = ?10, \
+             media_url = COALESCE(?11, media_url), media_type = COALESCE(?12, media_type) WHERE id = ?1",
+            params![a.id, a.feed_id, a.title, a.url, a.content, a.description, a.date, a.author,
+                a.is_read as i64, a.is_favorite as i64, a.media_url, a.media_type],
+        )?;
+        if changed == 0 {
+            tx.execute(
+                "INSERT INTO articles (id, feed_id, title, url, content, description, date, author, \
+                 is_read, is_favorite, media_url, media_type) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                params![a.id, a.feed_id, a.title, a.url, a.content, a.description, a.date, a.author,
+                    a.is_read as i64, a.is_favorite as i64, a.media_url, a.media_type],
+            )?;
+        }
+        self.record_article_version(&a.id, &a.title, a.content.as_deref())?;
+        tx.commit()?;
+        Ok(changed == 0)
+    }
+
     /// Append a change-history version for an article, deduped
     /// by the SHA-256 of title + NUL + content (Python
     /// `record_article_version`). Returns true when a row was
@@ -1921,4 +1985,15 @@ impl Db {
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
         rows.collect()
     }
+}
+
+// Read the original Python representation and the JSON written by early ports.
+fn decode_tags(raw: &str) -> Vec<String> {
+    serde_json::from_str::<Vec<String>>(raw).unwrap_or_else(|_| {
+        raw.lines()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect()
+    })
 }

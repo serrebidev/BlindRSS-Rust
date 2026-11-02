@@ -79,6 +79,14 @@ const PAYWALL_STUB_MAX_CHARS: usize = 600;
 /// Python `_METERED_PREVIEW_MARKERS` + its reader notice.
 const METERED_MARKERS: &[&str] = &["to read as many articles as you like"];
 const METERED_NOTICE: &str = "Only the free preview of this article is published on the page — the rest requires a subscription. Open the original link in your browser to read it.";
+
+pub(crate) fn metered_preview_notice(html: &str) -> Option<&'static str> {
+    let lower = html.to_lowercase();
+    METERED_MARKERS
+        .iter()
+        .any(|marker| lower.contains(marker))
+        .then_some(METERED_NOTICE)
+}
 const PAYWALL_NOTICE: &str = "This article is behind a paywall (subscription required), so the full text can't be fetched automatically. Open the original link in your browser to read it.";
 
 /// The Register's leading section kickers (Python
@@ -996,6 +1004,282 @@ pub fn image_alt_marker(alt: &str) -> String {
     }
 }
 
+/// Reader structure preferences mirror Python's `ARTICLE_STRUCTURE_DEFAULTS`.
+#[derive(Debug, Clone, Copy)]
+pub struct StructureOptions {
+    pub tables: bool,
+    pub headings: bool,
+    pub lists: bool,
+    pub quotes: bool,
+    pub links: bool,
+}
+
+impl Default for StructureOptions {
+    fn default() -> Self {
+        Self {
+            tables: true,
+            headings: false,
+            lists: false,
+            quotes: false,
+            links: false,
+        }
+    }
+}
+
+static TEXT_STRUCTURE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(1);
+
+/// Apply once at startup and again after Settings changes.
+pub fn configure_text_structure(cfg: &crate::config::Config) {
+    let bits = ["tables", "headings", "lists", "quotes", "links"]
+        .iter()
+        .enumerate()
+        .fold(0, |bits, (i, key)| {
+            bits | (u8::from(cfg.get_bool(&format!("article_structure_{key}"), i == 0)) << i)
+        });
+    TEXT_STRUCTURE.store(bits, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn structure_options() -> StructureOptions {
+    let bits = TEXT_STRUCTURE.load(std::sync::atomic::Ordering::Relaxed);
+    StructureOptions {
+        tables: bits & 1 != 0,
+        headings: bits & 2 != 0,
+        lists: bits & 4 != 0,
+        quotes: bits & 8 != 0,
+        links: bits & 16 != 0,
+    }
+}
+
+fn escape_structure_text(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn table_text(html: &str) -> String {
+    if tag_tokens(html).iter().any(|t| {
+        !t.close
+            && matches!(
+                t.name.as_str(),
+                "p" | "h1"
+                    | "h2"
+                    | "h3"
+                    | "h4"
+                    | "h5"
+                    | "h6"
+                    | "article"
+                    | "section"
+                    | "aside"
+                    | "nav"
+                    | "form"
+                    | "ul"
+                    | "ol"
+                    | "blockquote"
+                    | "figure"
+            )
+    }) {
+        return String::new();
+    }
+    // A nested table is layout, as in Python's format_table_text.
+    if tag_tokens(html)
+        .iter()
+        .filter(|t| !t.close && t.name == "table")
+        .count()
+        > 1
+    {
+        return String::new();
+    }
+    let mut header: Option<Vec<String>> = None;
+    let mut grid = Vec::new();
+    for row in find_elements(html, Some("tr"), &|_| true) {
+        let row_html = &html[row.inner_start..row.inner_end];
+        let mut cells = find_elements(row_html, Some("th"), &|_| true);
+        let all_headers =
+            !cells.is_empty() && find_elements(row_html, Some("td"), &|_| true).is_empty();
+        cells.extend(find_elements(row_html, Some("td"), &|_| true));
+        cells.sort_by_key(|cell| cell.start);
+        let texts: Vec<String> = cells
+            .iter()
+            .map(|cell| {
+                html_to_text_raw(&row_html[cell.inner_start..cell.inner_end], false)
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect();
+        if texts.iter().all(|text| text.is_empty()) {
+            continue;
+        }
+        if texts.iter().any(|text| text.chars().count() > 400) {
+            return String::new();
+        }
+        let in_head = html[..row.start]
+            .rfind("<thead")
+            .is_some_and(|start| !html[start..row.start].contains("</thead"));
+        if header.is_none() && grid.is_empty() && (all_headers || in_head) {
+            header = Some(texts);
+        } else {
+            grid.push(texts);
+            if grid.len() > 100 {
+                return String::new();
+            }
+        }
+    }
+    let columns = grid
+        .iter()
+        .chain(header.iter())
+        .map(Vec::len)
+        .max()
+        .unwrap_or(0);
+    if columns < 2 || grid.is_empty() {
+        return header
+            .into_iter()
+            .flatten()
+            .chain(grid.into_iter().flatten())
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+    let caption = find_elements(html, Some("caption"), &|_| true)
+        .first()
+        .map(|c| html_to_text_raw(&html[c.inner_start..c.inner_end], false))
+        .unwrap_or_default();
+    let mut lines = vec![format!(
+        "Table with {} rows and {columns} columns{}.",
+        grid.len(),
+        if caption.is_empty() {
+            String::new()
+        } else {
+            format!(": {caption}")
+        }
+    )];
+    for (i, row) in grid.iter().enumerate() {
+        let pairs: Vec<String> = row
+            .iter()
+            .enumerate()
+            .filter(|(_, value)| !value.is_empty())
+            .map(|(column, value)| {
+                if let Some(header) = header.as_ref().filter(|h| h.len() == row.len()) {
+                    format!("{}: {value}", header[column])
+                } else {
+                    value.clone()
+                }
+            })
+            .collect();
+        lines.push(format!("Row {}: {}.", i + 1, pairs.join("; ")));
+    }
+    lines.push("End of table.".into());
+    lines.join("\n")
+}
+
+fn linearize_structure_html(html: &str, options: StructureOptions) -> String {
+    let mut html = html.to_string();
+    if options.tables {
+        let mut tables = find_elements(&html, Some("table"), &|_| true);
+        tables.reverse();
+        for table in tables {
+            let text = table_text(&html[table.start..table.end]);
+            if !text.is_empty() {
+                let paragraphs = text
+                    .lines()
+                    .map(|line| format!("<p>{}</p>", escape_structure_text(line)))
+                    .collect::<String>();
+                html.replace_range(table.start..table.end, &paragraphs);
+            }
+        }
+    }
+    if !(options.headings || options.lists || options.quotes || options.links) {
+        return html;
+    }
+    let mut edits: Vec<(usize, usize, String)> = Vec::new();
+    let mut lists: Vec<(bool, usize)> = Vec::new();
+    let mut anchors: Vec<(usize, String)> = Vec::new();
+    for token in tag_tokens(&html) {
+        let name = token.name.as_str();
+        let open = &html[token.start..token.end];
+        if options.headings && matches!(name, "h1" | "h2" | "h3" | "h4" | "h5" | "h6") {
+            edits.push((
+                token.start,
+                token.end,
+                if token.close {
+                    "</p>".into()
+                } else {
+                    format!("<p>Heading level {}: ", &name[1..])
+                },
+            ));
+        }
+        if options.lists {
+            if matches!(name, "ul" | "ol") {
+                if token.close {
+                    lists.pop();
+                } else {
+                    lists.push((name == "ol", 0));
+                }
+            } else if name == "li"
+                && !token.close
+                && let Some((ordered, index)) = lists.last_mut()
+            {
+                *index += 1;
+                edits.push((
+                    token.end,
+                    token.end,
+                    if *ordered {
+                        format!("{index}. ")
+                    } else {
+                        "• ".into()
+                    },
+                ));
+            }
+        }
+        if options.quotes && name == "blockquote" {
+            edits.push((
+                token.start,
+                token.end,
+                if token.close {
+                    "<p>End of quote.</p></div>".into()
+                } else {
+                    "<div><p>Quote:</p>".into()
+                },
+            ));
+        }
+        if options.links && name == "a" {
+            if token.close {
+                if let Some((start, href)) = anchors.pop() {
+                    let text = html_to_text_raw(&html[start..token.start], false);
+                    if !href.is_empty() && !text.contains(&href) {
+                        let label = if text.trim().is_empty() {
+                            href
+                        } else {
+                            format!(" ({href})")
+                        };
+                        edits.push((token.start, token.start, escape_structure_text(&label)));
+                    }
+                }
+            } else {
+                let href = attr_value(open, "href")
+                    .map(|h| unescape_entities(&h))
+                    .unwrap_or_default();
+                let allowed = (href.starts_with("http://") || href.starts_with("https://"))
+                    && !href.chars().any(|c| c.is_whitespace() || c.is_control());
+                anchors.push((token.end, if allowed { href } else { String::new() }));
+            }
+        }
+    }
+    edits.sort_by_key(|(start, end, _)| (*start, *end));
+    for (start, end, replacement) in edits.into_iter().rev() {
+        html.replace_range(start..end, &replacement);
+    }
+    html
+}
+
+/// Explicit preferences keep callers and tests independent of global settings.
+pub fn html_to_text_with_structure(
+    html: &str,
+    keep_alt: bool,
+    options: StructureOptions,
+) -> String {
+    html_to_text_raw(&linearize_structure_html(html, options), keep_alt)
+}
+
 pub fn html_to_text(html: &str) -> String {
     html_to_text_opts(html, false)
 }
@@ -1005,6 +1289,10 @@ pub fn html_to_text(html: &str) -> String {
 /// set, each <img> becomes its `[Image: alt]` marker in document
 /// order (alt, falling back to title) instead of dropping.
 pub fn html_to_text_opts(html: &str, keep_alt: bool) -> String {
+    html_to_text_with_structure(html, keep_alt, structure_options())
+}
+
+fn html_to_text_raw(html: &str, keep_alt: bool) -> String {
     let mut out = String::with_capacity(html.len());
     let lower = html.to_lowercase();
     let bytes = html.as_bytes();
@@ -1440,7 +1728,8 @@ pub fn extract_article_opts(
             source: "bloomberg",
         };
     }
-    match extract_article_impl(html_in, url, feed_text, keep_alt) {
+    let structured = linearize_structure_html(html_in, structure_options());
+    match extract_article_impl(&structured, url, feed_text, keep_alt) {
         ExtractOutcome::Article {
             title,
             text,
@@ -1652,7 +1941,7 @@ fn extract_article_impl(
     }
 
     // Missing-table re-append: keep table data the extractor dropped.
-    if html_lower.contains("<table") {
+    if structure_options().tables && html_lower.contains("<table") {
         let missing: Vec<String> = table_lines(html)
             .into_iter()
             .filter(|cell| !text.contains(cell.as_str()))
@@ -2721,6 +3010,7 @@ pub fn fetch_full_text_opts(
         let expanded = expand_sky_flourish_tables(html, url);
         let outcome = extract_article_opts(&expanded, url, feed_text, keep_alt);
         gate_seen = matches!(outcome, ExtractOutcome::Gate { .. });
+<<<<<<< Updated upstream
         if let ExtractOutcome::Article {
             title,
             text,
@@ -2769,6 +3059,18 @@ pub fn fetch_full_text_opts(
                     text: merged,
                     source,
                 },
+=======
+        if matches!(outcome, ExtractOutcome::Article { .. }) {
+            return (
+                follow_article_pages(
+                    outcome,
+                    html,
+                    url,
+                    cookie_header,
+                    encoding_override,
+                    keep_alt,
+                ),
+>>>>>>> Stashed changes
                 first_html,
             );
         }
@@ -2831,6 +3133,151 @@ pub fn fetch_full_text_opts(
             },
             first_html,
         ),
+    }
+}
+
+/// Find an article continuation, excluding next-story navigation and
+/// cross-origin links. Cookies must never travel to an unrelated host.
+pub fn find_next_page(html: &str, base_url: &str) -> Option<String> {
+    let base = url::Url::parse(base_url).ok()?;
+    let host = base.host_str()?;
+    if [
+        "wired.com",
+        "ning.com",
+        "neowin.net",
+        "bloomberg.com",
+        "slashdot.org",
+        "github.com",
+    ]
+    .iter()
+    .any(|domain| host == *domain || host.ends_with(&format!(".{domain}")))
+    {
+        return None;
+    }
+    let next_story =
+        regex::Regex::new(r"(?i)next[\s_-]*(?:stor(?:y|ies)|articles?|posts?|read|up)\b").unwrap();
+    let label = regex::Regex::new(
+        r"(?i)^(?:(?:next|older)(?:\s+(?:page|pages|entries))?\s*[›»>]*|[›»>]+)$",
+    )
+    .unwrap();
+    let tokens = tag_tokens(html);
+    // Explicit rel=next takes precedence over heuristic navigation labels.
+    for pass in 0..3 {
+        for token in &tokens {
+            if token.close || (token.name != "link" && token.name != "a") {
+                continue;
+            }
+            let open = &html[token.start..token.end];
+            let explicit = attr_value(open, "rel")
+                .is_some_and(|v| v.split_whitespace().any(|r| r.eq_ignore_ascii_case("next")));
+            if match pass {
+                0 => token.name != "link" || !explicit,
+                1 => token.name != "a" || !explicit,
+                _ => token.name != "a" || explicit,
+            } {
+                continue;
+            }
+            let text = if token.name == "a" {
+                let rest = &html[token.end..];
+                let end = rest.to_ascii_lowercase().find("</a").unwrap_or(0);
+                html_to_text(&rest[..end]).trim().to_lowercase()
+            } else {
+                String::new()
+            };
+            let class = attr_value(open, "class").unwrap_or_default().to_lowercase();
+            let aria = attr_value(open, "aria-label")
+                .unwrap_or_default()
+                .to_lowercase();
+            if next_story.is_match(&format!("{text} {class} {aria} {open}")) {
+                continue;
+            }
+            if !explicit
+                && !(label.is_match(&text) || class.contains("next") || aria.starts_with("next"))
+            {
+                continue;
+            }
+            let href = unescape_entities(&attr_value(open, "href")?);
+            let mut target = match base.join(href.trim()) {
+                Ok(target) => target,
+                Err(_) => continue,
+            };
+            target.set_fragment(None);
+            let mut current = base.clone();
+            current.set_fragment(None);
+            if matches!(target.scheme(), "http" | "https")
+                && target.origin() == base.origin()
+                && target != current
+            {
+                return Some(target.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn follow_article_pages(
+    outcome: ExtractOutcome,
+    html: &str,
+    url: &str,
+    cookie_header: &str,
+    encoding_override: &str,
+    keep_alt: bool,
+) -> ExtractOutcome {
+    let ExtractOutcome::Article {
+        title,
+        text,
+        source,
+    } = outcome
+    else {
+        return outcome;
+    };
+    let mut visited = std::collections::HashSet::from([url.to_string()]);
+    let mut next = find_next_page(html, url);
+    let mut texts = vec![text];
+    for _ in 1..6 {
+        let Some(current) = next.take().filter(|u| visited.insert(u.clone())) else {
+            break;
+        };
+        let Ok((bytes, content_type)) = fetch_page_bytes(&current, cookie_header) else {
+            break;
+        };
+        let html = decode_bytes(&bytes, &content_type, encoding_override);
+        let ExtractOutcome::Article { text, .. } =
+            extract_article_opts(&html, &current, None, keep_alt)
+        else {
+            break;
+        };
+        texts.push(text);
+        next = find_next_page(&html, &current);
+    }
+    let text = if texts.len() == 1 {
+        texts.pop().unwrap_or_default()
+    } else {
+        let mut seen = std::collections::HashSet::new();
+        texts
+            .into_iter()
+            .flat_map(|text| {
+                text.split("\n\n")
+                    .map(str::trim)
+                    .filter(|p| !p.is_empty())
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|paragraph| {
+                let key = paragraph
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .to_lowercase();
+                key.chars().count() < 25 || seen.insert(key)
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    };
+    ExtractOutcome::Article {
+        title,
+        text,
+        source,
     }
 }
 

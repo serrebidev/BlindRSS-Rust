@@ -206,9 +206,6 @@ impl Provider for HostedProvider {
         Ok(articles)
     }
     fn mark_read(&self, article: &Article, read: bool) -> Result<(), String> {
-        self.db()?
-            .mark_read(&article.id, read)
-            .map_err(|e| format!("{e}"))?;
         match self.kind {
             HostedKind::GReader(_) => {
                 if article.feed_id.starts_with("feed/") {
@@ -226,12 +223,11 @@ impl Provider for HostedProvider {
                 }
             }
         }
-        Ok(())
+        self.db()?
+            .mark_read(&article.id, read)
+            .map_err(|e| format!("{e}"))
     }
     fn set_favorite(&self, article: &Article, favorite: bool) -> Result<(), String> {
-        self.db()?
-            .set_favorite(&article.id, favorite)
-            .map_err(|e| format!("{e}"))?;
         match self.kind {
             HostedKind::GReader(_) => {
                 if article.feed_id.starts_with("feed/") {
@@ -239,20 +235,20 @@ impl Provider for HostedProvider {
                 }
             }
             HostedKind::Miniflux => {
-                // Miniflux bookmarks toggle; only call when the
-                // desired state differs (cache said not favorite
-                // before this call in the toggle flow).
+                // Miniflux bookmarks toggle; read the server state
+                // before setting an explicit desired state.
                 if let Some(entry) = article
                     .id
                     .strip_prefix("miniflux-entry:")
                     .and_then(|s| s.parse::<i64>().ok())
                 {
-                    let _ = favorite; // the app toggles from the old state
-                    self.miniflux()?.toggle_bookmark_remote(entry)?;
+                    self.miniflux()?.set_bookmark_remote(entry, favorite)?;
                 }
             }
         }
-        Ok(())
+        self.db()?
+            .set_favorite(&article.id, favorite)
+            .map_err(|e| format!("{e}"))
     }
     fn add_feed(&self, url: &str) -> Result<String, String> {
         match self.kind {

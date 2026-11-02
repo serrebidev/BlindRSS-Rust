@@ -7,7 +7,9 @@
 //! Position is saved every second by the window timer, so closing
 //! the window at any point loses at most a second of progress.
 
+use crate::media_backend::MediaBackend;
 use blindrss_core::db::Chapter;
+use blindrss_core::playback::{ResumePolicy, saved_state};
 use blindrss_core::{Article, Db, PlaybackState};
 use std::cell::RefCell;
 use std::collections::HashSet;
@@ -15,6 +17,18 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use wxdragon::prelude::*;
 use wxdragon::widgets::media_ctrl::SeekMode;
+
+type PlayerCommand = Rc<dyn Fn(&str) -> bool>;
+
+thread_local! {
+    static PLAYERS: RefCell<Vec<(usize, PlayerCommand)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Route main-window shortcuts to the most recently opened player.
+pub fn dispatch_command(id: &str) -> bool {
+    let action = PLAYERS.with(|players| players.borrow().last().map(|(_, action)| action.clone()));
+    action.is_some_and(|action| action(id))
+}
 
 /// A range the player skips over, with its announcement label.
 #[derive(Clone)]
@@ -28,6 +42,9 @@ struct PlayerState {
     article_id: String,
     title: String,
     db_path: PathBuf,
+    article_url: String,
+    resume: ResumePolicy,
+    last_save: std::time::Instant,
     seeked: bool,
     saved_position_ms: i64,
     /// Skip ranges delivered by the SponsorBlock / silence
@@ -149,29 +166,34 @@ fn fmt_speed(rate: f64) -> String {
 const SPEEDS: [f64; 9] = [0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0];
 
 /// End-of-media test for the saved playback row: a position within
-/// five seconds of the end counts as completed. A clip shorter than
-/// those five seconds is NOT complete at position zero — the older
+/// the configured end threshold counts as completed. A clip shorter than
+/// that threshold is NOT complete at position zero — the older
 /// `pos >= len - 5000` form compared against a negative bound and
 /// marked every short clip finished the moment it opened, so it
 /// never resumed where the user left it.
-fn reached_end(pos: i64, len: i64) -> bool {
-    len > 0 && pos > 0 && len - pos <= 5_000
+fn reached_end(pos: i64, len: i64, threshold: i64) -> bool {
+    len > 0 && pos > 0 && len.saturating_sub(pos) <= threshold
 }
 
-fn save_position(state: &PlayerState, media: &MediaCtrl, force_completed: bool) {
+fn save_position(state: &PlayerState, media: &MediaBackend, force_completed: bool) {
+    if !state.resume.enabled || !state.seeked && !force_completed {
+        return;
+    }
     let Ok(db) = Db::open(&state.db_path) else {
         return;
     };
     let pos = media.tell();
     let len = media.length();
-    let completed = force_completed || reached_end(pos, len);
-    let _ = db.upsert_playback_state(
+    let completed = force_completed || reached_end(pos, len, state.resume.complete_threshold_ms);
+    let _ = state.resume.save_state(
+        &db,
         &state.article_id,
+        &state.article_url,
         &PlaybackState {
             position_ms: pos,
             duration_ms: if len > 0 { Some(len) } else { None },
             completed,
-            seek_supported: Some(true),
+            seek_supported: None,
             title: Some(state.title.clone()),
         },
     );
@@ -282,11 +304,15 @@ pub fn open_player_queue(
     index: usize,
 ) {
     set_queue_index(index as i64);
+    let chapters = Db::open(&crate::db_path())
+        .ok()
+        .and_then(|db| db.chapters(&article.id).ok())
+        .unwrap_or_default();
     open_player_impl(
         _parent,
         article,
         stream_url,
-        Vec::new(),
+        chapters,
         Some((entries, index)),
     );
 }
@@ -324,6 +350,7 @@ fn eq_wrap(url: &str, cfg: &blindrss_core::config::Config) -> String {
 /// app's own HTTP stack and streamed over the local proxy,
 /// then a live ffmpeg transcode of the URL. Returns which
 /// path loaded: "" direct, "proxy", "ffmpeg", or "failed".
+<<<<<<< Updated upstream
 fn load_with_fallbacks(media: &MediaCtrl, url: &str) -> &'static str {
     // The primary load goes through the range cache when the
     // Python gate says so (Batch 36): it serves a truthful
@@ -333,6 +360,10 @@ fn load_with_fallbacks(media: &MediaCtrl, url: &str) -> &'static str {
     let cfg = blindrss_core::config::Config::load(&crate::config_path()).unwrap_or_default();
     let primary = blindrss_core::rangecache::maybe_range_cache_url(url, &[], false, None, &cfg);
     if media.load_uri(&primary) {
+=======
+fn load_with_fallbacks(media: &MediaBackend, url: &str) -> &'static str {
+    if media.load_uri(url) {
+>>>>>>> Stashed changes
         return "";
     }
     if url.starts_with("http://") || url.starts_with("https://") {
@@ -357,16 +388,16 @@ fn open_player_impl(
 ) {
     let db_path = crate::db_path();
     let cfg = blindrss_core::config::Config::load(&crate::config_path()).unwrap_or_default();
+    let resume = ResumePolicy::from_config(&cfg);
     let saved = Db::open(&db_path)
         .ok()
-        .and_then(|db| db.playback_state(&article.id).ok().flatten())
-        .filter(|s| !s.completed)
-        .map(|s| s.position_ms)
+        .and_then(|db| saved_state(&db, &article.id, &article.url).ok().flatten())
+        .map(|s| resume.resume_target(&s, &stream_url))
         .unwrap_or(0);
 
     // Player knobs from config (Python keys/defaults).
     let seek_back_ms = cfg.get_i64("seek_back_ms", 10_000);
-    let seek_fwd_ms = cfg.get_i64("seek_forward_ms", 10_000);
+    let seek_fwd_ms = cfg.get_i64("seek_forward_ms", seek_back_ms);
     let volume_step = (cfg.get_i64("volume_step", 5) as f64 / 100.0).clamp(0.01, 0.5);
     // Persisted volume (Python `volume`: int percent, default 100).
     let start_volume = (cfg.get_i64("volume", 100) as f64 / 100.0).clamp(0.0, 1.0);
@@ -389,7 +420,7 @@ fn open_player_impl(
         .with_title(&format!("Playing: {}", article.title))
         .with_size(Size::new(560, 460))
         .build();
-    let media = MediaCtrl::builder(&frame).build();
+    let media = MediaBackend::new(&frame, &cfg);
     let play_btn = Button::builder(&frame)
         .with_label(&crate::tr("Play"))
         .build();
@@ -474,7 +505,7 @@ fn open_player_impl(
     row2.add(&prev_ch_btn, 0, SizerFlag::All, 4);
     row2.add(&next_ch_btn, 0, SizerFlag::All, 4);
     let col = BoxSizer::builder(Orientation::Vertical).build();
-    col.add(&media, 1, SizerFlag::Expand | SizerFlag::All, 4);
+    col.add(&media.window(), 1, SizerFlag::Expand | SizerFlag::All, 4);
     col.add_sizer(&row, 0, SizerFlag::Expand, 0);
     col.add_sizer(&row2, 0, SizerFlag::Expand, 0);
     col.add(&pos_label, 0, SizerFlag::All, 4);
@@ -495,6 +526,9 @@ fn open_player_impl(
         article_id: article.id.clone(),
         title: article.title.clone(),
         db_path,
+        article_url: article.url.clone(),
+        resume,
+        last_save: std::time::Instant::now(),
         seeked: saved <= 0,
         saved_position_ms: saved,
         skips: Vec::new(),
@@ -521,7 +555,11 @@ fn open_player_impl(
         }),
     }));
 
-    let wrapped = eq_wrap(&stream_url, &cfg);
+    let wrapped = if media.uses_vlc() {
+        stream_url.clone()
+    } else {
+        eq_wrap(&stream_url, &cfg)
+    };
     // An EQ-wrapped URL is already a local ffmpeg stream (its
     // own network path is ffmpeg's), so it loads directly;
     // anything else goes through the fallback chain.
@@ -572,6 +610,7 @@ fn open_player_impl(
         let st = state.clone();
         media.on_finished(move |_| {
             let mut s = st.borrow_mut();
+            save_position(&s, &media, true);
             let Some(q) = s.queue.as_mut() else { return };
             if q.index + 1 >= q.entries.len() {
                 set_queue_index(-1);
@@ -586,13 +625,10 @@ fn open_player_impl(
             let tx = q.tx.clone();
             drop(s);
             std::thread::spawn(move || {
-                let result = blindrss_core::media::resolve_for_play(
-                    entry.media_url.as_deref(),
-                    entry.media_type.as_deref(),
-                    &entry.url,
-                    entry.content.as_deref(),
-                )
-                .map(|r| crate::maybe_cache_youtube(&entry, &r.url, r.via_ytdlp));
+                let cfg =
+                    blindrss_core::config::Config::load(&crate::config_path()).unwrap_or_default();
+                let result = blindrss_core::media::resolve_article_for_play(&cfg, &entry)
+                    .map(|r| crate::maybe_cache_youtube(&entry, &r.url, r.via_ytdlp));
                 let _ = tx.send((next, result));
             });
         });
@@ -600,9 +636,10 @@ fn open_player_impl(
 
     let m = media;
     let st_pp = state.clone();
-    play_btn.on_click(move |_| {
+    let play_pause: Rc<dyn Fn()> = Rc::new(move || {
         if m.get_state() == MediaState::Playing {
             m.pause();
+            save_position(&st_pp.borrow(), &m, false);
             // A deliberate pause/stop cancels the autoplay
             // watchdog — it must never fight the user.
             st_pp.borrow_mut().autoplay_active = false;
@@ -612,13 +649,17 @@ fn open_player_impl(
             crate::announce("general", "Playing");
         }
     });
+    let pp = play_pause.clone();
+    play_btn.on_click(move |_| pp());
     let m = media;
     let st = state.clone();
-    stop_btn.on_click(move |_| {
+    let stop: Rc<dyn Fn()> = Rc::new(move || {
+        save_position(&st.borrow(), &m, false);
         m.stop();
         st.borrow_mut().autoplay_active = false;
-        save_position(&st.borrow(), &m, false);
     });
+    let stop_click = stop.clone();
+    stop_btn.on_click(move |_| stop_click());
     let m = media;
     back_btn.on_click(move |_| {
         m.seek(-seek_back_ms, SeekMode::FromCurrent);
@@ -648,24 +689,32 @@ fn open_player_impl(
         );
     });
     // Speed stepping through the standard ladder, announced.
-    for (btn, dir) in [(slower_btn, -1i32), (faster_btn, 1i32)] {
+    let change_speed: Rc<dyn Fn(i32)> = {
         let m = media;
         let frame_sp = frame;
-        btn.on_click(move |_| {
+        Rc::new(move |dir| {
             let cur = m.get_playback_rate();
             let idx = SPEEDS
                 .iter()
                 .position(|s| (*s - cur).abs() < 0.01)
                 .unwrap_or(2);
             let next = (idx as i32 + dir).clamp(0, SPEEDS.len() as i32 - 1) as usize;
-            let rate = SPEEDS[next];
+            let rate = if dir == 0 { 1.0 } else { SPEEDS[next] };
             if (rate - cur).abs() > 0.001 {
                 m.set_playback_rate(rate);
+                let mut cfg =
+                    blindrss_core::config::Config::load(&crate::config_path()).unwrap_or_default();
+                cfg.set_path("playback_speed", serde_json::json!(rate));
+                let _ = cfg.save(&crate::config_path());
                 let label = format!("Speed {}x", fmt_speed(rate));
                 frame_sp.set_status_text(&label, 0);
                 crate::announce("playback_speed", &label);
             }
-        });
+        })
+    };
+    for (btn, dir) in [(slower_btn, -1i32), (faster_btn, 1i32)] {
+        let speed = change_speed.clone();
+        btn.on_click(move |_| speed(dir));
     }
     // Chapter navigation, announced via media_navigation.
     {
@@ -864,6 +913,7 @@ fn open_player_impl(
     let seek_pos_t = seek_pos.clone();
     let seek_len_t = seek_len.clone();
     timer.on_tick(move |_| {
+        m.tick();
         let len = m.length();
         let pos = m.tell();
         // Refresh the seek slider's accessible-value snapshot
@@ -894,25 +944,48 @@ fn open_player_impl(
                             q.index = idx;
                             let entry = q.entries[idx].clone();
                             s.article_id = entry.id.clone();
+                            s.article_url = entry.url.clone();
                             s.title = entry.title.clone();
                             s.skips.clear();
                             s.skipped.clear();
                             s.last_chapter = None;
                             let cfg2 = blindrss_core::config::Config::load(&crate::config_path())
                                 .unwrap_or_default();
+                            s.resume = ResumePolicy::from_config(&cfg2);
+                            s.last_save = std::time::Instant::now();
+                            s.last_saved_pos = -1;
                             s.skip_rx = spawn_skip_workers(&cfg2, &entry, &stream);
                             s.saved_position_ms = Db::open(&s.db_path)
                                 .ok()
-                                .and_then(|db| db.playback_state(&entry.id).ok().flatten())
-                                .filter(|saved| !saved.completed)
-                                .map(|saved| saved.position_ms)
+                                .and_then(|db| {
+                                    saved_state(&db, &entry.id, &entry.url).ok().flatten()
+                                })
+                                .map(|saved| s.resume.resume_target(&saved, &stream))
                                 .unwrap_or(0);
                             s.seeked = s.saved_position_ms <= 0;
-                            *chapters_tick.borrow_mut() = (Vec::new(), Vec::new());
+                            let mut chapters = Db::open(&s.db_path)
+                                .ok()
+                                .and_then(|db| db.chapters(&entry.id).ok())
+                                .unwrap_or_default();
+                            chapters.sort_by(|a, b| a.start.total_cmp(&b.start));
+                            let starts =
+                                chapters.iter().map(|c| (c.start * 1000.0) as i64).collect();
                             chapter_list.clear();
+                            for chapter in &chapters {
+                                chapter_list.append(&format!(
+                                    "{} - {}",
+                                    fmt_ms((chapter.start * 1000.0) as i64),
+                                    chapter.title.as_deref().unwrap_or("Chapter")
+                                ));
+                            }
+                            *chapters_tick.borrow_mut() = (chapters, starts);
                             set_queue_index(idx as i64);
-                            queue_load =
-                                Some((eq_wrap(&stream, &cfg2), stream, entry.title.clone()));
+                            let wrapped = if m.uses_vlc() {
+                                stream.clone()
+                            } else {
+                                eq_wrap(&stream, &cfg2)
+                            };
+                            queue_load = Some((wrapped, stream, entry.title.clone()));
                         }
                         Err(e) => queue_error = Some(e),
                     }
@@ -1054,13 +1127,66 @@ fn open_player_impl(
         }
         {
             let mut s = st.borrow_mut();
-            if s.last_saved_pos < 0 || (pos - s.last_saved_pos).abs() >= 5_000 {
+            if s.resume.enabled
+                && s.seeked
+                && pos >= 1_000
+                && s.last_save.elapsed() >= s.resume.save_interval
+                && pos != s.last_saved_pos
+            {
                 s.last_saved_pos = pos;
+                s.last_save = std::time::Instant::now();
                 save_position(&s, &m, false);
             }
         }
     });
     timer.start(1000, false);
+
+    let player_key = frame.get_handle() as usize;
+    PLAYERS.with(|players| {
+        players.borrow_mut().push((
+            player_key,
+            Rc::new(move |id| {
+                match id {
+                    "player.play_pause" => play_pause(),
+                    "player.stop" => stop(),
+                    "player.show_hide" => {
+                        let show = !frame.is_shown();
+                        frame.show(show);
+                        if show {
+                            frame.raise();
+                            play_btn.set_focus();
+                        }
+                    }
+                    "player.chapters" => {
+                        frame.show(true);
+                        frame.raise();
+                        chapter_list.set_focus();
+                    }
+                    "player.equalizer" => {
+                        crate::dialogs::show_equalizer(&frame, &crate::config_path());
+                        let cfg = blindrss_core::config::Config::load(&crate::config_path())
+                            .unwrap_or_default();
+                        media.apply_equalizer(&blindrss_core::equalizer::EqConfig::from_config(
+                            &cfg,
+                        ));
+                    }
+                    "speed.up" => change_speed(1),
+                    "speed.down" => change_speed(-1),
+                    "speed.reset" => change_speed(0),
+                    _ => return false,
+                }
+                true
+            }),
+        ))
+    });
+    let closing_state = state.clone();
+    frame.on_close(move |event| {
+        timer.stop();
+        save_position(&closing_state.borrow(), &media, false);
+        media.close();
+        PLAYERS.with(|players| players.borrow_mut().retain(|(key, _)| *key != player_key));
+        event.skip(true);
+    });
 
     frame.show(true);
     // Land keyboard focus on Play/Pause, not the media pane:
@@ -1081,18 +1207,18 @@ mod tests {
     #[test]
     fn short_media_is_not_complete_at_zero() {
         // 3-second clip: opening it must not be "finished".
-        assert!(!reached_end(0, 3_000));
+        assert!(!reached_end(0, 3_000, 60_000));
         // Nor is the very start of a long episode.
-        assert!(!reached_end(0, 600_000));
-        assert!(!reached_end(0, 0));
+        assert!(!reached_end(0, 600_000, 60_000));
+        assert!(!reached_end(0, 0, 60_000));
     }
 
     #[test]
     fn near_the_end_is_complete() {
-        assert!(reached_end(596_000, 600_000));
-        assert!(reached_end(600_000, 600_000));
+        assert!(reached_end(596_000, 600_000, 60_000));
+        assert!(reached_end(600_000, 600_000, 60_000));
         // A short clip is complete once it is played past the start.
-        assert!(reached_end(2_900, 3_000));
-        assert!(!reached_end(0, 4_999));
+        assert!(reached_end(2_900, 3_000, 60_000));
+        assert!(!reached_end(0, 4_999, 60_000));
     }
 }

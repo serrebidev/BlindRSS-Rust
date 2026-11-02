@@ -1,5 +1,8 @@
 # BlindRSS Parity Audit — every provider, every feature
 
+Current source comparison and ports: [2026-11-01 audit](PARITY-2026-11-01.md).
+The historical status rows below have not all been reconciled with later work.
+
 Generated 2026-10-30 by mechanically auditing the Python source
 (serrebidev/BlindRSS v2.5.4, commit 9a69e59): AST scans of
 `providers/`, `core/`, `gui/`, plus the help-topic and shortcut

@@ -60,6 +60,7 @@ fn delete_tombstone_restore_cycle() {
             author: None,
             media_url: None,
             media_type: None,
+            tags: Vec::new(),
         }],
     };
     assert_eq!(store_parsed(&db, &feed, &parsed).unwrap(), 0);

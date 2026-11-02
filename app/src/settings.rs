@@ -472,11 +472,28 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
         &cfg.get_i64("per_host_max_connections", 4).to_string(),
         false,
     );
-    let ignore_cache_cb = add_check(
+    let workload = cfg.get_str(
+        "automatic_feed_refresh_workload",
+        if cfg.get_bool("ignore_feed_cache", false) {
+            "always_full"
+        } else {
+            "startup_full"
+        },
+    );
+    let refresh_workload = add_choice(
         &dialog,
         &sizer,
-        "Ignore feed cache",
-        cfg.get_bool("ignore_feed_cache", false),
+        "Automatic feed refresh",
+        &[
+            "Use feed cache",
+            "Full fetch at startup, cached later",
+            "Always fetch in full",
+        ],
+        match workload {
+            "cached" => 0,
+            "always_full" => 2,
+            _ => 1,
+        },
     );
 
     // Reading.
@@ -539,6 +556,33 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
         "Show articles as rich HTML (WebView)",
         cfg.get_bool("full_text_rich_view", false),
     );
+    let structure_choices: Vec<(&str, CheckBox)> = [
+        ("article_structure_tables", "Describe article tables", true),
+        (
+            "article_structure_headings",
+            "Announce article heading levels",
+            false,
+        ),
+        (
+            "article_structure_lists",
+            "Preserve article list markers",
+            false,
+        ),
+        ("article_structure_quotes", "Mark article quotations", false),
+        (
+            "article_structure_links",
+            "Include link targets in article text",
+            false,
+        ),
+    ]
+    .into_iter()
+    .map(|(key, label, default)| {
+        (
+            key,
+            add_check(&dialog, &sizer, label, cfg.get_bool(key, default)),
+        )
+    })
+    .collect();
     // Article opening (Python issue #31): default browser or a
     // custom command template with %1 for the URL.
     let open_method_choice = add_choice(
@@ -657,6 +701,99 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
         &sizer,
         "Show player when playback starts",
         cfg.get_bool("show_player_on_play", true),
+    );
+    let resume_cb = add_check(
+        &dialog,
+        &sizer,
+        "Resume playback from the saved position",
+        cfg.get_bool("resume_playback", true),
+    );
+    let playback_fields: Vec<(&str, TextCtrl, i64, i64)> = [
+        (
+            "resume_save_interval_s",
+            "Save playback position every (seconds)",
+            15,
+            1,
+            3600,
+        ),
+        (
+            "resume_back_ms",
+            "Rewind on resume (milliseconds)",
+            10_000,
+            0,
+            600_000,
+        ),
+        (
+            "resume_min_ms",
+            "Minimum saved position to resume (milliseconds)",
+            0,
+            0,
+            3_600_000,
+        ),
+        (
+            "resume_complete_threshold_ms",
+            "Treat remaining playback as complete below (milliseconds)",
+            60_000,
+            0,
+            3_600_000,
+        ),
+        (
+            "vlc_network_caching_ms",
+            "VLC network buffer (milliseconds)",
+            1000,
+            0,
+            60_000,
+        ),
+        (
+            "vlc_local_proxy_network_caching_ms",
+            "VLC local proxy network buffer (milliseconds)",
+            1000,
+            0,
+            60_000,
+        ),
+        (
+            "vlc_local_proxy_file_caching_ms",
+            "VLC local proxy file buffer (milliseconds)",
+            1000,
+            0,
+            60_000,
+        ),
+    ]
+    .into_iter()
+    .map(|(key, label, default, lo, hi)| {
+        (
+            key,
+            add_field(
+                &dialog,
+                &sizer,
+                label,
+                &cfg.get_i64(key, default).to_string(),
+                false,
+            ),
+            lo,
+            hi,
+        )
+    })
+    .collect();
+    let mut soundcards = vec![("System default".to_string(), String::new())];
+    soundcards.extend(crate::media_backend::soundcards(&cfg));
+    let saved_soundcard = cfg.get_str("preferred_soundcard", "").to_string();
+    if !saved_soundcard.is_empty() && !soundcards.iter().any(|(_, id)| id == &saved_soundcard) {
+        soundcards.push((
+            format!("Saved device (currently unavailable): {saved_soundcard}"),
+            saved_soundcard.to_string(),
+        ));
+    }
+    let labels: Vec<&str> = soundcards.iter().map(|(label, _)| label.as_str()).collect();
+    let soundcard_choice = add_choice(
+        &dialog,
+        &sizer,
+        "Audio output device",
+        &labels,
+        soundcards
+            .iter()
+            .position(|(_, id)| id == &saved_soundcard)
+            .unwrap_or(0),
     );
     let speed_field = add_field(
         &dialog,
@@ -797,6 +934,12 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
         &sizer,
         "Close button hides to the tray",
         cfg.get_bool("close_to_tray", false),
+    );
+    let minimize_tray_cb = add_check(
+        &dialog,
+        &sizer,
+        "Minimizing hides to the tray",
+        cfg.get_bool("minimize_to_tray", true),
     );
     let start_tray_cb = add_check(
         &dialog,
@@ -978,25 +1121,33 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
     }
 
     add_heading(&dialog, &sizer, "Advanced");
-    let mut ua_items: Vec<&str> = vec!["Automatic (matches this computer)"];
-    ua_items.extend(
+    let mut ua_options: Vec<(String, String)> =
+        vec![("auto".into(), "Automatic (matches this computer)".into())];
+    ua_options.extend(blindrss_core::user_agents::installed_choices());
+    ua_options.extend(
         blindrss_core::user_agents::PRESETS
             .iter()
-            .map(|(_, l, _)| *l),
+            .map(|(key, label, _)| (key.to_string(), label.to_string())),
     );
-    ua_items.push("Custom (use the text below)");
+    ua_options.push(("custom".into(), "Custom (use the text below)".into()));
     let ua_mode0 = cfg.get_str("user_agent_mode", "auto").to_string();
-    let ua_sel = if ua_mode0 == "custom" {
-        ua_items.len() - 1
-    } else if ua_mode0 == "auto" || ua_mode0.is_empty() {
-        0
-    } else {
-        blindrss_core::user_agents::PRESETS
-            .iter()
-            .position(|(k, _, _)| *k == ua_mode0)
-            .map(|i| i + 1)
-            .unwrap_or(0)
-    };
+    if ua_mode0.starts_with("installed:") && !ua_options.iter().any(|(key, _)| key == &ua_mode0) {
+        ua_options.insert(
+            1,
+            (
+                ua_mode0.clone(),
+                format!(
+                    "{} (unavailable)",
+                    ua_mode0.trim_start_matches("installed:")
+                ),
+            ),
+        );
+    }
+    let ua_sel = ua_options
+        .iter()
+        .position(|(key, _)| key == &ua_mode0)
+        .unwrap_or(0);
+    let ua_items: Vec<&str> = ua_options.iter().map(|(_, label)| label.as_str()).collect();
     let ua_choice = add_choice(
         &dialog,
         &sizer,
@@ -1218,6 +1369,25 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
                     None
                 }
             };
+            for (key, field, lo, hi) in &playback_fields {
+                if let Some((key, value)) = num(field, key, *lo, *hi) {
+                    cfg.set_path(&key, serde_json::json!(value));
+                }
+            }
+            cfg.set_path("resume_playback", serde_json::json!(resume_cb.is_checked()));
+            cfg.set_path(
+                "preferred_soundcard",
+                serde_json::json!(
+                    soundcard_choice
+                        .get_selection()
+                        .and_then(|i| soundcards.get(i as usize))
+                        .map(|(_, id)| id.as_str())
+                        .unwrap_or(&saved_soundcard)
+                ),
+            );
+            for (key, control) in &structure_choices {
+                cfg.set_path(key, serde_json::json!(control.is_checked()));
+            }
             for (key, v) in [
                 num(&max_conc_field, "max_concurrent_refreshes", 1, 64),
                 num(&timeout_field, "feed_timeout_seconds", 1, 300),
@@ -1248,7 +1418,15 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
             }
             cfg.set_path(
                 "ignore_feed_cache",
-                serde_json::json!(ignore_cache_cb.is_checked()),
+                serde_json::json!(refresh_workload.get_selection() == Some(2)),
+            );
+            cfg.set_path(
+                "automatic_feed_refresh_workload",
+                serde_json::json!(match refresh_workload.get_selection() {
+                    Some(0) => "cached",
+                    Some(2) => "always_full",
+                    _ => "startup_full",
+                }),
             );
             cfg.set_path(
                 "search_mode",
@@ -1321,6 +1499,10 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
                 serde_json::json!(close_tray_cb.is_checked()),
             );
             cfg.set_path(
+                "minimize_to_tray",
+                serde_json::json!(minimize_tray_cb.is_checked()),
+            );
+            cfg.set_path(
                 "start_in_system_tray",
                 serde_json::json!(start_tray_cb.is_checked()),
             );
@@ -1340,16 +1522,11 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
                 "install_updates_automatically",
                 serde_json::json!(auto_install_cb.is_checked()),
             );
-            let ua_value = match ua_choice.get_selection() {
-                Some(0) | None => "auto".to_string(),
-                Some(sel) if (sel as usize) == blindrss_core::user_agents::PRESETS.len() + 1 => {
-                    "custom".to_string()
-                }
-                Some(sel) => blindrss_core::user_agents::PRESETS
-                    .get((sel - 1) as usize)
-                    .map(|(k, _, _)| k.to_string())
-                    .unwrap_or_else(|| "auto".to_string()),
-            };
+            let ua_value = ua_choice
+                .get_selection()
+                .and_then(|sel| ua_options.get(sel as usize))
+                .map(|(key, _)| key.as_str())
+                .unwrap_or("auto");
             cfg.set_path("user_agent_mode", serde_json::json!(ua_value));
             cfg.set_path(
                 "user_agent_custom",

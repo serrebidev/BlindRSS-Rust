@@ -11,6 +11,60 @@ use std::net::TcpStream;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MediaStatus {
+    pub position: f64,
+    pub duration: f64,
+    pub state: String,
+}
+
+pub fn parse_media_status(value: &serde_json::Value) -> Result<MediaStatus, String> {
+    let status = value
+        .get("status")
+        .and_then(|v| v.as_array())
+        .ok_or("Cast receiver returned no media status")?;
+    let Some(media) = status.first() else {
+        return Ok(MediaStatus {
+            state: "IDLE".into(),
+            ..Default::default()
+        });
+    };
+    let position = media
+        .get("currentTime")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let duration = media
+        .pointer("/media/duration")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    if !position.is_finite() || position < 0.0 || !duration.is_finite() || duration < 0.0 {
+        return Err("Cast receiver returned an invalid playback time".into());
+    }
+    Ok(MediaStatus {
+        position,
+        duration,
+        state: media
+            .get("playerState")
+            .and_then(|v| v.as_str())
+            .unwrap_or("IDLE")
+            .into(),
+    })
+}
+
+fn seek_payload(session: i64, seconds: f64) -> Result<serde_json::Value, String> {
+    if !seconds.is_finite() || seconds < 0.0 {
+        return Err("Seek position must be a finite, nonnegative number".into());
+    }
+    Ok(serde_json::json!({"type": "SEEK", "mediaSessionId": session, "currentTime": seconds}))
+}
+
+fn volume_payload(level: f64) -> Result<serde_json::Value, String> {
+    if !level.is_finite() || !(0.0..=1.0).contains(&level) {
+        return Err("Volume must be between 0 and 1".into());
+    }
+    Ok(serde_json::json!({"type": "SET_VOLUME", "volume": {"level": level}}))
+}
+
 #[derive(Debug)]
 struct NoVerify;
 
@@ -269,6 +323,9 @@ impl CastSession {
 
     /// Play / pause / stop the loaded media.
     pub fn media_control(&mut self, command: &str) -> Result<(), String> {
+        if !matches!(command, "PLAY" | "PAUSE" | "STOP") {
+            return Err("Unknown Cast playback command".into());
+        }
         let transport = self
             .app_transport
             .clone()
@@ -284,6 +341,49 @@ impl CastSession {
         Ok(())
     }
 
+    pub fn media_status(&mut self) -> Result<MediaStatus, String> {
+        let transport = self
+            .app_transport
+            .clone()
+            .ok_or("launch the receiver first")?;
+        let status = self.request(
+            &transport,
+            NS_MEDIA,
+            serde_json::json!({"type":"GET_STATUS"}),
+            "MEDIA_STATUS",
+            Duration::from_secs(8),
+        )?;
+        parse_media_status(&status)
+    }
+
+    pub fn seek(&mut self, seconds: f64) -> Result<(), String> {
+        let session = self.media_session_id.ok_or("no media loaded")?;
+        let payload = seek_payload(session, seconds)?;
+        let transport = self
+            .app_transport
+            .clone()
+            .ok_or("launch the receiver first")?;
+        self.request(
+            &transport,
+            NS_MEDIA,
+            payload,
+            "MEDIA_STATUS",
+            Duration::from_secs(8),
+        )?;
+        Ok(())
+    }
+
+    pub fn set_volume(&mut self, level: f64) -> Result<(), String> {
+        self.request(
+            RECEIVER_ID,
+            NS_RECEIVER,
+            volume_payload(level)?,
+            "RECEIVER_STATUS",
+            Duration::from_secs(8),
+        )?;
+        Ok(())
+    }
+
     /// Ping the device (heartbeat namespace).
     pub fn ping(&mut self) -> Result<(), String> {
         self.send(&json_message(
@@ -291,5 +391,37 @@ impl CastSession {
             NS_HEARTBEAT,
             serde_json::json!({"type": "PING"}),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_cast_status_and_missing_media_as_idle() {
+        let value = serde_json::json!({"type":"MEDIA_STATUS", "status":[{"mediaSessionId":7,"currentTime":42.5,"playerState":"PAUSED","media":{"duration":3600}}]});
+        let status = parse_media_status(&value).unwrap();
+        assert_eq!(status.position, 42.5);
+        assert_eq!(status.duration, 3600.0);
+        assert_eq!(status.state, "PAUSED");
+        assert_eq!(
+            parse_media_status(&serde_json::json!({"status":[]}))
+                .unwrap()
+                .state,
+            "IDLE"
+        );
+    }
+
+    #[test]
+    fn cast_controls_reject_invalid_numbers_and_keep_protocol_fields() {
+        assert!(seek_payload(7, -1.0).is_err());
+        assert!(seek_payload(7, f64::NAN).is_err());
+        assert!(volume_payload(f64::INFINITY).is_err());
+        assert!(volume_payload(1.1).is_err());
+        let seek = seek_payload(7, 42.5).unwrap();
+        assert_eq!(seek["mediaSessionId"], 7);
+        assert_eq!(seek["currentTime"], 42.5);
+        assert_eq!(volume_payload(0.5).unwrap()["volume"]["level"], 0.5);
     }
 }

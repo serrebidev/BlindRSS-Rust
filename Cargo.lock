@@ -150,6 +150,7 @@ name = "blindrss"
 version = "0.1.36"
 dependencies = [
  "blindrss-core",
+ "libloading",
  "rcgen",
  "rustls",
  "serde_json",

@@ -21,6 +21,11 @@ maintainer's machine); the key decisions:
 
 ## Status
 
+The latest source comparison and implemented ports are recorded in
+[the 2026-11-01 feature audit](docs/PARITY-2026-11-01.md), including the remaining
+gaps. The early-stage description below is historical; full parity is not yet
+established.
+
 Stage 1-3 first slice: data layer, config reader, RSS/Atom parsing,
 extraction cascade v1 (gate markers, engine-disagreement rule,
 prefer-feed-content, table re-append) with regression tests against the

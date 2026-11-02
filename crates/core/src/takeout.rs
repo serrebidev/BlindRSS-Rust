@@ -24,13 +24,27 @@ fn playlist_feed(playlist_id: &str) -> String {
 fn channel_id_from_url(url: &str) -> Option<String> {
     // Channel URLs in Takeout rows look like
     // https://www.youtube.com/channel/UCxxxxxxxx
-    let marker = "/channel/";
-    let start = url.find(marker)? + marker.len();
-    let id: String = url[start..]
-        .chars()
-        .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
-        .collect();
-    if id.len() >= 10 { Some(id) } else { None }
+    let parsed = url::Url::parse(url).ok()?;
+    if !matches!(
+        parsed.host_str()?,
+        "youtube.com" | "www.youtube.com" | "m.youtube.com"
+    ) {
+        return None;
+    }
+    let mut parts = parsed.path_segments()?;
+    if parts.next()? != "channel" {
+        return None;
+    }
+    let id = parts.next()?;
+    if id.len() >= 10
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        Some(id.to_string())
+    } else {
+        None
+    }
 }
 
 /// Minimal CSV reader: quoted fields, embedded commas/newlines,
@@ -86,7 +100,7 @@ fn csv_rows(text: &str) -> Vec<Vec<String>> {
 }
 
 fn subscriptions_from_csv(text: &str, out: &mut Vec<TakeoutFeed>, seen: &mut Vec<String>) {
-    let rows = csv_rows(text);
+    let rows = csv_rows(text.trim_start_matches('\u{feff}'));
     if rows.is_empty() {
         return;
     }
@@ -121,10 +135,27 @@ fn playlists_from_csv(text: &str, out: &mut Vec<TakeoutFeed>, seen: &mut Vec<Str
     let _ = (text, out, seen);
 }
 
+fn read_member(reader: &mut impl Read) -> Result<String, String> {
+    let mut bytes = Vec::new();
+    reader
+        .take(64 * 1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("Takeout member read failed: {e}"))?;
+    if bytes.len() > 64 * 1024 * 1024 {
+        return Err("Takeout member is too large".to_string());
+    }
+    Ok(String::from_utf8_lossy(&bytes)
+        .trim_start_matches('\u{feff}')
+        .to_string())
+}
+
 /// Parse a Takeout ZIP file's bytes into feed entries.
 pub fn parse_takeout_zip(bytes: &[u8]) -> Result<Vec<TakeoutFeed>, String> {
     let cursor = std::io::Cursor::new(bytes);
     let mut archive = zip::ZipArchive::new(cursor).map_err(|e| format!("not a valid ZIP: {e}"))?;
+    if archive.len() > 20_000 {
+        return Err("The selected archive contains too many files".to_string());
+    }
     let mut out: Vec<TakeoutFeed> = Vec::new();
     let mut seen: Vec<String> = Vec::new();
     let mut found_youtube = false;
@@ -137,19 +168,29 @@ pub fn parse_takeout_zip(bytes: &[u8]) -> Result<Vec<TakeoutFeed>, String> {
             continue;
         }
         found_youtube = true;
+        if file.size() > 64 * 1024 * 1024 {
+            return Err(format!("Takeout member is too large: {}", file.name()));
+        }
         if name.ends_with("/subscriptions/subscriptions.csv")
             || name.ends_with("subscriptions.csv") && name.contains("subscriptions")
         {
-            let mut text = String::new();
-            if file.read_to_string(&mut text).is_ok() {
+            let text = read_member(&mut file)?;
+            {
                 subscriptions_from_csv(&text, &mut out, &mut seen);
+            }
+        } else if name.ends_with("/channels/channel.csv") {
+            let text = read_member(&mut file)?;
+            let start = out.len();
+            subscriptions_from_csv(&text, &mut out, &mut seen);
+            for feed in &mut out[start..] {
+                feed.source = "owner".to_string();
             }
         } else if name.contains("/playlists/") && name.ends_with(".csv") {
             // Playlist file names look like "Playlist Name.csv" with
             // no id; Takeout also writes "playlists.csv" indexes with
             // a Playlist ID column in newer exports.
-            let mut text = String::new();
-            if file.read_to_string(&mut text).is_ok() {
+            let text = read_member(&mut file)?;
+            {
                 let rows = csv_rows(&text);
                 if let Some(header) = rows.first() {
                     let low: Vec<String> = header.iter().map(|h| h.trim().to_lowercase()).collect();
@@ -181,30 +222,42 @@ pub fn parse_takeout_zip(bytes: &[u8]) -> Result<Vec<TakeoutFeed>, String> {
                 playlists_from_csv(&text, &mut out, &mut seen);
             }
         } else if name.ends_with("watch-history.html") {
-            let mut text = String::new();
-            if file.read_to_string(&mut text).is_ok() {
+            let text = read_member(&mut file)?;
+            {
                 // Channels appear as channel links in the history page.
-                let mut idx = 0;
-                while let Some(pos) = text[idx..].find("/channel/") {
-                    let start = idx + pos;
-                    if let Some(cid) = channel_id_from_url(&text[start.saturating_sub(40)..]) {
+                static ANCHORS: std::sync::LazyLock<regex::Regex> =
+                    std::sync::LazyLock::new(|| {
+                        regex::Regex::new(
+                            r#"(?is)<a\b[^>]*\bhref\s*=\s*["']([^"']+)["'][^>]*>(.*?)</a\s*>"#,
+                        )
+                        .expect("fixed history-link regex")
+                    });
+                for link in ANCHORS.captures_iter(&text) {
+                    if let Some(cid) = channel_id_from_url(&link[1]) {
                         let feed = channel_feed(&cid);
                         if !seen.contains(&feed) {
                             seen.push(feed.clone());
+                            let title = crate::extract::html_to_text(&link[2]);
                             out.push(TakeoutFeed {
-                                title: cid.clone(),
+                                title: if title.trim().is_empty() {
+                                    cid
+                                } else {
+                                    title.trim().to_string()
+                                },
                                 url: feed,
                                 source: "history".to_string(),
                             });
                         }
                     }
-                    idx = start + 9;
                 }
             }
         }
     }
     if !found_youtube {
         return Err("No YouTube and YouTube Music export found in this archive".to_string());
+    }
+    if out.is_empty() {
+        return Err("No subscribable YouTube channels or playlists were found".to_string());
     }
     Ok(out)
 }

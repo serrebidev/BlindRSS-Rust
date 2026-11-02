@@ -21,6 +21,7 @@
 //! see PARITY §7.
 
 use serde_json::Value;
+mod github;
 
 /// Try every thread reconstructor for this URL.
 pub fn thread_text(url: &str) -> Option<(String, String)> {
