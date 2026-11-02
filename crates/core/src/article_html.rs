@@ -828,12 +828,18 @@ pub fn clean_article_html(html: &str, url: &str, use_traf_prune: bool) -> String
     if html.is_empty() {
         return String::new();
     }
-    let keep_text = if use_traf_prune {
+    // Forum threads are rebuilt before the generic main-node pick —
+    // a thread is a flat list of sibling posts and the pick lands on
+    // a single one (Python `_forum_reconstruct`). A rebuilt body is
+    // exempt from the trafilatura prune, whose keep-text reflects
+    // only the part generic extraction picked.
+    let forum_frag = crate::forum_sources::forum_thread_html_for(url, html);
+    let keep_text = if use_traf_prune && forum_frag.is_none() {
         article_keep_text(html, url)
     } else {
         String::new()
     };
-    let mut frag = pick_main_fragment(html);
+    let mut frag = forum_frag.unwrap_or_else(|| pick_main_fragment(html));
 
     // Social embeds first, so the passes below keep the resulting
     // iframe/anchor nodes.

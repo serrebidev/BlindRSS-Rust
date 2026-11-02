@@ -1246,3 +1246,71 @@ mapping, and the help-guide section in all 16 locales.
 The main window is the single reading surface on every
 platform; its reader already carries the mitigations that
 matter (content replacement on load, announcements).
+Source depth resolution (v0.1.41; gaps 3-4 — PARITY-2026-11-01
+gaps 3-4): the specialized source readers are completed.
+(1) HTML forum thread linearization is ported
+(`forum_sources::forum_blocks` / `forum_thread_text` /
+`forum_thread_html`, wired into the extraction cascade's
+site-specific branch and the rich reader's reconstruct
+step): Python's `_FORUM_LAYOUTS` for Invision Community
+(article.ipsComment, [data-role=commentContent],
+h3.cAuthorPane_author, time), vBulletin 4
+(li.postbitlegacy[id], blockquote.postcontent,
+.postcounter/.username/.postdate, .signature junk),
+FluxBB and Drupal ride along, expressed over the
+extractor's balanced tag scanner as tag/class/attribute
+selector steps — no CSS engine needed. Per-post junk is
+stripped, ellipsized link text is expanded to the real
+href, the body wrapper's class/id is dropped, and the
+hosts are Python's `_FORUM_THREAD_HOSTS` gate. XenForo
+has NO Python layout (the audit names it, the Python
+tree ships none); a XenForo 2 layout in the same shape
+(article.message--post, .bbWrapper, .message-name,
+attribution-opposite post number) is added keyed on its
+distinctive markup alone. (2) Google Groups conversation
+rebuild: `google_groups_thread_document` parses the
+server-rendered div.eH2Xlc messages (region body, h3
+author, .zX2W9c date, data-message-id, quote blocks
+dropped) into the semantic thread document, and
+`google_support_thread_document` decodes Google Help
+Communities' embedded `var thread_view` payload (JS
+single-quote literal decode, nested-array topic/replies,
+micro/milli/second timestamp labels); both are served
+through `web_thread_html` from the reconstructed-article
+path. (3) Discourse reconstruction now matches Python's
+completeness: print=true topic fetch, missing post ids
+from the stream fetched in batches of 100, post_number
+ordering, 10,000-post cap, display-name authors,
+reply-to markers. (4) YouTube RSS-error/uploads backfill
+is finished to Python's semantics: the history state
+table now uses Python's own columns (done/last_attempt —
+early Rust builds created state/attempted_at, renamed
+in place inside schema init), `youtube_history_due`
+mirrors Python exactly (done=1 re-lists immediately, the
+day-long retry after a failed attempt), the attempt is
+marked before listing, the history listing runs before
+the RSS fetch at Python's 5,000-item / 300 s budget and
+marks done only on a stored non-empty listing, an empty
+RSS-error fallback listing re-raises the original RSS
+error instead of succeeding with zero articles, and
+channel/search listing dates are date-only as Python's
+parser emits. (5) FeedSearchDialog depth: all of
+Python's directory sources were already present; the
+remaining per-source detail is now ported — Reddit
+subscriber suffixes, Lemmy/Kbin "Lemmy - name (N subs)"
+details, PieFed community/user details, Mastodon
+@acct/follower and tag recent-use details, Bluesky
+handle/did details plus the OpenRSS tag result,
+Mixcloud follower counts and per-user playlist
+surfacing, SoundCloud follower/owner/track-count
+details, Groups.io per-row details, Feedspot host
+details, the NewsBlur 20-result cap, website-scan feed
+titles for the first five candidates, and YouTube's
+query variants, match scoring, merged playlist-first
+ranking and "Name / @handle | N plays" details.
+Regression: source_depth_parity (13 tests — the Python
+forum fixtures for Invision/vBulletin/FluxBB/Drupal, a
+XenForo fixture, Google Groups + Support rebuilds,
+history-state due rules incl. the legacy-column repair,
+feedsearch details) plus threads.rs discourse unit
+tests.

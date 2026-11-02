@@ -649,12 +649,29 @@ fn fetch_youtube_search(
     let mut items: Vec<SourceItem> = entries
         .iter()
         .filter_map(|e| flat_entry_item(e, "youtube"))
+        .map(|mut it| {
+            it.published = youtube_date_only(it.published);
+            it
+        })
         .collect();
     for it in items.iter_mut() {
         it.media_url = Some(it.url.clone());
         it.media_type = Some("video/youtube".to_string());
     }
     Ok((format!("YouTube: {query}"), dedupe_items(items)))
+}
+
+/// Python `_fetch_youtube_listing_items` dates are date-only
+/// ("2026-11-01", from upload_date or the timestamp's UTC date),
+/// never datetimes: truncate the RFC 3339 form `entry_date` builds.
+fn youtube_date_only(published: Option<String>) -> Option<String> {
+    published.map(|p| {
+        if p.len() > 10 && p.as_bytes().get(10) == Some(&b'T') {
+            p[..10].to_string()
+        } else {
+            p
+        }
+    })
 }
 
 /// Enumerate a channel's uploads playlist (Python
@@ -664,11 +681,19 @@ pub fn fetch_youtube_channel_items(
     channel_id: &str,
     max_items: usize,
 ) -> Result<(String, Vec<SourceItem>), String> {
+    fetch_youtube_channel_items_with_timeout(channel_id, max_items, 120)
+}
+
+pub fn fetch_youtube_channel_items_with_timeout(
+    channel_id: &str,
+    max_items: usize,
+    timeout_s: u64,
+) -> Result<(String, Vec<SourceItem>), String> {
     let listing_url = format!(
         "https://www.youtube.com/playlist?list=UU{}",
         &channel_id[2..]
     );
-    let entries = ytdlp_flat_listing(&listing_url, max_items, 120, true)?;
+    let entries = ytdlp_flat_listing(&listing_url, max_items, timeout_s, true)?;
     let mut title = String::new();
     let mut items = Vec::new();
     for e in &entries {
@@ -678,6 +703,7 @@ pub fn fetch_youtube_channel_items(
             title = u;
         }
         if let Some(mut it) = flat_entry_item(e, "youtube") {
+            it.published = youtube_date_only(it.published);
             // Stable id: the same one the native RSS feed uses, so
             // the two sources never duplicate each other (issue #107).
             if let Some(vid) = it.url.rsplit('=').next()

@@ -1922,6 +1922,13 @@ fn extract_article_impl(
                 "#smallhead",
             ],
         )
+    } else if crate::forum_sources::is_forum_thread_host(url)
+        || !crate::forum_sources::forum_thread_text_for(url, html).is_empty()
+    {
+        // Forum threads (Python `_is_forum_thread_host` branch):
+        // linearize every post instead of letting the generic engines
+        // keep a single sibling block.
+        crate::forum_sources::forum_thread_text_for(url, html)
     } else if is_socast_page(html) {
         socast_text(html)
     } else {
@@ -2882,7 +2889,9 @@ pub(crate) fn is_google_news_url(url: &str) -> bool {
 
 /// Rebuilt source documents retain replies, headings and links that a generic scraper drops.
 pub(crate) fn reconstructed_article_html(url: &str) -> Option<(String, String)> {
-    crate::threads::github_html(url).or_else(|| crate::forum_sources::topic_html(url))
+    crate::threads::github_html(url)
+        .or_else(|| crate::forum_sources::topic_html(url))
+        .or_else(|| crate::forum_sources::web_thread_html(url))
 }
 
 /// Fetch a page and extract its full text, running Python's

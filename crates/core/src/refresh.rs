@@ -164,15 +164,27 @@ pub fn refresh_feed(db: &Db, feed: &Feed) -> Result<usize, String> {
         };
         return store_parsed(db, feed, &parsed);
     }
+    // One-time channel history backfill (issue #109) runs before
+    // the fetch, as in Python: the RSS feed carries only the newest
+    // 15 uploads, so list the whole uploads playlist once and store
+    // it under the same stable ids, whatever the RSS fetch then does.
+    let channel_id = crate::sources::youtube_channel_id(&feed.url);
+    if let Some(cid) = &channel_id {
+        youtube_history_backfill(db, feed, cid);
+    }
     let parsed = match crate::feeds::fetch_with_cache(db, &feed.url, false) {
         Ok(p) => p,
         Err(e) => {
             // YouTube channel feeds answer 404/500 at random for
             // some channels (issue #107): fall back to listing the
-            // uploads playlist through yt-dlp.
-            if let Some(cid) = crate::sources::youtube_channel_id(&feed.url) {
+            // uploads playlist through yt-dlp. An empty listing is
+            // not a recovery — Python re-raises the RSS error.
+            if let Some(cid) = &channel_id {
                 let (title, items) =
-                    crate::sources::fetch_youtube_channel_items(&cid, 30).map_err(|_| e.clone())?;
+                    crate::sources::fetch_youtube_channel_items(cid, 30).map_err(|_| e.clone())?;
+                if items.is_empty() {
+                    return Err(e);
+                }
                 let parsed = crate::feeds::ParsedFeed {
                     title,
                     entries: crate::sources::items_to_entries(shape_stable_ids(db, feed, items)),
@@ -182,14 +194,7 @@ pub fn refresh_feed(db: &Db, feed: &Feed) -> Result<usize, String> {
             return Err(e);
         }
     };
-    let stored = store_parsed(db, feed, &parsed)?;
-    // One-time channel history backfill (issue #109): the RSS feed
-    // carries only the newest 15 uploads, so list the whole uploads
-    // playlist once and store it under the same stable ids.
-    if let Some(cid) = crate::sources::youtube_channel_id(&feed.url) {
-        youtube_history_backfill(db, feed, &cid);
-    }
-    Ok(stored)
+    store_parsed(db, feed, &parsed)
 }
 
 /// Shape channel-listing items for storage: an id already owned by
@@ -213,31 +218,38 @@ fn shape_stable_ids(
         .collect()
 }
 
+/// Python's history constants: the full uploads playlist, with a
+/// five-minute listing budget.
+const YOUTUBE_HISTORY_MAX_ITEMS: usize = 5000;
+const YOUTUBE_HISTORY_TIMEOUT_S: u64 = 300;
+
 fn youtube_history_backfill(db: &Db, feed: &Feed, channel_id: &str) {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    let (state, attempted) = db.youtube_history_state(&feed.id).unwrap_or((0, 0));
-    if state == 2 {
-        return; // done (Python's _YOUTUBE_HISTORY_DONE)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    if !db.youtube_history_due(&feed.id, now) {
+        return;
     }
-    if state == 1 && now - attempted < 86_400 {
-        return; // failed attempt retries after a day
-    }
-    match crate::sources::fetch_youtube_channel_items(channel_id, 500) {
-        Ok((_title, items)) => {
-            let parsed = crate::feeds::ParsedFeed {
-                title: feed.title.clone(),
-                entries: crate::sources::items_to_entries(shape_stable_ids(db, feed, items)),
-            };
-            // History items are stored unread but are NOT new-item
-            // news: the count is deliberately discarded.
-            let _ = store_parsed(db, feed, &parsed);
+    // Python marks the attempt (done = 0, last_attempt = now) before
+    // listing, so a crash mid-listing still waits out the retry day.
+    let _ = db.set_youtube_history_state(&feed.id, 0, now);
+    if let Ok((_title, items)) = crate::sources::fetch_youtube_channel_items_with_timeout(
+        channel_id,
+        YOUTUBE_HISTORY_MAX_ITEMS,
+        YOUTUBE_HISTORY_TIMEOUT_S,
+    ) && !items.is_empty()
+    {
+        let parsed = crate::feeds::ParsedFeed {
+            title: feed.title.clone(),
+            entries: crate::sources::items_to_entries(shape_stable_ids(db, feed, items)),
+        };
+        // History items are stored unread but are NOT new-item
+        // news: the count is deliberately discarded. Python marks
+        // the history done only when the listing produced items
+        // and they were stored.
+        if store_parsed(db, feed, &parsed).is_ok() {
             let _ = db.set_youtube_history_state(&feed.id, 2, now);
-        }
-        Err(_) => {
-            let _ = db.set_youtube_history_state(&feed.id, 1, now);
         }
     }
 }
