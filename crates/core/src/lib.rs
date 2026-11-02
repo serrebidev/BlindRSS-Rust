@@ -5,6 +5,7 @@
 //! application remains the shipping product; this crate is developed in
 //! parallel and must stay able to read any database the Python app writes.
 
+pub mod accessible;
 pub mod announce;
 pub mod archive;
 pub mod archive_store;
