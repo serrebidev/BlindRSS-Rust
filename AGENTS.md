@@ -464,3 +464,16 @@ Default vocabulary: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-
 
 Single-context: the domain authority for this port is `docs/PARITY.md`
 (the parity checklist against the Python spec) plus this guide. See `docs/agents/domain.md`.
+
+## Release signing
+
+- Releases are minisign-signed (BlindRadio's pattern): `cargo xtask sign`
+  in each release leg, `.minisig` beside every zip, publish refuses to
+  proceed when any asset or signature is missing.
+- The secret key lives ONLY in the `MINISIGN_KEY` repository secret
+  (`MINISIGN_PASSWORD` unlocks it) — never in git, never in a file on
+  this box. Losing it means rotating the key, and already-installed
+  copies can then never verify a new release. The public half is
+  `crates/core/assets/minisign.pub`; changing it takes a new release.
+- The updater verifies the `.minisig` against that embedded key before
+  staging an update (fail closed) — do not weaken it to a warning.

@@ -1748,3 +1748,31 @@ lifted into shared closures the PLAYERS action match calls,
 so the Player menu and tray entries work whenever a player
 is open. The Chapters/speed submenu statics stand as
 recorded.
+
+Release signing resolution (2026-11-02, at the owner's
+direction — "using shipfitter like BlindRadio and its
+signing key, kept private, not into the repo"): releases
+are now minisign-signed exactly as BlindRadio's are. The
+workspace gains crates/xtask with the `sign` command ported
+from BlindRadio's xtask (the env-parameter split in
+sign_file_with is the only deviation, for tests); the
+release workflow signs each platform zip in its leg with
+the MINISIGN_KEY repository secret (MINISIGN_PASSWORD
+unlocks the encrypted key), uploads the `.minisig` beside
+the zip, refuses to publish unless every asset and
+signature arrived, and lists the signatures in SHA256SUMS.
+The public half (key ID 151E848B8939A63F — the same key
+BlindRadio publishes) is committed at
+crates/core/assets/minisign.pub and copied into every
+package; the secret half exists only as the GitHub
+repository secret, never in git. The updater closes the
+loop: download_and_stage_update still checks SHA256SUMS,
+and now also requires the zip's `.minisig` and verifies it
+against the embedded public key before staging — fail
+closed, so releases from before signing (which carry no
+signature) can no longer be staged by a signing-era build.
+Regression: the xtask round-trip test signs with a
+throwaway keypair and verifies through minisign-verify
+(the updater's own call), plus an encrypted-key test
+proving the password path; core signature tests cover the
+fail-closed cases.

@@ -1,0 +1,13 @@
+[package]
+name = "xtask"
+edition.workspace = true
+license.workspace = true
+version = "0.1.0"
+publish = false
+
+[dependencies]
+minisign = "0.10"
+
+[dev-dependencies]
+# The check the updater itself makes on a download.
+minisign-verify = "0.2"

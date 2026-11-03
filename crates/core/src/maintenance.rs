@@ -183,9 +183,42 @@ fn platform_asset_suffix() -> &'static str {
     }
 }
 
-/// Fetch the latest release and pick this platform's zip plus
-/// the SHA256SUMS asset: (tag, zip url, sums url).
-pub fn latest_release_assets() -> Result<(String, Option<String>, Option<String>), String> {
+/// The release signing public key (the file the release
+/// workflow ships; the secret half lives only in the
+/// MINISIGN_KEY repository secret, never in git).
+const MINISIGN_PUB: &str = include_str!("../assets/minisign.pub");
+
+/// Verify a downloaded update against its `.minisig` (the
+/// minisign signature the release workflow writes beside
+/// every asset). Fail closed: any parse or verify error is
+/// an error, never a skip.
+pub fn verify_update_signature(bytes: &[u8], sig_text: &str) -> Result<(), String> {
+    let pub_b64 = MINISIGN_PUB
+        .lines()
+        .nth(1)
+        .map(str::trim)
+        .ok_or("embedded minisign.pub has no key line")?;
+    let public_key = minisign_verify::PublicKey::from_base64(pub_b64)
+        .map_err(|e| format!("update public key: {e}"))?;
+    let signature = minisign_verify::Signature::decode(sig_text)
+        .map_err(|e| format!("update signature: {e}"))?;
+    public_key
+        .verify(bytes, &signature, false)
+        .map_err(|_| "update download failed signature verification".to_string())
+}
+
+/// The downloadable pieces of the latest release for this
+/// platform.
+pub struct LatestReleaseAssets {
+    pub tag: String,
+    pub zip_url: Option<String>,
+    pub sums_url: Option<String>,
+    pub sig_url: Option<String>,
+}
+
+/// Fetch the latest release and pick this platform's zip, the
+/// SHA256SUMS asset and the zip's `.minisig`.
+pub fn latest_release_assets() -> Result<LatestReleaseAssets, String> {
     let mut resp = crate::http::agent()
         .get("https://api.github.com/repos/serrebidev/BlindRSS-Rust/releases/latest")
         .call()
@@ -202,8 +235,10 @@ pub fn latest_release_assets() -> Result<(String, Option<String>, Option<String>
         .ok_or("no tag in release response")?
         .to_string();
     let suffix = platform_asset_suffix();
+    let sig_suffix = format!("{suffix}.minisig");
     let mut zip_url = None;
     let mut sums_url = None;
+    let mut sig_url = None;
     if let Some(assets) = value.get("assets").and_then(|a| a.as_array()) {
         for a in assets {
             let name = a.get("name").and_then(|n| n.as_str()).unwrap_or("");
@@ -211,7 +246,9 @@ pub fn latest_release_assets() -> Result<(String, Option<String>, Option<String>
                 .get("browser_download_url")
                 .and_then(|u| u.as_str())
                 .map(|s| s.to_string());
-            if name.ends_with(suffix) {
+            if name.ends_with(&sig_suffix) {
+                sig_url = url.clone();
+            } else if name.ends_with(suffix) {
                 zip_url = url.clone();
             }
             if name == "SHA256SUMS" {
@@ -219,18 +256,31 @@ pub fn latest_release_assets() -> Result<(String, Option<String>, Option<String>
             }
         }
     }
-    Ok((tag, zip_url, sums_url))
+    Ok(LatestReleaseAssets {
+        tag,
+        zip_url,
+        sums_url,
+        sig_url,
+    })
 }
 
 /// Download the latest platform zip, verify it against the
-/// release's SHA256SUMS, and stage it under
+/// release's SHA256SUMS and its minisign signature, and stage it under
 /// `<data_dir>/update_pending/` for the next start to apply.
 /// Returns the staged tag.
 pub fn download_and_stage_update(data_dir: &std::path::Path) -> Result<String, String> {
     use sha2::Digest;
-    let (tag, zip_url, sums_url) = latest_release_assets()?;
-    let zip_url = zip_url.ok_or("no platform zip in the latest release")?;
-    let sums_url = sums_url.ok_or("release has no SHA256SUMS to verify against")?;
+    let latest = latest_release_assets()?;
+    let tag = latest.tag;
+    let zip_url = latest
+        .zip_url
+        .ok_or("no platform zip in the latest release")?;
+    let sums_url = latest
+        .sums_url
+        .ok_or("release has no SHA256SUMS to verify against")?;
+    let sig_url = latest
+        .sig_url
+        .ok_or("release has no signature to verify against")?;
     let mut resp = crate::http::agent()
         .get(&sums_url)
         .call()
@@ -266,6 +316,15 @@ pub fn download_and_stage_update(data_dir: &std::path::Path) -> Result<String, S
     if digest != expected {
         return Err("update download failed checksum verification".to_string());
     }
+    let mut resp = crate::http::agent()
+        .get(&sig_url)
+        .call()
+        .map_err(|e| format!("update signature: {e}"))?;
+    let sig_text = resp
+        .body_mut()
+        .read_to_string()
+        .map_err(|e| format!("update signature: {e}"))?;
+    verify_update_signature(&bytes, &sig_text)?;
     let pending = data_dir.join("update_pending");
     if pending.exists() {
         let _ = std::fs::remove_dir_all(&pending);
@@ -278,4 +337,38 @@ pub fn download_and_stage_update(data_dir: &std::path::Path) -> Result<String, S
         .map_err(|e| format!("update extract: {e}"))?;
     std::fs::write(pending.join("VERSION"), &tag).map_err(|e| format!("stage: {e}"))?;
     Ok(tag)
+}
+
+#[cfg(test)]
+mod signature_tests {
+    use super::verify_update_signature;
+
+    /// A real signature made by the release key (BlindRadio
+    /// v0.2.45's BlindRadio.tar.gz.minisig, public release
+    /// data; same key ID as the embedded public key).
+    const REAL_SIG: &str = concat!(
+        "untrusted comment: signature from rsign secret key\n",
+        "RUQ/pjmJi4QeFfDwFtbcmjzYhf6KKpipIoYxMcM1FwDONDjm+kZ8AOuBUR4GqZi+vg0tVeJMlwW7pf/A9o/7TAgr9TWhfNIOUw4=\n",
+        "trusted comment: timestamp:1793660993\tfile:BlindRadio.tar.gz\thashed\n",
+        "db1orUnRYjuxaADwHx2ksQ9dz7oABgGrFLxd87IyuEL1RHV8hF+N3k2SHcGjx7/PGRcmij+LMSj1E/7qtxBFCg==\n",
+    );
+
+    #[test]
+    fn garbage_signature_is_rejected() {
+        assert!(verify_update_signature(b"bytes", "not a signature").is_err());
+        assert!(verify_update_signature(b"bytes", "").is_err());
+    }
+
+    #[test]
+    fn real_signature_over_other_bytes_is_rejected() {
+        // The key ID matches the embedded public key, so this
+        // exercises the Ed25519 check itself, not a parse or
+        // key-mismatch path: signed bytes != these bytes.
+        let err = verify_update_signature(b"not the signed archive", REAL_SIG)
+            .expect_err("a signature must not verify over different bytes");
+        assert!(
+            err.contains("failed signature verification"),
+            "unexpected error: {err}"
+        );
+    }
 }

@@ -116,6 +116,7 @@ jobs:
           cp app/assets/sounds/*.wav dist/BlindRSS/sounds/
           mkdir -p dist/BlindRSS/docs
           cp -r docs/help dist/BlindRSS/docs/
+          cp crates/core/assets/minisign.pub dist/BlindRSS/
           cd dist
           if [ "$RUNNER_OS" = "Windows" ]; then
             7z a "BlindRSS-${{ github.ref_name }}-${{ runner.os }}.zip" BlindRSS
@@ -123,11 +124,25 @@ jobs:
             zip -r "BlindRSS-${{ github.ref_name }}-${{ runner.os }}.zip" BlindRSS
           fi
 
+      # Every asset carries its minisign signature, so the
+      # updater can verify the download (same pattern as
+      # BlindRadio). The key lives in the MINISIGN_KEY
+      # repository secret, never in git; MINISIGN_PASSWORD
+      # unlocks it.
+      - name: Sign release assets (minisign)
+        shell: bash
+        env:
+          MINISIGN_KEY: ${{ secrets.MINISIGN_KEY }}
+          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+        run: cargo xtask sign dist/*.zip
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: BlindRSS-${{ github.ref_name }}-${{ runner.os }}
-          path: dist/*.zip
+          path: |
+            dist/*.zip
+            dist/*.zip.minisig
 
   publish:
     name: Publish release
@@ -139,13 +154,26 @@ jobs:
           path: artifacts
           merge-multiple: true
 
+      # A leg that failed must not publish: every asset and
+      # its signature has to be there (BlindRadio's rule).
+      - name: Verify every asset and signature arrived
+        shell: bash
+        run: |
+          tag="${{ github.ref_name }}"
+          for os in Windows Linux macOS; do
+            for wanted in "BlindRSS-$tag-$os.zip" "BlindRSS-$tag-$os.zip.minisig"; do
+              test -f "artifacts/$wanted" || { echo "missing: $wanted"; exit 1; }
+            done
+          done
+
       - name: Checksums
-        run: cd artifacts && sha256sum *.zip > SHA256SUMS
+        run: cd artifacts && sha256sum *.zip *.zip.minisig > SHA256SUMS
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
           files: |
             artifacts/*.zip
+            artifacts/*.zip.minisig
             artifacts/SHA256SUMS
           generate_release_notes: true
