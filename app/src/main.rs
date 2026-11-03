@@ -874,45 +874,31 @@ fn startup_maintenance() {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs_f64())
                 .unwrap_or(0.0);
-            if now - last >= 86_400.0 {
+            if blindrss_core::maintenance::auto_backup_due(last, now) {
                 let raw_dir = cfg.get_str("auto_backup_dir", "").trim().to_string();
                 let dir = if raw_dir.is_empty() {
                     data_dir().join("backups")
                 } else {
                     PathBuf::from(raw_dir)
                 };
-                if std::fs::create_dir_all(&dir).is_ok() {
-                    // Local-time-free stamp: seconds since epoch
-                    // keeps names sortable without a date crate.
-                    let stamp = format!("{}", now as i64);
-                    let dest = dir.join(format!("BlindRSS-auto-backup-{stamp}.zip"));
-                    if blindrss_core::maintenance::create_backup(&db_path(), &config_path(), &dest)
-                        .is_ok()
-                    {
-                        let mut autos: Vec<PathBuf> = std::fs::read_dir(&dir)
-                            .map(|rd| {
-                                rd.filter_map(|e| e.ok().map(|e| e.path()))
-                                    .filter(|p| {
-                                        p.file_name()
-                                            .map(|n| {
-                                                n.to_string_lossy()
-                                                    .starts_with("BlindRSS-auto-backup-")
-                                            })
-                                            .unwrap_or(false)
-                                    })
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        autos.sort();
-                        while autos.len() > 7 {
-                            let old = autos.remove(0);
-                            let _ = std::fs::remove_file(old);
-                        }
-                        let mut cfg2 =
-                            blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
-                        cfg2.set_path("auto_backup_last", serde_json::json!(now));
-                        let _ = cfg2.save(&config_path());
-                    }
+                // Python's run_auto_backup: timestamped
+                // `BlindRSS-auto-backup-YYYY-MM-DD-HHMMSS.zip` name
+                // plus rotation over prefix+`.zip` names only, so
+                // Rust and Python backups in one folder rotate
+                // together and nothing else is ever deleted.
+                if blindrss_core::maintenance::run_auto_backup(
+                    &dir,
+                    &data_dir(),
+                    &config_path(),
+                    &db_path(),
+                    blindrss_core::maintenance::AUTO_BACKUP_KEEP,
+                )
+                .is_ok()
+                {
+                    let mut cfg2 =
+                        blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+                    cfg2.set_path("auto_backup_last", serde_json::json!(now));
+                    let _ = cfg2.save(&config_path());
                 }
             }
         }
@@ -1450,6 +1436,8 @@ enum RefreshMsg {
     MediaReady(String, Result<MediaResolution, String>),
     /// A finished download: description of what landed where.
     DownloadDone(Article, Result<PathBuf, String>),
+    /// A finished manual backup (worker): the saved path or error.
+    BackupDone(Result<PathBuf, String>),
     /// Detect Audio finished for an article: the detected
     /// (media URL, media type), or None when no audio was found
     /// on the article's page (Python's on_detect_audio).
@@ -5873,6 +5861,7 @@ fn main() {
         let state_bk = state.clone();
         let tree_bk = tree;
         let list_bk = list;
+        let tx_bk = tx.clone();
         let act_backup: Rc<dyn Fn()> = Rc::new(move || {
             let dlg = FileDialog::builder(&frame_bk)
                 .with_message("Save backup")
@@ -5885,14 +5874,23 @@ fn main() {
                 return;
             }
             if let Some(path) = dlg.get_path() {
-                match blindrss_core::maintenance::create_backup(
-                    &db_path(),
-                    &config_path(),
-                    &PathBuf::from(&path),
-                ) {
-                    Ok(()) => frame_bk.set_status_text(&format!("Backup saved to {path}"), 0),
-                    Err(e) => frame_bk.set_status_text(&format!("Backup: {e}"), 0),
-                }
+                // Python runs the backup on a worker (VACUUM + ZIP
+                // of a large library must not block the UI) and
+                // reports through the drain, where the completion
+                // message carries the sensitive-data notice.
+                frame_bk.set_status_text("Backing up data...", 0);
+                let tx_bk = tx_bk.clone();
+                std::thread::spawn(move || {
+                    let dest = PathBuf::from(&path);
+                    let result = blindrss_core::maintenance::create_backup(
+                        &db_path(),
+                        &config_path(),
+                        &data_dir(),
+                        &dest,
+                    )
+                    .map(|()| dest);
+                    let _ = tx_bk.send(RefreshMsg::BackupDone(result));
+                });
             }
         });
         let state_rs = state.clone();
@@ -8923,6 +8921,38 @@ fn main() {
                             _ => {}
                         }
                     }
+                    Ok(RefreshMsg::BackupDone(result)) => match result {
+                        Ok(path) => {
+                            // Python's completion message, including
+                            // the sensitive-data notice: the backup
+                            // holds passwords, API keys and cookies.
+                            let md = MessageDialog::builder(
+                                &frame_tick,
+                                &format!(
+                                    "Backup saved to {}\n\nIt contains your passwords, API keys and site cookies, so keep it private.",
+                                    path.display()
+                                ),
+                                "Back Up Data",
+                            )
+                            .with_style(
+                                MessageDialogStyle::OK | MessageDialogStyle::IconInformation,
+                            )
+                            .build();
+                            md.show_modal();
+                            md.destroy();
+                        }
+                        Err(e) => {
+                            let md = MessageDialog::builder(
+                                &frame_tick,
+                                &format!("Backup failed: {e}"),
+                                "Error",
+                            )
+                            .with_style(MessageDialogStyle::OK | MessageDialogStyle::IconError)
+                            .build();
+                            md.show_modal();
+                            md.destroy();
+                        }
+                    },
                     Ok(RefreshMsg::DownloadDone(article, result)) => match result {
                         Ok(path) => {
                             let indexed = blindrss_core::config::Config::load(&config_path())

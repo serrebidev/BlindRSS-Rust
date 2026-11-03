@@ -126,7 +126,8 @@ fn staged_restore_applies_at_start() {
         let mut cfgs = std::fs::File::create(dir.join("config.json")).unwrap();
         cfgs.write_all(b"{}").unwrap();
     }
-    blindrss_core::maintenance::create_backup(&src, &dir.join("config.json"), &zip_path).unwrap();
+    blindrss_core::maintenance::create_backup(&src, &dir.join("config.json"), &dir, &zip_path)
+        .unwrap();
     blindrss_core::maintenance::stage_restore(&zip_path, &dir).unwrap();
     assert!(dir.join("restore_pending/rss.db").exists());
     assert!(blindrss_core::maintenance::apply_pending_restore(

@@ -2277,3 +2277,70 @@ Python's `deleted:all` tree node in the main window. Screen-reader
 acceptance of the rebuilt dialog (NVDA pass over columns, search,
 multi-restore, confirmed purge, failure messages) remains pending the
 owner's hands, as does acceptance with real hosted accounts.
+## Audit 8 Task 5 resolution — safe backup and restore lifecycle (O01, O02, O09, O10, O11, O12)
+
+Closed 2026-11-03 on branch `audit8/task5-backup`, built on current main
+(`d4d69f6`). Assumption: Task 1 (atomic config) runs in parallel on another
+branch; this batch does not change config save/load, only moves and validates
+`config.json` as a file, and keeps the existing
+`apply_pending_restore(data_dir, db_path)` signature, so integration only
+needs to re-check the shared call sites in `app/src/main.rs`.
+
+- **O01** — `apply_pending_restore` removes the old database's `-wal`/`-shm`
+  sidecars at the stopped-DB boundary (after the old DB is moved aside,
+  before the restored file lands; nothing else in the codebase touches
+  sidecars). Regression `a8_restore_removes_stale_wal_shm`: stale WAL/SHM
+  beside the target are gone after apply and the restored rows read back
+  correctly.
+- **O02** — Restore now validates the full staged contents before any swap:
+  staging unpacks into a unique `restore-*` directory inside the data dir,
+  validates the staged DB with `PRAGMA integrity_check` (not just the
+  header) and the staged config as a JSON object, and only then swaps the
+  staging directory into `restore_pending/` (the old pending directory is
+  renamed aside first and restored if the swap fails). Config-only
+  archives stage and apply without touching the database; omitted
+  optional files are preserved. The direct `restore_backup` helper got
+  the same validate-everything-before-writing-anything treatment with
+  per-file atomic replacement. Regressions:
+  `a8_stage_rejects_header_valid_corrupt_db`, `a8_stage_rejects_bad_config`,
+  `a8_config_only_backup_stages_and_applies`,
+  `a8_failed_second_stage_preserves_first_stage`, `a8_foreign_zip_rejected`
+  (keeps Python's "This file is not a BlindRSS backup." message),
+  `a8_restore_backup_direct_validates_before_writing`.
+- **O09** — Backups include Python's four optional files
+  (`site_cookies.txt`, `site_cookies_ua.txt`, `site_cookies_ua_hosts.json`,
+  `youtube_cookies.txt`) when present, and staged restores apply them into
+  the data directory. `create_backup` gained the `data_dir` parameter
+  Python's signature has. Regression
+  `a8_optional_files_round_trip_and_omission_preserves`.
+- **O10** — Backup writes are atomic: DB snapshot and ZIP partial use
+  process-unique names (pid + nanoseconds + atomic counter), the ZIP is
+  renamed over the destination only when complete, and a failure leaves
+  the previous archive and no partial behind. A backup also no longer
+  fabricates a `{}` config or an empty database when the source file is
+  absent (Python includes each member only when it exists). Regressions:
+  `a8_failed_backup_preserves_existing_archive`,
+  `a8_concurrent_backups_do_not_collide`.
+- **O11** — The manual Back Up Data action now runs `create_backup` on a
+  worker thread and reports through the existing `RefreshMsg` drain
+  (`RefreshMsg::BackupDone`); completion shows Python's message including
+  "It contains your passwords, API keys and site cookies, so keep it
+  private.", and failure shows Python's "Backup failed: …" error dialog.
+  App-caller wiring is compile-verified; the dialog itself is GUI surface
+  and owner screen-reader acceptance remains pending like every GUI item.
+- **O12** — New core `run_auto_backup` + `auto_backup_due` port Python's
+  rotation: names are `BlindRSS-auto-backup-YYYY-MM-DD-HHMMSS.zip`
+  (fixed-width UTC stamp; the format is what lexicographic rotation
+  sorts on and it interleaves correctly with Python's local-time names),
+  and rotation deletes only prefix + `.zip` matches beyond the keep
+  count. The app's startup maintenance now calls it instead of its
+  epoch-second names and its prefix-only scan, which could delete every
+  new Rust backup in a folder holding dated Python backups. Regression
+  `a8_auto_backup_rotation_mixed_names` (dated Python names, an old
+  epoch Rust name, a manual backup and a same-prefix non-ZIP file all
+  survive correctly).
+
+Checks (this batch): `cargo test -p blindrss-core --test
+maintenance_slice --test ops_slice` — 14 + 2 passed, including the 11 new
+Audit 8 tests; full workspace clippy/test/build gate results are recorded
+in the batch commit message.
