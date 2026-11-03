@@ -642,8 +642,8 @@ fn category_tree_collection_and_delete() {
     std::fs::create_dir_all(&dir).unwrap();
     let db = blindrss_core::db::Db::open_or_create(&dir.join("rss.db")).unwrap();
     db.add_category("News").unwrap();
-    db.add_category("News/Tech").unwrap();
-    db.add_category("News/Tech/AI").unwrap();
+    db.add_category("News / Tech").unwrap();
+    db.add_category("News / Tech / AI").unwrap();
     db.add_category("Sports").unwrap();
     let mk = |id: &str, cat: Option<&str>| blindrss_core::db::Feed {
         id: id.to_string(),
@@ -654,7 +654,7 @@ fn category_tree_collection_and_delete() {
         icon_url: None,
     };
     db.insert_feed_if_missing(&mk("f1", Some("News"))).unwrap();
-    db.insert_feed_if_missing(&mk("f2", Some("News/Tech/AI")))
+    db.insert_feed_if_missing(&mk("f2", Some("News / Tech / AI")))
         .unwrap();
     db.insert_feed_if_missing(&mk("f3", Some("Sports")))
         .unwrap();

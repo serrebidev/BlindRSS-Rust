@@ -68,9 +68,9 @@ fn ids(db: &Db, path: &str) -> Vec<String> {
 
 fn setup() -> Db {
     let db = temp_db();
-    db.ensure_category_path("News/Tech").unwrap();
+    db.ensure_category_path("News / Tech").unwrap();
     feed(&db, "f_news", Some("News"));
-    feed(&db, "f_tech", Some("News/Tech"));
+    feed(&db, "f_tech", Some("News / Tech"));
     feed(&db, "f_loose", None);
     feed(&db, "f_sentinel", Some("Uncategorized"));
     article(&db, "a1", "f_news", "2026-10-01");
@@ -91,7 +91,7 @@ fn setup() -> Db {
 fn category_view_includes_subtree_feeds_and_labels() {
     let db = setup();
     assert_eq!(ids(&db, "News"), vec!["a1", "a2", "a6"]);
-    assert_eq!(ids(&db, "News/Tech"), vec!["a2"]);
+    assert_eq!(ids(&db, "News / Tech"), vec!["a2"]);
 }
 
 #[test]

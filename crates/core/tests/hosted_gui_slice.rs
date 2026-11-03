@@ -112,6 +112,29 @@ fn greader_label_ops_surface_http_failure() {
 }
 
 #[test]
+fn miniflux_uncategorized_is_a_real_category() {
+    // Audit 8 D11: the sentinel capability is provider-shaped —
+    // only Miniflux's "Uncategorized" is a real, mutable
+    // category; Local and the GReader family keep it protected.
+    use blindrss_core::config::Config;
+    use blindrss_core::provider::get_provider;
+    let dir = std::env::temp_dir();
+    let local = get_provider(&Config::default(), dir.join("rss.db"));
+    assert!(!local.uncategorized_is_real_category());
+    for (name, real) in [("miniflux", true), ("inoreader", false), ("bazqux", false)] {
+        let mut cfg = Config::default();
+        cfg.set_path("active_provider", serde_json::json!(name));
+        let p = get_provider(&cfg, dir.join("rss.db"));
+        assert_eq!(p.uncategorized_is_real_category(), real, "{name}");
+        assert_eq!(
+            blindrss_core::provider::uncategorized_is_real_category(&cfg),
+            real,
+            "{name} config helper"
+        );
+    }
+}
+
+#[test]
 fn miniflux_category_create_posts_the_leaf_title() {
     let (url, server) = server(vec![(201, r#"{"id": 7, "title": "Podcasts"}"#)]);
     let client = MinifluxClient::new(&url, "test-key");

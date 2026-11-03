@@ -71,7 +71,11 @@ pub mod windows_shortcuts;
 pub mod youtube_account;
 pub mod ytfull;
 
-pub use db::{Article, Category, Chapter, Db, Feed, PlaybackState};
+pub use db::{
+    Article, CATEGORY_PATH_SEP, Category, Chapter, Db, Feed, PlaybackState, category_display_leaf,
+    category_parent_path, category_subtree_mapping, make_category_path, remap_delete_behavior,
+    sanitize_category_leaf,
+};
 pub use extract::{ExtractOutcome, extract_article};
 pub use feeds::{ParsedEntry, ParsedFeed, parse_feed};
 pub use refresh::{refresh_all, refresh_feed, store_parsed};

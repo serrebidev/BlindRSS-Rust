@@ -25,24 +25,26 @@ fn fresh_database_opens_empty_and_valid() {
 fn category_paths_and_delete_reparenting() {
     let path = scratch("blindrss_batch1_cats.db");
     let db = Db::open_or_create(&path).unwrap();
-    db.ensure_category_path("News/Tech").unwrap();
-    db.ensure_category_path("News/World").unwrap();
+    db.ensure_category_path("News / Tech").unwrap();
+    db.ensure_category_path("News / World").unwrap();
     let titles: Vec<String> = db
         .categories()
         .unwrap()
         .iter()
         .map(|c| c.title.clone())
         .collect();
-    assert_eq!(titles, vec!["News", "News/Tech", "News/World"]);
-    // A feed living in News/Tech, one directly in News.
+    assert_eq!(titles, vec!["News", "News / Tech", "News / World"]);
+    // A feed living in News / Tech, one directly in News.
     let f1 = db
-        .add_feed("https://example.com/f1", "f1", Some("News/Tech"))
+        .add_feed("https://example.com/f1", "f1", Some("News / Tech"))
         .unwrap();
     db.add_feed("https://example.com/f2", "f2", Some("News"))
         .unwrap();
     let f1 = f1.id;
-    // Deleting News/Tech drops f1 to News.
-    assert!(db.delete_category_path("News/Tech").unwrap());
+    // Deleting News / Tech sends f1 to Uncategorized (Python
+    // delete_category: feeds in the deleted category fall back
+    // to the sentinel, not up to the parent).
+    assert!(db.delete_category_path("News / Tech").unwrap());
     let feeds = db.feeds().unwrap();
     assert_eq!(
         feeds
@@ -51,12 +53,21 @@ fn category_paths_and_delete_reparenting() {
             .unwrap()
             .category
             .as_deref(),
-        Some("News")
+        Some("Uncategorized")
     );
-    // Deleting News reparents f1/f2 to uncategorized and News/World to root.
+    // Deleting News sends its feeds to Uncategorized too and
+    // reparents News / World to the root as "World".
     assert!(db.delete_category_path("News").unwrap());
     let feeds = db.feeds().unwrap();
-    assert_eq!(feeds.iter().find(|f| f.id == f1).unwrap().category, None);
+    assert_eq!(
+        feeds
+            .iter()
+            .find(|f| f.id == f1)
+            .unwrap()
+            .category
+            .as_deref(),
+        Some("Uncategorized")
+    );
     let titles: Vec<String> = db
         .categories()
         .unwrap()
@@ -71,7 +82,7 @@ fn category_paths_and_delete_reparenting() {
 fn rename_category_moves_the_subtree() {
     let path = scratch("blindrss_batch1_rename.db");
     let db = Db::open_or_create(&path).unwrap();
-    db.ensure_category_path("Old/Sub").unwrap();
+    db.ensure_category_path("Old / Sub").unwrap();
     db.rename_category("Old", "New").unwrap();
     let titles: Vec<String> = db
         .categories()
@@ -79,7 +90,7 @@ fn rename_category_moves_the_subtree() {
         .iter()
         .map(|c| c.title.clone())
         .collect();
-    assert_eq!(titles, vec!["New", "New/Sub"]);
+    assert_eq!(titles, vec!["New", "New / Sub"]);
     let _ = std::fs::remove_file(&path);
 }
 
@@ -156,14 +167,14 @@ fn opml_import_builds_full_category_paths() {
     assert_eq!(n, 2);
     let feeds = db.feeds().unwrap();
     let nested = feeds.iter().find(|f| f.title == "Example").unwrap();
-    assert_eq!(nested.category.as_deref(), Some("News/Tech"));
+    assert_eq!(nested.category.as_deref(), Some("News / Tech"));
     let titles: Vec<String> = db
         .categories()
         .unwrap()
         .iter()
         .map(|c| c.title.clone())
         .collect();
-    assert_eq!(titles, vec!["News", "News/Tech"]);
+    assert_eq!(titles, vec!["News", "News / Tech"]);
     let _ = std::fs::remove_file(&path);
 }
 
@@ -175,7 +186,7 @@ fn opml_import_under_prefixes_and_export_nests() {
     assert_eq!(n, 2);
     let feeds = db.feeds().unwrap();
     let nested = feeds.iter().find(|f| f.title == "Example").unwrap();
-    assert_eq!(nested.category.as_deref(), Some("Imports/News/Tech"));
+    assert_eq!(nested.category.as_deref(), Some("Imports / News / Tech"));
     let solo = feeds.iter().find(|f| f.title == "Solo").unwrap();
     assert_eq!(solo.category.as_deref(), Some("Imports"));
     // Export nests the path as an outline hierarchy that the
@@ -186,7 +197,7 @@ fn opml_import_under_prefixes_and_export_nests() {
     blindrss_core::opml::import_opml(&db2, &xml).unwrap();
     let feeds2 = db2.feeds().unwrap();
     let nested2 = feeds2.iter().find(|f| f.title == "Example").unwrap();
-    assert_eq!(nested2.category.as_deref(), Some("Imports/News/Tech"));
+    assert_eq!(nested2.category.as_deref(), Some("Imports / News / Tech"));
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(&path2);
 }

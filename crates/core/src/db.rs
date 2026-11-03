@@ -45,6 +45,68 @@ pub struct Category {
     pub parent_id: Option<String>,
 }
 
+/// Python `core/db.py` CATEGORY_PATH_SEP: a category's identity
+/// is its full path (`Parent / Child`) in storage; only the leaf
+/// is displayed. Two subcategories sharing a leaf name under
+/// different parents must not collide (Python issue #27).
+pub const CATEGORY_PATH_SEP: &str = " / ";
+
+/// Join a parent category path and a leaf title into a full
+/// category path (Python `make_category_path`).
+pub fn make_category_path(parent: Option<&str>, leaf: &str) -> String {
+    let leaf = leaf.trim();
+    match parent.map(str::trim).filter(|p| !p.is_empty()) {
+        Some(p) => format!("{p}{CATEGORY_PATH_SEP}{leaf}"),
+        None => leaf.to_string(),
+    }
+}
+
+/// The leaf (last path segment) of a category path, for display
+/// (Python `category_display_leaf`).
+pub fn category_display_leaf(path: &str) -> String {
+    match path.rsplit_once(CATEGORY_PATH_SEP) {
+        Some((_, leaf)) => leaf.to_string(),
+        None => path.to_string(),
+    }
+}
+
+/// The parent path of a category path, if any.
+pub fn category_parent_path(path: &str) -> Option<String> {
+    path.rsplit_once(CATEGORY_PATH_SEP)
+        .map(|(parent, _)| parent.to_string())
+}
+
+/// Strip the path separator out of a user-entered leaf name so it
+/// cannot corrupt the path encoding (Python
+/// `sanitize_category_leaf`).
+pub fn sanitize_category_leaf(leaf: &str) -> String {
+    leaf.trim().replace(CATEGORY_PATH_SEP, " - ")
+}
+
+/// The (old, new) path mapping for a subtree rooted at `old`
+/// when the root moves to `new`: the root itself plus every
+/// descendant, tails preserved.
+pub fn category_subtree_mapping(titles: &[String], old: &str, new: &str) -> Vec<(String, String)> {
+    let prefix = format!("{old}{CATEGORY_PATH_SEP}");
+    titles
+        .iter()
+        .filter(|t| t.as_str() == old || t.starts_with(&prefix))
+        .map(|t| (t.clone(), format!("{new}{}", &t[old.len()..])))
+        .collect()
+}
+
+/// Rewrite a `delete_behavior` config value (`category:<path>`)
+/// through a category path mapping (Python
+/// `LocalProvider._update_category_delete_behavior`). Returns
+/// the new value when the target category was remapped.
+pub fn remap_delete_behavior(behavior: &str, mapping: &[(String, String)]) -> Option<String> {
+    let target = behavior.trim().strip_prefix("category:")?.trim();
+    mapping
+        .iter()
+        .find(|(old, _)| old == target)
+        .map(|(_, new)| format!("category:{new}"))
+}
+
 /// One recorded change-history version of an article
 /// (Python `article_versions` row, newest first when listed).
 #[derive(Debug, Clone, PartialEq)]
@@ -1205,38 +1267,202 @@ impl Db {
         Ok(())
     }
 
-    /// Rename a category: the categories row and every feed's
-    /// category title string move together (Python semantics).
-    pub fn rename_category(&self, old_title: &str, new_title: &str) -> rusqlite::Result<()> {
-        // Renaming a category renames its whole subtree: descendant
-        // category paths and feed assignments keep their tails.
+    /// Run `f` inside BEGIN IMMEDIATE … COMMIT, rolling back on
+    /// any error (the schema-init transaction pattern). Category
+    /// mutations rewrite many rows across tables; a failure
+    /// midway must leave the old working data untouched.
+    fn category_txn<T>(&self, f: impl FnOnce(&Self) -> rusqlite::Result<T>) -> rusqlite::Result<T> {
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        match f(self) {
+            Ok(v) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(v)
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
+    }
+
+    /// Rewrite every stored reference to a category path after
+    /// the path itself moves (Python `core/db.py`
+    /// `rewrite_category_references`): article overrides, article
+    /// labels, per-feed delete targets and filter-rule
+    /// move/label action targets. The global config
+    /// `delete_behavior` target is remapped by the caller through
+    /// `remap_delete_behavior` with the same mapping.
+    fn rewrite_category_references(&self, old: &str, new: &str) -> rusqlite::Result<()> {
         self.conn.execute(
-            "UPDATE categories SET title = ?2 WHERE title = ?1",
-            params![old_title, new_title],
+            "UPDATE articles SET category_override = ?1 WHERE category_override = ?2",
+            params![new, old],
         )?;
         self.conn.execute(
-            "UPDATE categories SET title = ?2 || substr(title, ?3) \
-             WHERE title LIKE ?1",
-            params![
-                format!("{old_title}/%"),
-                format!("{new_title}/"),
-                (old_title.len() + 2) as i64
-            ],
+            "INSERT OR IGNORE INTO article_labels (article_id, category) \
+             SELECT article_id, ?1 FROM article_labels WHERE category = ?2",
+            params![new, old],
         )?;
         self.conn.execute(
-            "UPDATE feeds SET category = ?2 WHERE category = ?1",
-            params![old_title, new_title],
+            "DELETE FROM article_labels WHERE category = ?1",
+            params![old],
         )?;
         self.conn.execute(
-            "UPDATE feeds SET category = ?2 || substr(category, ?3) \
-             WHERE category LIKE ?1",
-            params![
-                format!("{old_title}/%"),
-                format!("{new_title}/"),
-                (old_title.len() + 2) as i64
-            ],
+            "UPDATE feeds SET delete_behavior = ?1 WHERE delete_behavior = ?2",
+            params![format!("category:{new}"), format!("category:{old}")],
         )?;
+        let rules: Vec<(String, Option<String>)> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT id, actions_json FROM filter_rules")?;
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for (id, raw) in rules {
+            let Some(raw) = raw else { continue };
+            let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+                continue;
+            };
+            let mut changed = false;
+            if let Some(obj) = value.as_object_mut() {
+                for key in ["move", "label"] {
+                    if obj.get(key).and_then(|v| v.as_str()) == Some(old) {
+                        obj.insert(key.to_string(), serde_json::Value::String(new.to_string()));
+                        changed = true;
+                    }
+                }
+            }
+            if changed {
+                self.conn.execute(
+                    "UPDATE filter_rules SET actions_json = ?1 WHERE id = ?2",
+                    params![value.to_string(), id],
+                )?;
+            }
+        }
         Ok(())
+    }
+
+    /// Apply a category path mapping inside the current
+    /// transaction: category rows, feed assignments and every
+    /// reference (see `rewrite_category_references`).
+    fn apply_category_mapping(&self, mapping: &[(String, String)]) -> rusqlite::Result<()> {
+        for (old, new) in mapping {
+            self.conn.execute(
+                "UPDATE categories SET title = ?1 WHERE title = ?2",
+                params![new, old],
+            )?;
+            self.conn.execute(
+                "UPDATE feeds SET category = ?1 WHERE category = ?2",
+                params![new, old],
+            )?;
+            self.rewrite_category_references(old, new)?;
+        }
+        Ok(())
+    }
+
+    fn category_row(&self, title: &str) -> rusqlite::Result<Option<(String, Option<String>)>> {
+        use rusqlite::OptionalExtension;
+        self.conn
+            .query_row(
+                "SELECT id, parent_id FROM categories WHERE title = ?1",
+                params![title],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+    }
+
+    fn category_title_by_id(&self, id: &str) -> rusqlite::Result<Option<String>> {
+        use rusqlite::OptionalExtension;
+        self.conn
+            .query_row(
+                "SELECT title FROM categories WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()
+    }
+
+    /// Rename a category (Python `LocalProvider.rename_category`):
+    /// `new_leaf` is the new LEAF name; the node keeps its parent,
+    /// its descendants keep their path tails, and every feed
+    /// assignment and reference moves with it, transactionally.
+    /// False when the category is missing or the target path is
+    /// already taken; on false (or error) nothing has changed.
+    pub fn rename_category(&self, old_title: &str, new_leaf: &str) -> rusqlite::Result<bool> {
+        let old_path = old_title.trim();
+        let leaf = sanitize_category_leaf(new_leaf);
+        if old_path.is_empty() || leaf.is_empty() {
+            return Ok(false);
+        }
+        let Some((_, parent_id)) = self.category_row(old_path)? else {
+            return Ok(false);
+        };
+        let parent_path = match &parent_id {
+            Some(pid) => self.category_title_by_id(pid)?,
+            None => None,
+        };
+        let new_path = make_category_path(parent_path.as_deref(), &leaf);
+        if new_path == old_path {
+            return Ok(true);
+        }
+        if self.category_row(&new_path)?.is_some() {
+            return Ok(false);
+        }
+        let titles: Vec<String> = self.categories()?.into_iter().map(|c| c.title).collect();
+        let mapping = category_subtree_mapping(&titles, old_path, &new_path);
+        self.category_txn(|db| db.apply_category_mapping(&mapping))?;
+        Ok(true)
+    }
+
+    /// Move a category under a new parent (Python
+    /// `LocalProvider.move_category`, issue #86): the leaf name
+    /// is kept, only the ancestry changes; the node's `parent_id`
+    /// is updated and every descendant path, feed assignment and
+    /// reference is rewritten transactionally. False — with
+    /// nothing changed — for the protected sentinel, a missing
+    /// category or parent, a move under itself/its own subtree,
+    /// or a leaf collision under the destination parent.
+    pub fn move_category(&self, title: &str, parent_title: Option<&str>) -> rusqlite::Result<bool> {
+        let old_path = title.trim();
+        let new_parent = parent_title.map(str::trim).filter(|s| !s.is_empty());
+        if old_path.is_empty() || old_path.eq_ignore_ascii_case("uncategorized") {
+            return Ok(false);
+        }
+        if new_parent.is_some_and(|p| p.eq_ignore_ascii_case("uncategorized")) {
+            return Ok(false);
+        }
+        let descendant = format!("{old_path}{CATEGORY_PATH_SEP}");
+        if new_parent.is_some_and(|p| p == old_path || p.starts_with(&descendant)) {
+            return Ok(false);
+        }
+        let Some((cat_id, _)) = self.category_row(old_path)? else {
+            return Ok(false);
+        };
+        let new_parent_id = match new_parent {
+            Some(p) => match self.category_row(p)? {
+                Some((id, _)) => Some(id),
+                None => return Ok(false),
+            },
+            None => None,
+        };
+        let new_path = make_category_path(new_parent, &category_display_leaf(old_path));
+        if new_path == old_path {
+            return Ok(true);
+        }
+        if self.category_row(&new_path)?.is_some() {
+            return Ok(false);
+        }
+        let titles: Vec<String> = self.categories()?.into_iter().map(|c| c.title).collect();
+        let mapping = category_subtree_mapping(&titles, old_path, &new_path);
+        let new_parent_id2 = new_parent_id.clone();
+        self.category_txn(|db| {
+            db.apply_category_mapping(&mapping)?;
+            db.conn.execute(
+                "UPDATE categories SET parent_id = ?1 WHERE id = ?2",
+                params![new_parent_id2, cat_id],
+            )?;
+            Ok(())
+        })?;
+        Ok(true)
     }
 
     /// Move one feed into a category (None = uncategorized).
@@ -1295,18 +1521,28 @@ impl Db {
         Ok(cat)
     }
 
-    /// Ensure a category path exists ("News/Tech"), creating any
+    /// Ensure a category path exists ("News / Tech"), creating any
     /// missing rows with parent links (Python's local provider
     /// stores hierarchy natively in categories.parent_id while the
-    /// title carries the full path). Returns the leaf's id.
+    /// title carries the full path). Path segments are split on
+    /// CATEGORY_PATH_SEP only: a bare "/" is part of a leaf name.
+    /// Returns the leaf's id.
     pub fn ensure_category_path(&self, path: &str) -> rusqlite::Result<String> {
         let mut parent_id: Option<String> = None;
         let mut current = String::new();
-        for segment in path.split('/').filter(|s| !s.trim().is_empty()) {
-            if !current.is_empty() {
-                current.push('/');
+        for segment in path.split(CATEGORY_PATH_SEP) {
+            let leaf = sanitize_category_leaf(segment);
+            if leaf.is_empty() {
+                continue;
             }
-            current.push_str(segment.trim());
+            current = make_category_path(
+                if current.is_empty() {
+                    None
+                } else {
+                    Some(current.as_str())
+                },
+                &leaf,
+            );
             let existing: Option<String> = self
                 .conn
                 .query_row(
@@ -1340,84 +1576,101 @@ impl Db {
         Ok(parent_id.unwrap_or_default())
     }
 
-    /// Delete a category by full path (Python delete_category):
-    /// direct children and their feeds are reparented to the
-    /// deleted node's parent, shortening their paths; the node
-    /// itself is removed. Refuses when a reparented child would
-    /// collide with an existing category of the same name.
+    /// Delete a category by full path (Python
+    /// `LocalProvider.delete_category`): direct children are
+    /// reparented to the deleted node's parent, shortening their
+    /// paths; feeds directly in the deleted category fall back to
+    /// Uncategorized; every reference follows the same mapping,
+    /// all in one transaction. When a reparented child would
+    /// collide with an existing category, Python's fallback
+    /// applies instead: the whole subtree is dropped and its
+    /// feeds go to Uncategorized. False — nothing changed — for
+    /// the protected sentinel or a missing category.
     pub fn delete_category_path(&self, path: &str) -> rusqlite::Result<bool> {
-        let row: Option<(String, Option<String>)> = self
-            .conn
-            .query_row(
-                "SELECT id, parent_id FROM categories WHERE title = ?1",
-                params![path],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .ok();
-        let Some((cat_id, parent_id)) = row else {
+        let path = path.trim();
+        if path.is_empty() || path.eq_ignore_ascii_case("uncategorized") {
+            return Ok(false);
+        }
+        let Some((cat_id, parent_id)) = self.category_row(path)? else {
             return Ok(false);
         };
         let parent_path: Option<String> = match &parent_id {
-            Some(pid) => self
-                .conn
-                .query_row(
-                    "SELECT title FROM categories WHERE id = ?1",
-                    params![pid],
-                    |r| r.get(0),
-                )
-                .ok(),
+            Some(pid) => self.category_title_by_id(pid)?,
             None => None,
         };
-        let old_prefix = format!("{path}/");
+        let old_prefix = format!("{path}{CATEGORY_PATH_SEP}");
         let new_prefix = parent_path
             .as_ref()
-            .map(|p| format!("{p}/"))
+            .map(|p| format!("{p}{CATEGORY_PATH_SEP}"))
             .unwrap_or_default();
-        let cats = self.categories()?;
-        // Collision check: a shortened descendant path must not
-        // land on an existing category outside the subtree.
-        for c in &cats {
-            if let Some(rest) = c.title.strip_prefix(&old_prefix) {
-                let target = format!("{new_prefix}{rest}");
-                if cats
-                    .iter()
-                    .any(|o| o.title == target && o.id != c.id && !o.title.starts_with(&old_prefix))
-                {
-                    return Ok(false);
+        let titles: Vec<String> = self.categories()?.into_iter().map(|c| c.title).collect();
+        let descendants: Vec<String> = titles
+            .iter()
+            .filter(|t| t.starts_with(&old_prefix))
+            .cloned()
+            .collect();
+        // A shortened descendant path must not land on an existing
+        // category outside the subtree (nor on another shortened
+        // descendant).
+        let mut remaining: std::collections::HashSet<String> = titles.iter().cloned().collect();
+        for d in &descendants {
+            remaining.remove(d);
+        }
+        remaining.remove(path);
+        let mut mapping: Vec<(String, String)> = Vec::new();
+        let mut collision = false;
+        for old_p in &descendants {
+            let new_p = format!("{new_prefix}{}", &old_p[old_prefix.len()..]);
+            if remaining.contains(&new_p) {
+                collision = true;
+                break;
+            }
+            remaining.insert(new_p.clone());
+            mapping.push((old_p.clone(), new_p));
+        }
+        if collision {
+            // Python's safe fallback: drop the whole subtree,
+            // feeds and references go to Uncategorized.
+            let mut subtree = vec![path.to_string()];
+            subtree.extend(descendants.iter().cloned());
+            self.category_txn(|db| {
+                for p in &subtree {
+                    db.conn.execute(
+                        "UPDATE feeds SET category = 'Uncategorized' WHERE category = ?1",
+                        params![p],
+                    )?;
+                    db.rewrite_category_references(p, "Uncategorized")?;
+                    db.conn
+                        .execute("DELETE FROM categories WHERE title = ?1", params![p])?;
                 }
-            }
+                Ok(())
+            })?;
+            return Ok(true);
         }
-        // Rewrite descendant category paths, then feeds, then the
-        // node itself.
-        for c in &cats {
-            if let Some(rest) = c.title.strip_prefix(&old_prefix) {
-                let target = format!("{new_prefix}{rest}");
-                self.conn.execute(
-                    "UPDATE categories SET title = ?2 WHERE id = ?1",
-                    params![c.id, target],
-                )?;
-            }
-        }
-        self.conn.execute(
-            "UPDATE feeds SET category = ?2 WHERE category = ?1",
-            params![path, parent_path],
-        )?;
-        self.conn.execute(
-            "UPDATE feeds SET category = ?2 || substr(category, ?3) \
-             WHERE category LIKE ?1",
-            params![
-                format!("{old_prefix}%"),
-                new_prefix,
-                (old_prefix.len() + 1) as i64
-            ],
-        )?;
-        // Children of the deleted node now belong to its parent.
-        self.conn.execute(
-            "UPDATE categories SET parent_id = ?2 WHERE parent_id = ?1",
-            params![cat_id, parent_id],
-        )?;
-        self.conn
-            .execute("DELETE FROM categories WHERE id = ?1", params![cat_id])?;
+        // Shortest paths first: a same-named child inherits the
+        // deleted node's path only after the node row is gone.
+        mapping.sort_by_key(|(old, _)| old.len());
+        self.category_txn(|db| {
+            // Reparent direct children (parent_id is by id, so
+            // deeper links hold).
+            db.conn.execute(
+                "UPDATE categories SET parent_id = ?1 WHERE parent_id = ?2",
+                params![parent_id, cat_id],
+            )?;
+            // Feeds directly in the deleted category fall back to
+            // Uncategorized, and references follow.
+            db.conn.execute(
+                "UPDATE feeds SET category = 'Uncategorized' WHERE category = ?1",
+                params![path],
+            )?;
+            db.rewrite_category_references(path, "Uncategorized")?;
+            // Free the old path before a same-named child
+            // inherits it.
+            db.conn
+                .execute("DELETE FROM categories WHERE id = ?1", params![cat_id])?;
+            db.apply_category_mapping(&mapping)?;
+            Ok(())
+        })?;
         Ok(true)
     }
 
@@ -1564,7 +1817,7 @@ impl Db {
         // The subtree name set: the path plus every descendant path
         // known to the categories table or carried by a feed.
         let mut names: Vec<String> = vec![path.to_string()];
-        let prefix = format!("{path}/");
+        let prefix = format!("{path}{CATEGORY_PATH_SEP}");
         let mut push_name = |n: &str| {
             if (n == path || n.starts_with(&prefix)) && !names.iter().any(|x| x == n) {
                 names.push(n.to_string());
@@ -1801,7 +2054,7 @@ impl Db {
     /// Feeds whose category is `path` or a subcategory of it
     /// (Python's delete-category-with-feeds feed collection).
     pub fn feeds_in_category_tree(&self, path: &str) -> rusqlite::Result<Vec<Feed>> {
-        let prefix = format!("{path}/");
+        let prefix = format!("{path}{CATEGORY_PATH_SEP}");
         Ok(self
             .feeds()?
             .into_iter()
@@ -1818,7 +2071,7 @@ impl Db {
     /// the caller removes or reparents the feeds first). Returns
     /// false when the category does not exist.
     pub fn delete_category_tree(&self, path: &str) -> rusqlite::Result<bool> {
-        let prefix = format!("{path}/");
+        let prefix = format!("{path}{CATEGORY_PATH_SEP}");
         let ids: Vec<String> = self
             .categories()?
             .into_iter()

@@ -55,6 +55,16 @@ pub trait Provider {
         category: Option<&str>,
     ) -> Result<(), String>;
     fn mark_all_read(&self, feed_id: Option<&str>) -> Result<usize, String>;
+    /// Python `providers/base.py::uncategorized_is_real_category`:
+    /// true when this provider's "Uncategorized" is an ordinary,
+    /// deletable category rather than the synthetic "no category"
+    /// bucket. Only Miniflux qualifies — it requires every feed
+    /// to have a category, so "no category" is a real server
+    /// category the user can rename or delete (issue #86). The
+    /// system-folder guards consult this capability.
+    fn uncategorized_is_real_category(&self) -> bool {
+        false
+    }
     /// Pull the provider's latest content into the cache.
     /// Returns a human summary.
     fn refresh(&self) -> Result<String, String>;
@@ -275,6 +285,11 @@ impl Provider for HostedProvider {
     fn is_remote(&self) -> bool {
         true
     }
+    fn uncategorized_is_real_category(&self) -> bool {
+        // Miniflux only (Python providers/miniflux.py); the
+        // GReader family uses the sentinel as "no folder".
+        matches!(self.kind, HostedKind::Miniflux)
+    }
     fn feeds(&self) -> Result<Vec<Feed>, String> {
         // The cache holds this provider's subscriptions under
         // its id scheme (GReader "feed/..." stream ids, Miniflux
@@ -467,6 +482,15 @@ pub fn get_provider(cfg: &Config, db_path: PathBuf) -> Box<dyn Provider + Send> 
         "miniflux" => hosted("miniflux", HostedKind::Miniflux),
         _ => Box::new(LocalProvider { db_path }),
     }
+}
+
+/// The active provider's sentinel capability (see
+/// `Provider::uncategorized_is_real_category`), resolved from
+/// config for call sites that hold no provider object.
+pub fn uncategorized_is_real_category(cfg: &Config) -> bool {
+    // Mirrors the HostedProvider override: Miniflux is the only
+    // provider whose Uncategorized is a real category.
+    active_name(cfg) == "miniflux"
 }
 
 /// The configured active provider's name, normalized.

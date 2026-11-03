@@ -452,12 +452,7 @@ fn mirror_hosted_category_create(tx: &std::sync::mpsc::Sender<RefreshMsg>, full_
         if url.is_empty() || key.is_empty() {
             return;
         }
-        let leaf = full_path
-            .rsplit('/')
-            .next()
-            .unwrap_or(&full_path)
-            .trim()
-            .to_string();
+        let leaf = blindrss_core::category_display_leaf(full_path.trim());
         if leaf.is_empty() {
             return;
         }
@@ -1782,6 +1777,34 @@ fn is_uncategorized_cat(category: Option<&str>) -> bool {
     c.is_empty() || c.eq_ignore_ascii_case("uncategorized")
 }
 
+/// Python `gui/mainframe.py::_is_protected_uncategorized` (Audit
+/// 8 D11): the sentinel is protected only when the active
+/// provider treats it as the synthetic "no category" bucket.
+/// On Miniflux it is a real category and the rename/remove
+/// guards step aside.
+fn is_protected_uncategorized(category: Option<&str>) -> bool {
+    if !is_uncategorized_cat(category) {
+        return false;
+    }
+    let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+    !blindrss_core::provider::uncategorized_is_real_category(&cfg)
+}
+
+/// Remap the global config `delete_behavior` category target
+/// through a category path mapping (Python
+/// `LocalProvider._update_category_delete_behavior`).
+fn remap_global_delete_behavior(mapping: &[(String, String)]) {
+    if mapping.is_empty() {
+        return;
+    }
+    let mut cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+    let current = cfg.get_str("delete_behavior", "").to_string();
+    if let Some(new) = blindrss_core::remap_delete_behavior(&current, mapping) {
+        cfg.set_path("delete_behavior", serde_json::json!(new));
+        let _ = cfg.save(&config_path());
+    }
+}
+
 /// The category path of the current tree selection, if any.
 fn selected_category(st: &State) -> Option<String> {
     st.selected_feed
@@ -1799,7 +1822,7 @@ fn feeds_in_category(feeds: &[Feed], path: &str) -> Vec<Feed> {
             .cloned()
             .collect();
     }
-    let prefix = format!("{path}/");
+    let prefix = format!("{path}{}", blindrss_core::CATEGORY_PATH_SEP);
     feeds
         .iter()
         .filter(|f| {
@@ -1936,7 +1959,7 @@ fn rebuild_tree(state: &mut State, tree: &TreeCtrl) {
     let counts = db.unread_counts().unwrap_or_default();
     let feeds = state.feeds.clone();
     // Category grouping (Python parity): a node per category path
-    // ("News", "News/Tech"), feeds under their category node,
+    // ("News", "News / Tech"), feeds under their category node,
     // uncategorized feeds at the root. Node data is "cat:<path>".
     let expand_cats = blindrss_core::config::Config::load(&config_path())
         .unwrap_or_default()
@@ -1985,20 +2008,23 @@ fn rebuild_tree(state: &mut State, tree: &TreeCtrl) {
     }
     for path in &paths {
         let mut cur = String::new();
-        for seg in path.split('/').filter(|s| !s.trim().is_empty()) {
+        for seg in path
+            .split(blindrss_core::CATEGORY_PATH_SEP)
+            .filter(|s| !s.trim().is_empty())
+        {
             let parent = if cur.is_empty() {
                 root.clone()
             } else {
                 cat_items.get(&cur).cloned().unwrap_or_else(|| root.clone())
             };
             if !cur.is_empty() {
-                cur.push('/');
+                cur.push_str(blindrss_core::CATEGORY_PATH_SEP);
             }
             cur.push_str(seg.trim());
             if !cat_items.contains_key(&cur) {
                 // Node label: leaf name plus the unread total of
                 // every feed in scope, Python-style.
-                let prefix = format!("{cur}/");
+                let prefix = format!("{cur}{}", blindrss_core::CATEGORY_PATH_SEP);
                 let unread: i64 = feeds
                     .iter()
                     .filter(|f| {
@@ -4365,38 +4391,65 @@ fn main() {
                 frame_rc.set_status_text("Selected feed has no category", 0);
                 return;
             };
-            if is_uncategorized_cat(Some(&category)) {
+            if is_protected_uncategorized(Some(&category)) {
                 frame_rc.set_status_text("The Uncategorized folder cannot be renamed.", 0);
                 return;
             }
             if !db_ok {
                 return;
             }
+            // Python's rename prompt edits the LEAF only; the
+            // node keeps its parent (Db::rename_category takes
+            // the new leaf, like Python's provider method).
+            let leaf = blindrss_core::category_display_leaf(&category);
             let Some(new_name) = prompt_focus(
                 &frame_rc,
                 "New category name:",
                 "Rename Category",
-                &category,
+                &leaf,
                 &state_rc.borrow(),
                 &tree_rc,
                 &list_rc,
             ) else {
                 return;
             };
-            if new_name.trim().is_empty() || new_name.trim() == category {
+            let new_leaf = blindrss_core::sanitize_category_leaf(&new_name);
+            if new_leaf.is_empty() || new_leaf == leaf {
                 return;
             }
+            let new_path = blindrss_core::make_category_path(
+                blindrss_core::category_parent_path(&category).as_deref(),
+                &new_leaf,
+            );
+            let mapping = {
+                let st = state_rc.borrow();
+                st.db
+                    .as_ref()
+                    .and_then(|db| db.categories().ok())
+                    .map(|cats| {
+                        blindrss_core::category_subtree_mapping(
+                            &cats.into_iter().map(|c| c.title).collect::<Vec<_>>(),
+                            &category,
+                            &new_path,
+                        )
+                    })
+                    .unwrap_or_default()
+            };
             let mut st = state_rc.borrow_mut();
+            let renamed = match &st.db {
+                Some(db) => db.rename_category(&category, &new_leaf),
+                None => Ok(false),
+            };
             if let Some(db) = &st.db {
-                let _ = db.rename_category(&category, new_name.trim());
                 st.feeds = db.feeds().unwrap_or_default();
             }
             drop(st);
-            mirror_hosted_category(
-                &tx_rc,
-                Some((category.clone(), new_name.trim().to_string())),
-                None,
-            );
+            if !matches!(renamed, Ok(true)) {
+                frame_rc.set_status_text("Category not renamed (missing, or the name is taken)", 0);
+                return;
+            }
+            remap_global_delete_behavior(&mapping);
+            mirror_hosted_category(&tx_rc, Some((category.clone(), new_path)), None);
             let mut st = state_rc.borrow_mut();
             rebuild_tree(&mut st, &tree_rc);
             refill_articles(&mut st, &list_rc);
@@ -4409,9 +4462,9 @@ fn main() {
 
         // Edit Category (tree context / feeds.edit_selected):
         // Python's CategoryPropertiesDialog (Batch 41a) — rename
-        // the leaf and/or move under another category. One
-        // Db::rename_category call moves the whole subtree, so
-        // it covers Python's move-then-rename sequence.
+        // the leaf and/or move under another category, applied
+        // as Python does: move first (Db::move_category), then
+        // rename the leaf (Db::rename_category).
         let state_ec = state.clone();
         let frame_ec = frame;
         let tree_ec = tree;
@@ -4426,7 +4479,7 @@ fn main() {
                 frame_ec.set_status_text("Select a category in the tree first", 0);
                 return;
             };
-            if is_uncategorized_cat(Some(&category)) {
+            if is_protected_uncategorized(Some(&category)) {
                 frame_ec.set_status_text("The Uncategorized folder cannot be renamed or moved.", 0);
                 return;
             }
@@ -4443,15 +4496,50 @@ fn main() {
             if new_path == category {
                 return;
             }
+            let (new_leaf, new_parent) = (
+                blindrss_core::category_display_leaf(&new_path),
+                blindrss_core::category_parent_path(&new_path),
+            );
+            let old_leaf = blindrss_core::category_display_leaf(&category);
+            let old_parent = blindrss_core::category_parent_path(&category);
+            let titles: Vec<String> = {
+                let st = state_ec.borrow();
+                st.db
+                    .as_ref()
+                    .and_then(|db| db.categories().ok())
+                    .map(|cats| cats.into_iter().map(|c| c.title).collect())
+                    .unwrap_or_default()
+            };
+            let mapping = blindrss_core::category_subtree_mapping(&titles, &category, &new_path);
             let mut st = state_ec.borrow_mut();
             if let Some(db) = &st.db {
-                if let Some((parent, _)) = new_path.rsplit_once('/') {
+                if let Some(parent) = &new_parent {
                     let _ = db.ensure_category_path(parent);
                 }
-                let _ = db.rename_category(&category, &new_path);
+                // Move first, then rename (Python's order: the
+                // only collision that can block is at the
+                // destination).
+                let mut current = category.clone();
+                if new_parent != old_parent {
+                    if matches!(db.move_category(&current, new_parent.as_deref()), Ok(true)) {
+                        current =
+                            blindrss_core::make_category_path(new_parent.as_deref(), &old_leaf);
+                    } else {
+                        drop(st);
+                        frame_ec.set_status_text(
+                            "Category could not be moved (name taken at the destination)",
+                            0,
+                        );
+                        return;
+                    }
+                }
+                if new_leaf != old_leaf {
+                    let _ = db.rename_category(&current, &new_leaf);
+                }
                 st.feeds = db.feeds().unwrap_or_default();
             }
             drop(st);
+            remap_global_delete_behavior(&mapping);
             mirror_hosted_category(&tx_ec, Some((category.clone(), new_path.clone())), None);
             let mut st = state_ec.borrow_mut();
             rebuild_tree(&mut st, &tree_ec);
@@ -6218,8 +6306,8 @@ fn main() {
                     return;
                 };
                 let full = match &parent {
-                    Some(p) => format!("{p}/{}", name.trim()),
-                    None => name.trim().to_string(),
+                    Some(p) => blindrss_core::make_category_path(Some(p), name.trim()),
+                    None => blindrss_core::sanitize_category_leaf(name.trim()),
                 };
                 let st = state_ac.borrow();
                 match st.db.as_ref().map(|db| db.ensure_category_path(&full)) {
@@ -6246,14 +6334,14 @@ fn main() {
                     frame_dc.set_status_text("Select a category in the tree first", 0);
                     return;
                 };
-                if is_uncategorized_cat(Some(&path)) {
+                if is_protected_uncategorized(Some(&path)) {
                     frame_dc.set_status_text("The Uncategorized folder cannot be removed.", 0);
                     return;
                 }
                 let dlg = MessageDialog::builder(
                     &frame_dc,
                     &format!(
-                        "Delete category {path}? Its feeds and subcategories move up to the parent category."
+                        "Delete category {path}? Its feeds move to Uncategorized and its subcategories move up to the parent category."
                     ),
                     "Delete Category",
                 )
@@ -6264,10 +6352,46 @@ fn main() {
                 if rc != ID_YES {
                     return;
                 }
+                // Snapshot titles first: the global delete
+                // target remap needs the old subtree, and whether
+                // each descendant landed on its shortened path or
+                // (collision fallback) on Uncategorized.
+                let titles_before: Vec<String> = state_dc
+                    .borrow()
+                    .db
+                    .as_ref()
+                    .and_then(|db| db.categories().ok())
+                    .map(|cats| cats.into_iter().map(|c| c.title).collect())
+                    .unwrap_or_default();
                 let mut st = state_dc.borrow_mut();
                 let deleted = st.db.as_ref().map(|db| db.delete_category_path(&path));
                 if matches!(deleted, Some(Ok(true))) {
+                    let titles_after: Vec<String> = st
+                        .db
+                        .as_ref()
+                        .and_then(|db| db.categories().ok())
+                        .map(|cats| cats.into_iter().map(|c| c.title).collect())
+                        .unwrap_or_default();
+                    let prefix = format!("{path}{}", blindrss_core::CATEGORY_PATH_SEP);
+                    let parent_prefix = blindrss_core::category_parent_path(&path)
+                        .map(|p| format!("{p}{}", blindrss_core::CATEGORY_PATH_SEP))
+                        .unwrap_or_default();
+                    let mut mapping = vec![(path.clone(), "Uncategorized".to_string())];
+                    for t in titles_before.iter().filter(|t| t.starts_with(&prefix)) {
+                        let shortened = format!("{parent_prefix}{}", &t[prefix.len()..]);
+                        mapping.push((
+                            t.clone(),
+                            if titles_after.contains(&shortened) {
+                                shortened
+                            } else {
+                                "Uncategorized".to_string()
+                            },
+                        ));
+                    }
+                    drop(st);
+                    remap_global_delete_behavior(&mapping);
                     mirror_hosted_category(&tx_dc, None, Some(path.clone()));
+                    st = state_dc.borrow_mut();
                 }
                 match deleted {
                     Some(Ok(true)) => {
@@ -6361,7 +6485,7 @@ fn main() {
                     frame_df.set_status_text("Select a category in the tree first", 0);
                     return;
                 };
-                if is_uncategorized_cat(Some(&path)) {
+                if is_protected_uncategorized(Some(&path)) {
                     frame_df.set_status_text("The Uncategorized folder cannot be removed.", 0);
                     return;
                 }
@@ -6372,7 +6496,7 @@ fn main() {
                         .as_ref()
                         .and_then(|db| db.feeds_in_category_tree(&path).ok())
                         .unwrap_or_default();
-                    let prefix = format!("{path}/");
+                    let prefix = format!("{path}{}", blindrss_core::CATEGORY_PATH_SEP);
                     let subcats = st
                         .db
                         .as_ref()

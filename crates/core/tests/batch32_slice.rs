@@ -71,7 +71,7 @@ fn concurrent_ensure_category_path_is_idempotent() {
         let p = path.clone();
         handles.push(std::thread::spawn(move || {
             let db = Db::open(&p).unwrap();
-            db.ensure_category_path("News/Tech")
+            db.ensure_category_path("News / Tech")
         }));
     }
     let mut ids = Vec::new();
@@ -81,6 +81,6 @@ fn concurrent_ensure_category_path_is_idempotent() {
     assert!(ids.iter().all(|i| i == &ids[0]), "ids diverged: {ids:?}");
     let db = Db::open(&path).unwrap();
     let cats = db.categories().unwrap();
-    assert_eq!(cats.iter().filter(|c| c.title == "News/Tech").count(), 1);
+    assert_eq!(cats.iter().filter(|c| c.title == "News / Tech").count(), 1);
     assert_eq!(cats.iter().filter(|c| c.title == "News").count(), 1);
 }

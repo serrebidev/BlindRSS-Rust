@@ -5,7 +5,7 @@
 //! belong to that category. feeds.category stores the category title,
 //! matching the Python schema.
 
-use crate::db::{Db, Feed};
+use crate::db::{Db, Feed, make_category_path};
 use opml::{OPML, Outline};
 
 fn collect(
@@ -23,11 +23,8 @@ fn collect(
             out.push((url.clone(), title, category.map(str::to_string)));
         } else if !o.outlines.is_empty() {
             // Nested category outlines build the full path
-            // ("News/Tech"), matching Python's category identity.
-            let child = match category {
-                Some(parent) => format!("{parent}/{}", o.text.trim()),
-                None => o.text.trim().to_string(),
-            };
+            // ("News / Tech"), matching Python's category identity.
+            let child = make_category_path(category, o.text.trim());
             collect(&o.outlines, Some(&child), out);
         }
     }
@@ -52,7 +49,7 @@ pub fn import_opml_under(db: &Db, xml: &str, target: Option<&str>) -> Result<usi
             continue;
         }
         let category = match (target, category) {
-            (Some(t), Some(c)) => Some(format!("{t}/{c}")),
+            (Some(t), Some(c)) => Some(make_category_path(Some(t), &c)),
             (Some(t), None) => Some(t.to_string()),
             (None, c) => c,
         };
@@ -110,7 +107,10 @@ pub fn export_opml_feeds(feeds: &[Feed]) -> Result<String, String> {
         };
         let mut node = &mut root;
         if let Some(cat) = &f.category {
-            for segment in cat.split('/').filter(|s| !s.trim().is_empty()) {
+            for segment in cat
+                .split(crate::db::CATEGORY_PATH_SEP)
+                .filter(|s| !s.trim().is_empty())
+            {
                 node = node.children.entry(segment.trim().to_string()).or_default();
             }
         }

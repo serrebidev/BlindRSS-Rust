@@ -2056,3 +2056,64 @@ Python view-ID decode and full encode round trips) plus app unit tests
 batch commit message / PR notes). A manual restart after a successful
 location change (plan Task 1) remains owner-side acceptance, as does
 the NVDA pass over the Settings Advanced page.
+### Audit 8 Task 2 resolution — D01, D02, D11 (2026-11-03)
+
+Reproduction first: a probe test against the pre-fix code showed
+`ensure_category_path("Podcasts / Others")` storing `Podcasts/Others`
+(bare-slash split), so Python-created children were invisible to the
+Rust subtree queries; `Db::move_category` and the provider sentinel
+capability did not exist at all.
+
+- D01: category identity now uses Python's canonical separator
+  everywhere. `crates/core/src/db.rs` exports `CATEGORY_PATH_SEP`
+  (" / "), `make_category_path`, `category_display_leaf`,
+  `category_parent_path` and `sanitize_category_leaf` (ports of
+  `core/db.py`); creation (`ensure_category_path`), membership
+  (`category_membership`), subtree feed collection, tree deletion,
+  OPML import/export nesting, the app tree build, the New Category
+  join and the dialogs path helpers all split/join on it. A bare "/"
+  inside a leaf (e.g. "AC/DC Fans") is an ordinary character, as in
+  Python. Duplicate leaf names under different parents stay
+  distinct; no stored duplicates were collapsed.
+- D02: rename/move/delete are transactional (`BEGIN IMMEDIATE` …
+  COMMIT with rollback on error) and rewrite every reference, per
+  Python `rewrite_category_references` plus
+  `_update_category_delete_behavior`: category rows, feed
+  assignments, `articles.category_override`, `article_labels`,
+  per-feed `feeds.delete_behavior` targets, filter-rule
+  move/label action targets in `actions_json`, and the global
+  config `delete_behavior` target (remapped by the app through
+  `remap_delete_behavior` with the mutation's path mapping).
+  `Db::rename_category` now takes the new LEAF (the node keeps its
+  parent; collision with an existing path refuses with nothing
+  changed), matching Python's provider signature; the app's rename
+  prompt edits the leaf, and Category Properties applies Python's
+  move-first-then-rename order through the new
+  `Db::move_category` (which also maintains `parent_id`, refuses
+  sentinel/self/descendant moves and destination collisions).
+  `Db::delete_category_path` follows Python exactly: direct
+  children reparent to the deleted node's parent with shortened
+  paths, feeds directly in the deleted category fall back to
+  Uncategorized, and on a reparent collision Python's fallback
+  drops the subtree with its feeds going to Uncategorized.
+- D11: `Provider::uncategorized_is_real_category` (default false,
+  true only for Miniflux) plus the config-level
+  `provider::uncategorized_is_real_category` helper. The four app
+  guard sites (rename, edit/properties, delete, delete-with-feeds)
+  consult `is_protected_uncategorized`, so the local sentinel
+  stays protected while Miniflux's real category can be renamed
+  and deleted; hosted rename/delete mirroring already routes
+  through the Miniflux/GReader remote calls.
+
+Evidence: new `crates/core/tests/audit8_categories.rs` (7 tests:
+spaced-path creation/parent links, Python-child membership and
+tree queries, rename rewriting overrides/labels/filter targets/
+per-feed delete targets with the sibling leaf untouched, refused
+rename leaving every reference intact, move collision/self-move
+refusals plus a successful reparenting move, delete reparenting
+with reference rewrite to Uncategorized, provider capability) —
+all pass. Existing suites updated to Python-shaped spaced paths
+and Python delete semantics: batch1, batch25, batch27, batch32,
+audit7, manage, ops, hosted_gui (plus a capability test there).
+Owner screen-reader acceptance of the category dialogs remains
+pending as manual acceptance, per the plan.

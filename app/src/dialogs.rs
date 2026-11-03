@@ -664,34 +664,34 @@ pub fn show_category_picker(
 
 /// Categories that may become the parent of `path` (Python's
 /// `_eligible_parent_categories`): every stored category except
-/// the category itself and its own descendants, which cannot
-/// become their own ancestors.
+/// the category itself, its own descendants (which cannot
+/// become their own ancestors) and the Uncategorized sentinel.
 fn category_parent_choices(path: &str, all: &[String]) -> Vec<String> {
-    let descendant_prefix = format!("{path}/");
+    let descendant_prefix = format!("{path}{}", blindrss_core::CATEGORY_PATH_SEP);
     all.iter()
-        .filter(|c| c.as_str() != path && !c.starts_with(&descendant_prefix))
+        .filter(|c| {
+            c.as_str() != path
+                && !c.starts_with(&descendant_prefix)
+                && !c.trim().eq_ignore_ascii_case("uncategorized")
+        })
         .cloned()
         .collect()
 }
 
 /// The full path for a category after a Category Properties
 /// edit: the (sanitized) leaf under the chosen parent, or the
-/// leaf alone at top level. Path segments are joined with "/",
-/// the separator Rust storage uses (see Db::rename_category).
+/// leaf alone at top level. Path segments are joined with
+/// CATEGORY_PATH_SEP (" / "), Python's storage separator.
 fn category_edited_path(leaf: &str, parent: Option<&str>) -> String {
-    let leaf = leaf.trim().replace('/', " ").trim().to_string();
-    match parent.map(str::trim).filter(|p| !p.is_empty()) {
-        Some(p) => format!("{p}/{leaf}"),
-        None => leaf,
-    }
+    blindrss_core::make_category_path(parent, &blindrss_core::sanitize_category_leaf(leaf))
 }
 
 /// Split a stored category path into (leaf, parent path).
 fn category_leaf_parent(path: &str) -> (String, Option<String>) {
-    match path.rsplit_once('/') {
-        Some((parent, leaf)) => (leaf.trim().to_string(), Some(parent.trim().to_string())),
-        None => (path.trim().to_string(), None),
-    }
+    (
+        blindrss_core::category_display_leaf(path.trim()),
+        blindrss_core::category_parent_path(path.trim()),
+    )
 }
 
 /// Category Properties (Python's CategoryPropertiesDialog,
@@ -3342,12 +3342,12 @@ mod category_properties_tests {
 
     #[test]
     fn parent_choices_exclude_self_and_descendants() {
-        let all: Vec<String> = ["News", "News/Tech", "News/Tech/AI", "Sports"]
+        let all: Vec<String> = ["News", "News / Tech", "News / Tech / AI", "Sports"]
             .iter()
             .map(|s| s.to_string())
             .collect();
         assert_eq!(
-            category_parent_choices("News/Tech", &all),
+            category_parent_choices("News / Tech", &all),
             vec!["News".to_string(), "Sports".to_string()]
         );
         // A top-level category can move under anything but itself.
@@ -3357,19 +3357,22 @@ mod category_properties_tests {
     #[test]
     fn edited_path_joins_leaf_under_parent() {
         assert_eq!(category_edited_path("Tech", None), "Tech");
-        assert_eq!(category_edited_path("Tech", Some("News")), "News/Tech");
+        assert_eq!(category_edited_path("Tech", Some("News")), "News / Tech");
         assert_eq!(
             category_edited_path("  Tech  ", Some(" News ")),
-            "News/Tech"
+            "News / Tech"
         );
-        // A separator typed into the leaf cannot corrupt the path.
-        assert!(!category_edited_path("A/B", None).contains('/'));
+        // The spaced separator typed into the leaf cannot corrupt
+        // the path (Python sanitize_category_leaf); a bare "/"
+        // is an ordinary leaf character.
+        assert_eq!(category_edited_path("A / B", None), "A - B");
+        assert_eq!(category_edited_path("AC/DC", None), "AC/DC");
     }
 
     #[test]
     fn leaf_parent_split_matches_storage_paths() {
         assert_eq!(
-            category_leaf_parent("News/Tech"),
+            category_leaf_parent("News / Tech"),
             ("Tech".to_string(), Some("News".to_string()))
         );
         assert_eq!(category_leaf_parent("News"), ("News".to_string(), None));

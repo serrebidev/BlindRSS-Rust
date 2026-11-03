@@ -85,7 +85,7 @@ fn category_pages_and_count_cover_the_subtree() {
     let (db, path) = scratch("catpage");
     let mut sql = feed_sql("f1", "Podcasts");
     sql.push_str(&feed_sql("f2", "News"));
-    sql.push_str(&feed_sql("f3", "Podcasts/Sub"));
+    sql.push_str(&feed_sql("f3", "Podcasts / Sub"));
     for i in 0..4 {
         sql.push_str(&article_sql(
             &format!("p{i}"),
