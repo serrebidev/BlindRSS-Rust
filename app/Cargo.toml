@@ -9,6 +9,7 @@ blindrss-core = { path = "../crates/core" }
 serde_json = "1"
 libloading = "0.8.9"
 wxdragon = { version = "0.9.24", features = ["media-ctrl", "richtext", "stc", "webview"] }
+ship-shape = "0.5.0"
 rcgen = "0.13"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 

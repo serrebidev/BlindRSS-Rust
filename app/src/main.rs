@@ -16,6 +16,7 @@ mod msaa_names;
 mod player;
 mod settings;
 mod startup;
+mod update;
 
 use blindrss_core::{Article, Db, Feed, ParsedFeed, store_parsed_with_retention};
 use std::cell::RefCell;
@@ -677,78 +678,6 @@ fn queue_entry_article(e: &serde_json::Value) -> Article {
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string()),
-    }
-}
-
-/// Apply a staged update (maintenance::download_and_stage_
-/// update) before anything else starts: the staged tree
-/// replaces the executable's folder contents. The running
-/// binary is renamed aside first (Windows allows renaming a
-/// running exe; the old copy is cleaned up on a later start),
-/// then the staged files are copied over.
-fn apply_pending_update() {
-    let pending = data_dir().join("update_pending");
-    let staged_root = pending.join("BlindRSS");
-    let exe_name = if cfg!(target_os = "windows") {
-        "blindrss.exe"
-    } else {
-        "blindrss"
-    };
-    let staged_exe = staged_root.join(exe_name);
-    if !staged_exe.exists() {
-        return;
-    }
-    let Ok(current) = std::env::current_exe() else {
-        return;
-    };
-    let Some(exe_dir) = current.parent().map(|p| p.to_path_buf()) else {
-        return;
-    };
-    // Clean a previous swap's leftovers.
-    let old = exe_dir.join("blindrss.old");
-    if old.exists() {
-        let _ = std::fs::remove_file(&old);
-    }
-    // Try to rename the running exe aside; if it fails (locked, the
-    // Windows loader holding it, antivirus), fall back to copying the
-    // new exe over the current one. Only a successful install drops
-    // the staged tree: when even the copy fails the update stays
-    // pending for the next start rather than vanishing silently.
-    if std::fs::rename(&current, &old).is_err() {
-        match std::fs::copy(&staged_exe, exe_dir.join(exe_name)) {
-            Ok(_) => {
-                log_line("update: copied staged exe in place (rename failed)");
-                let _ = std::fs::remove_dir_all(&pending);
-            }
-            Err(e) => log_line(&format!(
-                "update: could not install the staged exe ({e}); keeping it for the next start"
-            )),
-        }
-        return;
-    }
-    // Copy the whole staged tree over the install folder.
-    fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
-        if let Ok(rd) = std::fs::read_dir(from) {
-            for entry in rd.flatten() {
-                let dest = to.join(entry.file_name());
-                let path = entry.path();
-                if path.is_dir() {
-                    let _ = std::fs::create_dir_all(&dest);
-                    copy_tree(&path, &dest);
-                } else {
-                    let _ = std::fs::copy(&path, &dest);
-                }
-            }
-        }
-    }
-    copy_tree(&staged_root, &exe_dir);
-    if exe_dir.join(exe_name).exists() {
-        let _ = std::fs::remove_dir_all(&pending);
-    } else {
-        // The swap left no executable behind (the copy failed): put
-        // the old binary back and keep the staged tree for a retry.
-        log_line("update: staged exe missing after copy; restoring the previous exe");
-        let _ = std::fs::rename(&old, &current);
     }
 }
 
@@ -1454,12 +1383,8 @@ enum RefreshMsg {
     /// Cast discovery finished: the devices found plus the
     /// article and its resolved stream URL, for the picker.
     CastDevices(Vec<blindrss_core::cast::CastDevice>, Article, String),
-    /// Update check: latest release tag.
-    UpdateChecked(Result<(String, Option<String>), String>),
     /// Open-article-by-URL result: (page title, plain text).
     OpenedArticle(Result<(String, String, String), String>),
-    /// A downloaded + verified update awaiting a restart.
-    UpdateStaged(Result<String, String>),
     /// A finished active-provider action (hosted refresh,
     /// subscribe, unsubscribe): a human summary or an error.
     ProviderAction(Result<String, String>),
@@ -2632,7 +2557,6 @@ fn main() {
         return;
     }
     let _ = wxdragon::main(|_| {
-        apply_pending_update();
         apply_http_config();
         startup_maintenance();
         let language = ui_language();
@@ -5942,16 +5866,18 @@ fn main() {
                 None => frame_pr.set_status_text("No database", 0),
             }
         });
+        // Check for Updates (Tools menu + Settings): ship-shape
+        // runs the whole flow (check, dialog, verified download,
+        // install/restart) on its own worker; Manual also reports
+        // up-to-date and errors. ship-shape refuses overlapping
+        // checks itself.
         let frame_up = frame;
-        let tx_up = tx.clone();
         let act_update: Rc<dyn Fn()> = Rc::new(move || {
-            frame_up.set_status_text("Checking for updates...", 0);
-            let tx = tx_up.clone();
-            std::thread::spawn(move || {
-                let _ = tx.send(RefreshMsg::UpdateChecked(
-                    blindrss_core::maintenance::check_update(),
-                ));
-            });
+            update::check(&frame_up, ship_shape::ui::CheckTrigger::Manual);
+        });
+        let frame_up_auto = frame;
+        let act_update_auto: Rc<dyn Fn()> = Rc::new(move || {
+            update::check(&frame_up_auto, ship_shape::ui::CheckTrigger::Automatic);
         });
 
         // Settings: provider accounts + download folder + Inoreader
@@ -9089,45 +9015,12 @@ fn main() {
                         Ok(msg) => frame_tick.set_status_text(&msg, 0),
                         Err(e) => frame_tick.set_status_text(&format!("Cast: {e}"), 0),
                     },
-                    Ok(RefreshMsg::UpdateStaged(result)) => match result {
-                        Ok(tag) => frame_tick.set_status_text(
-                            &format!("Update {tag} downloaded — restart BlindRSS to apply it"),
-                            0,
-                        ),
-                        Err(e) => frame_tick.set_status_text(&format!("Update download: {e}"), 0),
-                    },
                     Ok(RefreshMsg::OpenedArticle(result)) => match result {
                         Ok((url, title, text)) => {
                             article_window::open(&title, &text, Some(&url));
                             frame_tick.set_status_text("Article opened in its own window", 0);
                         }
                         Err(e) => frame_tick.set_status_text(&format!("Open article: {e}"), 0),
-                    },
-                    Ok(RefreshMsg::UpdateChecked(result)) => match result {
-                        Ok((tag, _)) => {
-                            if tag.trim_start_matches('v') == env!("CARGO_PKG_VERSION") {
-                                frame_tick.set_status_text("BlindRSS is up to date", 0);
-                            } else {
-                                frame_tick.set_status_text(&format!("Update available: {tag}"), 0);
-                                let cfg = blindrss_core::config::Config::load(&config_path())
-                                    .unwrap_or_default();
-                                if cfg.get_bool("install_updates_automatically", false) {
-                                    frame_tick.set_status_text(
-                                        &format!("Downloading update {tag}..."),
-                                        0,
-                                    );
-                                    let tx_stage = tx.clone();
-                                    std::thread::spawn(move || {
-                                        let result =
-                                            blindrss_core::maintenance::download_and_stage_update(
-                                                &data_dir(),
-                                            );
-                                        let _ = tx_stage.send(RefreshMsg::UpdateStaged(result));
-                                    });
-                                }
-                            }
-                        }
-                        Err(e) => frame_tick.set_status_text(&format!("Updates: {e}"), 0),
                     },
                     Ok(RefreshMsg::AllDone(path)) => {
                         if path != state_tick.borrow().store_path {
@@ -9258,6 +9151,9 @@ fn main() {
             let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
             frame.show(!cfg.get_bool("start_in_system_tray", false));
         }
+        // A copy relaunched by a ship-shape update comes to the
+        // front (no-op on an ordinary start).
+        ship_shape::ui::bring_to_front_after_update(&frame);
         // Python `_focus_default_control`, ported faithfully: Python
         // schedules it with wx.CallAfter from __init__ (the frame is
         // shown later by main.py) and the handler checks IsShown
@@ -9294,11 +9190,12 @@ fn main() {
                 startup_timer.start(1200, true);
             }
             // Startup update check (auto_check_updates, default
-            // on): the UpdateChecked drain reports, and stages
-            // the download when install_updates_automatically.
+            // on): ship-shape with the Automatic trigger — only an
+            // available update surfaces, as a dialog the user
+            // confirms before anything downloads.
             if cfg.get_bool("auto_check_updates", true) {
                 let update_timer = Box::leak(Box::new(Timer::new(&frame)));
-                let update_start = act_update.clone();
+                let update_start = act_update_auto.clone();
                 update_timer.on_tick(move |_| {
                     update_start();
                 });

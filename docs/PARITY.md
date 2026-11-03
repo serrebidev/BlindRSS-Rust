@@ -2344,3 +2344,79 @@ Checks (this batch): `cargo test -p blindrss-core --test
 maintenance_slice --test ops_slice` — 14 + 2 passed, including the 11 new
 Audit 8 tests; full workspace clippy/test/build gate results are recorded
 in the batch commit message.
+### Audit 8 Task 6 resolution — safe, usable updater (O03, O04, O05, O17)
+
+Owner correction during implementation (Brandon, 2026-11-03: "I am to use
+shipfitter for the updater. We've gone over this."): the hand-rolled staging
+updater shipped in v0.1.51 was the wrong shape. Like BlindRadio
+(`crates/blindradio/src/update.rs`) and the Rust IPTV client (its PR #125
+deleted its hand-rolled updater the same way), the runtime updater is now
+ship-shape 0.5.0; the hand-rolled code is deleted, not patched. Release-side
+signing (cargo xtask sign, release.yml, MINISIGN_KEY secret) is unchanged.
+
+What landed:
+
+- `app/src/update.rs` (new): `config()` builds one
+  `ship_shape::UpdaterConfig` — repo `serrebidev/BlindRSS-Rust`, app name
+  `BlindRSS`, current version from `app/Cargo.toml`, `InstallKind::Portable`,
+  and the minisign public key read from the committed
+  `crates/core/assets/minisign.pub` (BlindRadio keypair, key ID
+  151E848B8939A63F). `check(parent, trigger)` calls
+  `ship_shape::ui::run_update_check` on the Stable channel.
+- Callers keep their labels and placement: the Tools menu / Settings
+  "Check for Updates" action (`tools.check_updates`) runs a Manual check
+  (ship-shape reports up-to-date and errors, and offers Download/Install
+  with release notes on Yes), and the launch timer still gated by
+  `auto_check_updates` (default on) runs an Automatic check (only an
+  available update surfaces). After the frame shows,
+  `bring_to_front_after_update` runs so a relaunched copy comes forward.
+- Deleted: `maintenance::check_update`, `parse_latest_release`,
+  `latest_release_assets`/`LatestReleaseAssets`, `download_and_stage_update`,
+  `verify_update_signature` and its unit tests (verification now lives in
+  ship-shape), core's `minisign-verify` dependency, the app's
+  `RefreshMsg::UpdateChecked`/`UpdateStaged` flow, and
+  `apply_pending_update` with its `update_pending/` staging directory.
+  The `install_updates_automatically` config key is retained on disk for
+  compatibility; ship-shape's flow always confirms before downloading, so
+  it no longer triggers a silent install (same behaviour as BlindRadio).
+
+Finding dispositions (all four closed by replacement; the findings targeted
+the deleted hand-rolled path):
+
+- O03 (default manual update had no installation action): the Manual
+  trigger drives ship-shape's full dialog flow — release notes, confirm,
+  progress, verified install, restart — under default settings.
+- O04 (inequality-only comparison could offer/install a downgrade):
+  ship-shape's `check_for_updates` parses and orders versions and only
+  reports an update when the release is newer; the Rust inequality check
+  is deleted with the rest of the hand-rolled path.
+- O05 (supporting-file copy failures discarded; staging deleted under a
+  still-running old process): install is ship-shape's platform code — the
+  download lands as a temp file, is renamed into place only after
+  verification, and the swap/restart runs through its detached platform
+  helper after the app exits; a failed verification or download removes
+  the temp file and leaves the running install untouched.
+- O17 (whole-asset buffering, no cancellation/retry/single-operation
+  guard): ship-shape streams the download in chunks with a progress
+  dialog and a cancellation flag polled per chunk, and its `ActiveCheck`
+  guard makes concurrent check/install calls a no-op.
+
+Evidence: `app/src/update.rs` tests — the config names the release repo,
+asset base name, current version and Portable kind, and embeds exactly the
+committed public key; two loopback tests drive
+`ship_shape::download_update_file` through that production config with
+(1) the real release key's signature over different bytes (same key ID, so
+the Ed25519 check itself runs) and (2) a garbage signature — both must
+error with `UpdateError::Verification` and install nothing.
+
+Open / not covered here:
+
+- Asset-name contract: ship-shape looks for `BlindRSS.zip` (Windows
+  Portable), `BlindRSS.tar.gz` (Linux Portable) and `BlindRSS.dmg`
+  (macOS), each with a `.minisig`. Current releases publish
+  `BlindRSS-vX.Y.Z-{Windows,macOS,Linux}.zip` instead, so until release
+  packaging publishes the ship-shape names (a shipfitter/release-lane
+  change, outside this task's no-workflow-edit boundary) the check will
+  honestly report that no matching download was found.
+- Manual packaged-build upgrades on all three OSes and an NVDA pass over
+  ship-shape's own dialogs remain owner acceptance, as the plan requires.

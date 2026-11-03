@@ -1,8 +1,7 @@
-//! Backup/restore, retention, and release-parse tests.
+//! Backup/restore and retention tests.
 
 use blindrss_core::maintenance::{
-    apply_pending_restore, create_backup, parse_latest_release, restore_backup, run_auto_backup,
-    stage_restore,
+    apply_pending_restore, create_backup, restore_backup, run_auto_backup, stage_restore,
 };
 
 fn scratch(name: &str) -> std::path::PathBuf {
@@ -484,13 +483,4 @@ fn a8_restore_backup_direct_validates_before_writing() {
     assert!(restore_backup(&zip, &db2, &cfg2).is_err());
     assert!(!db2.exists(), "DB written despite invalid config");
     assert!(!cfg2.exists());
-}
-
-#[test]
-fn release_parse() {
-    let json = r#"{"tag_name": "v0.2.0", "assets": [{"browser_download_url": "https://example.com/app.zip"}]}"#;
-    let (tag, url) = parse_latest_release(json).unwrap();
-    assert_eq!(tag, "v0.2.0");
-    assert_eq!(url.as_deref(), Some("https://example.com/app.zip"));
-    assert!(parse_latest_release("{}").is_none());
 }

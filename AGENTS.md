@@ -237,11 +237,11 @@ Python `core/casting.py`, in that order.
   `config.json`, never logged) and gettext catalog handling. Downloaded
   translation overrides win only within the same app version and stand
   down entirely when the override root resolves to the bundled tree.
-- `maintenance.rs`: backup/restore and self-update staging. Restore
+- `maintenance.rs`: backup/restore. Restore
   stages beside the database the app actually opens and swaps at
   relaunch (a restore that targets a path the app never opens silently
-  no-ops — fixed v0.1.32). Self-update never deletes a staged update
-  when a rename fails.
+  no-ops — fixed v0.1.32). Self-update is not here: `app/src/update.rs`
+  drives ship-shape (see §6 Updates).
 - `discovery.rs`, `takeout.rs`, `opml.rs`, `download.rs`,
   `archive.rs` (podcast archive recovery), `enrich.rs` (page-metadata
   enrichment — fills only empty author fields, unions tags, never
@@ -379,11 +379,19 @@ must stay compatible with):
   provider-specific and tested; update code and tests together.
 
 ### 6. Updates
-- Self-update checks the latest GitHub release, verifies SHA-256
-  against `SHA256SUMS` before applying, and stages the swap so a
-  failed rename never destroys the working install (see
-  `maintenance.rs`). Install-local runtime state (database, config,
-  caches, cookie files) is never moved or deleted by an update.
+- Self-update is ship-shape (`ship_shape::ui::run_update_check` from
+  `app/src/update.rs`), the shipfitter scheme also used by BlindRadio
+  and the Rust IPTV client — never a hand-rolled staging updater.
+  Check for Updates runs it with the Manual trigger; the launch check
+  (config `auto_check_updates`, default on) with Automatic, gated the
+  same way as before. Install kind is Portable. ship-shape compares
+  versions before offering anything, verifies the asset's `.minisig`
+  against the compiled-in public key (`crates/core/assets/minisign.pub`)
+  before installing (fail closed), and applies the swap/restart
+  through its platform helper. It looks for assets named
+  `BlindRSS.zip` (Windows), `BlindRSS.tar.gz` (Linux) and
+  `BlindRSS.dmg` (macOS), each with a `.minisig` beside it: release
+  packaging must publish those names for updates to be found.
 
 ## Tests
 - `crates/core/tests/` holds the batch/slice regression suites plus
@@ -478,5 +486,6 @@ Single-context: the domain authority for this port is `docs/PARITY.md`
   this box. Losing it means rotating the key, and already-installed
   copies can then never verify a new release. The public half is
   `crates/core/assets/minisign.pub`; changing it takes a new release.
-- The updater verifies the `.minisig` against that embedded key before
-  staging an update (fail closed) — do not weaken it to a warning.
+- The updater (ship-shape, see §6 Updates) verifies the `.minisig`
+  against that embedded key before installing (fail closed) — do not
+  weaken it to a warning.
