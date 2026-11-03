@@ -2411,12 +2411,18 @@ error with `UpdateError::Verification` and install nothing.
 
 Open / not covered here:
 
-- Asset-name contract: ship-shape looks for `BlindRSS.zip` (Windows
-  Portable), `BlindRSS.tar.gz` (Linux Portable) and `BlindRSS.dmg`
-  (macOS), each with a `.minisig`. Current releases publish
-  `BlindRSS-vX.Y.Z-{Windows,macOS,Linux}.zip` instead, so until release
-  packaging publishes the ship-shape names (a shipfitter/release-lane
-  change, outside this task's no-workflow-edit boundary) the check will
-  honestly report that no matching download was found.
+- Asset-name contract — RESOLVED by owner decision 2026-11-03 ("switch
+  fully to fixed ship-shape names like BlindRadio", with direct OK for
+  the workflow edit): `release.yml` now publishes exactly the names
+  ship-shape looks for — `BlindRSS.zip` (Windows Portable),
+  `BlindRSS.tar.gz` (Linux Portable) and `BlindRSS.dmg` (macOS), each
+  with a `.minisig` — replacing the versioned
+  `BlindRSS-vX.Y.Z-{Windows,macOS,Linux}.zip` names entirely. Archive
+  contents sit at the root (no wrapping folder), matching ship-shape's
+  Portable apply, which extracts over the app folder without stripping
+  a top folder. The publish leg verifies all six package/signature
+  files arrived; a release still carries 7 assets (3 packages, 3
+  signatures, SHA256SUMS). First live exercise is the next release
+  after this batch lands.
 - Manual packaged-build upgrades on all three OSes and an NVDA pass over
   ship-shape's own dialogs remain owner acceptance, as the plan requires.

@@ -96,7 +96,13 @@ jobs:
             hdiutil detach "$RUNNER_TEMP/vlc-mnt"
           fi
 
-      - name: Package (zip)
+      # Fixed ship-shape asset names (owner decision 2026-11-03,
+      # BlindRadio's scheme): BlindRSS.zip (Windows),
+      # BlindRSS.tar.gz (Linux), BlindRSS.dmg (macOS). Contents
+      # sit at the archive root — ship-shape's Portable apply
+      # extracts over the app folder with no top-folder stripping,
+      # so a wrapping folder would nest the install.
+      - name: Package
         shell: bash
         run: |
           mkdir -p dist/BlindRSS
@@ -117,11 +123,14 @@ jobs:
           mkdir -p dist/BlindRSS/docs
           cp -r docs/help dist/BlindRSS/docs/
           cp crates/core/assets/minisign.pub dist/BlindRSS/
-          cd dist
+          cd dist/BlindRSS
           if [ "$RUNNER_OS" = "Windows" ]; then
-            7z a "BlindRSS-${{ github.ref_name }}-${{ runner.os }}.zip" BlindRSS
+            7z a ../BlindRSS.zip *
+          elif [ "$RUNNER_OS" = "Linux" ]; then
+            tar -czf ../BlindRSS.tar.gz *
           else
-            zip -r "BlindRSS-${{ github.ref_name }}-${{ runner.os }}.zip" BlindRSS
+            cd ..
+            hdiutil create -volname BlindRSS -srcfolder BlindRSS -ov -format UDZO BlindRSS.dmg
           fi
 
       # Every asset carries its minisign signature, so the
@@ -134,15 +143,19 @@ jobs:
         env:
           MINISIGN_KEY: ${{ secrets.MINISIGN_KEY }}
           MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
-        run: cargo xtask sign dist/*.zip
+        run: ls dist/BlindRSS.zip dist/BlindRSS.tar.gz dist/BlindRSS.dmg 2>/dev/null | xargs cargo xtask sign
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: BlindRSS-${{ github.ref_name }}-${{ runner.os }}
           path: |
-            dist/*.zip
-            dist/*.zip.minisig
+            dist/BlindRSS.zip
+            dist/BlindRSS.zip.minisig
+            dist/BlindRSS.tar.gz
+            dist/BlindRSS.tar.gz.minisig
+            dist/BlindRSS.dmg
+            dist/BlindRSS.dmg.minisig
 
   publish:
     name: Publish release
@@ -159,21 +172,20 @@ jobs:
       - name: Verify every asset and signature arrived
         shell: bash
         run: |
-          tag="${{ github.ref_name }}"
-          for os in Windows Linux macOS; do
-            for wanted in "BlindRSS-$tag-$os.zip" "BlindRSS-$tag-$os.zip.minisig"; do
-              test -f "artifacts/$wanted" || { echo "missing: $wanted"; exit 1; }
-            done
+          for wanted in BlindRSS.zip BlindRSS.zip.minisig BlindRSS.tar.gz BlindRSS.tar.gz.minisig BlindRSS.dmg BlindRSS.dmg.minisig; do
+            test -f "artifacts/$wanted" || { echo "missing: $wanted"; exit 1; }
           done
 
       - name: Checksums
-        run: cd artifacts && sha256sum *.zip *.zip.minisig > SHA256SUMS
+        run: cd artifacts && sha256sum *.zip *.tar.gz *.dmg *.minisig > SHA256SUMS
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
           files: |
             artifacts/*.zip
-            artifacts/*.zip.minisig
+            artifacts/*.tar.gz
+            artifacts/*.dmg
+            artifacts/*.minisig
             artifacts/SHA256SUMS
           generate_release_notes: true

@@ -55,13 +55,18 @@ stated here and in `docs/PARITY.md`.
      `gh api`/`gh run view`); never infer success from a piped watch
      command's exit code.
   3. Tag `vX.Y.Z` on the green commit and push the tag. `release.yml`
-     builds the three platform zips and `SHA256SUMS`, then publishes.
+     builds the three platform packages and `SHA256SUMS`, then publishes.
   4. Verify by direct API read: the release exists, `draft=false`, all
-     four assets are present, and `/releases/latest` returns the new
+     seven assets are present, and `/releases/latest` returns the new
      tag. A handoff or script summary is not verification.
-- Artifacts: `BlindRSS-vX.Y.Z-Linux.zip`, `BlindRSS-vX.Y.Z-macOS.zip`,
-  `BlindRSS-vX.Y.Z-Windows.zip`, `SHA256SUMS`. Tag pushes also trigger a
-  duplicate CI run on the tag ref; that is harmless.
+- Artifacts (fixed ship-shape names, owner decision 2026-11-03 —
+  BlindRadio's scheme, replacing the old versioned names):
+  `BlindRSS.zip` (Windows), `BlindRSS.tar.gz` (Linux), `BlindRSS.dmg`
+  (macOS), each with its `.minisig`, plus `SHA256SUMS` — 7 assets.
+  Archive contents sit at the root (no wrapping folder): ship-shape's
+  Portable apply extracts over the app folder without stripping one.
+  Tag pushes also trigger a duplicate CI run on the tag ref; that is
+  harmless.
 - Pushing to `main` cancels the in-flight main CI run. Do not push
   mid-verification unless the new commit is the one being verified.
 - Signing: releases use the previous (unsigned/development) method until
@@ -391,7 +396,7 @@ must stay compatible with):
   through its platform helper. It looks for assets named
   `BlindRSS.zip` (Windows), `BlindRSS.tar.gz` (Linux) and
   `BlindRSS.dmg` (macOS), each with a `.minisig` beside it: release
-  packaging must publish those names for updates to be found.
+  packaging publishes those fixed names (owner decision 2026-11-03).
 
 ## Tests
 - `crates/core/tests/` holds the batch/slice regression suites plus
@@ -476,7 +481,7 @@ Single-context: the domain authority for this port is `docs/PARITY.md`
 ## Release signing
 
 - Releases are minisign-signed (BlindRadio's pattern): `cargo xtask sign`
-  in each release leg, `.minisig` beside every zip, publish refuses to
+  in each release leg, `.minisig` beside every package, publish refuses to
   proceed when any asset or signature is missing.
 - The secret key lives ONLY in the `MINISIGN_KEY` repository secret
   (`MINISIGN_PASSWORD` unlocks it when a future key is encrypted; the
