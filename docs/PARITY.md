@@ -1,7 +1,13 @@
 # BlindRSS Parity Audit — every provider, every feature
 
-Current source comparison and ports: [2026-11-01 audit](PARITY-2026-11-01.md).
-The historical status rows below have not all been reconciled with later work.
+Current source comparison: [Audit 8, 2026-11-03](AUDIT-8-2026-11-03.md),
+Python v2.5.8 (`2a7eeb3`) against Rust v0.1.53 (`1df3af2`).
+Outstanding work: **160 source-confirmed findings** (54 P1, 93 P2, 13 P3),
+with a [31-task implementation plan](superpowers/plans/2026-11-03-parity.md).
+These findings govern current open/closed status when historical rows or
+resolution paragraphs below disagree. No product fixes or runtime validation
+were performed by Audit 8. The [2026-11-01 audit](PARITY-2026-11-01.md) and
+earlier rows remain historical implementation records, not current parity proof.
 
 Generated 2026-10-30 by mechanically auditing the Python source
 (serrebidev/BlindRSS v2.5.4, commit 9a69e59): AST scans of
@@ -1935,3 +1941,47 @@ The due-claim rules bound the extra fetch to the rescan
 interval (30 days local default), and plumbing raw bytes
 through ParsedFeed would have touched every feed-source
 construction site for that saving alone.
+
+## 9. Audit 8 — current Python v2.5.8 comparison (2026-11-03)
+
+The [current audit](AUDIT-8-2026-11-03.md) compares Python `2a7eeb3` with
+Rust `1df3af2` (v0.1.53). It records 160 outstanding source differences:
+54 P1, 93 P2 and 13 P3. The [implementation plan](superpowers/plans/2026-11-03-parity.md)
+maps every finding to 31 independently reviewable tasks. This was an audit and
+documentation batch; no finding was implemented or verified by a runtime test.
+
+Important corrections to earlier closure claims:
+
+- Source listing/history/fallback helpers exist, but normal application refresh
+  and some subscription callers bypass them (F01). Feed storage also runs from
+  the GUI drain and may perform media network work (D22).
+- Hosted account files and mutation endpoints are implemented, but token refresh,
+  remote removal reconciliation and category inventory are incomplete (D07–D11).
+- Archive scheduling is connected, but ordinary hosted feed reads omit recovered
+  episodes, Play opens text, and busy-close/duration matching remain open
+  (F02, F04, F15, F16).
+- General range caching exists; first-refusal recovery, request bounds and
+  original/resolved caller context remain open (M03, M04, M20).
+- SponsorBlock still sends a bare video ID despite the guide's prefix-only
+  contract (M02). The new audit supersedes any claim that privacy parity is done.
+- Category paths, tombstone state/identity, retention, config writes, enrichment
+  tag unions and restore/update swaps have compatibility or data-safety gaps
+  (D01–D06, D14–D15, S02, R01, O01–O05).
+- Browser/CAPTCHA helpers have no production retrieval callers, and automatic
+  article translation has no automatic caller (B01–B02, O07–O08).
+- Rich/plain publisher and thread depth remains incomplete despite broad reader
+  closure language (R02–R14). Recent Python quiz, recommendation, hidden-player,
+  feed-cache and range-probe fixes were explicitly compared.
+
+Conversely, old no-libVLC-bundling and non-Chromecast-routing residuals are
+stale: release packaging now bundles VLC, Linux CI contains its smoke command,
+and all discovered receiver kinds route through the unified controls. This
+audit read those implementations; it did not run workflows or verify assets.
+The Accessible Browser remains intentionally removed, and explicit Load More
+remains the chosen accessible list behavior. Filtered/sorted paging is still
+missing (G03), rather than being covered by default-view paging.
+
+Before closing an Audit 8 ID, add its failing reproduction, fix, application
+caller coverage and actual check results here. Screen-reader/platform/hardware
+acceptance remains separately pending where required. Historical resolutions
+above are preserved as history and must not override this outstanding register.

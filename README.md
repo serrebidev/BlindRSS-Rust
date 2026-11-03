@@ -21,10 +21,10 @@ maintainer's machine); the key decisions:
 
 ## Status
 
-The latest source comparison and implemented ports are recorded in
-[the 2026-11-01 feature audit](docs/PARITY-2026-11-01.md), including the remaining
-gaps. The early-stage description below is historical; full parity is not yet
-established.
+The current Python v2.5.8 versus Rust v0.1.53 source comparison is recorded in
+[Audit 8](docs/AUDIT-8-2026-11-03.md), with 160 outstanding findings and a
+[prioritized implementation plan](docs/superpowers/plans/2026-11-03-parity.md).
+The early-stage description below is historical; full parity is not established.
 
 Stage 1-3 first slice: data layer, config reader, RSS/Atom parsing,
 extraction cascade v1 (gate markers, engine-disagreement rule,
