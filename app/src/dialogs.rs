@@ -552,7 +552,13 @@ pub fn show_filter_rules(frame: &Frame, db: &Db) {
     }
     {
         apply_btn.on_click(move |_| match Db::open(&crate::db_path()) {
-            Ok(db) => match blindrss_core::refresh::apply_rules_to_existing(&db) {
+            Ok(db) => match blindrss_core::refresh::apply_rules_to_existing(
+                &db,
+                blindrss_core::config::Config::load(&crate::config_path())
+                    .map(|c| c.get_str("delete_behavior", "deleted").to_string())
+                    .unwrap_or_else(|_| "deleted".to_string())
+                    .as_str(),
+            ) {
                 Ok(n) => status.set_label(&format!("Rules applied: {n} article(s) changed")),
                 Err(e) => status.set_label(&format!("Apply failed: {e}")),
             },
@@ -2178,7 +2184,12 @@ pub fn show_podcast_archive(frame: &Frame, db: &Db) -> Option<blindrss_core::Fee
                         let feed = db
                             .add_feed(&feed_url, &parsed.title, None)
                             .map_err(|e| e.to_string())?;
-                        blindrss_core::refresh::store_parsed(&db, &feed, &parsed)?;
+                        blindrss_core::refresh::store_parsed(
+                            &db,
+                            &feed,
+                            &parsed,
+                            cfg.get_str("delete_behavior", "deleted"),
+                        )?;
                         Ok(Some(feed.id))
                     })()
                 };

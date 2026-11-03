@@ -952,7 +952,7 @@ fn scan(
 /// that need the archive state store updated alongside (the
 /// Podcast Archive dialog, the background queues) use
 /// [`perform_local_scan`] with the database path instead.
-pub fn rescan_archive(db: &Db, feed: &Feed) -> Result<usize, String> {
+pub fn rescan_archive(db: &Db, feed: &Feed, global_delete_behavior: &str) -> Result<usize, String> {
     let result = scan_with_fetch(
         std::slice::from_ref(&feed.url),
         ScanOptions::default(),
@@ -978,7 +978,9 @@ pub fn rescan_archive(db: &Db, feed: &Feed) -> Result<usize, String> {
                 .map(|episode| episode.entry)
                 .collect(),
         },
+        global_delete_behavior,
     )
+    .map(|outcome| outcome.inserted)
 }
 
 /// How a local scan's state-store claim is taken (Python's three
@@ -1115,7 +1117,9 @@ pub fn perform_local_scan_with_fetch(
                 .map(|episode| episode.entry)
                 .collect(),
         },
-    )?;
+        &settings.delete_behavior,
+    )
+    .map(|outcome| outcome.inserted)?;
     let error = result_error(&result);
     store::finish(
         db_path,

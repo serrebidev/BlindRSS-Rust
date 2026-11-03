@@ -158,10 +158,12 @@ CREATE TABLE IF NOT EXISTS articles (id TEXT PRIMARY KEY, feed_id TEXT,
     category_override TEXT);
 CREATE TABLE IF NOT EXISTS categories (id TEXT PRIMARY KEY,
     title TEXT UNIQUE, parent_id TEXT);
-CREATE TABLE IF NOT EXISTS deleted_articles (feed_id TEXT,
-    article_id TEXT, url TEXT, deleted_at REAL, title TEXT, content TEXT,
-    description TEXT, date TEXT, author TEXT, media_url TEXT,
-    media_type TEXT, chapter_url TEXT);
+CREATE TABLE IF NOT EXISTS deleted_articles (feed_id TEXT NOT NULL,
+    article_id TEXT NOT NULL, url TEXT, deleted_at REAL NOT NULL,
+    title TEXT, content TEXT, description TEXT, date TEXT, author TEXT,
+    media_url TEXT, media_type TEXT, chapter_url TEXT, is_read INTEGER,
+    is_favorite INTEGER, purged INTEGER DEFAULT 0,
+    PRIMARY KEY (feed_id, article_id));
 CREATE TABLE IF NOT EXISTS chapters (id TEXT PRIMARY KEY,
     article_id TEXT, start REAL, title TEXT, href TEXT);
 CREATE TABLE IF NOT EXISTS playback_state (id TEXT PRIMARY KEY,
@@ -212,7 +214,7 @@ CREATE INDEX IF NOT EXISTS idx_chapters_article_id_start
 
 /// Columns Python added to existing tables by migration; older
 /// databases get them on open.
-const MIGRATION_COLUMNS: [(&str, &str, &str); 11] = [
+const MIGRATION_COLUMNS: [(&str, &str, &str); 13] = [
     ("feeds", "last_error", "TEXT"),
     ("feeds", "last_error_at", "REAL"),
     ("feeds", "last_success_at", "REAL"),
@@ -221,6 +223,8 @@ const MIGRATION_COLUMNS: [(&str, &str, &str); 11] = [
     ("articles", "category_override", "TEXT"),
     ("feeds", "delete_behavior", "TEXT"),
     ("deleted_articles", "purged", "INTEGER DEFAULT 0"),
+    ("deleted_articles", "is_read", "INTEGER"),
+    ("deleted_articles", "is_favorite", "INTEGER"),
     ("articles", "tags", "TEXT"),
     ("feeds", "feed_settings", "TEXT"),
     ("feeds", "show_images", "INTEGER"),
@@ -585,6 +589,19 @@ impl Db {
         limit: usize,
     ) -> rusqlite::Result<Vec<Article>> {
         self.articles_impl(feed_id, limit, 0, true)
+    }
+
+    /// One page of full rows (bodies included) in the same
+    /// date-DESC, id-DESC order as `articles`. Bulk rule
+    /// evaluation pages through the whole library with this
+    /// instead of loading it under a row ceiling (Audit 8 D21).
+    pub fn articles_page(
+        &self,
+        feed_id: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> rusqlite::Result<Vec<Article>> {
+        self.articles_impl(feed_id, limit, offset, false)
     }
 
     /// One page of light list rows (Audit 7 Finding A): the
@@ -1921,24 +1938,41 @@ impl Db {
 
     /// Delete an article, keeping a tombstone copy in deleted_articles
     /// (Python schema) so it can be restored and so refresh does not
-    /// resurrect it. Returns false when the article does not exist.
+    /// resurrect it. The snapshot carries the article's read/favorite
+    /// state (Python `remember_deleted_article`), and the article's
+    /// label/chapter rows go with it (Python's tombstone-and-remove
+    /// invariant). Returns false when the article does not exist.
     pub fn delete_article(&self, article_id: &str) -> rusqlite::Result<bool> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs_f64())
             .unwrap_or(0.0);
+        // OR REPLACE: re-deleting an id that already has a tombstone
+        // under this feed refreshes the snapshot (Python upserts on
+        // the (feed_id, article_id) conflict); older tables without
+        // the primary key simply insert.
         let copied = self.conn.execute(
-            "INSERT INTO deleted_articles \
+            "INSERT OR REPLACE INTO deleted_articles \
              (feed_id, article_id, url, deleted_at, title, content, description, \
-              date, author, media_url, media_type, chapter_url) \
+              date, author, media_url, media_type, chapter_url, is_read, \
+              is_favorite, purged) \
              SELECT feed_id, id, url, ?1, title, content, description, date, \
-                    author, media_url, media_type, chapter_url \
+                    author, media_url, media_type, chapter_url, is_read, \
+                    is_favorite, 0 \
              FROM articles WHERE id = ?2",
             params![now, article_id],
         )?;
         if copied == 0 {
             return Ok(false);
         }
+        self.conn.execute(
+            "DELETE FROM article_labels WHERE article_id = ?1",
+            params![article_id],
+        )?;
+        self.conn.execute(
+            "DELETE FROM chapters WHERE article_id = ?1",
+            params![article_id],
+        )?;
         self.conn
             .execute("DELETE FROM articles WHERE id = ?1", params![article_id])?;
         Ok(true)
@@ -1953,6 +1987,52 @@ impl Db {
     /// them only on restore or confirmed purge, so a deleted
     /// article's resurrection guard does not expire. Returns
     /// article rows removed.
+    /// The effective delete behavior for one feed: its
+    /// `feeds.delete_behavior` override wins over the global
+    /// `delete_behavior` setting (Python `_resolve_delete_behavior`).
+    pub fn effective_delete_behavior(
+        &self,
+        feed_id: &str,
+        global: &str,
+    ) -> crate::rules::DeleteBehavior {
+        let raw = self
+            .feed_delete_behavior(feed_id)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| global.to_string());
+        crate::rules::parse_delete_behavior(&raw)
+    }
+
+    /// Delete an article through a resolved delete behavior — the
+    /// one shared policy behind the interactive Delete command and
+    /// the filter-rule pipeline (Python `LocalProvider.delete_article`):
+    /// category behavior MOVES the article (sets its category
+    /// override) and keeps the row; purge tombstones it as purged;
+    /// deleted soft-deletes it. Returns false when the article does
+    /// not exist.
+    pub fn delete_article_with_behavior(
+        &self,
+        article_id: &str,
+        behavior: &crate::rules::DeleteBehavior,
+    ) -> rusqlite::Result<bool> {
+        match behavior {
+            crate::rules::DeleteBehavior::Category(path) => {
+                let exists = self.article_by_id(article_id)?.is_some();
+                if !exists {
+                    return Ok(false);
+                }
+                self.set_article_category_override(article_id, Some(path))?;
+                Ok(true)
+            }
+            crate::rules::DeleteBehavior::Purge => self.purge_article(article_id),
+            crate::rules::DeleteBehavior::Deleted => self.delete_article(article_id),
+        }
+    }
+
+    /// Retention: delete read, non-favorite articles older than
+    /// `keep_days` (by article date when parseable, else by row
+    /// position — dates are ISO text in this schema), plus
+    /// tombstones older than the same window. Returns rows removed.
     pub fn prune_old_articles(&self, keep_days: i64) -> rusqlite::Result<usize> {
         let Some(cutoff) = crate::retention::retention_cutoff_date(Some(keep_days)) else {
             return Ok(0);
@@ -1988,11 +2068,18 @@ impl Db {
     /// "purge"): the tombstone is kept but flagged purged, so
     /// it stays out of the Deleted view and cannot be restored.
     pub fn purge_article(&self, article_id: &str) -> rusqlite::Result<bool> {
+        let feed_id = self
+            .article_by_id(article_id)?
+            .map(|a| a.feed_id)
+            .unwrap_or_default();
         let deleted = self.delete_article(article_id)?;
-        self.conn.execute(
-            "UPDATE deleted_articles SET purged = 1 WHERE article_id = ?1",
-            params![article_id],
-        )?;
+        if deleted {
+            self.conn.execute(
+                "UPDATE deleted_articles SET purged = 1 \
+                 WHERE article_id = ?1 AND feed_id = ?2",
+                params![article_id, feed_id],
+            )?;
+        }
         Ok(deleted)
     }
 
@@ -2275,27 +2362,76 @@ impl Db {
         rows.collect()
     }
 
-    /// Restore a deleted article from its tombstone. Read/favorite state
-    /// is not part of the tombstone schema, so a restored article comes
-    /// back unread and unfavorited (same as Python).
+    /// Restore a deleted article from its tombstone, with its
+    /// snapshotted read/favorite state (Python
+    /// `restore_deleted_article`). Unscoped: succeeds only when
+    /// exactly one non-purged tombstone carries this article id —
+    /// an ambiguous id (tombstoned under several feeds) or a
+    /// purged tombstone restores nothing and keeps its row, so
+    /// the caller can surface the failure instead of dropping
+    /// the Deleted view entry.
     pub fn restore_article(&self, article_id: &str) -> rusqlite::Result<bool> {
+        let mut stmt = self.conn.prepare(
+            "SELECT feed_id FROM deleted_articles \
+             WHERE article_id = ?1 AND COALESCE(purged, 0) = 0",
+        )?;
+        let feeds: Vec<String> = stmt
+            .query_map(params![article_id], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        drop(stmt);
+        match feeds.as_slice() {
+            [feed_id] => self.restore_deleted_article(feed_id, article_id),
+            _ => Ok(false),
+        }
+    }
+
+    /// Restore one feed's tombstone for an article (Python
+    /// `restore_deleted_article` with a feed id). Purged
+    /// tombstones never restore. On success the tombstone row
+    /// is dropped; on failure nothing changes.
+    pub fn restore_deleted_article(
+        &self,
+        feed_id: &str,
+        article_id: &str,
+    ) -> rusqlite::Result<bool> {
         let restored = self.conn.execute(
-            "INSERT OR IGNORE INTO articles \
+            "INSERT OR REPLACE INTO articles \
              (id, feed_id, title, url, content, description, date, author, \
               is_read, is_favorite, media_url, media_type, chapter_url) \
              SELECT article_id, feed_id, title, url, content, description, \
-                    date, author, 0, 0, media_url, media_type, chapter_url \
-             FROM deleted_articles WHERE article_id = ?1",
-            params![article_id],
+                    date, author, COALESCE(is_read, 0), \
+                    COALESCE(is_favorite, 0), media_url, media_type, \
+                    chapter_url \
+             FROM deleted_articles \
+             WHERE feed_id = ?1 AND article_id = ?2 \
+               AND COALESCE(purged, 0) = 0",
+            params![feed_id, article_id],
         )?;
         if restored == 0 {
             return Ok(false);
         }
         self.conn.execute(
-            "DELETE FROM deleted_articles WHERE article_id = ?1",
-            params![article_id],
+            "DELETE FROM deleted_articles WHERE feed_id = ?1 AND article_id = ?2",
+            params![feed_id, article_id],
         )?;
         Ok(true)
+    }
+
+    /// Permanently delete one Deleted-view entry (Python
+    /// `purge_deleted_article`): the snapshot content is dropped
+    /// and the tombstone flagged purged, but the tombstone
+    /// identity is kept so refresh never recreates the article.
+    /// Returns false when no live tombstone matches.
+    pub fn purge_deleted_article(&self, feed_id: &str, article_id: &str) -> rusqlite::Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE deleted_articles SET purged = 1, title = NULL, \
+             content = NULL, description = NULL, author = NULL, \
+             media_url = NULL, media_type = NULL, chapter_url = NULL \
+             WHERE feed_id = ?1 AND article_id = ?2 \
+               AND COALESCE(purged, 0) = 0",
+            params![feed_id, article_id],
+        )?;
+        Ok(n > 0)
     }
 
     /// Tombstoned article ids, for the refresh resurrection check.
@@ -2353,9 +2489,10 @@ impl Db {
     pub fn deleted_articles(&self) -> rusqlite::Result<Vec<Article>> {
         let mut stmt = self.conn.prepare(
             "SELECT article_id, feed_id, title, url, content, description, date, \
-             author, media_url, media_type FROM deleted_articles \
+             author, media_url, media_type, is_read, is_favorite \
+             FROM deleted_articles \
              WHERE COALESCE(purged, 0) = 0 \
-             ORDER BY deleted_at DESC",
+             ORDER BY deleted_at DESC, article_id DESC",
         )?;
         let rows = stmt.query_map([], |r| {
             Ok(Article {
@@ -2367,13 +2504,59 @@ impl Db {
                 description: r.get(5)?,
                 date: r.get(6)?,
                 author: r.get(7)?,
-                is_read: false,
-                is_favorite: false,
                 media_url: r.get(8)?,
                 media_type: r.get(9)?,
+                is_read: r.get::<_, Option<i64>>(10)?.unwrap_or(0) != 0,
+                is_favorite: r.get::<_, Option<i64>>(11)?.unwrap_or(0) != 0,
             })
         })?;
         rows.collect()
+    }
+
+    /// Every article matching a smart-folder rule, evaluated by
+    /// paging through the whole library — no row ceiling, so a
+    /// match older than the first 100,000 rows is still found
+    /// (Audit 8 D21; Python evaluates smart folders without a
+    /// ceiling). Feed titles, tags and opened/updated facts come
+    /// from this database, as the retroactive rule application
+    /// reads them.
+    pub fn articles_matching_rule(
+        &self,
+        rule: &serde_json::Value,
+    ) -> rusqlite::Result<Vec<Article>> {
+        const PAGE: usize = 1_000;
+        let feed_titles: std::collections::HashMap<String, String> =
+            self.feeds()?.into_iter().map(|f| (f.id, f.title)).collect();
+        let tags = self.all_article_tags()?;
+        let opened = self.opened_article_ids()?;
+        let updated = self.updated_article_ids()?;
+        let empty_tags: Vec<String> = Vec::new();
+        let mut matched = Vec::new();
+        let mut offset = 0usize;
+        loop {
+            let page = self.articles_page(None, PAGE, offset)?;
+            let full_page = page.len() == PAGE;
+            for a in page {
+                let view = crate::rules::RuleArticle {
+                    article: &a,
+                    feed_title: feed_titles
+                        .get(&a.feed_id)
+                        .map(|s| s.as_str())
+                        .unwrap_or(""),
+                    opened: opened.contains(&a.id),
+                    updated: updated.contains(&a.id),
+                    tags: tags.get(&a.id).unwrap_or(&empty_tags),
+                };
+                if crate::rules::rule_matches(rule, &view) {
+                    matched.push(a);
+                }
+            }
+            if !full_page {
+                break;
+            }
+            offset += PAGE;
+        }
+        Ok(matched)
     }
 
     pub fn mark_all_read(&self, feed_id: Option<&str>) -> rusqlite::Result<usize> {

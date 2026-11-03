@@ -68,7 +68,7 @@ fn article_by_id_and_read_toggle() {
         </channel></rss>"#,
     )
     .unwrap();
-    blindrss_core::refresh::store_parsed(&db, &feed, &parsed).unwrap();
+    blindrss_core::refresh::store_parsed(&db, &feed, &parsed, "deleted").unwrap();
     let a = db.article_by_id("g1").unwrap().expect("article exists");
     assert_eq!(a.title, "One");
     assert!(!a.is_read);

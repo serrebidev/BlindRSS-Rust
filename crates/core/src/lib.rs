@@ -78,4 +78,6 @@ pub use db::{
 };
 pub use extract::{ExtractOutcome, extract_article};
 pub use feeds::{ParsedEntry, ParsedFeed, parse_feed};
-pub use refresh::{refresh_all, refresh_feed, store_parsed, store_parsed_with_retention};
+pub use refresh::{
+    StoreOutcome, refresh_all, refresh_feed, store_parsed, store_parsed_with_retention,
+};

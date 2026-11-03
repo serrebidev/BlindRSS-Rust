@@ -63,7 +63,12 @@ fn delete_tombstone_restore_cycle() {
             tags: Vec::new(),
         }],
     };
-    assert_eq!(store_parsed(&db, &feed, &parsed).unwrap(), 0);
+    assert_eq!(
+        store_parsed(&db, &feed, &parsed, "deleted")
+            .unwrap()
+            .inserted,
+        0
+    );
     // Restore brings it back.
     assert!(db.restore_article("a1").unwrap());
     assert_eq!(db.articles(None, 10).unwrap().len(), 2);

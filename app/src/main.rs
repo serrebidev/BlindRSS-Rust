@@ -1702,6 +1702,35 @@ fn selected_article_indices(list: &ListCtrl, state: &State) -> Vec<usize> {
     indices
 }
 
+/// Deleted Articles dialog policy (Audit 8 G07): after a
+/// restore/purge pass, only the rows whose operation SUCCEEDED
+/// leave the list. A failed row stays visible — removing it
+/// anyway (the old dialog's behavior) told the user a restore
+/// happened when nothing was restored. `succeeded` carries
+/// (feed_id, article_id) pairs, the tombstone identity.
+fn retain_failed_deleted_rows(rows: Vec<Article>, succeeded: &[(String, String)]) -> Vec<Article> {
+    rows.into_iter()
+        .filter(|a| {
+            !succeeded
+                .iter()
+                .any(|(feed_id, id)| feed_id == &a.feed_id && id == &a.id)
+        })
+        .collect()
+}
+
+/// Display title for a Deleted Articles row (Python falls back
+/// to the URL, then a placeholder, for identity-only tombstones
+/// with no snapshot title).
+fn deleted_display_title(a: &Article) -> String {
+    if !a.title.trim().is_empty() {
+        a.title.clone()
+    } else if !a.url.trim().is_empty() {
+        a.url.clone()
+    } else {
+        "(deleted article)".to_string()
+    }
+}
+
 fn has_direct_media_link(article: &Article) -> bool {
     article.media_url.as_deref().is_some_and(|u| {
         !u.trim().is_empty() && u != article.url && !blindrss_core::media::is_ytdlp_supported(u)
@@ -2316,32 +2345,10 @@ fn refill_inner(state: &mut State, list: &ListCtrl) {
         if let Some((_, _, rule_json, _)) = folders.iter().find(|(id, ..)| id == smart_id) {
             let rule: serde_json::Value =
                 serde_json::from_str(rule_json).unwrap_or(serde_json::Value::Null);
-            let feed_titles: std::collections::HashMap<&str, &str> = state
-                .feeds
-                .iter()
-                .map(|f| (f.id.as_str(), f.title.as_str()))
-                .collect();
-            // The whole library: a smart folder that silently
-            // ignored everything older than the 500 newest articles
-            // reported an empty (or wrong) view.
-            if let Ok(all) = db.articles(None, 100_000) {
-                let tags_map = db.all_article_tags().unwrap_or_default();
-                let opened_ids = db.opened_article_ids().unwrap_or_default();
-                let updated_ids = db.updated_article_ids().unwrap_or_default();
-                let empty_tags: Vec<String> = Vec::new();
-                let matched: Vec<Article> = all
-                    .into_iter()
-                    .filter(|a| {
-                        let view = blindrss_core::rules::RuleArticle {
-                            article: a,
-                            feed_title: feed_titles.get(a.feed_id.as_str()).copied().unwrap_or(""),
-                            opened: opened_ids.contains(&a.id),
-                            updated: updated_ids.contains(&a.id),
-                            tags: tags_map.get(&a.id).unwrap_or(&empty_tags),
-                        };
-                        blindrss_core::rules::rule_matches(&rule, &view)
-                    })
-                    .collect();
+            // The whole library, paged: a smart folder must not
+            // silently ignore matches beyond a row ceiling
+            // (Audit 8 D21).
+            if let Ok(matched) = db.articles_matching_rule(&rule) {
                 loaded = matched;
             }
         }
@@ -3604,23 +3611,20 @@ fn main() {
             let mut failure = None;
             if let Some(db) = st.db.as_ref() {
                 for a in &articles {
-                    // Delete behaviour: the feed's override wins over the
-                    // global setting ("deleted" tombstone, "purge", or
-                    // "category:<path>" move-instead-of-delete).
-                    let behavior = db
-                        .feed_delete_behavior(&a.feed_id)
-                        .ok()
-                        .flatten()
-                        .unwrap_or_else(|| cfg.get_str("delete_behavior", "deleted").to_string());
+                    // Delete behaviour: one shared resolution —
+                    // the feed's override wins over the global
+                    // setting, parsed exactly like Python's
+                    // parse_delete_behavior (Audit 8 D12).
+                    let behavior = db.effective_delete_behavior(
+                        &a.feed_id,
+                        cfg.get_str("delete_behavior", "deleted"),
+                    );
                     let result =
                         if a.feed_id == blindrss_core::youtube_account::RECOMMENDATIONS_FEED_ID {
                             db.delete_recommendation(&a.id).map(|_| ())
-                        } else if let Some(path) = behavior.strip_prefix("category:") {
-                            db.set_article_category_override(&a.id, Some(path))
-                        } else if behavior == "purge" {
-                            db.purge_article(&a.id).map(|_| ())
                         } else {
-                            db.delete_article(&a.id).map(|_| ())
+                            db.delete_article_with_behavior(&a.id, &behavior)
+                                .map(|_| ())
                         };
                     match result {
                         Ok(_) => done += 1,
@@ -3834,51 +3838,260 @@ fn main() {
         let state_deleted = state.clone();
         let frame_deleted = frame;
         let act_deleted: Rc<dyn Fn()> = Rc::new(move || {
-            let deleted = {
+            // Deleted Articles (Python's Deleted view, Audit 8
+            // G07): normal article columns, search filtering,
+            // multi-restore and confirmed permanent purge. A row
+            // leaves the list only when its operation succeeded;
+            // failures stay put and are reported.
+            let (deleted, feed_titles_owned) = {
                 let st = state_deleted.borrow();
                 let Some(db) = st.db.as_ref() else { return };
-                db.deleted_articles().unwrap_or_default()
+                let rows = db.deleted_articles().unwrap_or_default();
+                let titles: std::collections::HashMap<String, String> = st
+                    .feeds
+                    .iter()
+                    .map(|f| (f.id.clone(), f.title.clone()))
+                    .collect();
+                (rows, titles)
             };
             if deleted.is_empty() {
                 frame_deleted.set_status_text("No deleted articles", 0);
                 return;
             }
             let dlg = Dialog::builder(&frame_deleted, "Deleted Articles").build();
-            dlg.set_size(Size::new(560, 380));
-            let lb = ListBox::builder(&dlg).build();
-            for a in &deleted {
-                lb.append(&a.title);
-            }
+            dlg.set_size(Size::new(820, 480));
+            let search_label = StaticText::builder(&dlg).with_label("Search:").build();
+            let search_box = TextCtrl::builder(&dlg).build();
+            let lc = ListCtrl::builder(&dlg)
+                .with_style(ListCtrlStyle::Report)
+                .build();
+            setup_article_columns(&lc);
+            let status_lbl = StaticText::builder(&dlg).with_label("").build();
+            let open_btn = Button::builder(&dlg).with_label("Open").build();
             let restore_btn = Button::builder(&dlg).with_label("Restore Selected").build();
+            let purge_btn = Button::builder(&dlg)
+                .with_label("Delete Permanently...")
+                .build();
             let close_btn = Button::builder(&dlg).with_label("Close").build();
             let ds = BoxSizer::builder(Orientation::Vertical).build();
-            ds.add(&lb, 1, SizerFlag::Expand | SizerFlag::All, 4);
+            let srow = BoxSizer::builder(Orientation::Horizontal).build();
+            srow.add(&search_label, 0, SizerFlag::All, 4);
+            srow.add(&search_box, 1, SizerFlag::Expand | SizerFlag::All, 4);
+            ds.add_sizer(&srow, 0, SizerFlag::Expand | SizerFlag::All, 0);
+            ds.add(&lc, 1, SizerFlag::Expand | SizerFlag::All, 4);
+            ds.add(&status_lbl, 0, SizerFlag::Expand | SizerFlag::All, 4);
             let drow = BoxSizer::builder(Orientation::Horizontal).build();
+            drow.add(&open_btn, 0, SizerFlag::All, 4);
             drow.add(&restore_btn, 0, SizerFlag::All, 4);
+            drow.add(&purge_btn, 0, SizerFlag::All, 4);
             drow.add(&close_btn, 0, SizerFlag::All, 4);
             ds.add_sizer(&drow, 0, SizerFlag::All, 0);
             dlg.set_sizer(ds, true);
-            let ids: Vec<String> = deleted.iter().map(|a| a.id.clone()).collect();
-            let state_r = state_deleted.clone();
-            restore_btn.on_click(move |_| {
-                let Some(sel) = lb.get_selection() else {
-                    return;
-                };
-                let Some(id) = ids.get(sel as usize) else {
-                    return;
-                };
-                let mut st = state_r.borrow_mut();
-                if let Some(db) = st.db.as_ref() {
-                    let _ = db.restore_article(id);
-                }
-                lb.delete(sel);
-                refill_articles(&mut st, &list);
-                frame_deleted.set_status_text("Article restored", 0);
-            });
+
+            let all_rows = Rc::new(std::cell::RefCell::new(deleted));
+            let shown = Rc::new(std::cell::RefCell::new(all_rows.borrow().clone()));
+            let feed_titles_owned = Rc::new(feed_titles_owned);
+            // (Re)fill the list from the shown rows, honouring
+            // the configured article columns.
+            let fill: Rc<dyn Fn()> = {
+                let shown_f = shown.clone();
+                let titles_f = feed_titles_owned.clone();
+                Rc::new(move || {
+                    let cfg =
+                        blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+                    let layout = blindrss_core::article_columns::layout_from_config(&cfg);
+                    let visible = blindrss_core::article_columns::visible_columns(&layout);
+                    let titles: std::collections::HashMap<&str, &str> = titles_f
+                        .iter()
+                        .map(|(k, v)| (k.as_str(), v.as_str()))
+                        .collect();
+                    lc.freeze();
+                    lc.delete_all_items();
+                    for (i, a) in shown_f.borrow().iter().enumerate() {
+                        let mut row = a.clone();
+                        row.title = deleted_display_title(a);
+                        lc.insert_item(i as i64, &row.title, None);
+                        for (col_idx, col) in visible.iter().enumerate().skip(1) {
+                            let cell = article_cell(&row, &col.key, &titles);
+                            lc.set_item_text_by_column(i as i64, col_idx as i32, &cell);
+                        }
+                    }
+                    lc.thaw();
+                })
+            };
+            fill();
+            // Search: every term must appear in the row's title,
+            // feed, author or URL (Python's view search shape).
+            // One closure, reused after restore/purge passes.
+            let refilter: Rc<dyn Fn()> = {
+                let all_s = all_rows.clone();
+                let shown_s = shown.clone();
+                let titles_s = feed_titles_owned.clone();
+                let fill_s = fill.clone();
+                Rc::new(move || {
+                    let query = search_box.get_value().to_lowercase();
+                    let terms: Vec<&str> = query.split_whitespace().collect();
+                    let filtered: Vec<Article> = all_s
+                        .borrow()
+                        .iter()
+                        .filter(|a| {
+                            if terms.is_empty() {
+                                return true;
+                            }
+                            let hay = format!(
+                                "{} {} {} {}",
+                                a.title.to_lowercase(),
+                                titles_s
+                                    .get(&a.feed_id)
+                                    .map(|s| s.to_lowercase())
+                                    .unwrap_or_default(),
+                                a.author.clone().unwrap_or_default().to_lowercase(),
+                                a.url.to_lowercase()
+                            );
+                            terms.iter().all(|t| hay.contains(t))
+                        })
+                        .cloned()
+                        .collect();
+                    *shown_s.borrow_mut() = filtered;
+                    fill_s();
+                })
+            };
+            {
+                let r = refilter.clone();
+                search_box.on_text_updated(move |_| r());
+            }
+            let selected_rows: Rc<dyn Fn() -> Vec<Article>> = {
+                let shown_sel = shown.clone();
+                Rc::new(move || {
+                    let mut out = Vec::new();
+                    let mut index = lc.get_first_selected_item();
+                    while index >= 0 {
+                        if let Some(a) = shown_sel.borrow().get(index as usize) {
+                            out.push(a.clone());
+                        }
+                        index = lc.get_next_item(
+                            index as i64,
+                            ListNextItemFlag::All,
+                            ListItemState::Selected,
+                        );
+                    }
+                    out
+                })
+            };
+            // One pass of restore or purge over the selection;
+            // only succeeded rows leave the dialog (and the
+            // failure count is announced, never swallowed).
+            let apply_op: Rc<dyn Fn(bool)> = {
+                let all_o = all_rows.clone();
+                let state_o = state_deleted.clone();
+                let selected_o = selected_rows.clone();
+                let refilter_o = refilter.clone();
+                Rc::new(move |purge: bool| {
+                    let targets = selected_o();
+                    if targets.is_empty() {
+                        status_lbl.set_label("Select one or more articles first");
+                        return;
+                    }
+                    let mut succeeded: Vec<(String, String)> = Vec::new();
+                    {
+                        let st = state_o.borrow();
+                        if let Some(db) = st.db.as_ref() {
+                            for a in &targets {
+                                let ok = if purge {
+                                    db.purge_deleted_article(&a.feed_id, &a.id)
+                                } else {
+                                    db.restore_deleted_article(&a.feed_id, &a.id)
+                                };
+                                if matches!(ok, Ok(true)) {
+                                    succeeded.push((a.feed_id.clone(), a.id.clone()));
+                                }
+                            }
+                        }
+                    }
+                    let failed = targets.len() - succeeded.len();
+                    let done = succeeded.len();
+                    *all_o.borrow_mut() =
+                        retain_failed_deleted_rows(all_o.borrow().clone(), &succeeded);
+                    // Re-apply the current search filter; failed
+                    // rows are still in all_rows, so they reappear.
+                    refilter_o();
+                    let verb = if purge {
+                        "Permanently deleted"
+                    } else {
+                        "Restored"
+                    };
+                    let note = if failed > 0 {
+                        format!("{verb} {done} article(s); {failed} failed and remain in the list")
+                    } else {
+                        format!("{verb} {done} article(s)")
+                    };
+                    status_lbl.set_label(&note);
+                    frame_deleted.set_status_text(&note, 0);
+                    if done > 0 {
+                        let mut st = state_o.borrow_mut();
+                        refill_articles(&mut st, &list);
+                    }
+                })
+            };
+            {
+                let a = apply_op.clone();
+                restore_btn.on_click(move |_| a(false));
+            }
+            {
+                let a = apply_op.clone();
+                let selected_p = selected_rows.clone();
+                purge_btn.on_click(move |_| {
+                    let n = selected_p().len();
+                    if n == 0 {
+                        status_lbl.set_label("Select one or more articles first");
+                        return;
+                    }
+                    let prompt = if n == 1 {
+                        "Permanently delete this article? It cannot be restored.".to_string()
+                    } else {
+                        format!("Permanently delete {n} articles? They cannot be restored.")
+                    };
+                    let md = MessageDialog::builder(&dlg, &prompt, "Confirm Permanent Delete")
+                        .with_style(MessageDialogStyle::YesNo | MessageDialogStyle::IconWarning)
+                        .build();
+                    let answer = md.show_modal();
+                    md.destroy();
+                    if answer == ID_YES {
+                        a(true);
+                    }
+                });
+            }
+            let open_selected: Rc<dyn Fn()> = {
+                let selected_q = selected_rows.clone();
+                Rc::new(move || {
+                    let targets = selected_q();
+                    let Some(a) = targets.first() else {
+                        status_lbl.set_label("Select an article first");
+                        return;
+                    };
+                    let body = a
+                        .content
+                        .clone()
+                        .filter(|c| !c.trim().is_empty())
+                        .or_else(|| a.description.clone())
+                        .unwrap_or_default();
+                    crate::article_window::open(&deleted_display_title(a), &body, Some(&a.url));
+                })
+            };
+            {
+                let o = open_selected.clone();
+                open_btn.on_click(move |_| o());
+            }
+            {
+                let o = open_selected.clone();
+                lc.on_item_activated(move |_| o());
+            }
+            let dlg_close = dlg;
             close_btn.on_click(move |_| {
-                dlg.end_modal(ID_OK);
+                dlg_close.end_modal(ID_OK);
             });
             dlg.show_modal();
+            dlg.destroy();
             restore_focus(&state_deleted.borrow(), &tree, &list);
         });
         {
@@ -5143,7 +5356,12 @@ fn main() {
             std::thread::spawn(move || {
                 let result = Db::open(&db_path())
                     .map_err(|e| format!("{e}"))
-                    .and_then(|db| blindrss_core::archive::rescan_archive(&db, &feed));
+                    .and_then(|db| {
+                        let global_behavior = blindrss_core::config::Config::load(&config_path())
+                            .map(|c| c.get_str("delete_behavior", "deleted").to_string())
+                            .unwrap_or_else(|_| "deleted".to_string());
+                        blindrss_core::archive::rescan_archive(&db, &feed, &global_behavior)
+                    });
                 let _ = tx.send(RefreshMsg::ArchiveDone(feed.title.clone(), result));
             });
         });
@@ -5542,7 +5760,12 @@ fn main() {
             std::thread::spawn(move || {
                 let result = Db::open(&db_path())
                     .map_err(|e| format!("{e}"))
-                    .and_then(|db| blindrss_core::archive::rescan_archive(&db, &feed));
+                    .and_then(|db| {
+                        let global_behavior = blindrss_core::config::Config::load(&config_path())
+                            .map(|c| c.get_str("delete_behavior", "deleted").to_string())
+                            .unwrap_or_else(|_| "deleted".to_string());
+                        blindrss_core::archive::rescan_archive(&db, &feed, &global_behavior)
+                    });
                 let _ = tx.send(RefreshMsg::ArchiveDone(feed.title.clone(), result));
             });
         });
@@ -8310,15 +8533,27 @@ fn main() {
                         }
                         let mut stored_new = 0usize;
                         if let Some(db) = st.db.as_ref() {
+                            // The count that reaches the status
+                            // line and notifications is Python's
+                            // new_items: rule-removed and
+                            // notification-suppressed articles do
+                            // not count (Audit 8 D13). The store
+                            // also enforces the retention boundary
+                            // (Audit 8 D04).
+                            let global_behavior =
+                                blindrss_core::config::Config::load(&config_path())
+                                    .map(|c| c.get_str("delete_behavior", "deleted").to_string())
+                                    .unwrap_or_else(|_| "deleted".to_string());
                             match store_parsed_with_retention(
                                 db,
                                 &feed,
                                 &parsed,
+                                &global_behavior,
                                 article_retention_cutoff().as_deref(),
                             ) {
-                                Ok(n) => {
-                                    new_total += n;
-                                    stored_new = n;
+                                Ok(outcome) => {
+                                    new_total += outcome.notify_count;
+                                    stored_new = outcome.notify_count;
                                     let _ = db.clear_feed_error(&feed.id);
                                 }
                                 Err(e) => frame_tick.set_status_text(
@@ -8357,10 +8592,17 @@ fn main() {
                                 add_category.as_deref().filter(|c| !c.trim().is_empty()),
                             ) {
                                 Ok(feed) => {
+                                    let global_behavior =
+                                        blindrss_core::config::Config::load(&config_path())
+                                            .map(|c| {
+                                                c.get_str("delete_behavior", "deleted").to_string()
+                                            })
+                                            .unwrap_or_else(|_| "deleted".to_string());
                                     let _ = store_parsed_with_retention(
                                         db,
                                         &feed,
                                         &parsed,
+                                        &global_behavior,
                                         article_retention_cutoff().as_deref(),
                                     );
                                     st.feeds.push(feed);
@@ -9104,6 +9346,39 @@ mod ui_parity_tests {
         );
         assert_eq!(remembered_view_value(None, 0), "all");
         assert_eq!(remembered_view_value(Some("smart:7"), 1), "smart:7");
+    }
+
+    #[test]
+    fn deleted_rows_leave_only_on_success() {
+        // Audit 8 G07: a failed restore/purge keeps its row in
+        // the Deleted Articles list; only succeeded rows leave,
+        // order otherwise preserved. Identity is (feed, article).
+        let mk = |feed: &str, id: &str| Article {
+            id: id.into(),
+            feed_id: feed.into(),
+            title: format!("T{id}"),
+            url: String::new(),
+            content: None,
+            description: None,
+            date: None,
+            author: None,
+            is_read: false,
+            is_favorite: false,
+            media_url: None,
+            media_type: None,
+        };
+        let rows = vec![mk("f1", "a"), mk("f2", "a"), mk("f1", "b")];
+        let kept = retain_failed_deleted_rows(rows, &[("f2".to_string(), "a".to_string())]);
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept[0].feed_id, "f1");
+        assert_eq!(kept[0].id, "a");
+        assert_eq!(kept[1].id, "b");
+        // Display title falls back title -> url -> placeholder.
+        let mut bare = mk("f1", "x");
+        bare.title = String::new();
+        assert_eq!(deleted_display_title(&bare), "(deleted article)");
+        bare.url = "https://example.com/x".into();
+        assert_eq!(deleted_display_title(&bare), "https://example.com/x");
     }
 
     #[test]

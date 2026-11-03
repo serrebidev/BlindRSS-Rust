@@ -143,7 +143,7 @@ fn pipeline_applies_on_store_with_stop_and_labels() {
         </channel></rss>"#,
     )
     .unwrap();
-    blindrss_core::refresh::store_parsed(&db, &feed, &parsed).unwrap();
+    blindrss_core::refresh::store_parsed(&db, &feed, &parsed, "deleted").unwrap();
     let g1 = db.article_by_id("g1").unwrap().unwrap();
     assert!(g1.is_read && g1.is_favorite);
     assert_eq!(

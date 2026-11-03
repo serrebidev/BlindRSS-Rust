@@ -36,15 +36,32 @@ fn entry_to_article(feed_id: &str, e: &ParsedEntry) -> Article {
     }
 }
 
-/// Store an already-parsed feed; returns how many new articles were
-/// stored. Split from fetching so a UI can fetch on a worker thread and
-/// store on its main thread, where the database connection lives.
+/// What one `store_parsed` call did (Python's per-feed refresh
+/// bookkeeping): how many articles were newly stored, and which
+/// of them are notification-eligible — stored, not removed by a
+/// rule, and not covered by a rule's skip-notification action
+/// (Python `_apply_rules_to_new_article` pops exactly those from
+/// the new-items count and summaries).
+#[derive(Debug, Clone, Default)]
+pub struct StoreOutcome {
+    pub inserted: usize,
+    pub notify_count: usize,
+    pub new_articles: Vec<Article>,
+}
+
+/// Store an already-parsed feed. Split from fetching so a UI can
+/// fetch on a worker thread and store on its main thread, where
+/// the database connection lives. `global_delete_behavior` is
+/// the global `delete_behavior` config value; a feed's own
+/// `feeds.delete_behavior` override wins over it when a filter
+/// rule deletes (Audit 8 D12).
 pub fn store_parsed(
     db: &Db,
     feed: &Feed,
     parsed: &crate::feeds::ParsedFeed,
-) -> Result<usize, String> {
-    store_parsed_with_retention(db, feed, parsed, None)
+    global_delete_behavior: &str,
+) -> Result<StoreOutcome, String> {
+    store_parsed_with_retention(db, feed, parsed, global_delete_behavior, None)
 }
 
 /// Store a parsed feed, refusing NEW entries outside the retention
@@ -54,8 +71,9 @@ pub fn store_parsed_with_retention(
     db: &Db,
     feed: &Feed,
     parsed: &crate::feeds::ParsedFeed,
+    global_delete_behavior: &str,
     retention_cutoff: Option<&str>,
-) -> Result<usize, String> {
+) -> Result<StoreOutcome, String> {
     // Deleted articles must not resurrect on refresh. Tombstones
     // are feed-scoped (Python `deleted_article_tombstones_for_feed`):
     // an entry matches on its raw id, its feed-scoped id, or its
@@ -65,7 +83,10 @@ pub fn store_parsed_with_retention(
     // Filter-rule pipeline (Python applies enabled rules to articles
     // as they arrive). Missing table (older fixtures) = no rules.
     let rules = db.filter_rules().unwrap_or_default();
-    let mut inserted = 0;
+    // The feed's effective delete behavior is resolved once, the
+    // way Python resolves it per feed before the entry loop.
+    let behavior = db.effective_delete_behavior(&feed.id, global_delete_behavior);
+    let mut outcome = StoreOutcome::default();
     for entry in &parsed.entries {
         let base_id = entry.id.trim().to_string();
         if base_id.is_empty() {
@@ -114,7 +135,7 @@ pub fn store_parsed_with_retention(
             .insert_article_if_new(&article)
             .map_err(|e| format!("store failed: {e}"))?
         {
-            inserted += 1;
+            outcome.inserted += 1;
             // NPR / Sky media attach (Python's generic parse path):
             // those program feeds ship no enclosure, so resolve the
             // audio for media-less new articles at store time.
@@ -144,6 +165,8 @@ pub fn store_parsed_with_retention(
                 )
                 .map_err(|e| format!("store tags failed: {e}"))?;
             }
+            let mut removed = false;
+            let mut skip_notification = false;
             if !rules.is_empty() {
                 let view = crate::rules::RuleArticle {
                     article: &article,
@@ -152,19 +175,31 @@ pub fn store_parsed_with_retention(
                     updated: false,
                     tags: &entry.tags,
                 };
-                apply_filter_pipeline(
-                    db,
+                let resolved = crate::rules::resolve_effective_actions(
                     &crate::rules::evaluate_pipeline(&rules, &view),
-                    &article,
+                    &behavior,
                 );
+                skip_notification = resolved.skip_notification;
+                removed = apply_filter_pipeline(db, &resolved, &article);
+            }
+            // Notification eligibility (Python D13 semantics):
+            // rule-removed and notification-suppressed articles
+            // were stored but are not "new article" news.
+            if !removed && !skip_notification {
+                outcome.notify_count += 1;
+                outcome.new_articles.push(article);
             }
         }
     }
-    Ok(inserted)
+    Ok(outcome)
 }
 
-/// Apply the filter-rule pipeline to one freshly stored article.
-fn apply_filter_pipeline(db: &Db, eff: &crate::rules::EffectiveActions, article: &Article) {
+/// Apply resolved filter-rule actions to one article (Python
+/// `apply_effective_actions`): read/favorite flags, labels, the
+/// move (an explicit move, or delete-to-category), then removal
+/// through the shared delete policy. Returns true when the
+/// article was removed from normal views.
+fn apply_filter_pipeline(db: &Db, eff: &crate::rules::ResolvedActions, article: &Article) -> bool {
     if eff.mark_read {
         let _ = db.mark_read(&article.id, true);
     }
@@ -174,16 +209,25 @@ fn apply_filter_pipeline(db: &Db, eff: &crate::rules::EffectiveActions, article:
     for label in &eff.labels {
         let _ = db.add_article_label(&article.id, label);
     }
+    if eff.removes_article() {
+        let behavior = if eff.purge {
+            crate::rules::DeleteBehavior::Purge
+        } else {
+            crate::rules::DeleteBehavior::Deleted
+        };
+        let _ = db.delete_article_with_behavior(&article.id, &behavior);
+        return true;
+    }
     if let Some(target) = &eff.move_to {
         let _ = db.set_article_category_override(&article.id, Some(target));
     }
-    if eff.delete {
-        let _ = db.delete_article(&article.id);
-    }
+    false
 }
 
-/// Refresh one feed; returns how many new articles were stored.
-pub fn refresh_feed(db: &Db, feed: &Feed) -> Result<usize, String> {
+/// Refresh one feed; returns how many new articles are
+/// notification-eligible (Python's per-feed `new_items`: stored
+/// and neither rule-removed nor notification-suppressed).
+pub fn refresh_feed(db: &Db, feed: &Feed, global_delete_behavior: &str) -> Result<usize, String> {
     // Listing sources (Batch 35): subscriptions with no native RSS
     // are enumerated by their source fetcher, mirroring the branch
     // order of Python `providers/local.py::_refresh_single_feed`.
@@ -216,7 +260,7 @@ pub fn refresh_feed(db: &Db, feed: &Feed) -> Result<usize, String> {
             title,
             entries: crate::sources::items_to_entries(items),
         };
-        return store_parsed(db, feed, &parsed);
+        return store_parsed(db, feed, &parsed, global_delete_behavior).map(|o| o.notify_count);
     }
     // One-time channel history backfill (issue #109) runs before
     // the fetch, as in Python: the RSS feed carries only the newest
@@ -224,7 +268,7 @@ pub fn refresh_feed(db: &Db, feed: &Feed) -> Result<usize, String> {
     // it under the same stable ids, whatever the RSS fetch then does.
     let channel_id = crate::sources::youtube_channel_id(&feed.url);
     if let Some(cid) = &channel_id {
-        youtube_history_backfill(db, feed, cid);
+        youtube_history_backfill(db, feed, cid, global_delete_behavior);
     }
     let parsed = match crate::feeds::fetch_with_cache(db, &feed.url, false) {
         Ok(p) => p,
@@ -243,12 +287,13 @@ pub fn refresh_feed(db: &Db, feed: &Feed) -> Result<usize, String> {
                     title,
                     entries: crate::sources::items_to_entries(shape_stable_ids(db, feed, items)),
                 };
-                return store_parsed(db, feed, &parsed);
+                return store_parsed(db, feed, &parsed, global_delete_behavior)
+                    .map(|o| o.notify_count);
             }
             return Err(e);
         }
     };
-    store_parsed(db, feed, &parsed)
+    store_parsed(db, feed, &parsed, global_delete_behavior).map(|o| o.notify_count)
 }
 
 /// Shape channel-listing items for storage: an id already owned by
@@ -277,7 +322,7 @@ fn shape_stable_ids(
 const YOUTUBE_HISTORY_MAX_ITEMS: usize = 5000;
 const YOUTUBE_HISTORY_TIMEOUT_S: u64 = 300;
 
-fn youtube_history_backfill(db: &Db, feed: &Feed, channel_id: &str) {
+fn youtube_history_backfill(db: &Db, feed: &Feed, channel_id: &str, global_delete_behavior: &str) {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs_f64())
@@ -299,10 +344,10 @@ fn youtube_history_backfill(db: &Db, feed: &Feed, channel_id: &str) {
             entries: crate::sources::items_to_entries(shape_stable_ids(db, feed, items)),
         };
         // History items are stored unread but are NOT new-item
-        // news: the count is deliberately discarded. Python marks
+        // news: the outcome is deliberately discarded. Python marks
         // the history done only when the listing produced items
         // and they were stored.
-        if store_parsed(db, feed, &parsed).is_ok() {
+        if store_parsed(db, feed, &parsed, global_delete_behavior).is_ok() {
             let _ = db.set_youtube_history_state(&feed.id, 2, now);
         }
     }
@@ -310,58 +355,91 @@ fn youtube_history_backfill(db: &Db, feed: &Feed, channel_id: &str) {
 
 /// Refresh every feed, collecting per-feed results. One feed failing
 /// does not stop the others (Python behaves the same way).
-pub fn refresh_all(db: &Db) -> Vec<(String, Result<usize, String>)> {
+pub fn refresh_all(db: &Db, global_delete_behavior: &str) -> Vec<(String, Result<usize, String>)> {
     let feeds = match db.feeds() {
         Ok(f) => f,
         Err(e) => return vec![("<database>".to_string(), Err(format!("{e}")))],
     };
     feeds
         .iter()
-        .map(|f| (f.title.clone(), refresh_feed(db, f)))
+        .map(|f| (f.title.clone(), refresh_feed(db, f, global_delete_behavior)))
         .collect()
 }
 
 /// Apply the whole filter-rule pipeline to articles already in
 /// the database (the rules dialog's "Apply to existing articles").
-/// Returns how many articles any rule acted on.
-pub fn apply_rules_to_existing(db: &Db) -> Result<usize, String> {
+/// Returns how many articles any rule acted on. Evaluation pages
+/// through the whole library — Python applies rules to existing
+/// articles without a row ceiling, so a match beyond the first
+/// 100,000 rows is still reached (Audit 8 D21). Each article's
+/// delete action resolves through its own feed's effective
+/// delete behavior (Audit 8 D12).
+pub fn apply_rules_to_existing(db: &Db, global_delete_behavior: &str) -> Result<usize, String> {
     let rules = db.filter_rules().map_err(|e| format!("{e}"))?;
     if rules.is_empty() {
         return Ok(0);
     }
-    let feed_titles: std::collections::HashMap<String, String> = db
-        .feeds()
-        .map_err(|e| format!("{e}"))?
-        .into_iter()
-        .map(|f| (f.id, f.title))
+    let feeds = db.feeds().map_err(|e| format!("{e}"))?;
+    let feed_titles: std::collections::HashMap<String, String> = feeds
+        .iter()
+        .map(|f| (f.id.clone(), f.title.clone()))
         .collect();
-    let articles = db.articles(None, 100_000).map_err(|e| format!("{e}"))?;
-    let mut changed = 0usize;
+    // Resolve each feed's delete behavior once, not per article.
+    let feed_behaviors: std::collections::HashMap<String, crate::rules::DeleteBehavior> = feeds
+        .iter()
+        .map(|f| {
+            (
+                f.id.clone(),
+                db.effective_delete_behavior(&f.id, global_delete_behavior),
+            )
+        })
+        .collect();
+    let global_behavior = crate::rules::parse_delete_behavior(global_delete_behavior);
     let tags = db.all_article_tags().map_err(|e| format!("{e}"))?;
     let opened = db.opened_article_ids().map_err(|e| format!("{e}"))?;
     let updated = db.updated_article_ids().map_err(|e| format!("{e}"))?;
     let empty_tags = Vec::new();
-    for article in &articles {
-        let view = crate::rules::RuleArticle {
-            article,
-            feed_title: feed_titles
+    // Two phases, like Python (fetch all rows, then apply):
+    // evaluating is read-only paging, applying happens after,
+    // so a rule that removes rows cannot shift the windows and
+    // skip later articles.
+    const PAGE: usize = 1_000;
+    let mut work: Vec<(Article, crate::rules::ResolvedActions)> = Vec::new();
+    let mut offset = 0usize;
+    loop {
+        let page = db
+            .articles_page(None, PAGE, offset)
+            .map_err(|e| format!("{e}"))?;
+        let full_page = page.len() == PAGE;
+        for article in &page {
+            let view = crate::rules::RuleArticle {
+                article,
+                feed_title: feed_titles
+                    .get(&article.feed_id)
+                    .map(|s| s.as_str())
+                    .unwrap_or(""),
+                opened: opened.contains(&article.id),
+                updated: updated.contains(&article.id),
+                tags: tags.get(&article.id).unwrap_or(&empty_tags),
+            };
+            let behavior = feed_behaviors
                 .get(&article.feed_id)
-                .map(|s| s.as_str())
-                .unwrap_or(""),
-            opened: opened.contains(&article.id),
-            updated: updated.contains(&article.id),
-            tags: tags.get(&article.id).unwrap_or(&empty_tags),
-        };
-        let eff = crate::rules::evaluate_pipeline(&rules, &view);
-        if eff.mark_read
-            || eff.mark_favorite
-            || eff.delete
-            || eff.move_to.is_some()
-            || !eff.labels.is_empty()
-        {
-            changed += 1;
-            apply_filter_pipeline(db, &eff, article);
+                .unwrap_or(&global_behavior);
+            let resolved = crate::rules::resolve_effective_actions(
+                &crate::rules::evaluate_pipeline(&rules, &view),
+                behavior,
+            );
+            if resolved.any() {
+                work.push((article.clone(), resolved));
+            }
         }
+        if !full_page {
+            break;
+        }
+        offset += PAGE;
     }
-    Ok(changed)
+    for (article, resolved) in &work {
+        apply_filter_pipeline(db, resolved, article);
+    }
+    Ok(work.len())
 }

@@ -29,6 +29,11 @@ pub struct ArchiveSettings {
     pub enabled: bool,
     pub max_snapshots: usize,
     pub rescan_days: f64,
+    /// The global `delete_behavior` setting, carried here because
+    /// archive recovery stores episodes through the same rule
+    /// pipeline as a refresh (Audit 8 D12: rule deletes during a
+    /// scan resolve through the configured behavior too).
+    pub delete_behavior: String,
 }
 
 impl Default for ArchiveSettings {
@@ -37,6 +42,7 @@ impl Default for ArchiveSettings {
             enabled: true,
             max_snapshots: 5000,
             rescan_days: 30.0,
+            delete_behavior: "deleted".to_string(),
         }
     }
 }
@@ -62,6 +68,7 @@ impl ArchiveSettings {
             enabled: cfg.get_bool("podcast_archive_enabled", true),
             max_snapshots: max_snapshots.clamp(1, 5000) as usize,
             rescan_days: days,
+            delete_behavior: cfg.get_str("delete_behavior", "deleted").to_string(),
         }
     }
 

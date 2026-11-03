@@ -171,6 +171,107 @@ fn action_str(actions: &Value, key: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// The configured delete behavior (Python
+/// `core/filters.py::parse_delete_behavior`): what the abstract
+/// "delete" action — and the interactive Delete command — does
+/// with an article.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeleteBehavior {
+    /// Soft delete: tombstone snapshot + remove (Deleted view).
+    Deleted,
+    /// Permanent: tombstone flagged purged + remove.
+    Purge,
+    /// Move instead of delete: file under this category path.
+    Category(String),
+}
+
+/// Parse a delete-behavior string (per-feed override or the
+/// global `delete_behavior` setting). Unknown/empty values fall
+/// back to the safe default, soft delete.
+pub fn parse_delete_behavior(value: &str) -> DeleteBehavior {
+    let text = value.trim();
+    if text.is_empty() {
+        return DeleteBehavior::Deleted;
+    }
+    let low = text.to_lowercase();
+    if low == "purge" {
+        return DeleteBehavior::Purge;
+    }
+    if low == "deleted" {
+        return DeleteBehavior::Deleted;
+    }
+    if low.starts_with("category:") {
+        let cat = text.split_once(':').map(|x| x.1).unwrap_or("").trim();
+        if !cat.is_empty() {
+            return DeleteBehavior::Category(cat.to_string());
+        }
+    }
+    DeleteBehavior::Deleted
+}
+
+/// Actions after the abstract "delete" is folded through the
+/// configured delete behavior (Python `resolve_effective_actions`
+/// output shape).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ResolvedActions {
+    pub mark_read: bool,
+    pub mark_favorite: bool,
+    /// Includes the delete-to-category target, which takes
+    /// precedence over an explicit rule "move".
+    pub move_to: Option<String>,
+    pub labels: Vec<String>,
+    /// Tombstone + physically remove the row.
+    pub remove: bool,
+    /// Tombstone marked purged + remove.
+    pub purge: bool,
+    pub skip_notification: bool,
+}
+
+impl ResolvedActions {
+    /// True when the article leaves normal views (Python
+    /// `effective_removes_article`).
+    pub fn removes_article(&self) -> bool {
+        self.remove || self.purge
+    }
+
+    /// True when any action is set (the pipeline matched with
+    /// something to do).
+    pub fn any(&self) -> bool {
+        self.mark_read
+            || self.mark_favorite
+            || self.move_to.is_some()
+            || !self.labels.is_empty()
+            || self.remove
+            || self.purge
+            || self.skip_notification
+    }
+}
+
+/// Fold the pipeline aggregate through the delete behavior
+/// (Python `resolve_effective_actions`).
+pub fn resolve_effective_actions(
+    agg: &EffectiveActions,
+    behavior: &DeleteBehavior,
+) -> ResolvedActions {
+    let mut out = ResolvedActions {
+        mark_read: agg.mark_read,
+        mark_favorite: agg.mark_favorite,
+        move_to: agg.move_to.clone(),
+        labels: agg.labels.clone(),
+        remove: false,
+        purge: false,
+        skip_notification: agg.skip_notification,
+    };
+    if agg.delete {
+        match behavior {
+            DeleteBehavior::Category(cat) => out.move_to = Some(cat.clone()),
+            DeleteBehavior::Purge => out.purge = true,
+            DeleteBehavior::Deleted => out.remove = true,
+        }
+    }
+    out
+}
+
 /// Run enabled rules in order against one article; a matching rule
 /// with stop=true ends the pipeline (Python semantics).
 pub fn evaluate_pipeline(rules: &[FilterRule], art: &RuleArticle) -> EffectiveActions {

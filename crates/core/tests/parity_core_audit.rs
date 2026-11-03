@@ -31,7 +31,7 @@ fn feed_links_and_tags_reach_filter_rules() {
     .unwrap();
     let parsed = parsed();
     assert_eq!(parsed.entries[0].url, "https://example.com/article");
-    store_parsed(&db, &feed, &parsed).unwrap();
+    store_parsed(&db, &feed, &parsed, "deleted").unwrap();
     assert_eq!(db.article_tags("item").unwrap(), vec!["Technology"]);
     assert!(db.article_by_id("item").unwrap().unwrap().is_favorite);
     drop(db);
@@ -43,7 +43,7 @@ fn python_tags_survive_enrichment_and_existing_filters_use_real_facts() {
     let feed = db
         .add_feed("https://example.com/feed", "News", None)
         .unwrap();
-    store_parsed(&db, &feed, &parsed()).unwrap();
+    store_parsed(&db, &feed, &parsed(), "deleted").unwrap();
     let conn = rusqlite::Connection::open(&path).unwrap();
     conn.execute(
         "UPDATE articles SET tags = 'Python\nRust' WHERE id = 'item'",
@@ -75,7 +75,7 @@ fn python_tags_survive_enrichment_and_existing_filters_use_real_facts() {
     db.record_article_version("item", "Title", Some("two"))
         .unwrap();
     db.create_filter_rule("facts", &json!({"match":"all","conditions":[{"field":"tag","value":"feeds"},{"field":"opened","value":true},{"field":"updated","value":true}]}).to_string(), r#"{"mark_read":true}"#, true, false).unwrap();
-    assert_eq!(apply_rules_to_existing(&db).unwrap(), 1);
+    assert_eq!(apply_rules_to_existing(&db, "deleted").unwrap(), 1);
     assert!(db.article_by_id("item").unwrap().unwrap().is_read);
     drop(conn);
     drop(db);
@@ -87,7 +87,7 @@ fn unknown_rule_fields_do_not_match_any_group() {
     let feed = db
         .add_feed("https://example.com/feed", "News", None)
         .unwrap();
-    store_parsed(&db, &feed, &parsed()).unwrap();
+    store_parsed(&db, &feed, &parsed(), "deleted").unwrap();
     let a = db.article_by_id("item").unwrap().unwrap();
     let facts = RuleArticle {
         article: &a,

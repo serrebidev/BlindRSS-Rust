@@ -88,6 +88,9 @@ pub trait Provider {
 /// The local backend: everything goes to the on-disk database.
 pub struct LocalProvider {
     db_path: PathBuf,
+    /// The global `delete_behavior` setting captured at
+    /// construction (per-feed overrides still win at apply time).
+    delete_behavior: String,
 }
 
 impl LocalProvider {
@@ -127,7 +130,7 @@ impl Provider for LocalProvider {
         let feed = db
             .add_feed(&feed_url, &parsed.title, None)
             .map_err(|e| format!("{e}"))?;
-        crate::refresh::store_parsed(&db, &feed, &parsed)?;
+        crate::refresh::store_parsed(&db, &feed, &parsed, &self.delete_behavior)?;
         Ok(format!("Added {}", feed.title))
     }
     fn remove_feed(&self, feed: &Feed) -> Result<(), String> {
@@ -157,7 +160,7 @@ impl Provider for LocalProvider {
         // (progress + cancel); the trait path does the same
         // work synchronously for non-UI callers.
         let db = self.db()?;
-        let results = crate::refresh::refresh_all(&db);
+        let results = crate::refresh::refresh_all(&db, &self.delete_behavior);
         let new: usize = results.iter().filter_map(|(_, r)| r.as_ref().ok()).sum();
         Ok(format!("{new} new article(s)"))
     }
@@ -480,7 +483,10 @@ pub fn get_provider(cfg: &Config, db_path: PathBuf) -> Box<dyn Provider + Send> 
         "bazqux" => hosted("bazqux", HostedKind::GReader(GReaderService::BazQux)),
         "inoreader" => hosted("inoreader", HostedKind::GReader(GReaderService::Inoreader)),
         "miniflux" => hosted("miniflux", HostedKind::Miniflux),
-        _ => Box::new(LocalProvider { db_path }),
+        _ => Box::new(LocalProvider {
+            db_path,
+            delete_behavior: cfg.get_str("delete_behavior", "deleted").to_string(),
+        }),
     }
 }
 

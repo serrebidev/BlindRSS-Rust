@@ -2179,3 +2179,101 @@ app and xtask, `cargo test --workspace` 450 passed / 0 failed, and
 `cargo build -p blindrss` successfully. Category path handling is untouched: this batch builds on
 current main's path code and assumes Task 2's canonical `" / "` separator
 work lands independently (no category code is modified here).
+## Audit 8 Task 4 — delete/restore and complete rule application (D12, D13, D14, D21, G07)
+
+Branch `audit8/task4-delete-rules`, built on main at `d4d69f6`. Python spec:
+`core/filters.py` (`parse_delete_behavior`, `resolve_effective_actions`,
+`apply_effective_actions`), `core/db.py` (tombstone snapshot/restore/purge),
+`providers/local.py` (`_resolve_delete_behavior`, `_apply_rules_to_new_article`,
+`apply_filter_rules_to_existing`, `delete_article`), `gui/mainframe.py`
+(Deleted Articles view and restore/purge flows).
+
+Failing reproductions first: new core suite `crates/core/tests/audit8_task4_slice.rs`
+(12 tests) was written against the pre-fix tree and failed to compile with
+exactly the expected missing-API errors (no delete-behavior resolution, no
+scoped restore/purge, no paged rule matching, `store_parsed` returning a bare
+insertion count). After the fix all 12 pass:
+
+- D14 — `tombstone_preserves_read_and_favorite_through_restore` and
+  `python_origin_tombstone_restores_its_flags`: `deleted_articles` snapshots
+  now include `is_read`/`is_favorite` (fresh-schema columns plus two migration
+  entries; the migration loop remains the only ALTER site). `Db::delete_article`
+  copies both flags from the row (and now also clears `article_labels` and
+  `chapters` rows, as Python's `_tombstone_and_remove` does). Restore returns
+  the stored flags, with NULL (identity-only Python tombstones) restoring as
+  unread/non-favorite. The old doc claim that Python restores literal zeroes
+  was wrong and is corrected.
+- D14/G07 core — `restore_refuses_purged_and_ambiguous_tombstones` and
+  `purge_deleted_article_nulls_snapshot_but_keeps_tombstone`: new
+  `Db::restore_deleted_article(feed_id, article_id)` restores only that feed's
+  non-purged tombstone with `INSERT OR REPLACE`; unscoped `restore_article`
+  now requires exactly one non-purged tombstone for the id and leaves rows
+  untouched otherwise. New `Db::purge_deleted_article(feed_id, article_id)`
+  mirrors Python: snapshot columns nulled, `purged=1`, identity kept so
+  refresh never recreates the article; a second purge returns false.
+  `deleted_articles()` returns the real flags and orders by
+  `deleted_at DESC, article_id DESC` (Python order).
+- D12 — `parse_and_resolve_delete_behavior_matches_python`,
+  `filter_delete_with_purge_behavior_does_not_soft_delete`,
+  `filter_delete_with_category_behavior_moves_instead_of_deleting`,
+  `filter_delete_feed_override_beats_global`, and
+  `apply_rules_to_existing_honors_delete_behavior`: `rules.rs` now ports
+  `parse_delete_behavior` (`DeleteBehavior::{Deleted, Purge, Category}`) and
+  `resolve_effective_actions` (`ResolvedActions`), including Python's rule
+  that delete-to-category beats an explicit move. One shared path,
+  `Db::delete_article_with_behavior` + `Db::effective_delete_behavior`
+  (per-feed override, else the configured global), serves the rule pipeline
+  for new and existing articles and the interactive Delete command, which
+  previously matched the behavior string ad hoc and case-sensitively.
+- D13 — `store_outcome_excludes_deleted_and_notification_suppressed`:
+  `refresh::store_parsed` now returns `StoreOutcome { inserted, notify_count,
+  new_articles }`; rule-removed and `skip_notification` articles are excluded
+  from the notification-eligible count and summaries, matching Python's
+  `new_items` accounting. `refresh_feed`/`refresh_all` return the
+  notification-eligible counts. Archive rescans deliberately keep counting
+  stored episodes (`inserted`) for their recovered-episode semantics.
+- D21 — `apply_rules_to_existing_reaches_beyond_100k_rows` and
+  `smart_folder_matching_reaches_beyond_100k_rows`: the 100,000-row ceiling
+  is gone. `apply_rules_to_existing` collects matches over 1,000-row pages
+  (`Db::articles_page`) before applying, exactly as Python snapshots all rows
+  first, so deletions cannot shift later pages. New
+  `Db::articles_matching_rule` pages the same way and is the production path
+  for the main window's smart-folder refill, replacing the inline
+  100,000-row load. Tests build a 100,001-row library whose only match is
+  the oldest row.
+- G07 — the Deleted Articles dialog is rebuilt on the standard article
+  ListCtrl (same columns/cells as the main list) with term search across
+  title/feed/author/URL, Open (double-click/Enter), multi-select Restore,
+  and multi-select Delete Permanently behind Python's confirmation prompt
+  ("Permanently delete this article? It cannot be restored." / plural).
+  Rows leave the list only for items the core call actually restored or
+  purged (`retain_failed_deleted_rows`); partial failures are reported and
+  the failed rows stay, replacing the old title-only single-restore dialog
+  that removed its row even when restore failed. App policy test
+  `deleted_rows_leave_only_on_success` covers the retention rule and the
+  display-title fallback (title, then URL, then "(deleted article)").
+
+Application caller coverage: refresh drain FeedDone and Add Feed paths pass
+the configured `delete_behavior`; `LocalProvider` carries it from config;
+the podcast archive queue/manual paths carry it via `ArchiveSettings`;
+the rules manager's Apply button passes it to `apply_rules_to_existing`;
+interactive Delete resolves through the shared core path; smart-folder
+refill calls `articles_matching_rule`.
+
+Check results: new suite 12/12; affected existing core suites 49/49
+(rules, articles, refresh, batch4, batch5, parity_core_audit, ops,
+archive_parity, manage, hosted_gui); final gate after `cargo fmt --all`:
+workspace clippy (`--all-targets -D warnings`) clean, `cargo test
+--workspace` 456 passed / 0 failed, `cargo build -p blindrss` OK. The app
+gate ran in a private copy of the shared target dir because parallel
+worktrees sharing one target dir reuse each other's `blindrss-core`
+artifacts (identical package metadata), which produced stale-API compile
+errors against this branch's new core signatures; the private copy
+eliminated the collision.
+
+Open, honestly: D15 (feed-scoped tombstone URL identity) is Task 3's scope
+and is not closed here. The Deleted Articles surface is a full dialog, not
+Python's `deleted:all` tree node in the main window. Screen-reader
+acceptance of the rebuilt dialog (NVDA pass over columns, search,
+multi-restore, confirmed purge, failure messages) remains pending the
+owner's hands, as does acceptance with real hosted accounts.

@@ -66,14 +66,14 @@ fn refresh_stores_new_articles_once() {
         category: None,
         icon_url: None,
     };
-    let inserted = refresh_feed(&db, &feed).unwrap();
+    let inserted = refresh_feed(&db, &feed, "deleted").unwrap();
     assert_eq!(inserted, 2);
     assert_eq!(db.unread_count(None).unwrap(), 2);
     let articles = db.articles(Some("served"), 10).unwrap();
     assert_eq!(articles.len(), 2);
     assert!(articles.iter().any(|a| a.title == "Served One"));
     // Second refresh: dedupe on entry id, nothing new.
-    let inserted = refresh_feed(&db, &feed).unwrap();
+    let inserted = refresh_feed(&db, &feed, "deleted").unwrap();
     assert_eq!(inserted, 0);
     std::fs::remove_file(&path).ok();
 }
@@ -107,9 +107,9 @@ fn refresh_revalidates_cached_feed_and_stores_tags() {
     let feed = db
         .add_feed(&format!("http://{address}/feed"), "Feed", None)
         .unwrap();
-    assert_eq!(refresh_feed(&db, &feed).unwrap(), 1);
+    assert_eq!(refresh_feed(&db, &feed, "deleted").unwrap(), 1);
     assert_eq!(db.article_tags("cached-item").unwrap(), vec!["Technology"]);
-    assert_eq!(refresh_feed(&db, &feed).unwrap(), 0);
+    assert_eq!(refresh_feed(&db, &feed, "deleted").unwrap(), 0);
     let requests = server.join().unwrap();
     assert!(requests[1].contains("if-none-match: \"refresh1\""));
     drop(db);

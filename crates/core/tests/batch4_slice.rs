@@ -71,7 +71,7 @@ fn apply_rules_to_existing_articles() {
         };
         db.insert_article_if_new(&art).unwrap();
     }
-    let changed = blindrss_core::refresh::apply_rules_to_existing(&db).unwrap();
+    let changed = blindrss_core::refresh::apply_rules_to_existing(&db, "deleted").unwrap();
     assert_eq!(changed, 1);
     let articles = db.articles(None, 10).unwrap();
     let a1 = articles.iter().find(|a| a.id == "a1").unwrap();
