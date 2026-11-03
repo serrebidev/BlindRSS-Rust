@@ -471,7 +471,10 @@ Single-context: the domain authority for this port is `docs/PARITY.md`
   in each release leg, `.minisig` beside every zip, publish refuses to
   proceed when any asset or signature is missing.
 - The secret key lives ONLY in the `MINISIGN_KEY` repository secret
-  (`MINISIGN_PASSWORD` unlocks it) — never in git, never in a file on
+  (`MINISIGN_PASSWORD` unlocks it when a future key is encrypted; the
+  current key loads unencrypted, and the xtask treats an empty
+  password variable as unset because GitHub passes unset secrets as
+  empty strings) — never in git, never in a file on
   this box. Losing it means rotating the key, and already-installed
   copies can then never verify a new release. The public half is
   `crates/core/assets/minisign.pub`; changing it takes a new release.

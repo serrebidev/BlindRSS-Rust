@@ -43,7 +43,14 @@ fn sign_file(path: &Path) -> Result<bool, String> {
     let Ok(key) = std::env::var("MINISIGN_KEY") else {
         return Ok(false);
     };
-    let password = std::env::var("MINISIGN_PASSWORD").ok();
+    // GitHub passes an unset secret as an EMPTY variable, and
+    // an empty password here would take the encrypted-key
+    // branch and fail ("Key is not encrypted") on this
+    // unencrypted key — the v0.1.50 release died exactly
+    // there. Empty means absent.
+    let password = std::env::var("MINISIGN_PASSWORD")
+        .ok()
+        .filter(|p| !p.is_empty());
     sign_file_with(path, &key, password.as_deref())?;
     Ok(true)
 }
