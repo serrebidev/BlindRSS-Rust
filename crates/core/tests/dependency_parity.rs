@@ -12,8 +12,11 @@
 //! scripts); the pure policy tests run everywhere.
 
 use blindrss_core::dependency::*;
+#[cfg(unix)]
 use std::io::Write;
-use std::path::{Path, PathBuf};
+#[cfg(not(windows))]
+use std::path::Path;
+use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
 fn unique_dir(tag: &str) -> PathBuf {
@@ -259,11 +262,13 @@ fn ytdlp_throttle_marks_only_success_and_lasts_24h() {
 /// Loopback HTTP fixture: serves the nightly release API JSON on
 /// /api and the fake yt-dlp asset on /asset (or a 500), counting
 /// asset hits so tests can prove a current copy is not re-fetched.
+#[cfg(unix)]
 struct NightlyServer {
     base: String,
     asset_hits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
+#[cfg(unix)]
 fn nightly_server(latest: &str, asset_body: Option<Vec<u8>>) -> NightlyServer {
     use std::io::Read;
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
