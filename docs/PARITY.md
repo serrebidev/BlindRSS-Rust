@@ -4453,3 +4453,16 @@ main over 37f8ae9; the only conflict was the append-only
 PARITY region (union). Merged gate: fmt clean, clippy clean
 (workspace and core windows-gnu), 737 passed / 0 failed,
 build OK.
+
+**Silence progress assertion corrected (2026-11-04):** the
+Task 21 test `scan_completes_and_reports_progress_incrementally`
+failed on the macOS CI leg: the last progress snapshot held
+only the first range. The trailing range ends exactly at
+EOF, so it closes only at finalize, and pipe chunking
+decides whether a cadence tick lands after the close — the
+assertion "last progress equals the final set" encoded
+timing as contract. It now asserts the real contract: every
+progress set is a prefix of the final set (progress
+converges, never contradicts). Production code unchanged;
+the player consumes the scan's return value, not progress,
+for the final ranges.

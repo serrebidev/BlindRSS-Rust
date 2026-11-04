@@ -403,15 +403,22 @@ fn scan_completes_and_reports_progress_incrementally() {
         "{ranges:?}"
     );
     // Progress fires on Python's 5 s-of-audio cadence; early
-    // progress cannot contain the second range yet, and the
-    // last progress set is the final set.
+    // progress cannot contain the second range yet, and every
+    // progress set is a prefix of the final set — progress
+    // never contradicts the result, it only converges to it.
+    // Whether the LAST progress call already carries the
+    // trailing range is timing, not contract: that range ends
+    // exactly at EOF, so it closes only at finalize, and pipe
+    // chunking decides whether a cadence tick lands after the
+    // close (Linux) or before it (macOS CI, 2026-11-04).
     assert!(progress.len() >= 2, "progress calls: {}", progress.len());
     assert!(
         !progress[0].0.iter().any(|r| r.0 >= 7000),
         "first progress: {:?}",
         progress[0]
     );
-    assert_eq!(progress.last().unwrap().0, ranges);
+    let last = &progress.last().unwrap().0;
+    assert_eq!(&ranges[..last.len()], last.as_slice());
 }
 
 #[cfg(unix)]
