@@ -1576,6 +1576,12 @@ struct State {
     /// Queue context for the in-flight queue playback: the
     /// entry articles and the index being started.
     pending_queue: Option<(Vec<Article>, usize)>,
+    /// Player-session generation of the in-flight playback
+    /// resolve (Audit 8 M11): a MediaReady stamped with any
+    /// other generation is stale — a newer activation, a queue
+    /// advance or a close superseded it — and is dropped.
+    /// Zero is never a live generation.
+    pending_play_gen: u64,
     reader_cache: blindrss_core::reader_cache::ReaderCache,
     reader_generation: u64,
     pending_fulltext: Option<(u64, String)>,
@@ -1586,12 +1592,11 @@ struct State {
     auto_load: Option<(u64, std::time::Instant)>,
 }
 
-/// A resolved playback stream: URL, optional yt-dlp info and request headers.
-type MediaResolution = (
-    String,
-    Option<blindrss_core::media::MediaInfo>,
-    Vec<(String, String)>,
-);
+/// A resolved playback stream: URL and request headers. The
+/// yt-dlp metadata lookup is NOT part of the resolution any
+/// more (Audit 8 M11): it travels separately as
+/// `RefreshMsg::MediaInfoReady` so it can never delay the audio.
+type MediaResolution = (String, Vec<(String, String)>);
 
 enum RefreshMsg {
     /// One feed's worker refresh finished: the committed store
@@ -1611,8 +1616,15 @@ enum RefreshMsg {
     ),
     /// Rich (WebView) full article: (article id, fragment if any).
     RichHtml(String, Option<String>),
-    /// yt-dlp resolution for playback: (stream URL, info if fetched).
-    MediaReady(String, Result<MediaResolution, String>),
+    /// yt-dlp resolution for playback: (player generation,
+    /// article id, stream + headers). Deliveries stamped with
+    /// a generation that is no longer current are dropped.
+    MediaReady(u64, String, Result<MediaResolution, String>),
+    /// yt-dlp metadata for an already-delivered playback
+    /// (chapters): (player generation, article id, info). Kept
+    /// off the playback critical path (M11); applied only
+    /// while its generation is still the session's.
+    MediaInfoReady(u64, String, Option<blindrss_core::media::MediaInfo>),
     /// A finished download: description of what landed where.
     DownloadDone(Article, Result<PathBuf, String>),
     /// A finished manual backup (worker): the saved path or error.
@@ -3452,6 +3464,7 @@ fn main() {
             find_query: String::new(),
             pending_play: None,
             pending_queue: None,
+            pending_play_gen: 0,
             refresh_new: Vec::new(),
             refresh_failed: false,
             search_focused: false,
@@ -5431,33 +5444,55 @@ fn main() {
             // media; list rows are light, so resolve it first.
             ensure_content(st.db.as_ref(), &mut article);
             drop(st);
-            state_pm.borrow_mut().pending_play = Some(article.clone());
+            // The player session opens NOW, in its loading
+            // state (Audit 8 M11): the resolution below runs on
+            // the worker and is delivered under this
+            // generation. Activating the media the session
+            // already holds only toggles it — nothing resolves.
+            let pgen = match player::begin_play(&frame_pm, &article) {
+                player::BeginOutcome::Toggled => return,
+                player::BeginOutcome::Loading(pgen) => pgen,
+            };
+            {
+                let mut st = state_pm.borrow_mut();
+                st.pending_play = Some(article.clone());
+                st.pending_play_gen = pgen;
+            }
             frame_pm.set_status_text("Finding playable media...", 0);
             let tx = tx_pm.clone();
             let id = article.id.clone();
             let path = db_path();
             std::thread::spawn(move || {
-                let result = blindrss_core::media::resolve_article_for_play(
+                let resolved = blindrss_core::media::resolve_article_for_play(
                     &blindrss_core::config::Config::load(&config_path()).unwrap_or_default(),
                     &article,
-                )
-                .map(|r| {
-                    if r.detected
-                        && let Ok(db) = Db::open(&path)
-                    {
-                        let _ =
-                            db.update_article_media(&article.id, &r.url, r.media_type.as_deref());
+                );
+                let (result, via_ytdlp) = match resolved {
+                    Ok(r) => {
+                        if r.detected
+                            && let Ok(db) = Db::open(&path)
+                        {
+                            let _ = db.update_article_media(
+                                &article.id,
+                                &r.url,
+                                r.media_type.as_deref(),
+                            );
+                        }
+                        let headers = playback_headers_for(&article, &r.url, &path);
+                        let url = maybe_cache_youtube(&article, &r.url, r.via_ytdlp);
+                        (Ok((url, headers)), r.via_ytdlp)
                     }
-                    let info = if r.via_ytdlp {
-                        blindrss_core::media::info(&article.url).ok()
-                    } else {
-                        None
-                    };
-                    let url = maybe_cache_youtube(&article, &r.url, r.via_ytdlp);
-                    let headers = playback_headers_for(&article, &r.url, &path);
-                    (url, info, headers)
-                });
-                let _ = tx.send(RefreshMsg::MediaReady(id, result));
+                    Err(e) => (Err(e), false),
+                };
+                let _ = tx.send(RefreshMsg::MediaReady(pgen, id.clone(), result));
+                // The yt-dlp metadata lookup runs only after
+                // the stream is on its way: it must never delay
+                // the audio (M11). Its chapters apply only
+                // while this generation is still current.
+                if via_ytdlp {
+                    let info = blindrss_core::media::info(&article.url).ok();
+                    let _ = tx.send(RefreshMsg::MediaInfoReady(pgen, id, info));
+                }
             });
         });
         {
@@ -5800,13 +5835,24 @@ fn main() {
                 media_url: Some(url.clone()),
                 media_type: None,
             };
-            state_om.borrow_mut().pending_play = Some(article.clone());
+            // The session opens before anything resolves
+            // (M11); pasting the URL that is already loaded
+            // toggles it instead.
+            let pgen = match player::begin_play(&frame_om, &article) {
+                player::BeginOutcome::Toggled => return,
+                player::BeginOutcome::Loading(pgen) => pgen,
+            };
+            {
+                let mut st = state_om.borrow_mut();
+                st.pending_play = Some(article.clone());
+                st.pending_play_gen = pgen;
+            }
             frame_om.set_status_text("Loading media...", 0);
             let tx = tx_om.clone();
             let path = db_path();
             std::thread::spawn(move || {
                 let headers = playback_headers_for(&article, &url, &path);
-                let _ = tx.send(RefreshMsg::MediaReady(article.id, Ok((url, None, headers))));
+                let _ = tx.send(RefreshMsg::MediaReady(pgen, article.id, Ok((url, headers))));
             });
         });
 
@@ -5834,9 +5880,17 @@ fn main() {
                             media_url: Some(result.url.clone()),
                             media_type: None,
                         };
+                        // The session opens before the resolve
+                        // (M11); re-choosing the loaded result
+                        // toggles it instead.
+                        let pgen = match player::begin_play(&frame_vs, &article) {
+                            player::BeginOutcome::Toggled => return,
+                            player::BeginOutcome::Loading(pgen) => pgen,
+                        };
                         {
                             let mut st = state_vs.borrow_mut();
                             st.pending_play = Some(article.clone());
+                            st.pending_play_gen = pgen;
                         }
                         frame_vs.set_status_text("Loading...", 0);
                         let tx = tx_vs.clone();
@@ -5847,17 +5901,19 @@ fn main() {
                                 &blindrss_core::config::Config::load(&config_path())
                                     .unwrap_or_default(),
                                 &article,
-                            )
-                            .map(|r| {
-                                let info = if r.via_ytdlp {
-                                    blindrss_core::media::info(&article.url).ok()
-                                } else {
-                                    None
-                                };
-                                let headers = playback_headers_for(&article, &r.url, &path);
-                                (r.url, info, headers)
-                            });
-                            let _ = tx.send(RefreshMsg::MediaReady(id, resolved));
+                            );
+                            let (resolved, via_ytdlp) = match resolved {
+                                Ok(r) => {
+                                    let headers = playback_headers_for(&article, &r.url, &path);
+                                    (Ok((r.url, headers)), r.via_ytdlp)
+                                }
+                                Err(e) => (Err(e), false),
+                            };
+                            let _ = tx.send(RefreshMsg::MediaReady(pgen, id.clone(), resolved));
+                            if via_ytdlp {
+                                let info = blindrss_core::media::info(&article.url).ok();
+                                let _ = tx.send(RefreshMsg::MediaInfoReady(pgen, id, info));
+                            }
                         });
                     }
                     Some(("subscribe", result)) => {
@@ -5964,30 +6020,40 @@ fn main() {
             };
             let stubs: Vec<Article> = entries.iter().map(queue_entry_article).collect();
             let article = stubs[index].clone();
+            // The session opens on the entry immediately, with
+            // its queue context (M11); a queue start is always
+            // a fresh load, never a toggle.
+            let pgen = match player::begin_queue_play(&frame_qp, &article, stubs.clone(), index) {
+                player::BeginOutcome::Toggled => return,
+                player::BeginOutcome::Loading(pgen) => pgen,
+            };
             {
                 let mut st = state_qp.borrow_mut();
                 st.pending_play = Some(article.clone());
                 st.pending_queue = Some((stubs, index));
+                st.pending_play_gen = pgen;
             }
             frame_qp.set_status_text("Loading queue entry...", 0);
             let tx = tx_qp.clone();
             let path = db_path();
             std::thread::spawn(move || {
                 let id = article.id.clone();
-                let result = blindrss_core::media::resolve_article_for_play(
+                let resolved = blindrss_core::media::resolve_article_for_play(
                     &blindrss_core::config::Config::load(&config_path()).unwrap_or_default(),
                     &article,
-                )
-                .map(|r| {
-                    let info = if r.via_ytdlp {
-                        blindrss_core::media::info(&article.url).ok()
-                    } else {
-                        None
-                    };
-                    let headers = playback_headers_for(&article, &r.url, &path);
-                    (r.url, info, headers)
-                });
-                let _ = tx.send(RefreshMsg::MediaReady(id, result));
+                );
+                let (result, via_ytdlp) = match resolved {
+                    Ok(r) => {
+                        let headers = playback_headers_for(&article, &r.url, &path);
+                        (Ok((r.url, headers)), r.via_ytdlp)
+                    }
+                    Err(e) => (Err(e), false),
+                };
+                let _ = tx.send(RefreshMsg::MediaReady(pgen, id.clone(), result));
+                if via_ytdlp {
+                    let info = blindrss_core::media::info(&article.url).ok();
+                    let _ = tx.send(RefreshMsg::MediaInfoReady(pgen, id, info));
+                }
             });
         });
 
@@ -6642,6 +6708,10 @@ fn main() {
                 st.selected_article = None;
                 st.pending_play = None;
                 st.pending_queue = None;
+                // Zero is never a live player generation: an
+                // in-flight resolution for the old location can
+                // no longer deliver into the new database.
+                st.pending_play_gen = 0;
                 st.pending_fulltext = None;
                 st.auto_load = None;
                 st.reader_generation = st.reader_generation.wrapping_add(1);
@@ -9562,54 +9632,66 @@ fn main() {
                             }
                         }
                     }
-                    Ok(RefreshMsg::MediaReady(id, result)) => {
+                    Ok(RefreshMsg::MediaReady(pgen, id, result)) => {
+                        // Deliver only the resolution the current
+                        // pending load is waiting for: same
+                        // article, same player generation. Any
+                        // other stamp is stale — a newer
+                        // activation, a queue advance or a close
+                        // superseded it — and is dropped whole,
+                        // so it can never start audio (M11).
                         let mut st = state_tick.borrow_mut();
                         let article = st
                             .pending_play
                             .as_ref()
-                            .filter(|a| a.id == id)
-                            .cloned()
-                            .or_else(|| st.articles.iter().find(|a| a.id == id).cloned());
-                        let queue_ctx = st.pending_queue.take();
-                        if article.is_some() {
-                            st.pending_play = None;
-                        }
-                        match (article, result) {
-                            (Some(article), Ok((stream, info, headers))) => {
-                                let mut chapters = st
+                            .filter(|a| a.id == id && pgen != 0 && pgen == st.pending_play_gen)
+                            .cloned();
+                        let Some(article) = article else {
+                            continue;
+                        };
+                        st.pending_play = None;
+                        st.pending_play_gen = 0;
+                        // The session already holds its own copy
+                        // of the queue context (taken at
+                        // begin_queue_play); this just clears the
+                        // bookkeeping.
+                        let _ = st.pending_queue.take();
+                        match result {
+                            Ok((stream, headers)) => {
+                                let chapters = st
                                     .db
                                     .as_ref()
                                     .and_then(|db| db.chapters(&article.id).ok())
                                     .unwrap_or_default();
-                                if let Some(info) = info
-                                    && !info.chapters.is_empty()
-                                {
-                                    if let Some(db) = &st.db {
-                                        let _ = db.replace_chapters(&article.id, &info.chapters);
-                                    }
-                                    chapters = info.chapters;
-                                }
                                 drop(st);
-                                match queue_ctx {
-                                    Some((entries, index)) => player::open_player_queue(
-                                        &frame_tick,
-                                        article,
-                                        stream,
-                                        entries,
-                                        index,
-                                        headers,
-                                    ),
-                                    None => player::open_player(
-                                        &frame_tick,
-                                        article,
-                                        stream,
-                                        chapters,
-                                        headers,
-                                    ),
+                                player::deliver_media(pgen, &article, stream, chapters, headers);
+                            }
+                            Err(e) => {
+                                drop(st);
+                                player::fail_load(pgen);
+                                frame_tick.set_status_text(&format!("Play: {e}"), 0);
+                            }
+                        }
+                    }
+                    Ok(RefreshMsg::MediaInfoReady(pgen, _id, info)) => {
+                        // Chapters from the yt-dlp metadata
+                        // lookup, fetched after the stream was
+                        // delivered (M11): cache them on the
+                        // article as before, and hand them to
+                        // the player only while this load is
+                        // still the session's current one (the
+                        // player refuses a stale generation
+                        // itself).
+                        if let Some(info) = info
+                            && !info.chapters.is_empty()
+                        {
+                            {
+                                let st = state_tick.borrow();
+                                if let Some(db) = &st.db {
+                                    let _ = db.replace_chapters(&_id, &info.chapters);
                                 }
                             }
-                            (_, Err(e)) => frame_tick.set_status_text(&format!("Play: {e}"), 0),
-                            _ => {}
+                            player::update_chapters(pgen, info.chapters);
                         }
                     }
                     Ok(RefreshMsg::BackupDone(result)) => match result {
@@ -10182,6 +10264,7 @@ mod ui_parity_tests {
                 refresh_failed: false,
                 pending_play: None,
                 pending_queue: None,
+                pending_play_gen: 0,
                 reader_cache: blindrss_core::reader_cache::ReaderCache::default(),
                 reader_generation: 0,
                 auto_load: None,

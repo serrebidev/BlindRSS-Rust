@@ -3585,3 +3585,144 @@ local enclosures, not just a test artifact. `url_path_lower`
 now normalizes '\\' to '/' before splitting; regression test
 `media_url_detection_accepts_windows_file_paths` pins Windows
 and POSIX path shapes on every platform.
+## Audit 8 Task 18 resolution — one immediate cancellable player session (M01, M10, M11) (2026-11-04)
+
+Reproductions first: the policy the findings demand did not
+exist, so the new core tests pin Python's behaviour directly —
+`player_session.rs` unit tests (identity matching by id then
+target, toggle keeping the generation, a switch staling the old
+generation, forced loads never toggling, internal loads staling
+external results, close forgetting identity while generations
+keep moving), `announce.rs` HiddenAnnouncer tests (each load
+state spoken once per load while hidden, recorded-but-not-spoken
+while shown so a later hide never replays it, queue-advance
+suppression of the routine states but never of failure), and
+`playback.rs` seek-summary tests (Python's exact
+elapsed/remaining/total wording and time formats).
+
+- **M01 (competing players) — resolved.** The `PLAYERS` vec is
+  deleted. There is one `SESSION` registration holding one
+  `SessionControl`, and `blindrss_core::player_session` owns the
+  identity/generation policy (a port of `_ensure_player_window`
+  + `is_current_media`). Every activation goes through
+  `player::begin_play` / `begin_queue_play` on the UI thread:
+  the session already holding the item toggles (Playing pauses;
+  Stopped reloads the retained stream through the shared load
+  path, as Python's `resume_or_reload_current` does; otherwise
+  it resumes); anything else stops the old playback in the same
+  window (`begin_load` persists the outgoing position first,
+  when media actually loaded) and enters the loading state.
+  A queue start always loads (Python's queue path never takes
+  the toggle branch). The play queue advancing on media finish
+  bumps the generation from inside the session
+  (`begin_internal_load`), and closing the window clears the
+  session and forgets the policy identity. Main-window command
+  dispatch targets the one session.
+- **M10 (visibility + hidden announcements) — resolved.**
+  `show_player_on_play` now defaults to hidden at both Rust
+  read sites (player visibility, Settings checkbox): Python's
+  `DEFAULT_CONFIG` carries False and its loader merges defaults
+  into every config, so the settings dialog's local True
+  fallback never wins there. A fresh load with the preference
+  on shows + raises + focuses Play/Pause; with it off the
+  window is hidden and focus is not touched (no focus steal).
+  `HiddenAnnouncer` (core `announce.rs`) ports
+  `_announce_when_hidden`/`_hidden_announced`: "Loading
+  media..." at load begin (after visibility is applied, as
+  Python's deferred announce observes it), "Playing" at the
+  tick's first Playing transition of the load, and "Failed to
+  load media" when a delivery fails, a resolution fails, the
+  autoplay watchdog gives up, or a queue switch cannot load.
+  Queue auto-advance pre-suppresses the routine states and the
+  old unconditional "Now playing: {title}" announcement is
+  removed (frame title and status still follow the queue).
+  Explicit Play presses record the hidden set so the readiness
+  announcement never doubles what the press already said.
+  Seeks (buttons, arrow keys, slider, Player-menu dispatch)
+  (re)arm a 400 ms debounce — Python's `wx.CallLater(400)` with
+  Restart — and the tick speaks
+  `playback::seek_summary` ("Elapsed …, Remaining …, Total …",
+  elapsed-only for unknown length) via `media_navigation`.
+  The visible status texts are unchanged ("Could not load
+  media", "Could not play this media"); only the spoken text
+  follows Python.
+- **M11 (creation waits for resolution/metadata) — resolved.**
+  All four producers (Play, Open Media URL, Video Search Play,
+  play-queue start) call `begin_play`/`begin_queue_play`
+  BEFORE spawning their resolver: the window is created in its
+  loading state (`create_session` loads nothing) or reused in
+  it. `RefreshMsg::MediaReady` now carries the player
+  generation, and the drain delivers only the exact pending
+  (article, generation) pair; `deliver_media` re-checks the
+  generation and the article identity. A stale result — success
+  or failure — is dropped whole and never starts audio or
+  touches the status line. Cancelling is activating something
+  else, starting a queue, changing the data location
+  (pending generation zeroed) or closing the window. The yt-dlp
+  metadata lookup moved off the critical path: workers send the
+  stream first, then `MediaInfoReady`; its chapters are cached
+  to the database as before and reach the player through
+  `update_chapters`, which refuses a stale generation.
+  Cancellation hygiene found on the way: position saves
+  (outgoing save, Stop, close) now run only when media
+  actually loaded — with an immediate window, closing or
+  stopping mid-load would otherwise overwrite the article's
+  saved resume position with zero.
+
+Session shape left for Tasks 19–21: `start_loaded_stream` is
+the single load path (delivery, queue switch, toggle-reload),
+`PlayerState` retains the current stream/headers for reloads,
+and chapters are replaceable after delivery.
+
+Adjacent item, state reported, NOT fixed here:
+`MediaBackend::load_uri` still passes an empty referer to
+`vlc::media_options`, so the `:http-referrer` option is never
+emitted. The session rework did not change that signature; the
+fix belongs to Task 19, whose plan file list includes
+`media_backend.rs`.
+
+Deviations, named: (1) Python's toggle branch also refreshes
+chapters when they differ; the Rust toggle does not fetch
+chapters — chapter acquisition is Task 20's mechanism, and
+this task adds only the post-delivery `update_chapters` it
+will use. (2) Python's `resume_or_reload_current` has a
+casting branch; the Rust cast flow is a separate main-window
+path that never used the player window and is unchanged.
+(3) A queue switch now applies the persisted volume AND the
+configured playback speed through the shared load path (it
+previously re-applied volume only) — that is Python's
+per-load behaviour. (4) Seek amounts and the volume step are
+re-read from the config at use time; the one long-lived
+session would otherwise freeze their creation-time values
+(Python reads config per action). (5) Hidden "Playing"
+readiness is observed on the 1-second tick's play-state
+transition rather than a backend event, so it can land up to
+a second after Python's status-driven announcement.
+Accessibility pass before the UI edits: no controls were
+added, removed or reordered; accessible names are unchanged;
+the seek slider's MSAA snapshot contract is untouched (the
+tick remains the only writer); the new PlayerState fields are
+plain UI-thread state read by no accessibility callback; the
+visibility change is the M10 point itself — hidden mode never
+calls set_focus or raise. Owner screen-reader acceptance
+(NVDA toggle feel, hidden load/failure/readiness speech,
+debounced seek summaries) is not claimed.
+
+Gate in this tree: `cargo test --workspace` 661 passed / 0
+failed, read from the run's own summary and confirmed by a
+full recount (661 / 0 again). The delta is exactly this
+task's +15 new tests — 9 player_session, 4 HiddenAnnouncer,
+2 playback seek-summary; a diff census counts 15 `#[test]`
+added and 0 removed. The parent commit's true total is 646:
+the v0.1.56 base of 589 plus batch 1's per-task deltas
+(+15 Task 13, +15 Task 15, +27 Task 14, matching each task's
+own gate line). The batch-1 merged gate's reported 616
+undercounted the same commit by 30 — it coincides with Task
+14's single-tree count — though that run also had zero
+failures. Clippy `--workspace --all-targets -D warnings`
+clean (read from the run's own log after a first attempt's
+processes stalled orphaned on the wx check build and were
+killed by PID; the re-run finished clean), `cargo build
+-p blindrss` OK, `cargo fmt --all` run last and `--check`
+clean. No cfg(windows) code was touched, so the windows-gnu
+clippy leg was not required.

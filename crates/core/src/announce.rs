@@ -205,6 +205,53 @@ impl Announcements {
     }
 }
 
+/// Per-load hidden-window announcement dedupe (Audit 8 M10;
+/// Python `gui/player.py` `_announce_when_hidden` +
+/// `_hidden_announced`).
+///
+/// While the player window is hidden (Python's default), its
+/// status line cannot be read, so load-state changes are spoken
+/// instead — each distinct text at most once per load. A text is
+/// recorded even when the window is shown: hiding the player
+/// later must not replay states the user already saw. A load
+/// the user did not ask to hear about (the play queue advancing
+/// on its own) pre-suppresses its routine states; failures are
+/// never pre-suppressed — only trouble is worth saying then.
+#[derive(Debug, Clone, Default)]
+pub struct HiddenAnnouncer {
+    said: std::collections::HashSet<String>,
+}
+
+impl HiddenAnnouncer {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Start a new load: forget what the previous load said.
+    /// `suppress` texts are marked as already said (queue
+    /// auto-advance passes Python's "Loading media..." and
+    /// "Playing").
+    pub fn reset(&mut self, suppress: &[&str]) {
+        self.said.clear();
+        for text in suppress {
+            self.said.insert((*text).to_string());
+        }
+    }
+
+    /// Record `text` for this load and say whether the caller
+    /// should speak it now: only the first time per load, and
+    /// only while the window is hidden.
+    pub fn should_speak(&mut self, text: &str, window_shown: bool) -> bool {
+        let fresh = self.said.insert(text.to_string());
+        fresh && !window_shown
+    }
+
+    /// Whether `text` was already recorded for this load.
+    pub fn was_said(&self, text: &str) -> bool {
+        self.said.contains(text)
+    }
+}
+
 /// Settings test path: speech AND Braille, ignoring configuration
 /// (Python's announce_test — honoring "none" here would make a
 /// working setup indistinguishable from a broken one).
@@ -661,5 +708,55 @@ mod backend {
     }
     pub fn braille(_text: &str) -> bool {
         false
+    }
+}
+
+#[cfg(test)]
+mod hidden_announcer_tests {
+    use super::HiddenAnnouncer;
+
+    #[test]
+    fn hidden_window_speaks_each_load_state_once() {
+        // M10: with the player hidden, load/failure/readiness
+        // transitions are spoken — but never twice per load.
+        let mut a = HiddenAnnouncer::new();
+        a.reset(&[]);
+        assert!(a.should_speak("Loading media...", false));
+        assert!(!a.should_speak("Loading media...", false));
+        assert!(a.should_speak("Playing", false));
+        assert!(!a.should_speak("Playing", false));
+        assert!(a.should_speak("Failed to load media", false));
+    }
+
+    #[test]
+    fn shown_window_records_without_speaking() {
+        // Python: "even when shown: hiding the player later must
+        // not replay it" — the text is recorded either way.
+        let mut a = HiddenAnnouncer::new();
+        a.reset(&[]);
+        assert!(!a.should_speak("Playing", true));
+        assert!(a.was_said("Playing"));
+        assert!(!a.should_speak("Playing", false), "no replay after hiding");
+    }
+
+    #[test]
+    fn reset_starts_a_fresh_load() {
+        let mut a = HiddenAnnouncer::new();
+        a.reset(&[]);
+        assert!(a.should_speak("Playing", false));
+        a.reset(&[]);
+        assert!(a.should_speak("Playing", false), "a new load says it again");
+    }
+
+    #[test]
+    fn queue_advance_suppresses_routine_states_but_not_failure() {
+        // Python load_media(announce=False): the queue advancing
+        // on its own stays quiet about loading/playing, while a
+        // failure is still spoken.
+        let mut a = HiddenAnnouncer::new();
+        a.reset(&["Loading media...", "Playing"]);
+        assert!(!a.should_speak("Loading media...", false));
+        assert!(!a.should_speak("Playing", false));
+        assert!(a.should_speak("Failed to load media", false));
     }
 }

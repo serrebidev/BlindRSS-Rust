@@ -107,6 +107,33 @@ impl ResumePolicy {
     }
 }
 
+/// Format a millisecond position the way Python's player does
+/// (`_format_time` → `_format_chapter_timestamp`): `H:MM:SS`
+/// once an hour is reached, else `MM:SS`.
+pub fn format_time_ms(ms: i64) -> String {
+    let total = (ms.max(0)) / 1000;
+    let (h, m, s) = (total / 3600, (total % 3600) / 60, total % 60);
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m:02}:{s:02}")
+    }
+}
+
+/// The landed-seek summary Python announces once a burst of
+/// seek presses settles (`_compose_time_info`): elapsed,
+/// remaining and total, or elapsed only for a live stream /
+/// unknown length.
+pub fn seek_summary(position_ms: i64, duration_ms: i64) -> String {
+    let elapsed = format_time_ms(position_ms);
+    if duration_ms <= 0 {
+        return format!("Elapsed {elapsed}");
+    }
+    let remaining = format_time_ms(duration_ms - position_ms.max(0));
+    let total = format_time_ms(duration_ms);
+    format!("Elapsed {elapsed}, Remaining {remaining}, Total {total}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,6 +144,38 @@ mod tests {
             duration_ms: Some(600_000),
             ..PlaybackState::default()
         }
+    }
+
+    #[test]
+    fn seek_summary_matches_python_compose_time_info() {
+        // M10's debounced landed-seek summary: the same words as
+        // Python's time field — elapsed, remaining, total.
+        assert_eq!(
+            seek_summary(65_000, 240_000),
+            "Elapsed 01:05, Remaining 02:55, Total 04:00"
+        );
+        assert_eq!(
+            seek_summary(3_661_000, 7_200_000),
+            "Elapsed 1:01:01, Remaining 58:59, Total 2:00:00"
+        );
+        // Unknown length (live stream): elapsed only.
+        assert_eq!(seek_summary(65_000, 0), "Elapsed 01:05");
+        assert_eq!(seek_summary(0, 0), "Elapsed 00:00");
+        // Position past the end never makes remaining negative.
+        assert_eq!(
+            seek_summary(300_000, 240_000),
+            "Elapsed 05:00, Remaining 00:00, Total 04:00"
+        );
+    }
+
+    #[test]
+    fn format_time_ms_matches_python_format_time() {
+        assert_eq!(format_time_ms(0), "00:00");
+        assert_eq!(format_time_ms(59_000), "00:59");
+        assert_eq!(format_time_ms(60_000), "01:00");
+        assert_eq!(format_time_ms(3_599_000), "59:59");
+        assert_eq!(format_time_ms(3_600_000), "1:00:00");
+        assert_eq!(format_time_ms(-5_000), "00:00");
     }
 
     #[test]

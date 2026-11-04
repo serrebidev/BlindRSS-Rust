@@ -6,10 +6,23 @@
 //!
 //! Position is saved every second by the window timer, so closing
 //! the window at any point loses at most a second of progress.
+//!
+//! There is exactly ONE player session (Audit 8 M01/M10/M11,
+//! Python's `_ensure_player_window`): `begin_play` opens the
+//! window in its loading state immediately — before any
+//! resolution or metadata lookup runs — and the resolved stream
+//! is delivered into it under a generation stamp
+//! (`blindrss_core::player_session`). Activating the media the
+//! session already holds toggles play/pause; activating anything
+//! else stops the old playback and loads into the same window.
+//! A result stamped with an older generation is stale and never
+//! starts audio.
 
 use crate::media_backend::MediaBackend;
+use blindrss_core::announce::HiddenAnnouncer;
 use blindrss_core::db::Chapter;
 use blindrss_core::playback::{ResumePolicy, saved_state};
+use blindrss_core::player_session::{Activation, PlayerSession, SessionIdentity};
 use blindrss_core::{Article, Db, PlaybackState};
 use std::cell::RefCell;
 use std::collections::HashSet;
@@ -22,14 +35,100 @@ type PlayerCommand = Rc<dyn Fn(&str) -> bool>;
 type ResolvedMedia = (String, Vec<(String, String)>);
 type QueueResult = (usize, Result<ResolvedMedia, String>);
 
-thread_local! {
-    static PLAYERS: RefCell<Vec<(usize, PlayerCommand)>> = const { RefCell::new(Vec::new()) };
+/// Everything the main window (and this module's own tick and
+/// command closures) needs to drive the one live session.
+struct SessionControl {
+    frame: Frame,
+    media: MediaBackend,
+    state: Rc<RefCell<PlayerState>>,
+    chapters_live: Rc<RefCell<(Vec<Chapter>, Vec<i64>)>>,
+    chapter_list: ListBox,
+    play_btn: Button,
+    /// The main-window command surface (play/pause, stop,
+    /// seeks, volume, show/hide, chapters, equalizer, speed).
+    command: PlayerCommand,
 }
 
-/// Route main-window shortcuts to the most recently opened player.
+struct LiveSession {
+    /// Frame handle, so the close handler only clears the
+    /// session it belongs to.
+    key: usize,
+    control: Rc<SessionControl>,
+    command: PlayerCommand,
+}
+
+thread_local! {
+    static SESSION: RefCell<Option<LiveSession>> = const { RefCell::new(None) };
+    /// Identity/generation policy for the session. Kept outside
+    /// the window so generations keep moving across window
+    /// lifetimes: a result stamped before a close can never
+    /// match a later session.
+    static SESSION_POLICY: RefCell<PlayerSession> = RefCell::new(PlayerSession::new());
+}
+
+fn session_control() -> Option<Rc<SessionControl>> {
+    SESSION.with(|s| s.borrow().as_ref().map(|live| live.control.clone()))
+}
+
+/// True while `generation` is the live session's generation:
+/// a worker result stamped with it may still act.
+pub fn is_current(generation: u64) -> bool {
+    SESSION.with(|s| s.borrow().is_some())
+        && SESSION_POLICY.with(|p| p.borrow().is_current(generation))
+}
+
+/// Route main-window shortcuts to the one player session.
 pub fn dispatch_command(id: &str) -> bool {
-    let action = PLAYERS.with(|players| players.borrow().last().map(|(_, action)| action.clone()));
+    let action = SESSION.with(|s| s.borrow().as_ref().map(|live| live.command.clone()));
     action.is_some_and(|action| action(id))
+}
+
+/// The session identity of an article (Python's
+/// `is_current_media` inputs): its id, plus the playback target
+/// known before resolution — the enclosure URL when there is
+/// one, else the article URL.
+fn identity_of(article: &Article) -> SessionIdentity {
+    let target = article
+        .media_url
+        .as_deref()
+        .filter(|u| !u.is_empty())
+        .unwrap_or(&article.url);
+    SessionIdentity::new(&article.id, target)
+}
+
+/// Speak a load-state text the way Python's
+/// `_announce_when_hidden` does: once per load, and only while
+/// the player window is hidden (its status line cannot be read
+/// then). The text is recorded either way, so showing and later
+/// hiding the window never replays it.
+fn hidden_announce(state: &mut PlayerState, frame: &Frame, text: &str) {
+    if state.hidden.should_speak(text, frame.is_shown()) {
+        crate::announce("general", text);
+    }
+}
+
+/// Record a load-state text as already announced without
+/// speaking it here — for paths that just announced it through
+/// the unconditional channel (an explicit Play press), so the
+/// hidden-window mechanism does not say it a second time.
+fn note_announced(state: &mut PlayerState, text: &str) {
+    state.hidden.should_speak(text, true);
+}
+
+/// (Re)arm the debounced landed-seek summary (M10): every seek
+/// press pushes the announcement 400 ms out, so a burst of
+/// presses speaks once, with the position actually landed on —
+/// Python's `wx.CallLater(400, ...)` with Restart.
+fn arm_seek_summary(state: &Rc<RefCell<PlayerState>>) {
+    state.borrow_mut().seek_announce_at =
+        Some(std::time::Instant::now() + std::time::Duration::from_millis(400));
+}
+
+/// The volume step for one button press, read from the config
+/// at use time (percent → fraction, clamped like Python's).
+fn volume_step() -> f64 {
+    let cfg = blindrss_core::config::Config::load(&crate::config_path()).unwrap_or_default();
+    (cfg.get_i64("volume_step", 5) as f64 / 100.0).clamp(0.01, 0.5)
 }
 
 /// A range the player skips over, with its announcement label.
@@ -105,6 +204,18 @@ struct PlayerState {
     /// throttled to real movement; opening the DB every tick
     /// was needless UI-thread I/O).
     last_saved_pos: i64,
+    /// Per-load hidden-window load-state announcements
+    /// (Audit 8 M10): reset at every load; the tick speaks
+    /// "Playing" through it, load failures speak "Failed to
+    /// load media", queue advances pre-suppress the routine
+    /// states. UI thread only, like the rest of this state.
+    hidden: HiddenAnnouncer,
+    /// Debounced landed-seek summary (M10): armed by every
+    /// user seek (buttons, keys, slider, Player-menu dispatch)
+    /// at now + 400 ms and re-armed by the next press, exactly
+    /// Python's `wx.CallLater(400)` pattern; the tick speaks
+    /// the position summary when it fires.
+    seek_announce_at: Option<std::time::Instant>,
 }
 
 /// Custom accessibility for the seek slider: a VALUE TEXT in
@@ -319,41 +430,6 @@ fn spawn_skip_workers(
     skip_rx
 }
 
-pub fn open_player(
-    _parent: &Frame,
-    article: Article,
-    stream_url: String,
-    chapters: Vec<Chapter>,
-    headers: Vec<(String, String)>,
-) {
-    open_player_impl(_parent, article, stream_url, chapters, None, headers);
-}
-
-/// Open the player on one queue entry, advancing through the
-/// rest of the queue as each entry finishes.
-pub fn open_player_queue(
-    _parent: &Frame,
-    article: Article,
-    stream_url: String,
-    entries: Vec<Article>,
-    index: usize,
-    headers: Vec<(String, String)>,
-) {
-    set_queue_index(index as i64);
-    let chapters = Db::open(&crate::db_path())
-        .ok()
-        .and_then(|db| db.chapters(&article.id).ok())
-        .unwrap_or_default();
-    open_player_impl(
-        _parent,
-        article,
-        stream_url,
-        chapters,
-        Some((entries, index)),
-        headers,
-    );
-}
-
 /// Persist the player volume (Python config `volume`: int
 /// percent 0-100, default 100, saved whenever it changes).
 fn persist_volume(volume: f64) {
@@ -420,46 +496,428 @@ fn load_with_fallbacks(
     "failed"
 }
 
-fn open_player_impl(
+/// Load a resolved stream into the backend and start it,
+/// applying the persisted volume and playback speed and arming
+/// the autoplay watchdog. Shared by the delivery of a fresh
+/// load, a toggle-reload of an ended stream, and a play-queue
+/// switch. Returns false when every fallback failed.
+fn start_loaded_stream(
+    media: &MediaBackend,
+    frame: &Frame,
+    play_btn: &Button,
+    state: &Rc<RefCell<PlayerState>>,
+    stream: &str,
+    headers: Vec<(String, String)>,
+) -> bool {
+    let cfg = blindrss_core::config::Config::load(&crate::config_path()).unwrap_or_default();
+    let wrapped = if media.uses_vlc() {
+        stream.to_string()
+    } else {
+        eq_wrap(stream, &cfg, &headers)
+    };
+    // An EQ-wrapped URL is already a local ffmpeg stream (its
+    // own network path is ffmpeg's), so it loads directly;
+    // anything else goes through the fallback chain.
+    let via = if wrapped != stream {
+        if media.load_uri(&wrapped) {
+            ""
+        } else {
+            "failed"
+        }
+    } else {
+        load_with_fallbacks(media, stream, &headers)
+    };
+    if via == "failed" {
+        return false;
+    }
+    media.set_volume((cfg.get_i64("volume", 100) as f64 / 100.0).clamp(0.0, 1.0));
+    media.play();
+    play_btn.set_label(&crate::tr("Pause"));
+    let start_speed = cfg_f64(&cfg, "playback_speed", 1.0);
+    if (start_speed - 1.0).abs() > 0.001 {
+        media.set_playback_rate(start_speed);
+    }
+    frame.set_status_text(
+        match via {
+            "proxy" => "Playing (via local proxy)",
+            "ffmpeg" => "Playing (via ffmpeg)",
+            _ => "Playing",
+        },
+        0,
+    );
+    // Arm the autoplay watchdog: load success is not playback
+    // (see PlayerState::autoplay_active).
+    let mut s = state.borrow_mut();
+    s.stream = stream.to_string();
+    s.headers = headers;
+    s.autoplay_level = match via {
+        "proxy" => 1,
+        "ffmpeg" => 2,
+        _ if wrapped != stream => 2,
+        _ => 0,
+    };
+    s.autoplay_ticks = 0;
+    s.autoplay_active = true;
+    true
+}
+
+/// What one activation (Enter / Play) did with the session.
+pub enum BeginOutcome {
+    /// The session already held this media: play/pause was
+    /// toggled and nothing is loading. The caller must not
+    /// resolve or deliver anything.
+    Toggled,
+    /// The session is in its loading state for the item under
+    /// this generation. The caller resolves on a worker and
+    /// delivers (or fails) under the same generation; a newer
+    /// activation makes the delivery stale and it is dropped.
+    Loading(u64),
+}
+
+/// Begin playing `article` in the one player session, NOW —
+/// before any resolution or metadata lookup (Audit 8 M11,
+/// Python's `_open_article`): the window exists (or is reused)
+/// in its loading state when this returns, so the user can
+/// cancel by activating something else or closing it.
+pub fn begin_play(_parent: &Frame, article: &Article) -> BeginOutcome {
+    let alive = SESSION.with(|s| s.borrow().is_some());
+    let (kind, generation) =
+        SESSION_POLICY.with(|p| p.borrow_mut().activate(alive, identity_of(article)));
+    match kind {
+        Activation::Toggle => {
+            if let Some(control) = session_control() {
+                control.toggle_or_reload();
+            }
+            BeginOutcome::Toggled
+        }
+        Activation::Create => {
+            let control = create_session(article);
+            SESSION.with(|s| {
+                *s.borrow_mut() = Some(LiveSession {
+                    key: control.frame.get_handle() as usize,
+                    control: control.clone(),
+                    command: control.command.clone(),
+                });
+            });
+            control.begin_load(article, None);
+            BeginOutcome::Loading(generation)
+        }
+        Activation::Reuse => {
+            if let Some(control) = session_control() {
+                control.begin_load(article, None);
+            }
+            BeginOutcome::Loading(generation)
+        }
+    }
+}
+
+/// Begin a play queue on `entries[index]`: like `begin_play`
+/// but always a fresh load — Python's queue path calls
+/// `load_media` directly and never takes the toggle branch,
+/// even when the first entry is the media already loaded.
+pub fn begin_queue_play(
     _parent: &Frame,
-    article: Article,
+    article: &Article,
+    entries: Vec<Article>,
+    index: usize,
+) -> BeginOutcome {
+    let alive = SESSION.with(|s| s.borrow().is_some());
+    let (kind, generation) = SESSION_POLICY.with(|p| {
+        p.borrow_mut()
+            .activate_new_load(alive, identity_of(article))
+    });
+    let queue = Some((entries, index));
+    match kind {
+        Activation::Create => {
+            let control = create_session(article);
+            SESSION.with(|s| {
+                *s.borrow_mut() = Some(LiveSession {
+                    key: control.frame.get_handle() as usize,
+                    control: control.clone(),
+                    command: control.command.clone(),
+                });
+            });
+            control.begin_load(article, queue);
+        }
+        _ => {
+            if let Some(control) = session_control() {
+                control.begin_load(article, queue);
+            }
+        }
+    }
+    BeginOutcome::Loading(generation)
+}
+
+/// Deliver a resolved stream for the load stamped
+/// `generation`. A stale generation (a newer activation, a
+/// queue advance, a close) is dropped whole: it never starts
+/// audio (M11).
+pub fn deliver_media(
+    generation: u64,
+    article: &Article,
     stream_url: String,
     chapters: Vec<Chapter>,
-    queue: Option<(Vec<Article>, usize)>,
     headers: Vec<(String, String)>,
 ) {
+    if !is_current(generation) {
+        return;
+    }
+    let Some(control) = session_control() else {
+        return;
+    };
+    // The delivery must belong to the item the session is
+    // loading (the generation is the guard; this is the belt
+    // to its braces).
+    if control.state.borrow().article_id != article.id {
+        return;
+    }
+    control.deliver(article, stream_url, chapters, headers);
+}
+
+/// The resolution for the load stamped `generation` failed:
+/// the session leaves its loading state with the failure on
+/// the status line and, while hidden, spoken (M10).
+pub fn fail_load(generation: u64) {
+    if !is_current(generation) {
+        return;
+    }
+    let Some(control) = session_control() else {
+        return;
+    };
+    control.fail();
+}
+
+/// Replace the session's chapters (metadata that arrived after
+/// the audio started — M11 keeps it off the critical path).
+/// Refused for a stale generation.
+pub fn update_chapters(generation: u64, chapters: Vec<Chapter>) -> bool {
+    if !is_current(generation) {
+        return false;
+    }
+    let Some(control) = session_control() else {
+        return false;
+    };
+    control.set_chapters(chapters);
+    true
+}
+
+impl SessionControl {
+    /// Put the session into the loading state for `article`
+    /// (Python's `load_media` before its resolver runs): the
+    /// outgoing item's position is saved, old playback stops,
+    /// per-load state resets, visibility follows the
+    /// `show_player_on_play` preference (default hidden, no
+    /// focus steal) and the hidden load announcement is made.
+    fn begin_load(&self, article: &Article, queue: Option<(Vec<Article>, usize)>) {
+        let cfg = blindrss_core::config::Config::load(&crate::config_path()).unwrap_or_default();
+        if let Some((_, index)) = &queue {
+            set_queue_index(*index as i64);
+        }
+        {
+            let mut s = self.state.borrow_mut();
+            // Persist the outgoing item's position (Python's
+            // load_media does this for the previous media) —
+            // but only when media actually loaded for it. A
+            // virgin, still-loading or failed session has an
+            // empty stream, and saving then would overwrite
+            // the article's saved resume position with zero.
+            if !s.stream.is_empty() {
+                save_position(&s, &self.media, false);
+            }
+            self.media.stop();
+            s.autoplay_active = false;
+            s.article_id = article.id.clone();
+            s.article_url = article.url.clone();
+            s.title = article.title.clone();
+            s.stream = String::new();
+            s.headers = Vec::new();
+            s.skips.clear();
+            s.skipped.clear();
+            s.last_chapter = None;
+            let (_, rx) = std::sync::mpsc::channel();
+            s.skip_rx = rx;
+            s.saved_position_ms = 0;
+            s.seeked = true;
+            s.last_saved_pos = -1;
+            s.last_save = std::time::Instant::now();
+            s.resume = ResumePolicy::from_config(&cfg);
+            s.seek_announce_at = None;
+            // Force the tick's play-state sync to re-observe:
+            // without this, a load that reaches Playing before
+            // the next tick (previous item was playing too)
+            // would never register its readiness transition.
+            s.last_playing = None;
+            s.hidden.reset(&[]);
+            s.queue = queue.map(|(entries, index)| {
+                let (tx, rx) = std::sync::mpsc::channel();
+                QueueCtx {
+                    entries,
+                    index,
+                    rx,
+                    tx,
+                    loading: false,
+                }
+            });
+        }
+        *self.chapters_live.borrow_mut() = (Vec::new(), Vec::new());
+        self.chapter_list.clear();
+        self.frame.set_title(&article.title);
+        self.frame.set_status_text("Loading media...", 0);
+        // Visibility first, then the announcement: Python
+        // defers its hidden announcement until after
+        // `_open_article` has applied the preference.
+        self.apply_visibility(&cfg);
+        let mut s = self.state.borrow_mut();
+        hidden_announce(&mut s, &self.frame, "Loading media...");
+    }
+
+    /// Honor `show_player_on_play` for a fresh load (M10):
+    /// Python's merged-config default is hidden. Shown means
+    /// show + raise + focus on Play/Pause; hidden means the
+    /// window stays (or goes) out of sight and focus is NOT
+    /// touched — the main window keeps it.
+    fn apply_visibility(&self, cfg: &blindrss_core::config::Config) {
+        if cfg.get_bool("show_player_on_play", false) {
+            self.frame.show(true);
+            self.frame.raise();
+            self.play_btn.set_focus();
+        } else {
+            self.frame.show(false);
+        }
+    }
+
+    /// Start the resolved stream for the loading item.
+    fn deliver(
+        &self,
+        article: &Article,
+        stream_url: String,
+        chapters: Vec<Chapter>,
+        headers: Vec<(String, String)>,
+    ) {
+        let cfg = blindrss_core::config::Config::load(&crate::config_path()).unwrap_or_default();
+        let skip_rx = spawn_skip_workers(&cfg, article, &stream_url);
+        {
+            let mut s = self.state.borrow_mut();
+            s.skip_rx = skip_rx;
+            s.saved_position_ms = Db::open(&s.db_path)
+                .ok()
+                .and_then(|db| saved_state(&db, &article.id, &article.url).ok().flatten())
+                .map(|saved| s.resume.resume_target(&saved, &stream_url))
+                .unwrap_or(0);
+            s.seeked = s.saved_position_ms <= 0;
+        }
+        self.set_chapters(chapters);
+        if start_loaded_stream(
+            &self.media,
+            &self.frame,
+            &self.play_btn,
+            &self.state,
+            &stream_url,
+            headers,
+        ) {
+            self.frame.set_title(&format!("Playing: {}", article.title));
+        } else {
+            self.frame.set_status_text("Could not load media", 0);
+            let mut s = self.state.borrow_mut();
+            hidden_announce(&mut s, &self.frame, "Failed to load media");
+        }
+    }
+
+    /// Resolution failed for the loading item.
+    fn fail(&self) {
+        self.frame.set_status_text("Could not load media", 0);
+        let mut s = self.state.borrow_mut();
+        hidden_announce(&mut s, &self.frame, "Failed to load media");
+    }
+
+    /// Repeated activation of the held media (Python's
+    /// `is_current_media` branch): pause when playing, reload
+    /// when the stream ended or stopped, else resume.
+    fn toggle_or_reload(&self) {
+        match self.media.get_state() {
+            MediaState::Playing => {
+                self.media.pause();
+                let mut s = self.state.borrow_mut();
+                save_position(&s, &self.media, false);
+                // A deliberate pause cancels the autoplay
+                // watchdog — it must never fight the user.
+                s.autoplay_active = false;
+                crate::announce("general", "Paused");
+            }
+            MediaState::Stopped => {
+                let (stream, headers) = {
+                    let s = self.state.borrow();
+                    (s.stream.clone(), s.headers.clone())
+                };
+                if stream.is_empty() {
+                    // Still loading: nothing to reload yet.
+                    self.media.play();
+                    return;
+                }
+                if start_loaded_stream(
+                    &self.media,
+                    &self.frame,
+                    &self.play_btn,
+                    &self.state,
+                    &stream,
+                    headers,
+                ) {
+                    crate::announce("general", "Playing");
+                    let mut s = self.state.borrow_mut();
+                    note_announced(&mut s, "Playing");
+                } else {
+                    self.frame.set_status_text("Could not load media", 0);
+                    let mut s = self.state.borrow_mut();
+                    hidden_announce(&mut s, &self.frame, "Failed to load media");
+                }
+            }
+            _ => {
+                self.media.play();
+                crate::announce("general", "Playing");
+                let mut s = self.state.borrow_mut();
+                note_announced(&mut s, "Playing");
+            }
+        }
+    }
+
+    /// Replace the chapter set everywhere the window reads it
+    /// (navigation buttons, the tick, the list box).
+    fn set_chapters(&self, chapters: Vec<Chapter>) {
+        let mut chapters = chapters;
+        chapters.sort_by(|a, b| a.start.total_cmp(&b.start));
+        let starts: Vec<i64> = chapters.iter().map(|c| (c.start * 1000.0) as i64).collect();
+        self.chapter_list.clear();
+        for ch in &chapters {
+            let t = ch.title.as_deref().unwrap_or("Chapter");
+            self.chapter_list
+                .append(&format!("{} - {}", fmt_ms((ch.start * 1000.0) as i64), t));
+        }
+        *self.chapters_live.borrow_mut() = (chapters, starts);
+    }
+}
+
+/// Build the session window in its (empty) loading state. No
+/// media is loaded here: `begin_load` + `deliver` drive the
+/// load, so the window opens immediately (M11).
+fn create_session(article: &Article) -> Rc<SessionControl> {
     let db_path = crate::db_path();
     let cfg = blindrss_core::config::Config::load(&crate::config_path()).unwrap_or_default();
     let resume = ResumePolicy::from_config(&cfg);
-    let saved = Db::open(&db_path)
-        .ok()
-        .and_then(|db| saved_state(&db, &article.id, &article.url).ok().flatten())
-        .map(|s| resume.resume_target(&s, &stream_url))
-        .unwrap_or(0);
 
-    // Player knobs from config (Python keys/defaults).
+    // Player knobs from config (Python keys/defaults). The
+    // button labels are built from them once, here; the
+    // handlers re-read the config when used, because the one
+    // session outlives any single Settings change.
     let seek_back_ms = cfg.get_i64("seek_back_ms", 10_000);
     let seek_fwd_ms = cfg.get_i64("seek_forward_ms", seek_back_ms);
-    let volume_step = (cfg.get_i64("volume_step", 5) as f64 / 100.0).clamp(0.01, 0.5);
-    // Persisted volume (Python `volume`: int percent, default 100).
-    let start_volume = (cfg.get_i64("volume", 100) as f64 / 100.0).clamp(0.0, 1.0);
-    let start_speed = cfg_f64(&cfg, "playback_speed", 1.0);
-    let show_player = cfg.get_bool("show_player_on_play", true);
 
-    let mut chapters = chapters;
-    chapters.sort_by(|a, b| {
-        a.start
-            .partial_cmp(&b.start)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    let starts: Vec<i64> = chapters.iter().map(|c| (c.start * 1000.0) as i64).collect();
     // Shared with every handler so a queue switch (which clears
     // the chapters, like Python's load_media([])) is seen by the
     // navigation buttons and the tick alike.
-    let chapters_live = Rc::new(RefCell::new((chapters.clone(), starts.clone())));
+    let chapters_live = Rc::new(RefCell::new((Vec::new(), Vec::new())));
 
     let frame = Frame::builder()
-        .with_title(&format!("Playing: {}", article.title))
+        .with_title(&article.title)
         .with_size(Size::new(560, 460))
         .build();
     let media = MediaBackend::new(&frame, &cfg);
@@ -537,10 +995,8 @@ fn open_player_impl(
     let chapters_caption = StaticText::builder(&frame)
         .with_label(&crate::tr("Chapters"))
         .build();
-    for ch in &chapters {
-        let t = ch.title.as_deref().unwrap_or("Chapter");
-        chapter_list.append(&format!("{} - {}", fmt_ms((ch.start * 1000.0) as i64), t));
-    }
+    // The chapter list starts empty: chapters arrive with the
+    // delivery (or after it, via update_chapters).
 
     let row = BoxSizer::builder(Orientation::Horizontal).build();
     row.add(&play_btn, 0, SizerFlag::All, 4);
@@ -567,20 +1023,25 @@ fn open_player_impl(
     frame.create_status_bar(1, 0, -1, "player status");
     frame.set_status_text(&article.title, 0);
 
-    // Skip-range workers: SponsorBlock (YouTube) and ffmpeg
-    // silence detection report ranges over one channel; the tick
-    // drains and applies them.
-    let skip_rx = spawn_skip_workers(&cfg, &article, &stream_url);
-
+    // The window opens in its loading state: skip workers,
+    // the resume target and the stream itself all arrive with
+    // the delivery (SessionControl::deliver), so nothing here
+    // waits on resolution or metadata (M11). The skip channel
+    // starts senderless; the tick's drain treats a disconnected
+    // channel as "no ranges yet".
+    let (_, skip_rx) = std::sync::mpsc::channel();
     let state = Rc::new(RefCell::new(PlayerState {
-        article_id: article.id.clone(),
-        title: article.title.clone(),
+        // Virgin identity: begin_load binds the first article
+        // (and the empty stream marks "nothing loaded yet" for
+        // the position saves).
+        article_id: String::new(),
+        title: String::new(),
         db_path,
-        article_url: article.url.clone(),
+        article_url: String::new(),
         resume,
         last_save: std::time::Instant::now(),
-        seeked: saved <= 0,
-        saved_position_ms: saved,
+        seeked: true,
+        saved_position_ms: 0,
         skips: Vec::new(),
         skip_rx,
         skipped: HashSet::new(),
@@ -591,69 +1052,13 @@ fn open_player_impl(
         autoplay_ticks: 0,
         autoplay_level: 0,
         stream: String::new(),
-        headers: headers.clone(),
+        headers: Vec::new(),
         last_pos_text: String::new(),
         last_saved_pos: -1,
-        queue: queue.map(|(entries, index)| {
-            let (tx, rx) = std::sync::mpsc::channel();
-            QueueCtx {
-                entries,
-                index,
-                rx,
-                tx,
-                loading: false,
-            }
-        }),
+        hidden: HiddenAnnouncer::new(),
+        seek_announce_at: None,
+        queue: None,
     }));
-
-    let wrapped = if media.uses_vlc() {
-        stream_url.clone()
-    } else {
-        eq_wrap(&stream_url, &cfg, &headers)
-    };
-    // An EQ-wrapped URL is already a local ffmpeg stream (its
-    // own network path is ffmpeg's), so it loads directly;
-    // anything else goes through the fallback chain.
-    let via = if wrapped != stream_url {
-        if media.load_uri(&wrapped) {
-            ""
-        } else {
-            "failed"
-        }
-    } else {
-        load_with_fallbacks(&media, &stream_url, &headers)
-    };
-    if via != "failed" {
-        media.set_volume(start_volume);
-        media.play();
-        play_btn.set_label(&crate::tr("Pause"));
-        if (start_speed - 1.0).abs() > 0.001 {
-            media.set_playback_rate(start_speed);
-        }
-        frame.set_status_text(
-            match via {
-                "proxy" => "Playing (via local proxy)",
-                "ffmpeg" => "Playing (via ffmpeg)",
-                _ => "Playing",
-            },
-            0,
-        );
-        // Arm the autoplay watchdog: load success is not
-        // playback (see PlayerState::autoplay_active).
-        let mut s = state.borrow_mut();
-        s.stream = stream_url.clone();
-        s.autoplay_level = match via {
-            "proxy" => 1,
-            "ffmpeg" => 2,
-            _ if wrapped != stream_url => 2,
-            _ => 0,
-        };
-        s.autoplay_ticks = 0;
-        s.autoplay_active = true;
-    } else {
-        frame.set_status_text("Could not load media", 0);
-        crate::announce("general", "Could not load media");
-    }
 
     // Queue advance: media finished -> resolve the next queue
     // entry on a worker; the tick performs the switch.
@@ -705,6 +1110,10 @@ fn open_player_impl(
         } else {
             m.play();
             crate::announce("general", "Playing");
+            // This press already said it: the tick's
+            // hidden-window readiness announcement must not
+            // repeat it when the state lands.
+            note_announced(&mut st_pp.borrow_mut(), "Playing");
         }
     });
     let pp = play_pause.clone();
@@ -712,7 +1121,15 @@ fn open_player_impl(
     let m = media;
     let st = state.clone();
     let stop: Rc<dyn Fn()> = Rc::new(move || {
-        save_position(&st.borrow(), &m, false);
+        // Save only when media actually loaded (see
+        // begin_load): a stop during loading must not zero
+        // the article's saved resume position.
+        {
+            let s = st.borrow();
+            if !s.stream.is_empty() {
+                save_position(&s, &m, false);
+            }
+        }
         m.stop();
         st.borrow_mut().autoplay_active = false;
     });
@@ -721,23 +1138,35 @@ fn open_player_impl(
     // Seek / volume controls, shared between the window's
     // buttons and the main window's Player menu (Batch 41a's
     // player.rewind / player.forward / player.volume_* dispatch
-    // names land in the PLAYERS action match below).
+    // names land in the session command match below). Amounts
+    // are re-read from the config at use time: the one session
+    // outlives any single Settings change. Every seek (re)arms
+    // the debounced landed-seek summary (M10).
     let rewind: Rc<dyn Fn()> = {
         let m = media;
+        let st = state.clone();
         Rc::new(move || {
-            m.seek(-seek_back_ms, SeekMode::FromCurrent);
+            let cfg =
+                blindrss_core::config::Config::load(&crate::config_path()).unwrap_or_default();
+            m.seek(-cfg.get_i64("seek_back_ms", 10_000), SeekMode::FromCurrent);
+            arm_seek_summary(&st);
         })
     };
     let forward: Rc<dyn Fn()> = {
         let m = media;
+        let st = state.clone();
         Rc::new(move || {
-            m.seek(seek_fwd_ms, SeekMode::FromCurrent);
+            let cfg =
+                blindrss_core::config::Config::load(&crate::config_path()).unwrap_or_default();
+            let back = cfg.get_i64("seek_back_ms", 10_000);
+            m.seek(cfg.get_i64("seek_forward_ms", back), SeekMode::FromCurrent);
+            arm_seek_summary(&st);
         })
     };
     let volume_down: Rc<dyn Fn()> = {
         let m = media;
         Rc::new(move || {
-            let v = (m.get_volume() - volume_step).max(0.0);
+            let v = (m.get_volume() - volume_step()).max(0.0);
             m.set_volume(v);
             persist_volume(v);
             crate::announce(
@@ -749,7 +1178,7 @@ fn open_player_impl(
     let volume_up: Rc<dyn Fn()> = {
         let m = media;
         Rc::new(move || {
-            let v = (m.get_volume() + volume_step).min(1.0);
+            let v = (m.get_volume() + volume_step()).min(1.0);
             m.set_volume(v);
             persist_volume(v);
             crate::announce(
@@ -874,6 +1303,7 @@ fn open_player_impl(
         let frame_k = frame;
         let m = media;
         let st_k = state.clone();
+        let pp_k = play_pause.clone();
         let btn_handles: Vec<usize> = [
             play_btn,
             stop_btn,
@@ -916,30 +1346,31 @@ fn open_player_impl(
                     ev.skip(false);
                 }
                 // Space toggles play/pause anywhere a button
-                // does not already own it.
+                // does not already own it — the same closure
+                // the Play/Pause button runs.
                 32 if !on_button => {
-                    if m.get_state() == MediaState::Playing {
-                        m.pause();
-                        st_k.borrow_mut().autoplay_active = false;
-                        crate::announce("general", "Paused");
-                    } else {
-                        m.play();
-                        crate::announce("general", "Playing");
-                    }
+                    pp_k();
                     ev.skip(false);
                 }
                 // Left/Right seek, Up/Down volume — outside the
                 // controls that use arrows themselves.
                 314 if !on_slider && !on_list => {
-                    m.seek(-seek_back_ms, SeekMode::FromCurrent);
+                    let cfg = blindrss_core::config::Config::load(&crate::config_path())
+                        .unwrap_or_default();
+                    m.seek(-cfg.get_i64("seek_back_ms", 10_000), SeekMode::FromCurrent);
+                    arm_seek_summary(&st_k);
                     ev.skip(false);
                 }
                 316 if !on_slider && !on_list => {
-                    m.seek(seek_fwd_ms, SeekMode::FromCurrent);
+                    let cfg = blindrss_core::config::Config::load(&crate::config_path())
+                        .unwrap_or_default();
+                    let back = cfg.get_i64("seek_back_ms", 10_000);
+                    m.seek(cfg.get_i64("seek_forward_ms", back), SeekMode::FromCurrent);
+                    arm_seek_summary(&st_k);
                     ev.skip(false);
                 }
                 315 if !on_slider && !on_list => {
-                    let v = (m.get_volume() + volume_step).min(1.0);
+                    let v = (m.get_volume() + volume_step()).min(1.0);
                     m.set_volume(v);
                     persist_volume(v);
                     crate::announce(
@@ -949,7 +1380,7 @@ fn open_player_impl(
                     ev.skip(false);
                 }
                 317 if !on_slider && !on_list => {
-                    let v = (m.get_volume() - volume_step).max(0.0);
+                    let v = (m.get_volume() - volume_step()).max(0.0);
                     m.set_volume(v);
                     persist_volume(v);
                     crate::announce(
@@ -976,6 +1407,7 @@ fn open_player_impl(
             if len > 0 {
                 let target = len * ev.get_value() as i64 / 1000;
                 m.seek(target, SeekMode::FromStart);
+                arm_seek_summary(&st);
             }
         });
     }
@@ -1021,6 +1453,18 @@ fn open_player_impl(
                         Ok((stream, headers)) => {
                             q.index = idx;
                             let entry = q.entries[idx].clone();
+                            // The advance is a new load in the
+                            // session policy: any main-window
+                            // delivery still in flight for the
+                            // previous item goes stale, and the
+                            // routine load states are
+                            // pre-suppressed — the queue
+                            // advancing on its own says nothing
+                            // unless it fails (Python's
+                            // load_media(announce=False)).
+                            SESSION_POLICY
+                                .with(|p| p.borrow_mut().begin_internal_load(identity_of(&entry)));
+                            s.hidden.reset(&["Loading media...", "Playing"]);
                             s.article_id = entry.id.clone();
                             s.article_url = entry.url.clone();
                             s.title = entry.title.clone();
@@ -1058,12 +1502,7 @@ fn open_player_impl(
                             }
                             *chapters_tick.borrow_mut() = (chapters, starts);
                             set_queue_index(idx as i64);
-                            let wrapped = if m.uses_vlc() {
-                                stream.clone()
-                            } else {
-                                eq_wrap(&stream, &cfg2, &headers)
-                            };
-                            queue_load = Some((wrapped, stream, entry.title.clone(), headers));
+                            queue_load = Some((stream, entry.title.clone(), headers));
                         }
                         Err(e) => queue_error = Some(e),
                     }
@@ -1112,35 +1551,18 @@ fn open_player_impl(
             frame_tick.set_status_text(&label, 0);
             crate::announce("sponsor_skip", &label);
         }
-        if let Some((wrapped, raw, title, headers)) = queue_load {
-            let via = if wrapped != raw {
-                if m.load_uri(&wrapped) { "" } else { "failed" }
-            } else {
-                load_with_fallbacks(&m, &raw, &headers)
-            };
-            if via != "failed" {
-                m.play();
-                {
-                    let mut s = st.borrow_mut();
-                    s.stream = raw.clone();
-                    s.headers = headers;
-                    s.autoplay_level = match via {
-                        "proxy" => 1,
-                        "ffmpeg" => 2,
-                        _ if wrapped != raw => 2,
-                        _ => 0,
-                    };
-                    s.autoplay_ticks = 0;
-                    s.autoplay_active = true;
-                }
-                // A fresh load can reset the backend volume; the
-                // persisted level is the one in the config.
-                let cfg_q =
-                    blindrss_core::config::Config::load(&crate::config_path()).unwrap_or_default();
-                m.set_volume((cfg_q.get_i64("volume", 100) as f64 / 100.0).clamp(0.0, 1.0));
+        if let Some((stream, title, headers)) = queue_load {
+            // No "Now playing" announcement: the advance is a
+            // load the user did not just ask for, and Python
+            // stays quiet about it (load_media(announce=False));
+            // the frame title and status still follow.
+            if start_loaded_stream(&m, &frame_tick, &play_btn, &st, &stream, headers) {
                 frame_tick.set_title(&format!("Playing: {title}"));
                 frame_tick.set_status_text(&format!("Queue: {title}"), 0);
-                crate::announce("general", &format!("Now playing: {title}"));
+            } else {
+                frame_tick.set_status_text("Could not load media", 0);
+                let mut s = st.borrow_mut();
+                hidden_announce(&mut s, &frame_tick, "Failed to load media");
             }
         }
         if let Some(e) = queue_error {
@@ -1177,7 +1599,11 @@ fn open_player_impl(
                     } else if t >= 14 {
                         s.autoplay_active = false;
                         frame_tick.set_status_text("Could not play this media", 0);
-                        crate::announce("general", "Could not play this media");
+                        // Python's failure speech is the
+                        // hidden-window one: said once per load,
+                        // and only when the status line cannot
+                        // be read.
+                        hidden_announce(&mut s, &frame_tick, "Failed to load media");
                     }
                 }
             }
@@ -1185,17 +1611,44 @@ fn open_player_impl(
         // Keep the Play/Pause button's label honest about the
         // state — the label is its accessible name, so NVDA
         // users hear "Pause" while playing and "Play" while
-        // paused instead of a static "Play/Pause".
+        // paused instead of a static "Play/Pause". The same
+        // transition is the load's readiness moment: while the
+        // window is hidden, "Playing" is spoken once per load
+        // (M10).
         {
             let mut s = st.borrow_mut();
             if s.last_playing != Some(playing_now) {
                 s.last_playing = Some(playing_now);
+                if playing_now {
+                    hidden_announce(&mut s, &frame_tick, "Playing");
+                }
                 let label = if playing_now {
                     crate::tr("Pause")
                 } else {
                     crate::tr("Play")
                 };
                 play_btn.set_label(&label);
+            }
+        }
+        // Debounced landed-seek summary (M10): a burst of seek
+        // presses speaks once, 400 ms after the last one, with
+        // the position actually landed on.
+        {
+            let due = {
+                let mut s = st.borrow_mut();
+                match s.seek_announce_at {
+                    Some(at) if at <= std::time::Instant::now() => {
+                        s.seek_announce_at = None;
+                        true
+                    }
+                    _ => false,
+                }
+            };
+            if due {
+                crate::announce(
+                    "media_navigation",
+                    &blindrss_core::playback::seek_summary(m.tell(), m.length()),
+                );
             }
         }
         {
@@ -1230,66 +1683,81 @@ fn open_player_impl(
     timer.start(1000, false);
 
     let player_key = frame.get_handle() as usize;
-    PLAYERS.with(|players| {
-        players.borrow_mut().push((
-            player_key,
-            Rc::new(move |id| {
-                match id {
-                    "player.play_pause" => play_pause(),
-                    "player.stop" => stop(),
-                    "player.rewind" => rewind(),
-                    "player.forward" => forward(),
-                    "player.volume_up" => volume_up(),
-                    "player.volume_down" => volume_down(),
-                    "player.show_hide" => {
-                        let show = !frame.is_shown();
-                        frame.show(show);
-                        if show {
-                            frame.raise();
-                            play_btn.set_focus();
-                        }
-                    }
-                    "player.chapters" => {
-                        frame.show(true);
-                        frame.raise();
-                        chapter_list.set_focus();
-                    }
-                    "player.equalizer" => {
-                        crate::dialogs::show_equalizer(&frame, &crate::config_path());
-                        let cfg = blindrss_core::config::Config::load(&crate::config_path())
-                            .unwrap_or_default();
-                        media.apply_equalizer(&blindrss_core::equalizer::EqConfig::from_config(
-                            &cfg,
-                        ));
-                    }
-                    "speed.up" => change_speed(1),
-                    "speed.down" => change_speed(-1),
-                    "speed.reset" => change_speed(0),
-                    _ => return false,
+    let command: PlayerCommand = Rc::new(move |id| {
+        match id {
+            "player.play_pause" => play_pause(),
+            "player.stop" => stop(),
+            "player.rewind" => rewind(),
+            "player.forward" => forward(),
+            "player.volume_up" => volume_up(),
+            "player.volume_down" => volume_down(),
+            "player.show_hide" => {
+                let show = !frame.is_shown();
+                frame.show(show);
+                if show {
+                    frame.raise();
+                    play_btn.set_focus();
                 }
-                true
-            }),
-        ))
+            }
+            "player.chapters" => {
+                frame.show(true);
+                frame.raise();
+                chapter_list.set_focus();
+            }
+            "player.equalizer" => {
+                crate::dialogs::show_equalizer(&frame, &crate::config_path());
+                let cfg =
+                    blindrss_core::config::Config::load(&crate::config_path()).unwrap_or_default();
+                media.apply_equalizer(&blindrss_core::equalizer::EqConfig::from_config(&cfg));
+            }
+            "speed.up" => change_speed(1),
+            "speed.down" => change_speed(-1),
+            "speed.reset" => change_speed(0),
+            _ => return false,
+        }
+        true
     });
     let closing_state = state.clone();
     frame.on_close(move |event| {
         timer.stop();
-        save_position(&closing_state.borrow(), &media, false);
+        // Closing mid-load is the cancel path (M11): nothing
+        // played, so there is no position to save — and saving
+        // would overwrite the article's resume position with
+        // zero. Only a session with media loaded saves.
+        {
+            let s = closing_state.borrow();
+            if !s.stream.is_empty() {
+                save_position(&s, &media, false);
+            }
+        }
         media.close();
-        PLAYERS.with(|players| players.borrow_mut().retain(|(key, _)| *key != player_key));
+        // The session ends with its window: clear the live
+        // registration (only if it is still this window) and
+        // forget the policy identity — generations keep moving,
+        // so nothing stamped before the close can act later.
+        SESSION.with(|s| {
+            let mut slot = s.borrow_mut();
+            if slot.as_ref().is_some_and(|live| live.key == player_key) {
+                *slot = None;
+            }
+        });
+        SESSION_POLICY.with(|p| p.borrow_mut().close());
         event.skip(true);
     });
 
-    frame.show(true);
-    // Land keyboard focus on Play/Pause, not the media pane:
-    // the pane is a native video surface NVDA cannot read, and
-    // it is created first so it would otherwise take focus.
-    play_btn.set_focus();
-    // show_player_on_play: raise the player over the main window
-    // when playback starts (Python default in its settings UI).
-    if show_player {
-        frame.raise();
-    }
+    // No show/focus here: begin_load applies the
+    // show_player_on_play preference for the first load (and
+    // every later one) — hidden by default, without stealing
+    // focus (M10).
+    Rc::new(SessionControl {
+        frame,
+        media,
+        state,
+        chapters_live,
+        chapter_list,
+        play_btn,
+        command,
+    })
 }
 
 #[cfg(test)]

@@ -44,6 +44,7 @@ pub mod opencmd;
 pub mod opml;
 pub mod play_cache;
 pub mod playback;
+pub mod player_session;
 pub mod postprocess;
 pub mod provider;
 pub mod providers;

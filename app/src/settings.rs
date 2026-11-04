@@ -887,7 +887,10 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
         &media.win,
         &media.sizer,
         "Show player window when starting playback",
-        cfg.get_bool("show_player_on_play", true),
+        // Python's DEFAULT_CONFIG value is False and its loader
+        // merges defaults into every config, so the effective
+        // default is unchecked (Audit 8 M10).
+        cfg.get_bool("show_player_on_play", false),
     );
     let resume_cb = add_check(
         &media.win,
