@@ -239,6 +239,76 @@ pub fn media_type_for_url(url: &str) -> Option<String> {
     Some(ty.to_string())
 }
 
+/// Python's `canonical_media_type` (core/utils.py): strip any
+/// parameters, lowercase, drop a trailing slash, and fold the
+/// FLAC MIME aliases onto audio/flac.
+pub fn canonical_media_type(media_type: Option<&str>) -> String {
+    let mt = media_type
+        .unwrap_or("")
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let mt = mt.trim_end_matches('/');
+    if [
+        "audio/flac",
+        "audio/x-flac",
+        "application/flac",
+        "application/x-flac",
+    ]
+    .contains(&mt)
+    {
+        return "audio/flac".to_string();
+    }
+    mt.to_string()
+}
+
+/// Python's `media_type_is_audio_video_or_podcast`.
+pub fn media_type_is_audio_video_or_podcast(media_type: Option<&str>) -> bool {
+    let mt = canonical_media_type(media_type);
+    !mt.is_empty()
+        && (mt.starts_with("audio/") || mt.starts_with("video/") || mt.contains("podcast"))
+}
+
+/// Would the player open this article (Python
+/// `_should_play_in_player(article, include_downloads=False)`)?
+/// This is the article row's "Contains audio" test (Audit 8
+/// G11): a yt-dlp-supported article URL that is not plainly an
+/// image, or a playable enclosure. Completed downloads are
+/// deliberately not consulted — Python's label path excludes
+/// them; the live-progress correction in the main window covers
+/// rows whose media only becomes known once played.
+pub fn article_has_playable_media(article: &crate::Article) -> bool {
+    const IMAGE_EXTS: [&str; 6] = [".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"];
+    const AUDIO_EXTS: [&str; 8] = [
+        ".mp3", ".m4a", ".m4b", ".aac", ".ogg", ".opus", ".wav", ".flac",
+    ];
+    if !article.url.is_empty() && is_ytdlp_supported(&article.url) {
+        let url_low = article.url.to_ascii_lowercase();
+        if IMAGE_EXTS.iter().any(|ext| url_low.ends_with(ext)) {
+            return false;
+        }
+        return true;
+    }
+    if let Some(media_url) = article.media_url.as_deref().filter(|m| !m.is_empty()) {
+        let url = media_url.to_ascii_lowercase();
+        if IMAGE_EXTS.iter().any(|ext| url.ends_with(ext)) && !is_ytdlp_supported(media_url) {
+            return false;
+        }
+        if media_type_is_audio_video_or_podcast(article.media_type.as_deref()) {
+            return true;
+        }
+        if canonical_media_type(article.media_type.as_deref()) == "video/youtube" {
+            return true;
+        }
+        if AUDIO_EXTS.iter().any(|ext| url.ends_with(ext)) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Python's direct-media test: an audio/video (or stream) media
 /// type, a media file extension, or a stream manifest extension on
 /// the URL.

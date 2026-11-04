@@ -17,6 +17,7 @@ pub mod cast;
 pub mod castsession;
 pub mod castupnp;
 pub mod castwire;
+pub mod chapters;
 pub mod chromium;
 pub mod config;
 pub mod cookies;

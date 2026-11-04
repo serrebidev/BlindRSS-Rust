@@ -3106,14 +3106,20 @@ fn is_known_frame_id(id: &[u8]) -> bool {
     NAMED.contains(&id)
 }
 
-/// (title, author, content) from an MP3's embedded ID3 tag, or None
-/// when the tag carries no show-note text. Content candidates are
-/// USLT and COMM frames plus TXXX frames described as description /
-/// summary / show notes / transcript; the longest wins (Python).
-pub fn id3_metadata(url: &str) -> Option<(String, String, String)> {
-    let hdr = fetch_prefix_bytes(url, "bytes=0-9", 10)?;
+/// Walk the frames of the ID3v2 tag at `url` (a local path or a
+/// remote URL read by bounded prefix), returning each frame's
+/// id and payload after mutagen's flag handling: extended
+/// header skipped, tag/frame unsynchronisation decoded,
+/// compressed frames inflated, encrypted frames dropped.
+/// Shared by the show-notes reader (`id3_metadata`) and the
+/// chapter reader (`id3_chapters`) so both see the same frames.
+fn id3_frame_list(url: &str) -> (u8, Vec<(String, Vec<u8>)>) {
+    let mut out: Vec<(String, Vec<u8>)> = Vec::new();
+    let Some(hdr) = fetch_prefix_bytes(url, "bytes=0-9", 10) else {
+        return (0, out);
+    };
     if hdr.len() < 10 || &hdr[0..3] != b"ID3" {
-        return None;
+        return (0, out);
     }
     let version = hdr[3];
     let flags = hdr[5];
@@ -3124,11 +3130,13 @@ pub fn id3_metadata(url: &str) -> Option<(String, String, String)> {
         | ((ss[3] & 0x7F) as usize);
     let total = tag_size + 10 + if flags & 0x10 != 0 { 10 } else { 0 };
     if total <= 10 || total > 1_000_000 {
-        return None;
+        return (version, out);
     }
-    let tag = fetch_prefix_bytes(url, &format!("bytes=0-{}", total - 1), total)?;
+    let Some(tag) = fetch_prefix_bytes(url, &format!("bytes=0-{}", total - 1), total) else {
+        return (version, out);
+    };
     if tag.len() < total || &tag[0..3] != b"ID3" {
-        return None;
+        return (version, out);
     }
     // Frame region: the tag body after any extended header.
     // Mutagen skips the extended header; starting the scan at
@@ -3138,7 +3146,7 @@ pub fn id3_metadata(url: &str) -> Option<(String, String, String)> {
     let mut region_start = 10usize;
     if flags & 0x40 != 0 {
         if tag_end < 14 {
-            return None;
+            return (version, out);
         }
         // Mutagen heuristic: some taggers set the extended-header
         // flag without writing one — if the bytes at the frame
@@ -3149,7 +3157,7 @@ pub fn id3_metadata(url: &str) -> Option<(String, String, String)> {
                 // Synchsafe size of the whole extended header,
                 // including its 4 size bytes.
                 if tag[10..14].iter().any(|b| b & 0x80 != 0) {
-                    return None;
+                    return (version, out);
                 }
                 (((tag[10] & 0x7F) as usize) << 21)
                     | (((tag[11] & 0x7F) as usize) << 14)
@@ -3160,7 +3168,7 @@ pub fn id3_metadata(url: &str) -> Option<(String, String, String)> {
                 4 + u32::from_be_bytes([tag[10], tag[11], tag[12], tag[13]]) as usize
             };
             if skip == 0 || 10 + skip > tag_end {
-                return None;
+                return (version, out);
             }
             region_start = 10 + skip;
         }
@@ -3176,10 +3184,6 @@ pub fn id3_metadata(url: &str) -> Option<(String, String, String)> {
     } else {
         &tag[region_start..tag_end]
     };
-    let mut title = String::new();
-    let mut author = String::new();
-    let mut author2 = String::new();
-    let mut candidates: Vec<String> = Vec::new();
     let mut pos = 0usize;
     while pos + 10 <= frames.len() {
         let id = &frames[pos..pos + 4];
@@ -3268,15 +3272,34 @@ pub fn id3_metadata(url: &str) -> Option<(String, String, String)> {
             pos = end;
             continue;
         }
-        let id_str = std::str::from_utf8(id).unwrap_or("");
-        match id_str {
+        out.push((
+            std::str::from_utf8(id).unwrap_or("").to_string(),
+            payload.to_vec(),
+        ));
+        pos = end;
+    }
+    (version, out)
+}
+
+/// (title, author, content) from an MP3's embedded ID3 tag, or None
+/// when the tag carries no show-note text. Content candidates are
+/// USLT and COMM frames plus TXXX frames described as description /
+/// summary / show notes / transcript; the longest wins (Python).
+pub fn id3_metadata(url: &str) -> Option<(String, String, String)> {
+    let mut title = String::new();
+    let mut author = String::new();
+    let mut author2 = String::new();
+    let mut candidates: Vec<String> = Vec::new();
+    for (id_str, payload) in id3_frame_list(url).1 {
+        let payload: &[u8] = &payload;
+        match id_str.as_str() {
             "TIT2" | "TPE1" | "TPE2" => {
                 if !payload.is_empty() {
                     let text = id3_decode_text(payload[0], &payload[1..])
                         .replace('\0', " ")
                         .trim()
                         .to_string();
-                    match id_str {
+                    match id_str.as_str() {
                         "TIT2" if title.is_empty() => title = text,
                         "TPE1" if author.is_empty() => author = text,
                         "TPE2" if author2.is_empty() => author2 = text,
@@ -3316,7 +3339,6 @@ pub fn id3_metadata(url: &str) -> Option<(String, String, String)> {
             }
             _ => {}
         }
-        pos = end;
     }
     let content = candidates.into_iter().max_by_key(|c| c.len())?;
     if content.trim().is_empty() {
@@ -3326,6 +3348,116 @@ pub fn id3_metadata(url: &str) -> Option<(String, String, String)> {
         author = author2;
     }
     Some((title, author, content))
+}
+
+/// Walk one CHAP frame's embedded sub-frames (same frame
+/// header shape as the tag itself; sizes are synchsafe in
+/// v2.4, big-endian in v2.3). Sub-frames are read raw: the
+/// per-frame compression/encryption flags mutagen would apply
+/// are not interpreted at this level — plain sub-frames, the
+/// universal case in podcast tags, parse identically.
+fn id3_sub_frames(version: u8, mut bytes: &[u8]) -> Vec<(String, Vec<u8>)> {
+    let mut out = Vec::new();
+    while bytes.len() >= 10 {
+        let id = &bytes[0..4];
+        if id.iter().all(|b| *b == 0) || !id.iter().all(|b| b.is_ascii_alphanumeric()) {
+            break;
+        }
+        let size = if version == 4 {
+            if bytes[4..8].iter().any(|b| b & 0x80 != 0) {
+                break;
+            }
+            (((bytes[4] & 0x7F) as usize) << 21)
+                | (((bytes[5] & 0x7F) as usize) << 14)
+                | (((bytes[6] & 0x7F) as usize) << 7)
+                | ((bytes[7] & 0x7F) as usize)
+        } else {
+            u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as usize
+        };
+        let end = (10 + size).min(bytes.len());
+        out.push((
+            std::str::from_utf8(id).unwrap_or("").to_string(),
+            bytes[10..end].to_vec(),
+        ));
+        bytes = &bytes[end..];
+    }
+    out
+}
+
+/// The first text string of a text frame's payload (mutagen's
+/// `text[0]`), or a URL frame's raw text (URL frames carry no
+/// encoding byte; their text is Latin-1).
+fn id3_first_text(payload: &[u8], is_url_frame: bool) -> String {
+    if payload.is_empty() {
+        return String::new();
+    }
+    if is_url_frame {
+        let raw: String = payload.iter().map(|b| *b as char).collect();
+        return raw.split('\0').next().unwrap_or("").to_string();
+    }
+    let text = id3_decode_text(payload[0], &payload[1..]);
+    text.split('\0').next().unwrap_or("").to_string()
+}
+
+/// Chapters embedded in an MP3's ID3 tag (Python
+/// `_chapters_from_id3`, Audit 8 M12): each CHAP frame's start
+/// time, the first text of its first TIT2 sub-frame as the
+/// title, and the first URL among its WXXX, WOAR, WCOM and WPUB
+/// sub-frames consulted in that priority order — normalized
+/// with Python's sort/dedupe-merge.
+pub fn id3_chapters(url: &str) -> Vec<crate::Chapter> {
+    let (version, frames) = id3_frame_list(url);
+    let mut triples: Vec<(f64, String, Option<String>)> = Vec::new();
+    for (id, payload) in frames {
+        if id != "CHAP" {
+            continue;
+        }
+        // Element id (NUL-terminated), then start time, end
+        // time, start offset and end offset — 4-byte big-endian
+        // each — then the sub-frames.
+        let Some(nul) = payload.iter().position(|b| *b == 0) else {
+            continue;
+        };
+        let rest = &payload[nul + 1..];
+        if rest.len() < 16 {
+            continue;
+        }
+        let start_ms = u32::from_be_bytes([rest[0], rest[1], rest[2], rest[3]]);
+        let subs = id3_sub_frames(version, &rest[16..]);
+        let title = subs
+            .iter()
+            .find(|(sid, _)| sid == "TIT2")
+            .map(|(_, p)| id3_first_text(p, false))
+            .unwrap_or_default();
+        let mut href: Option<String> = None;
+        for frame_name in ["WXXX", "WOAR", "WCOM", "WPUB"] {
+            let Some((_, p)) = subs.iter().find(|(sid, _)| sid == frame_name) else {
+                continue;
+            };
+            let candidate = if frame_name == "WXXX" {
+                // Encoding byte, description, then the URL.
+                if p.is_empty() {
+                    String::new()
+                } else {
+                    match id3_split_descriptor(p[0], &p[1..]) {
+                        Some((_desc, rest)) => {
+                            let text = id3_decode_text(p[0], rest);
+                            text.split('\0').next().unwrap_or("").to_string()
+                        }
+                        None => String::new(),
+                    }
+                }
+            } else {
+                id3_first_text(p, true)
+            };
+            if !candidate.is_empty() {
+                href = Some(candidate);
+                break;
+            }
+        }
+        triples.push((start_ms as f64 / 1000.0, title, href));
+    }
+    crate::chapters::normalize_triples(triples)
 }
 
 // --- Metered preview (Python _looks_like_metered_preview) ---

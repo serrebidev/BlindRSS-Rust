@@ -23,6 +23,12 @@ fn scratch_db(tag: &str) -> (Db, PathBuf) {
          media_url TEXT, media_type TEXT, chapter_url TEXT);
          CREATE TABLE chapters (id TEXT PRIMARY KEY, article_id TEXT, \
          start REAL, title TEXT, href TEXT);
+         CREATE TABLE chapter_cache (id TEXT PRIMARY KEY, \
+         cache_key TEXT NOT NULL, start REAL, title TEXT, href TEXT);
+         CREATE TABLE chapter_sources (cache_key TEXT PRIMARY KEY, \
+         source_url TEXT NOT NULL, etag TEXT, last_modified TEXT, \
+         checked_at REAL NOT NULL DEFAULT 0, \
+         fetched_at REAL NOT NULL DEFAULT 0);
          CREATE TABLE playback_state (id TEXT PRIMARY KEY, \
          position_ms INTEGER NOT NULL DEFAULT 0, duration_ms INTEGER, \
          updated_at INTEGER NOT NULL, completed INTEGER NOT NULL DEFAULT 0, \
@@ -93,6 +99,110 @@ fn chapters_replace_and_read() {
     assert_eq!(ch[1].start, 95.5);
     db.replace_chapters("a1", &[]).unwrap();
     assert!(db.chapters("a1").unwrap().is_empty());
+    std::fs::remove_file(&path).ok();
+}
+
+/// Audit 8 Task 20: the hosted chapter cache and its source
+/// record (freshness bookkeeping for the Podcasting 2.0
+/// pipeline) roundtrip against the Python-shaped schema, and
+/// the single playback-state scan the row annotations consume
+/// returns every row.
+#[test]
+fn chapter_cache_source_and_state_scan() {
+    let (db, path) = scratch_db("cc");
+    assert!(db.cached_chapters("prov:art1").unwrap().is_empty());
+    assert!(db.chapter_source("prov:art1").unwrap().is_none());
+    db.replace_cached_chapters(
+        "prov:art1",
+        &[
+            Chapter {
+                start: 0.0,
+                title: Some("Cold Open".into()),
+                href: None,
+            },
+            Chapter {
+                start: 45.0,
+                title: Some("Segment".into()),
+                href: Some("https://example.com/s".into()),
+            },
+        ],
+    )
+    .unwrap();
+    let cached = db.cached_chapters("prov:art1").unwrap();
+    assert_eq!(cached.len(), 2);
+    assert_eq!(cached[0].title.as_deref(), Some("Cold Open"));
+    assert_eq!(cached[1].href.as_deref(), Some("https://example.com/s"));
+    // Replace clears the old set.
+    db.replace_cached_chapters("prov:art1", &[]).unwrap();
+    assert!(db.cached_chapters("prov:art1").unwrap().is_empty());
+
+    db.save_chapter_source(
+        "prov:art1",
+        &blindrss_core::db::ChapterSource {
+            source_url: "https://example.com/chapters.json".into(),
+            etag: Some("\"v1\"".into()),
+            last_modified: None,
+            checked_at: 100.0,
+            fetched_at: 90.0,
+        },
+    )
+    .unwrap();
+    let src = db.chapter_source("prov:art1").unwrap().unwrap();
+    assert_eq!(src.etag.as_deref(), Some("\"v1\""));
+    assert_eq!(src.checked_at, 100.0);
+    // Upsert updates in place (the 304 revalidation path).
+    db.save_chapter_source(
+        "prov:art1",
+        &blindrss_core::db::ChapterSource {
+            checked_at: 200.0,
+            ..src.clone()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        db.chapter_source("prov:art1").unwrap().unwrap().checked_at,
+        200.0
+    );
+
+    // The grouped counts the row annotations consume.
+    db.replace_chapters(
+        "a1",
+        &[
+            Chapter {
+                start: 0.0,
+                title: None,
+                href: None,
+            },
+            Chapter {
+                start: 10.0,
+                title: None,
+                href: None,
+            },
+        ],
+    )
+    .unwrap();
+    let counts = db
+        .chapter_counts(&["a1".to_string(), "missing".to_string()])
+        .unwrap();
+    assert_eq!(counts.get("a1"), Some(&2));
+    assert!(!counts.contains_key("missing"));
+
+    // The single playback-state scan.
+    db.upsert_playback_state(
+        "article:a1",
+        &PlaybackState {
+            position_ms: 5_000,
+            duration_ms: Some(90_000),
+            completed: false,
+            seek_supported: None,
+            title: None,
+        },
+    )
+    .unwrap();
+    let all = db.all_playback_states().unwrap();
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].0, "article:a1");
+    assert_eq!(all[0].1.position_ms, 5_000);
     std::fs::remove_file(&path).ok();
 }
 

@@ -22,9 +22,11 @@ use crate::media_backend::MediaBackend;
 use blindrss_core::announce::HiddenAnnouncer;
 use blindrss_core::db::Chapter;
 use blindrss_core::playback::{
-    PendingPlaybackWrites, ResumePolicy, SeekKind, SeekVerifier, saved_state,
+    PendingPlaybackWrites, PlaybackSnapshot, ResumePolicy, SeekKind, SeekVerifier,
+    chapter_commit_allowed, chapter_index_for_position, chapter_link_index, chapter_next_target,
+    chapter_prev_target, playback_speeds, saved_state, speed_index, speed_step,
 };
-use blindrss_core::player_session::{Activation, PlayerSession, SessionIdentity};
+use blindrss_core::player_session::{Activation, ChapterGate, PlayerSession, SessionIdentity};
 use blindrss_core::{Article, Db, PlaybackState};
 use std::cell::RefCell;
 use std::collections::HashSet;
@@ -46,6 +48,9 @@ struct SessionControl {
     chapters_live: Rc<RefCell<(Vec<Chapter>, Vec<i64>)>>,
     chapter_list: ListBox,
     play_btn: Button,
+    /// The speed picker (Audit 8 M15): its selection mirrors
+    /// the saved speed whenever the speed is a ladder rung.
+    speed_combo: ComboBox,
     /// The main-window command surface (play/pause, stop,
     /// seeks, volume, show/hide, chapters, equalizer, speed).
     command: PlayerCommand,
@@ -261,6 +266,37 @@ struct PlayerState {
     /// Python's `wx.CallLater(400)` pattern; the tick speaks
     /// the position summary when it fires.
     seek_announce_at: Option<std::time::Instant>,
+    /// Chapter list selection awaiting commit (Audit 8 M13,
+    /// Python's `_chapter_pending_idx`): selecting a chapter
+    /// records it; Enter (or double-click) commits the seek.
+    chapter_pending: Option<usize>,
+    /// Last committed chapter and when, in milliseconds on the
+    /// session's monotonic clock (Python's 350 ms same-chapter
+    /// commit debounce, `_commit_chapter_selection`).
+    chapter_commit: Option<(usize, u64)>,
+    /// Chapter-fetch staleness gate (Audit 8 M12): each
+    /// asynchronous chapter fetch for the live item is stamped
+    /// here; results apply only while their stamp is latest.
+    chapter_gate: ChapterGate,
+    /// Chapter-fetch results returning from worker threads,
+    /// drained by the tick: (generation, article id, stamp,
+    /// chapters).
+    chapter_tx: std::sync::mpsc::Sender<(u64, String, u64, Vec<Chapter>)>,
+    chapter_rx: std::sync::mpsc::Receiver<(u64, String, u64, Vec<Chapter>)>,
+    /// The playback target the main window's live status and
+    /// row annotations key on: the article's enclosure URL
+    /// when it has one, else its article URL (the session
+    /// identity target — NOT the resolved stream URL).
+    media_target: String,
+    /// Live playback snapshot for the main window (Audit 8
+    /// M15, Python's `playback_progress_snapshot`): the tick
+    /// refreshes it; the main window polls it. Plain data.
+    snapshot: PlaybackSnapshot,
+    /// True while the tick sets the volume slider
+    /// programmatically, so the slider's own event handler
+    /// ignores the change (the seek slider's `slider_guard`
+    /// pattern).
+    volume_guard: bool,
 }
 
 /// Custom accessibility for the seek slider: a VALUE TEXT in
@@ -323,6 +359,9 @@ fn set_queue_index(index: i64) {
     let _ = cfg.save(&path);
 }
 
+// Used by the Windows seek-slider accessible value text;
+// on other platforms nothing reads it.
+#[allow(dead_code)]
 fn fmt_ms(ms: i64) -> String {
     let total = (ms.max(0)) / 1000;
     format!(
@@ -338,7 +377,17 @@ fn fmt_speed(rate: f64) -> String {
     s.trim_end_matches('0').trim_end_matches('.').to_string()
 }
 
-const SPEEDS: [f64; 9] = [0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0];
+/// Player-window menu ids (the Chapters menu bar and the
+/// Chapters button's popup). Private to this frame — the main
+/// window's menu ids live in main.rs and never reach here.
+const PCM_SHOW_CHAPTERS: i32 = 2960;
+const PCM_OPEN_LINK: i32 = 2961;
+const PCM_PREV_CHAPTER: i32 = 2962;
+const PCM_NEXT_CHAPTER: i32 = 2963;
+const PCM_POPUP_OPEN_LINK: i32 = 2964;
+const PCM_POPUP_NONE: i32 = 2965;
+/// Popup chapter-jump items: base + chapter index.
+const PCM_CHAPTER_BASE: i32 = 3000;
 
 /// End-of-media test for the saved playback row: a position within
 /// the configured end threshold counts as completed. A clip shorter than
@@ -657,6 +706,16 @@ fn spawn_skip_workers(
     skip_rx
 }
 
+/// Apply a speed to the backend and mirror it in the picker
+/// (Python's `set_playback_speed`): an off-ladder rate leaves
+/// the picker's selection alone (no rung claims it).
+fn apply_speed_selection(media: &MediaBackend, combo: &ComboBox, rate: f64) {
+    media.set_playback_rate(rate);
+    if let Some(idx) = speed_index(&playback_speeds(), rate) {
+        combo.set_selection(idx as u32);
+    }
+}
+
 /// Persist the player volume (Python config `volume`: int
 /// percent 0-100, default 100, saved whenever it changes).
 fn persist_volume(volume: f64) {
@@ -814,6 +873,25 @@ pub fn begin_play(_parent: &Frame, article: &Article) -> BeginOutcome {
         Activation::Toggle => {
             if let Some(control) = session_control() {
                 control.toggle_or_reload();
+                // Python's toggle branch keeps the player's
+                // chapters in step with the article's stored
+                // set: chapters fetched since this item loaded
+                // (or a different set entirely) replace the
+                // player's when they differ (Audit 8 M12).
+                let stored = Db::open(&crate::db_path())
+                    .ok()
+                    .and_then(|db| db.chapters(&article.id).ok())
+                    .unwrap_or_default();
+                let differs = {
+                    let live = control.chapters_live.borrow();
+                    live.0.len() != stored.len()
+                        || live.0.iter().zip(stored.iter()).any(|(a, b)| {
+                            a.start != b.start || a.title != b.title || a.href != b.href
+                        })
+                };
+                if differs {
+                    control.set_chapters(stored);
+                }
             }
             BeginOutcome::Toggled
         }
@@ -940,6 +1018,115 @@ pub fn update_chapters(generation: u64, chapters: Vec<Chapter>) -> bool {
     true
 }
 
+/// Stamp an asynchronous chapter fetch for the article the
+/// session currently holds (Audit 8 M12): the stamp is what
+/// the fetch's result must present to apply. 0 when the
+/// session holds another article (or nothing) — the caller
+/// then has nothing to fetch for.
+pub fn begin_chapter_fetch(article_id: &str) -> u64 {
+    let Some(control) = session_control() else {
+        return 0;
+    };
+    let mut s = control.state.borrow_mut();
+    if s.article_id != article_id {
+        return 0;
+    }
+    s.chapter_gate.begin(article_id)
+}
+
+/// Apply chapters produced by an asynchronous fetch (Audit 8
+/// M12): the load generation must still be current AND the
+/// fetch stamp must still be the gate's latest for the article
+/// the session holds. A stale queue result — the fetch of an
+/// entry the queue has since left, or one superseded by a
+/// re-fetch — is refused whole.
+pub fn update_chapters_gated(
+    generation: u64,
+    article_id: &str,
+    stamp: u64,
+    chapters: Vec<Chapter>,
+) -> bool {
+    if !is_current(generation) {
+        return false;
+    }
+    let Some(control) = session_control() else {
+        return false;
+    };
+    {
+        let s = control.state.borrow();
+        if s.article_id != article_id || !s.chapter_gate.accepts(article_id, stamp) {
+            return false;
+        }
+    }
+    control.set_chapters(chapters);
+    true
+}
+
+/// The live playback snapshot for the main window's status
+/// field and row annotations (Audit 8 M15): a plain-data copy
+/// the player tick refreshes; no media calls happen here.
+pub fn progress_snapshot() -> PlaybackSnapshot {
+    let Some(control) = session_control() else {
+        return PlaybackSnapshot::default();
+    };
+    control.state.borrow().snapshot.clone()
+}
+
+/// Fill the chapter list and the live chapter cell from one
+/// chapter set: sorted by start, labeled with Python's chapter
+/// menu label (`_format_player_chapter_menu_label` — the same
+/// text the chapter choice and menus carry). Shared by the
+/// delivery path, late chapter upgrades and queue advances.
+fn fill_chapter_list(
+    list: &ListBox,
+    live: &Rc<RefCell<(Vec<Chapter>, Vec<i64>)>>,
+    chapters: Vec<Chapter>,
+) {
+    let mut chapters = chapters;
+    chapters.sort_by(|a, b| a.start.total_cmp(&b.start));
+    let starts: Vec<i64> = chapters.iter().map(|c| (c.start * 1000.0) as i64).collect();
+    list.clear();
+    for ch in &chapters {
+        list.append(&blindrss_core::chapters::chapter_menu_label(ch));
+    }
+    *live.borrow_mut() = (chapters, starts);
+}
+
+/// Spawn an asynchronous chapter fetch for one article (Audit
+/// 8 M12): the core pipeline (stored rows, Podcasting 2.0
+/// chapter file, YouTube metadata, embedded ID3) runs on a
+/// worker with its own database handle; the result returns on
+/// the session's chapter channel stamped with the load
+/// generation and the gate stamp taken when the fetch began,
+/// and the tick applies it only while both still match.
+fn spawn_chapter_fetch(
+    db_path: &std::path::Path,
+    tx: &std::sync::mpsc::Sender<(u64, String, u64, Vec<Chapter>)>,
+    generation: u64,
+    article_id: String,
+    stamp: u64,
+) {
+    let tx = tx.clone();
+    let db_path = db_path.to_path_buf();
+    std::thread::spawn(move || {
+        let chapters = Db::open_or_create(&db_path)
+            .map(|db| {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs_f64())
+                    .unwrap_or(0.0);
+                blindrss_core::chapters::get_article_chapters(
+                    &db,
+                    &blindrss_core::chapters::HttpChapterTransport,
+                    &article_id,
+                    now,
+                )
+            })
+            .unwrap_or_default();
+        let _ = tx.send((generation, article_id, stamp, chapters));
+    });
+}
+
 impl SessionControl {
     /// Put the session into the loading state for `article`
     /// (Python's `load_media` before its resolver runs): the
@@ -968,6 +1155,27 @@ impl SessionControl {
             s.article_id = article.id.clone();
             s.article_url = article.url.clone();
             s.title = article.title.clone();
+            // Outstanding chapter fetches belong to the old
+            // item: their results must never land on this one.
+            s.chapter_gate.invalidate();
+            s.chapter_pending = None;
+            s.chapter_commit = None;
+            s.media_target = article
+                .media_url
+                .as_deref()
+                .filter(|u| !u.is_empty())
+                .unwrap_or(&article.url)
+                .to_string();
+            s.snapshot = PlaybackSnapshot {
+                has_media: true,
+                playing: false,
+                state: "Loading media...".to_string(),
+                title: article.title.clone(),
+                article_id: article.id.clone(),
+                media_url: s.media_target.clone(),
+                position_ms: 0,
+                duration_ms: 0,
+            };
             s.stream = String::new();
             s.headers = Vec::new();
             s.skips.clear();
@@ -1055,6 +1263,13 @@ impl SessionControl {
             }
         }
         self.set_chapters(chapters);
+        // The picker mirrors the saved speed when it is a
+        // ladder rung (Python's set_playback_speed selection);
+        // an off-ladder saved value leaves it unselected.
+        let saved_speed = cfg_f64(&cfg, "playback_speed", 1.0);
+        if let Some(idx) = speed_index(&playback_speeds(), saved_speed) {
+            self.speed_combo.set_selection(idx as u32);
+        }
         if start_loaded_stream(
             &self.media,
             &self.frame,
@@ -1075,6 +1290,7 @@ impl SessionControl {
     fn fail(&self) {
         self.frame.set_status_text("Could not load media", 0);
         let mut s = self.state.borrow_mut();
+        s.snapshot.state = "Failed to load media".to_string();
         hidden_announce(&mut s, &self.frame, "Failed to load media");
     }
 
@@ -1137,16 +1353,7 @@ impl SessionControl {
     /// Replace the chapter set everywhere the window reads it
     /// (navigation buttons, the tick, the list box).
     fn set_chapters(&self, chapters: Vec<Chapter>) {
-        let mut chapters = chapters;
-        chapters.sort_by(|a, b| a.start.total_cmp(&b.start));
-        let starts: Vec<i64> = chapters.iter().map(|c| (c.start * 1000.0) as i64).collect();
-        self.chapter_list.clear();
-        for ch in &chapters {
-            let t = ch.title.as_deref().unwrap_or("Chapter");
-            self.chapter_list
-                .append(&format!("{} - {}", fmt_ms((ch.start * 1000.0) as i64), t));
-        }
-        *self.chapters_live.borrow_mut() = (chapters, starts);
+        fill_chapter_list(&self.chapter_list, &self.chapters_live, chapters);
     }
 }
 
@@ -1168,7 +1375,10 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
     // Shared with every handler so a queue switch (which clears
     // the chapters, like Python's load_media([])) is seen by the
     // navigation buttons and the tick alike.
-    let chapters_live = Rc::new(RefCell::new((Vec::new(), Vec::new())));
+    let chapters_live = Rc::new(RefCell::new((
+        Vec::<blindrss_core::db::Chapter>::new(),
+        Vec::<i64>::new(),
+    )));
 
     let frame = Frame::builder()
         .with_title(&article.title)
@@ -1205,13 +1415,46 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
     let next_ch_btn = Button::builder(&frame)
         .with_label(&crate::tr("Next Chapter"))
         .build();
+    // Speed picker (Audit 8 M15, Python's read-only speed
+    // combo): the full 0.5–4.0 ladder in 0.1 steps. Appended
+    // at the end of the second button row — no existing
+    // control moves.
+    let speed_combo = ComboBox::builder(&frame)
+        .with_style(ComboBoxStyle::ReadOnly)
+        .build();
+    {
+        let speeds = playback_speeds();
+        for speed in &speeds {
+            speed_combo.append(&format!("{}x", fmt_speed(*speed)));
+        }
+        if let Some(idx) = speed_index(&speeds, cfg_f64(&cfg, "playback_speed", 1.0)) {
+            speed_combo.set_selection(idx as u32);
+        }
+    }
+    // Chapters button (Python's "Chapters Menu"): opens the
+    // dynamic chapter popup — open-link item with live
+    // availability, then one jump item per chapter.
+    let chapters_btn = Button::builder(&frame)
+        .with_label(&crate::tr("Chapters"))
+        .build();
+    // Absolute volume (Audit 8 M15, Python's volume slider +
+    // percent readout): a new row appended after the chapter
+    // list, so the existing tab order is untouched.
+    let volume_slider = Slider::builder(&frame).build();
+    volume_slider.set_range(0, 100);
+    let volume_pct = cfg.get_i64("volume", 100).clamp(0, 100) as i32;
+    volume_slider.set_value(volume_pct);
+    let volume_value = TextCtrl::builder(&frame)
+        .with_style(TextCtrlStyle::ReadOnly)
+        .build();
+    volume_value.set_value(&format!("{volume_pct}%"));
     // Position readout as a read-only text control, not a
     // static text: it is focusable, so NVDA can land on it and
     // read the position on demand.
     let pos_label = TextCtrl::builder(&frame)
         .with_style(TextCtrlStyle::ReadOnly)
         .build();
-    pos_label.set_value(&crate::tr("0:00:00 / 0:00:00"));
+    pos_label.set_value(&crate::tr("No media loaded"));
     // Position snapshot for the seek slider's accessible
     // value: the tick (UI thread) stores, the MSAA callback
     // (NVDA's thread) only loads. See SeekAccessible.
@@ -1234,7 +1477,14 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
     // player labels every control the same way).
     crate::msaa_names::set_name(&seek_slider, &crate::tr("Seek"));
     crate::msaa_names::set_name(&chapter_list, &crate::tr("Chapters"));
-    crate::msaa_names::set_name(&pos_label, &crate::tr("Position"));
+    crate::msaa_names::set_name(&pos_label, &crate::tr("Playback Time"));
+    crate::msaa_names::set_name(&speed_combo, &crate::tr("Playback Speed"));
+    crate::msaa_names::set_name(&chapters_btn, &crate::tr("Chapters Menu"));
+    crate::msaa_names::set_name(&volume_slider, &crate::tr("Volume"));
+    crate::msaa_names::set_name(
+        &volume_value,
+        &format!("{} {volume_pct}%", crate::tr("Volume Level:")),
+    );
     crate::msaa_names::set_name(
         &back_btn,
         &format!("{} {}s", crate::tr("Rewind"), seek_back_ms / 1000),
@@ -1264,6 +1514,11 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
     row2.add(&faster_btn, 0, SizerFlag::All, 4);
     row2.add(&prev_ch_btn, 0, SizerFlag::All, 4);
     row2.add(&next_ch_btn, 0, SizerFlag::All, 4);
+    row2.add(&speed_combo, 0, SizerFlag::All, 4);
+    row2.add(&chapters_btn, 0, SizerFlag::All, 4);
+    let volume_row = BoxSizer::builder(Orientation::Horizontal).build();
+    volume_row.add(&volume_slider, 1, SizerFlag::Expand | SizerFlag::All, 4);
+    volume_row.add(&volume_value, 0, SizerFlag::All, 4);
     let col = BoxSizer::builder(Orientation::Vertical).build();
     col.add(&media.window(), 1, SizerFlag::Expand | SizerFlag::All, 4);
     col.add_sizer(&row, 0, SizerFlag::Expand, 0);
@@ -1273,9 +1528,26 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
     col.add(&seek_slider, 0, SizerFlag::Expand | SizerFlag::All, 4);
     col.add(&chapters_caption, 0, SizerFlag::All, 4);
     col.add(&chapter_list, 1, SizerFlag::Expand | SizerFlag::All, 4);
+    col.add_sizer(&volume_row, 0, SizerFlag::Expand, 0);
     frame.set_sizer(col, true);
     frame.create_status_bar(1, 0, -1, "player status");
     frame.set_status_text(&article.title, 0);
+    // Player menu bar (Audit 8 M13/M15, Python's
+    // _init_player_menu_bar): a Chapters menu whose items'
+    // availability the tick keeps in step with the active
+    // chapter (Python's `_refresh_chapter_controls_state`).
+    // Python's Playback menu holds only the Cast item; in the
+    // Rust port casting is main-window surface, so there is
+    // no Playback menu here.
+    let chapter_menu = Menu::builder()
+        .append_item(PCM_SHOW_CHAPTERS, "Show &Chapters\tCtrl+M", "")
+        .append_item(PCM_OPEN_LINK, "Open Chapter &Link\tCtrl+Shift+L", "")
+        .append_separator()
+        .append_item(PCM_PREV_CHAPTER, "&Previous Chapter\tCtrl+Shift+Left", "")
+        .append_item(PCM_NEXT_CHAPTER, "&Next Chapter\tCtrl+Shift+Right", "")
+        .build();
+    let menu_bar = MenuBar::builder().append(chapter_menu, "&Chapters").build();
+    frame.set_menu_bar(menu_bar);
 
     // The window opens in its loading state: skip workers,
     // the resume target and the stream itself all arrive with
@@ -1284,6 +1556,7 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
     // starts senderless; the tick's drain treats a disconnected
     // channel as "no ranges yet".
     let (_, skip_rx) = std::sync::mpsc::channel();
+    let (chapter_tx, chapter_rx) = std::sync::mpsc::channel();
     let (write_tx, write_confirm_rx) = spawn_write_worker(db_path.clone());
     let state = Rc::new(RefCell::new(PlayerState {
         // Virgin identity: begin_load binds the first article
@@ -1317,6 +1590,14 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
         last_saved_pos: -1,
         hidden: HiddenAnnouncer::new(),
         seek_announce_at: None,
+        chapter_pending: None,
+        chapter_commit: None,
+        chapter_gate: ChapterGate::new(),
+        chapter_tx,
+        chapter_rx,
+        media_target: String::new(),
+        snapshot: PlaybackSnapshot::default(),
+        volume_guard: false,
         queue: None,
     }));
 
@@ -1399,6 +1680,9 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
         m.stop();
         let mut s = st.borrow_mut();
         s.autoplay_active = false;
+        if had_stream {
+            s.snapshot.state = "Stopped".to_string();
+        }
         // Any pending seek verification ends with the stop;
         // Play re-runs the restore from the saved row (M08).
         s.seek_verify = None;
@@ -1470,22 +1754,20 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
     vdown_btn.on_click(move |_| vd());
     let vu = volume_up.clone();
     vup_btn.on_click(move |_| vu());
-    // Speed stepping through the standard ladder, announced.
+    // Speed stepping on Python's ladder (Audit 8 M15): the
+    // current speed is the SAVED one (Python reads the config,
+    // not the backend), snapped to the nearest rung and then
+    // stepped; the picker follows every change.
     let change_speed: Rc<dyn Fn(i32)> = {
         let m = media;
         let frame_sp = frame;
         Rc::new(move |dir| {
-            let cur = m.get_playback_rate();
-            let idx = SPEEDS
-                .iter()
-                .position(|s| (*s - cur).abs() < 0.01)
-                .unwrap_or(2);
-            let next = (idx as i32 + dir).clamp(0, SPEEDS.len() as i32 - 1) as usize;
-            let rate = if dir == 0 { 1.0 } else { SPEEDS[next] };
-            if (rate - cur).abs() > 0.001 {
-                m.set_playback_rate(rate);
-                let mut cfg =
-                    blindrss_core::config::Config::load(&crate::config_path()).unwrap_or_default();
+            let mut cfg =
+                blindrss_core::config::Config::load(&crate::config_path()).unwrap_or_default();
+            let current = cfg_f64(&cfg, "playback_speed", 1.0);
+            let rate = speed_step(&playback_speeds(), current, dir);
+            if (rate - current).abs() > 0.000_1 {
+                apply_speed_selection(&m, &speed_combo, rate);
                 cfg.set_path("playback_speed", serde_json::json!(rate));
                 let _ = cfg.save(&crate::config_path());
                 let label = format!("Speed {}x", fmt_speed(rate));
@@ -1498,82 +1780,265 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
         let speed = change_speed.clone();
         btn.on_click(move |_| speed(dir));
     }
-    // Chapter navigation, announced via media_navigation.
+    // Picking a speed in the picker applies it at once
+    // (Python's on_speed_select -> set_playback_speed).
     {
+        let m = media;
+        let frame_sc = frame;
+        speed_combo.on_selection_changed(move |_| {
+            let Some(sel) = speed_combo.get_selection() else {
+                return;
+            };
+            let speeds = playback_speeds();
+            let Some(&rate) = speeds.get(sel as usize) else {
+                return;
+            };
+            m.set_playback_rate(rate);
+            let mut cfg =
+                blindrss_core::config::Config::load(&crate::config_path()).unwrap_or_default();
+            cfg.set_path("playback_speed", serde_json::json!(rate));
+            let _ = cfg.save(&crate::config_path());
+            let label = format!("Speed {}x", fmt_speed(rate));
+            frame_sc.set_status_text(&label, 0);
+            crate::announce("playback_speed", &label);
+        });
+    }
+    // Chapter commands (Audit 8 M13, Python's player chapter
+    // model): selecting a chapter in the list only RECORDS it
+    // (Python's on_chapter_select); Enter / double-click
+    // commits the seek through the debounced commit path
+    // shared by every jump; Previous selects the previous
+    // chapter outright (no restart-current rule); the chapter
+    // link opens for the selection's — or the active —
+    // chapter when it carries a valid href.
+    let session_epoch = std::time::Instant::now();
+    let commit_chapter: Rc<dyn Fn(usize)> = {
         let m = media;
         let frame_ch = frame;
         let chapters_live_c = chapters_live.clone();
         let st = state.clone();
-        prev_ch_btn.on_click(move |_| {
+        Rc::new(move |idx| {
             let (chapters_nav, starts_nav) = chapters_live_c.borrow().clone();
-            let pos = m.tell();
-            let Some(idx) = chapter_index(&starts_nav, pos) else {
+            let Some(&target_ms) = starts_nav.get(idx) else {
+                return;
+            };
+            let now_ms = session_epoch.elapsed().as_millis() as u64;
+            {
+                let mut s = st.borrow_mut();
+                if !chapter_commit_allowed(s.chapter_commit, idx, now_ms) {
+                    return;
+                }
+                s.chapter_commit = Some((idx, now_ms));
+                s.chapter_pending = Some(idx);
+            }
+            chapter_list.set_selection(idx as u32, true);
+            // Python clamps the target to the duration when
+            // the duration is known.
+            let len = m.length();
+            let target = if len > 0 {
+                target_ms.min(len)
+            } else {
+                target_ms
+            };
+            m.seek(target, SeekMode::FromStart);
+            begin_user_seek(&mut st.borrow_mut(), target);
+            m.play();
+            let label = blindrss_core::chapters::chapter_announce_text(&chapters_nav[idx]);
+            frame_ch.set_status_text(&label, 0);
+            crate::announce("media_navigation", &label);
+        })
+    };
+    let jump_prev_chapter: Rc<dyn Fn()> = {
+        let m = media;
+        let frame_ch = frame;
+        let chapters_live_c = chapters_live.clone();
+        let commit = commit_chapter.clone();
+        Rc::new(move || {
+            let (_, starts_nav) = chapters_live_c.borrow().clone();
+            if starts_nav.is_empty() {
                 frame_ch.set_status_text("No chapters", 0);
                 return;
-            };
-            // Deeper than 2s into a chapter, Prev restarts it;
-            // within the first 2s, Prev goes to the chapter
-            // before (or restarts chapter 0).
-            let target = if pos - starts_nav[idx] > 2_000 {
-                idx
-            } else {
-                idx.saturating_sub(1)
-            };
-            m.seek(starts_nav[target], SeekMode::FromStart);
-            begin_user_seek(&mut st.borrow_mut(), starts_nav[target]);
-            m.play();
-            let label = chapter_label(&chapters_nav, target);
-            frame_ch.set_status_text(&label, 0);
-            crate::announce("media_navigation", &label);
-        });
-    }
-    {
+            }
+            let active = chapter_index_for_position(&starts_nav, m.tell());
+            match chapter_prev_target(active) {
+                Some(target) => commit(target),
+                None => frame_ch.set_status_text("No previous chapter", 0),
+            }
+        })
+    };
+    let jump_next_chapter: Rc<dyn Fn()> = {
         let m = media;
         let frame_ch = frame;
         let chapters_live_c = chapters_live.clone();
-        let st = state.clone();
-        next_ch_btn.on_click(move |_| {
-            let (chapters_nav, starts_nav) = chapters_live_c.borrow().clone();
-            let pos = m.tell();
-            let next = chapter_index(&starts_nav, pos).map(|i| i + 1).unwrap_or(0);
-            if next >= starts_nav.len() {
-                frame_ch.set_status_text("No next chapter", 0);
+        let commit = commit_chapter.clone();
+        Rc::new(move || {
+            let (_, starts_nav) = chapters_live_c.borrow().clone();
+            if starts_nav.is_empty() {
+                frame_ch.set_status_text("No chapters", 0);
                 return;
             }
-            m.seek(starts_nav[next], SeekMode::FromStart);
-            begin_user_seek(&mut st.borrow_mut(), starts_nav[next]);
-            m.play();
-            let label = chapter_label(&chapters_nav, next);
-            frame_ch.set_status_text(&label, 0);
-            crate::announce("media_navigation", &label);
-        });
+            let active = chapter_index_for_position(&starts_nav, m.tell());
+            match chapter_next_target(active, starts_nav.len()) {
+                Some(target) => commit(target),
+                None => frame_ch.set_status_text("No next chapter", 0),
+            }
+        })
+    };
+    {
+        let jump = jump_prev_chapter.clone();
+        prev_ch_btn.on_click(move |_| jump());
     }
+    {
+        let jump = jump_next_chapter.clone();
+        next_ch_btn.on_click(move |_| jump());
+    }
+    // Open the chapter link for the link-action chapter
+    // (Python's _open_chapter_link_at_index over
+    // _chapter_link_action_index): the list selection when it
+    // names a chapter, else the active chapter.
+    let open_chapter_link: Rc<dyn Fn()> = {
+        let m = media;
+        let frame_ch = frame;
+        let chapters_live_c = chapters_live.clone();
+        Rc::new(move || {
+            let (chapters_nav, starts_nav) = chapters_live_c.borrow().clone();
+            let active = chapter_index_for_position(&starts_nav, m.tell());
+            let link_idx = chapter_link_index(
+                chapter_list.get_selection().map(|s| s as usize),
+                active,
+                chapters_nav.len(),
+            );
+            let href = if link_idx >= 0 {
+                chapters_nav
+                    .get(link_idx as usize)
+                    .and_then(|c| c.href.as_deref())
+                    .and_then(blindrss_core::chapters::validated_chapter_href)
+            } else {
+                None
+            };
+            match href {
+                Some(url) => crate::open_article_link(&frame_ch, &url),
+                None => frame_ch.set_status_text("Chapter link unavailable", 0),
+            }
+        })
+    };
     // Seek to the chapter selected in the list — shared by
     // double-click and by Enter in the list (a screen reader
     // user cannot double-click; the list must be fully
-    // keyboard-operable).
+    // keyboard-operable). The commit goes to the pending
+    // selection recorded by the selection handler, falling
+    // back to the list's current selection.
     let chapter_seek: Rc<dyn Fn()> = {
-        let m = media;
-        let chapters_live_dl = chapters_live.clone();
         let st = state.clone();
+        let commit = commit_chapter.clone();
         Rc::new(move || {
-            let (chapters_dl, starts_dl) = chapters_live_dl.borrow().clone();
-            if let Some(sel) = chapter_list.get_selection()
-                && let Some(ms) = starts_dl.get(sel as usize)
-            {
-                m.seek(*ms, SeekMode::FromStart);
-                begin_user_seek(&mut st.borrow_mut(), *ms);
-                m.play();
-                crate::announce(
-                    "media_navigation",
-                    &chapter_label(&chapters_dl, sel as usize),
-                );
+            let idx = st
+                .borrow()
+                .chapter_pending
+                .or_else(|| chapter_list.get_selection().map(|s| s as usize));
+            if let Some(idx) = idx {
+                commit(idx);
             }
         })
     };
     {
         let cs = chapter_seek.clone();
         chapter_list.on_item_double_clicked(move |_| cs());
+    }
+    // Selecting a chapter records it as pending — no seek
+    // (Python's on_chapter_select). The tick's own selection
+    // sync records the same way, harmlessly: committing the
+    // active chapter seeks to its start, as in Python.
+    {
+        let st = state.clone();
+        chapter_list.on_selection_changed(move |_| {
+            if let Some(sel) = chapter_list.get_selection() {
+                st.borrow_mut().chapter_pending = Some(sel as usize);
+            }
+        });
+    }
+    // The Chapters button's popup (Python's
+    // _show_chapters_popup_menu): the open-link item for the
+    // link-action chapter with its availability, a separator,
+    // then one jump item per chapter with the active chapter
+    // marked [Current]. Built fresh on every click, so it
+    // always reflects the live set — including chapters that
+    // arrived after playback started (M12).
+    {
+        let m = media;
+        let frame_ch = frame;
+        let chapters_live_c = chapters_live.clone();
+        chapters_btn.on_click(move |_| {
+            let (chapters_nav, starts_nav) = chapters_live_c.borrow().clone();
+            let mut menu = Menu::builder();
+            if chapters_nav.is_empty() {
+                menu = menu.append_item(PCM_POPUP_NONE, "No chapters available", "");
+                let mut menu = menu.build();
+                menu.enable_item(PCM_POPUP_NONE, false);
+                frame_ch.popup_menu(&mut menu, None);
+                return;
+            }
+            let active = chapter_index_for_position(&starts_nav, m.tell());
+            let link_idx = chapter_link_index(
+                chapter_list.get_selection().map(|s| s as usize),
+                active,
+                chapters_nav.len(),
+            );
+            let link_label = if link_idx >= 0 {
+                format!(
+                    "Open Link for {}",
+                    blindrss_core::chapters::chapter_menu_label(&chapters_nav[link_idx as usize])
+                )
+            } else {
+                "Open Link for Selected Chapter".to_string()
+            };
+            let link_ok = link_idx >= 0
+                && chapters_nav
+                    .get(link_idx as usize)
+                    .and_then(|c| c.href.as_deref())
+                    .and_then(blindrss_core::chapters::validated_chapter_href)
+                    .is_some();
+            menu = menu.append_item(PCM_POPUP_OPEN_LINK, &link_label, "");
+            menu = menu.append_separator();
+            for (i, ch) in chapters_nav.iter().enumerate() {
+                let label = blindrss_core::chapters::chapter_menu_label(ch);
+                let label = if i as i64 == active {
+                    format!("[Current] {label}")
+                } else {
+                    label
+                };
+                menu = menu.append_item(PCM_CHAPTER_BASE + i as i32, &label, "");
+            }
+            let mut menu = menu.build();
+            menu.enable_item(PCM_POPUP_OPEN_LINK, link_ok);
+            frame_ch.popup_menu(&mut menu, None);
+        });
+    }
+    // The menu bar's Chapters menu and the popup's items land
+    // here (this frame's one menu handler).
+    {
+        let frame_m = frame;
+        let commit = commit_chapter.clone();
+        let prev = jump_prev_chapter.clone();
+        let next = jump_next_chapter.clone();
+        let open = open_chapter_link.clone();
+        frame.on_menu(move |ev| {
+            let id = ev.get_id();
+            match id {
+                PCM_SHOW_CHAPTERS => {
+                    frame_m.show(true);
+                    frame_m.raise();
+                    chapter_list.set_focus();
+                }
+                PCM_OPEN_LINK | PCM_POPUP_OPEN_LINK => open(),
+                PCM_PREV_CHAPTER => prev(),
+                PCM_NEXT_CHAPTER => next(),
+                _ if (PCM_CHAPTER_BASE..PCM_CHAPTER_BASE + 1000).contains(&id) => {
+                    commit((id - PCM_CHAPTER_BASE) as usize);
+                }
+                _ => {}
+            }
+        });
     }
 
     // Player keyboard control (the window had none: every
@@ -1596,12 +2061,26 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
             faster_btn,
             prev_ch_btn,
             next_ch_btn,
+            chapters_btn,
         ]
         .iter()
         .map(|b| b.get_handle() as usize)
         .collect();
         let slider_h = seek_slider.get_handle() as usize;
         let list_h = chapter_list.get_handle() as usize;
+        // Per-control help topics (Audit 8 M15, Python's
+        // set_help_topic tags at the end of player UI
+        // construction): the seek slider, the time readout and
+        // the volume slider are "player-controls", the speed
+        // picker is "playback-speed", the chapter controls are
+        // "chapters", everything else falls back to the
+        // frame's "player". (Python also tags its Cast button
+        // "casting"; the Rust player has no cast control —
+        // casting is main-window surface here.)
+        let speed_h = speed_combo.get_handle() as usize;
+        let volume_h = volume_slider.get_handle() as usize;
+        let pos_h = pos_label.get_handle() as usize;
+        let chapters_btn_h = chapters_btn.get_handle() as usize;
         frame.bind_internal(EventType::CHAR_HOOK, move |ev| {
             let code = ev.get_key_code().unwrap_or(0);
             let focused = ev
@@ -1641,7 +2120,15 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
                 if blindrss_core::shortcuts::help_key_action(&accel, &map)
                     == blindrss_core::shortcuts::HelpKeyAction::ContextHelp
                 {
-                    let topic = if on_list { "chapters" } else { "player" };
+                    let topic = if on_list || focused == chapters_btn_h {
+                        "chapters"
+                    } else if focused == speed_h {
+                        "playback-speed"
+                    } else if on_slider || focused == volume_h || focused == pos_h {
+                        "player-controls"
+                    } else {
+                        "player"
+                    };
                     crate::help::show_help_topic(&frame_k, &crate::ui_language(), Some(topic));
                     ev.skip(false);
                     return;
@@ -1700,8 +2187,9 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
                 // before shortcut delegation.)
                 // Space toggles play/pause anywhere a button
                 // does not already own it — the same closure
-                // the Play/Pause button runs.
-                32 if !on_button => {
+                // the Play/Pause button runs. The speed picker
+                // owns Space too (it opens the dropdown).
+                32 if !on_button && focused != speed_h => {
                     pp_k();
                     ev.skip(false);
                 }
@@ -1770,9 +2258,39 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
         });
     }
 
+    // Absolute volume slider (Audit 8 M15): a drag sets the
+    // volume outright (Python's on_volume_slider ->
+    // set_volume_percent). The backend volume is applied only
+    // while playing — Python does the same because changing
+    // VLC's volume while paused unpauses it (user-reported) —
+    // but the value always persists and the readout always
+    // follows. The tick's programmatic sync is guarded out.
+    {
+        let m = media;
+        let st = state.clone();
+        volume_slider.on_slider(move |_| {
+            if st.borrow().volume_guard {
+                return;
+            }
+            let percent = volume_slider.get_value().clamp(0, 100);
+            if m.get_state() == MediaState::Playing {
+                m.set_volume(percent as f64 / 100.0);
+            }
+            persist_volume(percent as f64 / 100.0);
+            volume_value.set_value(&format!("{percent}%"));
+            crate::msaa_names::set_name(
+                &volume_value,
+                &format!("{} {percent}%", crate::tr("Volume Level:")),
+            );
+        });
+    }
+
     // 1-second tick: drain skip ranges, resume seek once length
     // is known, apply skips, announce chapter crossings, update
     // the position label, and save playback state.
+    // The Chapters menu's availability as last refreshed by
+    // the tick: (chapter count, active index, link available).
+    let menu_state_last = Rc::new(std::cell::Cell::new((usize::MAX, i64::MIN, false)));
     let timer = Box::leak(Box::new(Timer::new(&frame)));
     let m = media;
     let st = state.clone();
@@ -1803,6 +2321,21 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
                         s.last_saved_pos = saved.position_ms;
                         s.last_save = std::time::Instant::now();
                     }
+                }
+            }
+            // Chapter-fetch results (Audit 8 M12): apply only
+            // while the load generation is current AND the
+            // fetch stamp still belongs to the article the
+            // session holds — a stale queue result is dropped
+            // whole. Empty results never apply (Python's fetch
+            // thread only delivers a non-empty set).
+            while let Ok((cgen, article_id, stamp, chapters)) = s.chapter_rx.try_recv() {
+                if SESSION_POLICY.with(|p| p.borrow().is_current(cgen))
+                    && s.article_id == article_id
+                    && s.chapter_gate.accepts(&article_id, stamp)
+                    && !chapters.is_empty()
+                {
+                    fill_chapter_list(&chapter_list, &chapters_tick, chapters);
                 }
             }
             // Queue advance: a resolved next entry switches the
@@ -1838,6 +2371,30 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
                             s.article_id = entry.id.clone();
                             s.article_url = entry.url.clone();
                             s.title = entry.title.clone();
+                            // The identity switch retires the
+                            // old entry's chapter fetches and
+                            // pending chapter state, and the
+                            // main window's live snapshot now
+                            // names the new entry (M12/M15).
+                            s.chapter_gate.invalidate();
+                            s.chapter_pending = None;
+                            s.chapter_commit = None;
+                            s.media_target = entry
+                                .media_url
+                                .as_deref()
+                                .filter(|u| !u.is_empty())
+                                .unwrap_or(&entry.url)
+                                .to_string();
+                            s.snapshot = PlaybackSnapshot {
+                                has_media: true,
+                                playing: false,
+                                state: "Loading media...".to_string(),
+                                title: entry.title.clone(),
+                                article_id: entry.id.clone(),
+                                media_url: s.media_target.clone(),
+                                position_ms: 0,
+                                duration_ms: 0,
+                            };
                             s.skips.clear();
                             s.skipped.clear();
                             s.last_chapter = None;
@@ -1859,22 +2416,31 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
                             if s.saved_position_ms > 0 {
                                 s.seek_verify = Some(resume_verifier(s.saved_position_ms, &stream));
                             }
-                            let mut chapters = Db::open(&s.db_path)
+                            let stored_chapters = Db::open(&s.db_path)
                                 .ok()
                                 .and_then(|db| db.chapters(&entry.id).ok())
                                 .unwrap_or_default();
-                            chapters.sort_by(|a, b| a.start.total_cmp(&b.start));
-                            let starts =
-                                chapters.iter().map(|c| (c.start * 1000.0) as i64).collect();
-                            chapter_list.clear();
-                            for chapter in &chapters {
-                                chapter_list.append(&format!(
-                                    "{} - {}",
-                                    fmt_ms((chapter.start * 1000.0) as i64),
-                                    chapter.title.as_deref().unwrap_or("Chapter")
-                                ));
+                            let had_chapters = !stored_chapters.is_empty();
+                            fill_chapter_list(&chapter_list, &chapters_tick, stored_chapters);
+                            // An entry with no stored chapters
+                            // gets the same asynchronous chapter
+                            // fetch a fresh load gets (M12):
+                            // provider / embedded results
+                            // upgrade the live player when they
+                            // land, gate-stamped so a result for
+                            // an entry the queue has since left
+                            // never applies.
+                            if !had_chapters {
+                                let stamp = s.chapter_gate.begin(&entry.id);
+                                let cgen = SESSION_POLICY.with(|p| p.borrow().generation());
+                                spawn_chapter_fetch(
+                                    &s.db_path,
+                                    &s.chapter_tx,
+                                    cgen,
+                                    entry.id.clone(),
+                                    stamp,
+                                );
                             }
-                            *chapters_tick.borrow_mut() = (chapters, starts);
                             set_queue_index(idx as i64);
                             queue_load = Some((stream, entry.title.clone(), headers));
                         }
@@ -1952,6 +2518,39 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
                     crate::announce("media_navigation", &chapter_label(&chapters_now, cur));
                 }
                 s.last_chapter = Some(cur);
+            }
+            // Chapters menu availability (M13, Python's
+            // _refresh_chapter_controls_state on its UI timer):
+            // Previous needs an earlier chapter, Next a later
+            // one, Open Link a valid href on the link-action
+            // chapter (the list selection when it names one,
+            // else the active chapter).
+            let active_now = chapter_index_for_position(&starts_now, pos);
+            let link_idx = chapter_link_index(
+                chapter_list.get_selection().map(|sel| sel as usize),
+                active_now,
+                chapters_now.len(),
+            );
+            let link_ok = link_idx >= 0
+                && chapters_now
+                    .get(link_idx as usize)
+                    .and_then(|c| c.href.as_deref())
+                    .and_then(blindrss_core::chapters::validated_chapter_href)
+                    .is_some();
+            let menu_key = (chapters_now.len(), active_now, link_ok);
+            if menu_state_last.get() != menu_key {
+                menu_state_last.set(menu_key);
+                // The menu bar owns the Chapters menu once
+                // attached; item state goes through it.
+                if let Some(menu_bar) = frame.get_menu_bar() {
+                    menu_bar
+                        .enable_item(PCM_PREV_CHAPTER, chapter_prev_target(active_now).is_some());
+                    menu_bar.enable_item(
+                        PCM_NEXT_CHAPTER,
+                        chapter_next_target(active_now, chapters_now.len()).is_some(),
+                    );
+                    menu_bar.enable_item(PCM_OPEN_LINK, link_ok);
+                }
             }
         }
         if let Some((end, label)) = seek_to {
@@ -2060,12 +2659,43 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
             }
         }
         {
-            let text = format!("{} / {}", fmt_ms(pos), fmt_ms(len));
-            let mut s = st.borrow_mut();
-            if s.last_pos_text != text {
-                s.last_pos_text = text.clone();
-                drop(s);
-                pos_label.set_value(&text);
+            // Python's time-info text (M15, _compose_time_info):
+            // elapsed / remaining / total, or elapsed only for
+            // a live or unknown-length stream. Before any media
+            // loads, the readout keeps its "No media loaded"
+            // initial text, as Python's does.
+            if !st.borrow().stream.is_empty() {
+                let text = blindrss_core::playback::seek_summary(pos, len);
+                let mut s = st.borrow_mut();
+                if s.last_pos_text != text {
+                    s.last_pos_text = text.clone();
+                    drop(s);
+                    pos_label.set_value(&text);
+                }
+            }
+        }
+        // Volume slider sync (M15): the slider and its readout
+        // follow the persisted volume when it changes through
+        // the buttons, the keys or a queue/load reset —
+        // guarded, so the sync never re-enters the slider's
+        // own handler. The persisted value is the truth every
+        // write path already maintains.
+        {
+            let cfg =
+                blindrss_core::config::Config::load(&crate::config_path()).unwrap_or_default();
+            let percent = cfg.get_i64("volume", 100).clamp(0, 100) as i32;
+            if volume_slider.get_value() != percent {
+                {
+                    let mut s = st.borrow_mut();
+                    s.volume_guard = true;
+                    volume_slider.set_value(percent);
+                    s.volume_guard = false;
+                }
+                volume_value.set_value(&format!("{percent}%"));
+                crate::msaa_names::set_name(
+                    &volume_value,
+                    &format!("{} {percent}%", crate::tr("Volume Level:")),
+                );
             }
         }
         if len > 0 {
@@ -2088,6 +2718,26 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
                 // its confirmation comes back.
                 s.last_queued_pos = pos;
                 save_position(&s, &m, false);
+            }
+        }
+        // Live snapshot for the main window (M15): refreshed
+        // here, on the UI thread, from backend state — the
+        // main window only ever copies this plain data, and
+        // nothing here runs in an accessibility callback.
+        {
+            let mut s = st.borrow_mut();
+            if s.snapshot.has_media {
+                s.snapshot.playing = playing_now;
+                s.snapshot.position_ms = pos;
+                s.snapshot.duration_ms = len;
+                if playing_now {
+                    s.snapshot.state = "Playing".to_string();
+                } else if m.get_state() == MediaState::Paused {
+                    s.snapshot.state = "Paused".to_string();
+                }
+                s.snapshot.title = s.title.clone();
+                s.snapshot.article_id = s.article_id.clone();
+                s.snapshot.media_url = s.media_target.clone();
             }
         }
     });
@@ -2136,10 +2786,13 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
         // would overwrite the article's resume position with
         // zero. Only a session with media loaded saves.
         {
-            let s = closing_state.borrow();
+            let mut s = closing_state.borrow_mut();
             if !s.stream.is_empty() {
                 save_position(&s, &media, false);
             }
+            // The main window's live status ends with the
+            // session: its field clears on the next poll.
+            s.snapshot = PlaybackSnapshot::default();
         }
         media.close();
         // The session ends with its window: clear the live
@@ -2167,6 +2820,7 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
         chapters_live,
         chapter_list,
         play_btn,
+        speed_combo,
         command,
     })
 }

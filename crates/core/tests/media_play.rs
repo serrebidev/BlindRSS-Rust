@@ -125,3 +125,90 @@ fn resolve_no_media_anywhere_is_a_clean_error() {
     let r = resolve_for_play(None, None, "", None);
     assert_eq!(r.unwrap_err(), "Article has no playable media");
 }
+
+/// Audit 8 Task 20 (G11): the row-annotation composition the
+/// GUI renders — one playback-state scan plus grouped chapter
+/// counts over a real database, resolved through the shared
+/// lookup order and composed exactly as Python's row cells.
+#[test]
+fn row_annotations_compose_from_scanned_state() {
+    use blindrss_core::Db;
+    use blindrss_core::db::{Chapter, PlaybackState};
+    use blindrss_core::media::article_has_playable_media;
+    use blindrss_core::playback::{article_media_label, display_title, state_for_article};
+
+    let path = std::env::temp_dir().join(format!(
+        "blindrss_t20_ann_{}_{}.db",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let db = Db::open_or_create(&path).unwrap();
+    db.add_feed("https://example.com/feed", "Feed", Some("Uncategorized"))
+        .unwrap();
+    let feeds = db.feeds().unwrap();
+    let feed_id = feeds[0].id.clone();
+    let episode = blindrss_core::Article {
+        id: "ep1".into(),
+        feed_id,
+        title: "Episode One".into(),
+        url: "https://example.com/ep1".into(),
+        content: Some("body".into()),
+        description: Some("desc".into()),
+        date: Some("2026-01-01".into()),
+        author: Some("Author".into()),
+        is_read: false,
+        is_favorite: false,
+        media_url: Some("https://cdn.example.com/ep1.mp3".into()),
+        media_type: Some("audio/mpeg".into()),
+    };
+    db.insert_article_if_new(&episode).unwrap();
+    db.upsert_playback_state(
+        "article:ep1",
+        &PlaybackState {
+            position_ms: 65_000,
+            duration_ms: Some(3_600_000),
+            completed: false,
+            seek_supported: None,
+            title: None,
+        },
+    )
+    .unwrap();
+    db.replace_chapters(
+        "ep1",
+        &[Chapter {
+            start: 0.0,
+            title: Some("Intro".into()),
+            href: None,
+        }],
+    )
+    .unwrap();
+
+    // The GUI's precompute: one scan, one grouped count query.
+    let states: std::collections::HashMap<String, PlaybackState> =
+        db.all_playback_states().unwrap().into_iter().collect();
+    let counts = db.chapter_counts(&["ep1".to_string()]).unwrap();
+    let state = state_for_article(
+        &states,
+        &episode.id,
+        episode.media_url.as_deref(),
+        &episode.url,
+    );
+    assert!(article_has_playable_media(&episode));
+    assert_eq!(
+        display_title(
+            &episode.title,
+            state,
+            counts.get("ep1").copied().unwrap_or(0) > 0
+        ),
+        "Episode One, 1:05 of 1:00:00, Chapters available"
+    );
+    assert_eq!(
+        article_media_label(true, state),
+        "Contains audio, 1:00:00, played 1:05"
+    );
+    std::fs::remove_file(&path).ok();
+}

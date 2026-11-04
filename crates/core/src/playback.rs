@@ -422,6 +422,290 @@ pub fn format_time_ms(ms: i64) -> String {
     }
 }
 
+/// Python's `build_playback_speeds` (core/utils.py): 0.5 to
+/// 4.0 in 0.1 steps, values rounded to two decimals, 1.0 always
+/// present, and any other value within 0.025 of 1.0 dropped (a
+/// no-op at this step size, kept for fidelity). 36 rungs.
+pub fn playback_speeds() -> Vec<f64> {
+    let mut speeds = Vec::new();
+    let mut i = 0i64;
+    loop {
+        let value = 0.5 + 0.1 * i as f64;
+        if value > 4.0 + 1e-9 {
+            break;
+        }
+        speeds.push((value * 100.0).round() / 100.0);
+        i += 1;
+    }
+    if !speeds.iter().any(|s| (*s - 1.0).abs() < 1e-9) {
+        speeds.push(1.0);
+    }
+    speeds.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    speeds.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
+    speeds.retain(|s| (*s - 1.0).abs() < 1e-9 || (*s - 1.0).abs() > 0.025);
+    speeds
+}
+
+/// The ladder index of a rate, or None when the rate is not a
+/// rung — Python's `speeds.index(speed)` raising ValueError,
+/// which leaves the speed picker showing no selection for an
+/// off-ladder saved value (Audit 8 M15).
+pub fn speed_index(speeds: &[f64], rate: f64) -> Option<usize> {
+    speeds.iter().position(|s| (*s - rate).abs() < 1e-9)
+}
+
+/// One step on the ladder (Python `_nudge_playback_speed`):
+/// snap the current rate to the nearest rung, then move by
+/// `dir`, clamped to the ladder ends. `dir == 0` is the reset
+/// command and always lands on 1.0.
+pub fn speed_step(speeds: &[f64], current: f64, dir: i32) -> f64 {
+    if dir == 0 || speeds.is_empty() {
+        return 1.0;
+    }
+    let nearest = speeds
+        .iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| {
+            (*a - current)
+                .abs()
+                .partial_cmp(&(*b - current).abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(i, _)| i)
+        .unwrap_or(0) as i32;
+    let idx = (nearest + dir).clamp(0, speeds.len() as i32 - 1);
+    speeds[idx as usize]
+}
+
+/// Python `_chapter_index_for_position`: the active chapter is
+/// the last one whose start is at or before the position;
+/// -1 before the first chapter (or with no chapters).
+pub fn chapter_index_for_position(starts_ms: &[i64], position_ms: i64) -> i64 {
+    starts_ms
+        .iter()
+        .rposition(|s| *s <= position_ms)
+        .map(|i| i as i64)
+        .unwrap_or(-1)
+}
+
+/// Python `on_prev_chapter`: the previous chapter outright —
+/// no restart-the-current-chapter rule. None at (or before)
+/// the first chapter.
+pub fn chapter_prev_target(active: i64) -> Option<usize> {
+    if active > 0 {
+        Some((active - 1) as usize)
+    } else {
+        None
+    }
+}
+
+/// Python `on_next_chapter`: with no active chapter the first
+/// chapter is next; at the last chapter there is no next.
+pub fn chapter_next_target(active: i64, count: usize) -> Option<usize> {
+    if count == 0 {
+        return None;
+    }
+    if active < 0 {
+        return Some(0);
+    }
+    if (active as usize) + 1 < count {
+        Some(active as usize + 1)
+    } else {
+        None
+    }
+}
+
+/// Python `_chapter_link_action_index`: the chapter control's
+/// current selection when it names a chapter, else the active
+/// chapter; -1 when neither does.
+pub fn chapter_link_index(selection: Option<usize>, active: i64, count: usize) -> i64 {
+    if let Some(sel) = selection
+        && sel < count
+    {
+        return sel as i64;
+    }
+    if active >= 0 && (active as usize) < count {
+        return active;
+    }
+    -1
+}
+
+/// Python's chapter-commit debounce (`_commit_chapter_selection`):
+/// committing the same chapter again within 350 ms is ignored,
+/// so a selection event plus its Enter do not seek twice.
+pub const CHAPTER_COMMIT_DEBOUNCE_MS: u64 = 350;
+
+pub fn chapter_commit_allowed(last: Option<(usize, u64)>, idx: usize, now_ms: u64) -> bool {
+    match last {
+        Some((last_idx, last_ms)) => {
+            !(last_idx == idx && now_ms.saturating_sub(last_ms) < CHAPTER_COMMIT_DEBOUNCE_MS)
+        }
+        None => true,
+    }
+}
+
+/// Format milliseconds the way the article list and the main
+/// status field do (Python `_format_media_time`): `m:ss`, or
+/// `h:mm:ss` at an hour or more. Minutes are NOT zero-padded —
+/// this differs deliberately from `format_time_ms`.
+pub fn format_media_time(ms: i64) -> String {
+    let total = ms.max(0) / 1000;
+    let (h, m, s) = (total / 3600, (total % 3600) / 60, total % 60);
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m}:{s:02}")
+    }
+}
+
+/// Python `_media_time_suffix`: the title-cell suffix from a
+/// saved playback state ("" when there is nothing to say).
+pub fn media_time_suffix(state: Option<&PlaybackState>) -> String {
+    let Some(st) = state else {
+        return String::new();
+    };
+    let dur = st.duration_ms.unwrap_or(0);
+    let pos = st.position_ms;
+    if st.completed {
+        if dur > 0 {
+            return format!(", played, {}", format_media_time(dur));
+        }
+        return ", played".to_string();
+    }
+    if dur > 0 && pos > 0 {
+        return format!(", {} of {}", format_media_time(pos), format_media_time(dur));
+    }
+    if dur > 0 {
+        return format!(", {}", format_media_time(dur));
+    }
+    if pos > 0 {
+        return format!(", {} played", format_media_time(pos));
+    }
+    String::new()
+}
+
+/// Python `_playback_time_annotation`, shared by the article
+/// list's Media column and the Play Queue dialog: total length
+/// first when known, then how much has been played — or
+/// "not played" for an untouched item.
+pub fn playback_time_annotation(state: Option<&PlaybackState>) -> String {
+    let dur = state.and_then(|s| s.duration_ms).unwrap_or(0);
+    let pos = state.map(|s| s.position_ms).unwrap_or(0);
+    let completed = state.map(|s| s.completed).unwrap_or(false);
+    let mut parts = Vec::new();
+    if dur > 0 {
+        parts.push(format_media_time(dur));
+    }
+    if completed {
+        parts.push("played".to_string());
+    } else if pos > 0 {
+        parts.push(format!("played {}", format_media_time(pos)));
+    } else {
+        parts.push("not played".to_string());
+    }
+    parts.join(", ")
+}
+
+/// Python's article Media cell (Audit 8 G11): "No audio" for an
+/// item the player would not open, else "Contains audio" plus
+/// the playback-time annotation.
+pub fn article_media_label(has_media: bool, state: Option<&PlaybackState>) -> String {
+    if !has_media {
+        return "No audio".to_string();
+    }
+    format!("Contains audio, {}", playback_time_annotation(state))
+}
+
+/// Python `_get_display_title`: the row's title cell — title,
+/// the media-time suffix, then the chapters marker.
+pub fn display_title(title: &str, state: Option<&PlaybackState>, has_chapters: bool) -> String {
+    let mut out = format!("{title}{}", media_time_suffix(state));
+    if has_chapters {
+        out.push_str(", Chapters available");
+    }
+    out
+}
+
+/// Python `_playback_state_for_article` over the one-scan
+/// annotation map: `article:{id}` first, then the media URL,
+/// then the article URL.
+pub fn state_for_article<'a>(
+    states: &'a std::collections::HashMap<String, PlaybackState>,
+    article_id: &str,
+    media_url: Option<&str>,
+    url: &str,
+) -> Option<&'a PlaybackState> {
+    if let Some(st) = states.get(&playback_id(article_id)) {
+        return Some(st);
+    }
+    if let Some(media) = media_url
+        && !media.is_empty()
+        && let Some(st) = states.get(media)
+    {
+        return Some(st);
+    }
+    if !url.is_empty() {
+        return states.get(url);
+    }
+    None
+}
+
+/// One live playback snapshot for the main window (Python
+/// `playback_progress_snapshot`): published by the player on
+/// its tick, consumed by the main frame's status field and the
+/// row-annotation refresh. Plain data — the player fills it
+/// from its atomic playback snapshot, never from inside an
+/// accessibility callback.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PlaybackSnapshot {
+    pub has_media: bool,
+    pub playing: bool,
+    /// The player's status-line text ("Playing", "Paused",
+    /// "Loading media...", ...); empty falls back to
+    /// Playing/Paused in the composed field text.
+    pub state: String,
+    pub title: String,
+    pub article_id: String,
+    pub media_url: String,
+    pub position_ms: i64,
+    pub duration_ms: i64,
+}
+
+impl PlaybackSnapshot {
+    pub fn remaining_ms(&self) -> i64 {
+        (self.duration_ms - self.position_ms).max(0)
+    }
+}
+
+/// Python `_on_player_progress`'s status-field text: verb,
+/// then the time part (so a long title can never push the time
+/// out of reach), then the title. Empty when there is no media
+/// — the field clears.
+pub fn live_status_text(snapshot: &PlaybackSnapshot) -> String {
+    if !snapshot.has_media {
+        return String::new();
+    }
+    let verb = if !snapshot.state.trim().is_empty() {
+        snapshot.state.trim()
+    } else if snapshot.playing {
+        "Playing"
+    } else {
+        "Paused"
+    };
+    let elapsed = format_media_time(snapshot.position_ms);
+    let time_part = if snapshot.duration_ms > 0 {
+        format!(
+            "{} / {} ({} left)",
+            elapsed,
+            format_media_time(snapshot.duration_ms),
+            format_media_time(snapshot.remaining_ms())
+        )
+    } else {
+        elapsed
+    };
+    format!("{verb}: {time_part} — {}", snapshot.title)
+}
+
 /// The landed-seek summary Python announces once a burst of
 /// seek presses settles (`_compose_time_info`): elapsed,
 /// remaining and total, or elapsed only for a live stream /

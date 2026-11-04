@@ -2497,26 +2497,47 @@ pub fn save_queue(config_path: &Path, entries: &[Value]) {
 
 /// The Play Queue dialog (Python's QueueDialog): a single list
 /// with labeled action buttons. Edits save immediately; Play
-/// returns the chosen entry index and closes.
-pub fn show_queue(frame: &Frame, config_path: &Path) -> Option<usize> {
+/// returns the chosen entry index and closes. `states` is the
+/// caller's single-scan playback-state map (Audit 8 G11):
+/// queue rows carry Python's shared time annotation, composed
+/// here from the precomputed map — no per-row lookups.
+pub fn show_queue(
+    frame: &Frame,
+    config_path: &Path,
+    states: &std::collections::HashMap<String, blindrss_core::PlaybackState>,
+) -> Option<usize> {
     let entries = Rc::new(RefCell::new(load_queue(config_path)));
     let dialog = Dialog::builder(frame, "Play Queue").build();
     bind_f1(frame, &dialog, "play-queue");
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let list = ListBox::builder(&dialog).build();
     sizer.add(&list, 1, SizerFlag::Expand | SizerFlag::All, 4);
+    let states = Rc::new(states.clone());
     let reload = {
         let entries = entries.clone();
+        let states = states.clone();
         move |select: Option<usize>| {
             list.clear();
             for e in entries.borrow().iter() {
                 let title = e.get("title").and_then(|v| v.as_str()).unwrap_or("");
                 let feed = e.get("feed_title").and_then(|v| v.as_str()).unwrap_or("");
-                list.append(&if feed.is_empty() {
+                let base = if feed.is_empty() {
                     title.to_string()
                 } else {
                     format!("{title} - {feed}")
+                };
+                let state = e.get("article_id").and_then(|v| v.as_str()).and_then(|id| {
+                    blindrss_core::playback::state_for_article(
+                        &states,
+                        id,
+                        e.get("media_url").and_then(|v| v.as_str()),
+                        e.get("url").and_then(|v| v.as_str()).unwrap_or(""),
+                    )
                 });
+                list.append(&format!(
+                    "{base}, {}",
+                    blindrss_core::playback::playback_time_annotation(state)
+                ));
             }
             if let Some(i) = select {
                 list.set_selection(i as u32, true);

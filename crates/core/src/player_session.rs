@@ -54,6 +54,49 @@ impl SessionIdentity {
     }
 }
 
+/// Staleness gate for asynchronous chapter fetches (Audit 8
+/// M12): a fetch is stamped when it starts with the article it
+/// belongs to and a per-gate sequence; its result applies only
+/// while that stamp is still the gate's latest. A queue advance
+/// or a re-fetch for the same article supersedes the stamp, and
+/// `invalidate` (a new load, a close) retires every outstanding
+/// stamp — a stale queue chapter result can never land on the
+/// item now playing. This is the second layer under the player
+/// generation check: the generation says the LOAD is current,
+/// the gate says this FETCH is.
+#[derive(Debug, Clone, Default)]
+pub struct ChapterGate {
+    sequence: u64,
+    current: Option<(String, u64)>,
+}
+
+impl ChapterGate {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Stamp a new fetch for `article_id`; returns the stamp.
+    pub fn begin(&mut self, article_id: &str) -> u64 {
+        self.sequence += 1;
+        self.current = Some((article_id.to_string(), self.sequence));
+        self.sequence
+    }
+
+    /// True while the stamp still names the latest fetch.
+    pub fn accepts(&self, article_id: &str, stamp: u64) -> bool {
+        stamp != 0
+            && self
+                .current
+                .as_ref()
+                .is_some_and(|(id, seq)| id == article_id && *seq == stamp)
+    }
+
+    /// Retire every outstanding stamp.
+    pub fn invalidate(&mut self) {
+        self.current = None;
+    }
+}
+
 /// Generation/identity state for the single player session.
 /// Generations start at 1; 0 is never current, so a default or
 /// reset pending generation can never accept a delivery.

@@ -1157,6 +1157,42 @@ fn rich_embed_url(url: &str) -> bool {
 
 /// Fetch + render the full rich article on a worker (the rich
 /// counterpart of the full-text fetch).
+/// Spawn the asynchronous chapter fetch for a fresh playback
+/// (Audit 8 M12, Python's `_fetch_chapters_for_player` thread):
+/// the fetch is stamped by the player session's chapter gate,
+/// runs the core pipeline on a worker with its own database
+/// handle (the pipeline stores what it finds), and reports
+/// back as `RefreshMsg::ChaptersReady`. A stamp of 0 means the
+/// session no longer holds this article — nothing to fetch.
+fn spawn_chapter_fetch(tx: &Sender<RefreshMsg>, generation: u64, article: &Article) {
+    let stamp = player::begin_chapter_fetch(&article.id);
+    if stamp == 0 {
+        return;
+    }
+    let tx = tx.clone();
+    let article_id = article.id.clone();
+    let path = db_path();
+    std::thread::spawn(move || {
+        let chapters = Db::open_or_create(&path)
+            .map(|db| {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs_f64())
+                    .unwrap_or(0.0);
+                blindrss_core::chapters::get_article_chapters(
+                    &db,
+                    &blindrss_core::chapters::HttpChapterTransport,
+                    &article_id,
+                    now,
+                )
+            })
+            .unwrap_or_default();
+        let _ = tx.send(RefreshMsg::ChaptersReady(
+            generation, article_id, stamp, chapters,
+        ));
+    });
+}
+
 fn spawn_rich_fetch(tx: &Sender<RefreshMsg>, article: &blindrss_core::db::Article) {
     let tx = tx.clone();
     let id = article.id.clone();
@@ -1495,6 +1531,46 @@ fn schedule_auto_fulltext(st: &mut State, force: bool) {
     st.auto_load = Some((st.reader_generation, std::time::Instant::now() + delay));
 }
 
+/// Precomputed article-row annotations (Audit 8 G11,
+/// Python's `_playback_states_cache` + per-article chapter
+/// knowledge): refreshed from ONE playback-state scan and ONE
+/// grouped chapter-count query per render, then reused by the
+/// refill and by every appended Load More page — the row
+/// insertion itself never touches the database.
+#[derive(Default)]
+struct RowAnnotations {
+    states: std::collections::HashMap<String, blindrss_core::PlaybackState>,
+    chapter_counts: std::collections::HashMap<String, i64>,
+}
+
+impl RowAnnotations {
+    fn state_for(&self, a: &Article) -> Option<&blindrss_core::PlaybackState> {
+        blindrss_core::playback::state_for_article(
+            &self.states,
+            &a.id,
+            a.media_url.as_deref(),
+            &a.url,
+        )
+    }
+
+    fn has_chapters(&self, a: &Article) -> bool {
+        self.chapter_counts.get(&a.id).copied().unwrap_or(0) > 0
+    }
+
+    /// The row's title cell (Python `_get_display_title`).
+    fn title_for(&self, a: &Article) -> String {
+        blindrss_core::playback::display_title(&a.title, self.state_for(a), self.has_chapters(a))
+    }
+
+    /// The row's Media cell (Python `_article_media_label`).
+    fn media_for(&self, a: &Article) -> String {
+        blindrss_core::playback::article_media_label(
+            blindrss_core::media::article_has_playable_media(a),
+            self.state_for(a),
+        )
+    }
+}
+
 struct State {
     db: Option<Db>,
     store_path: PathBuf,
@@ -1590,6 +1666,25 @@ struct State {
     /// timer fires it through the Read Full Text action once
     /// due; a generation change cancels it.
     auto_load: Option<(u64, std::time::Instant)>,
+    /// Precomputed row annotations for the current list
+    /// (Audit 8 G11): refreshed per render, reused per page.
+    row_annotations: RowAnnotations,
+    /// A row whose title cell a live annotation update wanted
+    /// to rewrite while it was the selected row: changing the
+    /// focused row's name makes NVDA re-read the whole row, so
+    /// Python defers it until the selection moves (its
+    /// `_flush_deferred_title_cells`).
+    deferred_title_row: Option<usize>,
+    /// The live playback status text currently shown in
+    /// status field 2 (Audit 8 M15), so the poll writes only
+    /// on change.
+    live_status_shown: String,
+    /// Display index of the "media" column in the current
+    /// list layout (None when the layout hides it), tracked
+    /// by the render so the live-progress poll can rewrite
+    /// the playing row's Media cell without rebuilding the
+    /// layout per poll.
+    media_column: Option<usize>,
 }
 
 /// Registry dispatch shared by the main frame's char hook and
@@ -1629,6 +1724,13 @@ enum RefreshMsg {
     /// off the playback critical path (M11); applied only
     /// while its generation is still the session's.
     MediaInfoReady(u64, String, Option<blindrss_core::media::MediaInfo>),
+    /// An asynchronous chapter fetch finished (Audit 8 M12):
+    /// (player generation, article id, fetch stamp, chapters).
+    /// The fetch pipeline already stored the rows; the drain
+    /// hands the set to the player through the gate, which
+    /// refuses it when a newer activation or fetch superseded
+    /// it.
+    ChaptersReady(u64, String, u64, Vec<blindrss_core::db::Chapter>),
     /// A finished download: description of what landed where.
     DownloadDone(Article, Result<PathBuf, String>),
     /// A finished manual backup (worker): the saved path or error.
@@ -1798,11 +1900,16 @@ const M_RESET_TITLE: i32 = 2243;
 const M_EDIT_CAT: i32 = 2244;
 const M_EQUALIZER: i32 = 2245;
 const M_MARKALL_CTX: i32 = 2247;
-/// Chapter Links submenu slots (Batch 41a): the article list
+/// Chapter Links submenu ids (Audit 8 G19): the article list
 /// context menu fills `chapter_link_urls` with the selected
-/// article's chapter hrefs and appends up to this many items.
+/// article's chapter links and gives item N the id BASE + N;
+/// the frame's menu handler resolves the range dynamically,
+/// so EVERY link is exposed — Python binds one item per link
+/// with no cap (the old 16-slot table silently dropped
+/// chapter 17+). The range sits above the fixed ids (which
+/// top out at 2247) and below the dialog range (5100+).
 const M_CHAPTER_LINK_BASE: i32 = 2900;
-const M_CHAPTER_LINK_SLOTS: i32 = 16;
+const M_CHAPTER_LINK_COUNT: i32 = 1000;
 
 /// Route remappable commands through the same actions as native menus.
 fn shortcut_menu_id(command: &str) -> Option<i32> {
@@ -2511,20 +2618,46 @@ fn sort_for_display(
 
 /// Insert list rows for `rows` starting at display index
 /// `start` (shared by the refill fill and Load More appends).
+/// The title cell carries Python's display title and the Media
+/// cell its playback annotation (Audit 8 G11), both composed
+/// from the precomputed `annotations` — no database work
+/// happens here.
 fn insert_article_rows(
     list: &ListCtrl,
     rows: &[Article],
     start: usize,
     feed_titles: &std::collections::HashMap<&str, &str>,
     visible: &[&blindrss_core::article_columns::ColumnLayout],
+    annotations: &RowAnnotations,
 ) {
     for (j, a) in rows.iter().enumerate() {
         let i = (start + j) as i64;
-        list.insert_item(i, &a.title, None);
+        list.insert_item(i, &annotations.title_for(a), None);
         for (col_idx, col) in visible.iter().enumerate().skip(1) {
-            let cell = article_cell(a, &col.key, feed_titles);
+            let cell = if col.key == "media" {
+                annotations.media_for(a)
+            } else {
+                article_cell(a, &col.key, feed_titles)
+            };
             list.set_item_text_by_column(i, col_idx as i32, &cell);
         }
+    }
+}
+
+/// Refresh the row-annotation cache for `ids` (Audit 8 G11):
+/// one playback-state scan and one grouped chapter-count
+/// query, merged into what earlier pages already computed —
+/// Python's `_refresh_playback_states_cache` runs the same
+/// single scan per list load.
+fn refresh_row_annotations(state: &mut State, ids: &[String]) {
+    let Some(db) = state.db.as_ref() else {
+        return;
+    };
+    if let Ok(all) = db.all_playback_states() {
+        state.row_annotations.states = all.into_iter().collect();
+    }
+    if let Ok(counts) = db.chapter_counts(ids) {
+        state.row_annotations.chapter_counts.extend(counts);
     }
 }
 
@@ -2552,6 +2685,12 @@ fn load_more_articles(state: &mut State, list: &ListCtrl) {
         list.thaw();
         return;
     }
+    // Appended pages reuse the render's annotation cache,
+    // extended with this page's chapter counts (G11: the
+    // precompute is shared, never redone per row). Refreshed
+    // before the feed-title map borrows the feed list.
+    let ids: Vec<String> = page.iter().map(|a| a.id.clone()).collect();
+    refresh_row_annotations(state, &ids);
     let feed_titles: std::collections::HashMap<&str, &str> = state
         .feeds
         .iter()
@@ -2561,7 +2700,14 @@ fn load_more_articles(state: &mut State, list: &ListCtrl) {
         &blindrss_core::config::Config::load(&config_path()).unwrap_or_default(),
     );
     let visible = blindrss_core::article_columns::visible_columns(&layout);
-    insert_article_rows(list, &page, offset, &feed_titles, &visible);
+    insert_article_rows(
+        list,
+        &page,
+        offset,
+        &feed_titles,
+        &visible,
+        &state.row_annotations,
+    );
     state.articles.extend(page);
     if state.view_total > state.articles.len() as i64 {
         let at = state.articles.len() as i64;
@@ -2902,12 +3048,28 @@ fn render_refill_rows(state: &mut State, list: &ListCtrl, loaded: Vec<Article>) 
         &blindrss_core::config::Config::load(&config_path()).unwrap_or_default(),
     );
     let visible = blindrss_core::article_columns::visible_columns(&layout);
+    // A fresh render replaces the annotation cache wholesale
+    // (chapter counts for rows no longer shown are dropped,
+    // like Python's per-render refresh). Refreshed before the
+    // feed-title map borrows the feed list.
+    state.row_annotations = RowAnnotations::default();
+    state.deferred_title_row = None;
+    state.media_column = visible.iter().position(|c| c.key == "media");
+    let ids: Vec<String> = loaded.iter().map(|a| a.id.clone()).collect();
+    refresh_row_annotations(state, &ids);
     let feed_titles: std::collections::HashMap<&str, &str> = state
         .feeds
         .iter()
         .map(|f| (f.id.as_str(), f.title.as_str()))
         .collect();
-    insert_article_rows(list, &loaded, 0, &feed_titles, &visible);
+    insert_article_rows(
+        list,
+        &loaded,
+        0,
+        &feed_titles,
+        &visible,
+        &state.row_annotations,
+    );
     state.articles = loaded;
     // Paged view with rows still unloaded: Python's trailing
     // placeholder row. It is a display row only — selection
@@ -3136,7 +3298,14 @@ fn main() {
             .with_title("BlindRSS")
             .with_size(Size::new(1100, 700))
             .build();
-        frame.create_status_bar(1, 0, -1, "status");
+        // Four status fields, Python's layout (widths
+        // [-2, -1, -1, -1]): field 0 keeps every message the
+        // app has always shown; field 2 is the live playback
+        // status (Audit 8 M15) — written only by the poll in
+        // the drain timer, only via set_status_text, so it
+        // never moves focus or forces speech.
+        let status_bar = frame.create_status_bar(4, 0, -1, "status");
+        status_bar.set_status_widths(&[-2, -1, -1, -1]);
 
         // Tray icon (orange square placeholder artwork; the real
         // app icon ships with the release packaging) with the
@@ -3465,6 +3634,10 @@ fn main() {
             reader_generation: 0,
             pending_fulltext: None,
             auto_load: None,
+            row_annotations: RowAnnotations::default(),
+            deferred_title_row: None,
+            live_status_shown: String::new(),
+            media_column: None,
         }));
 
         // A staged restore (Python backup.py semantics) applies
@@ -3625,6 +3798,17 @@ fn main() {
             st.pending_fulltext = None;
             st.selected_article = Some(idx as usize);
             st.focus_list = true;
+            // Flush a deferred live title rewrite (Audit 8
+            // M15/G11): the row whose title a live annotation
+            // update held back while it was focused is safe to
+            // rewrite now that the selection has moved off it.
+            if let Some(deferred) = st.deferred_title_row.take()
+                && deferred != idx as usize
+                && let Some(a) = st.articles.get(deferred).cloned()
+            {
+                let title = st.row_annotations.title_for(&a);
+                list.set_item_text_by_column(deferred as i64, 0, &title);
+            }
             let Some(mut a) = st.articles.get(idx as usize).cloned() else {
                 return;
             };
@@ -6101,7 +6285,17 @@ fn main() {
         let list_qo = list;
         let play_q = act_play_queue_index.clone();
         let act_queue_open: Rc<dyn Fn()> = Rc::new(move || {
-            let picked = dialogs::show_queue(&frame_qo, &config_path());
+            // The queue dialog's rows carry the shared time
+            // annotation (Audit 8 G11) from ONE playback-state
+            // scan, Python's pattern.
+            let states: std::collections::HashMap<String, blindrss_core::PlaybackState> = state_qo
+                .borrow()
+                .db
+                .as_ref()
+                .and_then(|db| db.all_playback_states().ok())
+                .map(|rows| rows.into_iter().collect())
+                .unwrap_or_default();
+            let picked = dialogs::show_queue(&frame_qo, &config_path(), &states);
             restore_focus(&state_qo.borrow(), &tree_qo, &list_qo);
             if let Some(index) = picked {
                 play_q(index);
@@ -8178,19 +8372,11 @@ fn main() {
                 }
             })
         };
-        // Chapter Links submenu slots: the list context menu
-        // stores the selected article's chapter hrefs here.
+        // Chapter Links submenu targets (Audit 8 G19): the
+        // list context menu stores the selected article's
+        // chapter links here; the frame menu handler resolves
+        // the whole id range against this list dynamically.
         let chapter_link_urls: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
-        let act_chapter_links: Vec<Rc<dyn Fn()>> = (0..M_CHAPTER_LINK_SLOTS)
-            .map(|slot| {
-                let urls = chapter_link_urls.clone();
-                Rc::new(move || {
-                    if let Some(url) = urls.borrow().get(slot as usize).cloned() {
-                        open_article_link(&frame, &url);
-                    }
-                }) as Rc<dyn Fn()>
-            })
-            .collect();
 
         // Menu bar rebuilt to Python's exact map (Batch 41a /
         // Audit 6 G1.1; authority gui/mainframe.py init_menus +
@@ -8659,19 +8845,28 @@ fn main() {
             (M_RESET_TITLE, act_reset_title.clone()),
             (M_EDIT_CAT, act_edit_category.clone()),
         ];
-        // Chapter Links slots (Batch 41a): ids are a contiguous
-        // range, appended after the fixed table.
-        let mut menu_actions = menu_actions;
-        for (slot, action) in act_chapter_links.into_iter().enumerate() {
-            menu_actions.push((M_CHAPTER_LINK_BASE + slot as i32, action));
-        }
         let frame_menu = frame;
         let quit_menu = quit_flag.clone();
+        let chapter_urls_menu = chapter_link_urls.clone();
         frame.on_menu(move |ev| {
             let id = ev.get_id();
             if id == M_EXIT {
                 quit_menu.set(true);
                 frame_menu.close(true);
+                return;
+            }
+            // Chapter Links (Audit 8 G19): ids in the reserved
+            // range index the stored link list dynamically —
+            // every chapter link stays reachable, not just the
+            // first sixteen.
+            if (M_CHAPTER_LINK_BASE..M_CHAPTER_LINK_BASE + M_CHAPTER_LINK_COUNT).contains(&id) {
+                if let Some(url) = chapter_urls_menu
+                    .borrow()
+                    .get((id - M_CHAPTER_LINK_BASE) as usize)
+                    .cloned()
+                {
+                    open_article_link(&frame_menu, &url);
+                }
                 return;
             }
             if let Some((_, action)) = menu_actions.iter().find(|(mid, _)| *mid == id) {
@@ -8830,39 +9025,16 @@ fn main() {
                 if let (Some(a), Some(db)) = (&article, &st.db) {
                     has_history = db.count_article_versions(&a.id).unwrap_or(0) > 0;
                     if let Ok(chapters) = db.chapters(&a.id) {
-                        for ch in chapters {
-                            let Some(href) = ch.href.as_deref().filter(|h| !h.trim().is_empty())
-                            else {
-                                continue;
-                            };
-                            let resolved =
-                                if href.starts_with("http://") || href.starts_with("https://") {
-                                    href.to_string()
-                                } else if let Some(rest) = href.strip_prefix('/') {
-                                    match a.url.split_once("://") {
-                                        Some((scheme, after)) => format!(
-                                            "{scheme}://{}/{}",
-                                            after.split('/').next().unwrap_or(""),
-                                            rest
-                                        ),
-                                        None => continue,
-                                    }
-                                } else {
-                                    match a.url.rsplit_once('/') {
-                                        Some((base, _)) => format!("{base}/{href}"),
-                                        None => continue,
-                                    }
-                                };
-                            let label = ch
-                                .title
-                                .as_deref()
-                                .filter(|t| !t.trim().is_empty())
-                                .map(|t| t.to_string())
-                                .unwrap_or_else(|| resolved.clone());
-                            hrefs.push((label, resolved));
-                            if hrefs.len() >= M_CHAPTER_LINK_SLOTS as usize {
-                                break;
-                            }
+                        // Python's `_article_chapter_links`
+                        // (Audit 8 G19): unusable hrefs are
+                        // skipped, relative ones resolve
+                        // against the article URL, everything
+                        // validates as a web URL — and there is
+                        // no count cap.
+                        for link in
+                            blindrss_core::chapters::article_chapter_links(&a.url, &chapters)
+                        {
+                            hrefs.push((link.label, link.url));
                         }
                     }
                 }
@@ -9280,6 +9452,90 @@ fn main() {
                     refill_articles(&mut st, &list);
                 }
             }
+            // Live playback status (Audit 8 M15, Python's
+            // `_on_player_progress`): the player publishes a
+            // plain-data snapshot on its own tick; this poll
+            // mirrors it into status field 2 and into the
+            // playing row's annotation. set_status_text only —
+            // focus never moves and nothing is forced into
+            // speech.
+            {
+                let snap = player::progress_snapshot();
+                let text = blindrss_core::playback::live_status_text(&snap);
+                let mut st = state_tick.borrow_mut();
+                if st.live_status_shown != text {
+                    st.live_status_shown = text.clone();
+                    frame_tick.set_status_text(&text, 2);
+                }
+                if snap.has_media {
+                    // Merge the live position into the
+                    // annotation cache (Python merges under
+                    // the article key and the media URL key;
+                    // an existing entry's completed flag
+                    // survives, its duration is the fallback
+                    // while the snapshot has none).
+                    fn merge_live(
+                        states: &mut std::collections::HashMap<
+                            String,
+                            blindrss_core::PlaybackState,
+                        >,
+                        key: String,
+                        snap: &blindrss_core::playback::PlaybackSnapshot,
+                    ) {
+                        let entry = states.entry(key).or_insert_with(|| {
+                            blindrss_core::PlaybackState {
+                                position_ms: 0,
+                                duration_ms: None,
+                                completed: false,
+                                seek_supported: None,
+                                title: None,
+                            }
+                        });
+                        entry.position_ms = snap.position_ms;
+                        if snap.duration_ms > 0 {
+                            entry.duration_ms = Some(snap.duration_ms);
+                        }
+                    }
+                    merge_live(
+                        &mut st.row_annotations.states,
+                        blindrss_core::playback::playback_id(&snap.article_id),
+                        &snap,
+                    );
+                    if !snap.media_url.is_empty() {
+                        merge_live(
+                            &mut st.row_annotations.states,
+                            snap.media_url.clone(),
+                            &snap,
+                        );
+                    }
+                    if let Some(idx) =
+                        st.articles.iter().position(|a| a.id == snap.article_id)
+                    {
+                        let (title, media) = {
+                            let a = &st.articles[idx];
+                            (
+                                st.row_annotations.title_for(a),
+                                st.row_annotations.media_for(a),
+                            )
+                        };
+                        if list.get_item_text(idx as i64, 0) != title {
+                            if st.selected_article == Some(idx) {
+                                // Python defers rewriting the
+                                // focused row's title: NVDA
+                                // would re-read the whole row.
+                                st.deferred_title_row = Some(idx);
+                            } else {
+                                list.set_item_text_by_column(idx as i64, 0, &title);
+                            }
+                        }
+                        if let Some(mcol) = st.media_column
+                            && list.get_item_text(idx as i64, mcol as i32) != media
+                        {
+                            list.set_item_text_by_column(idx as i64, mcol as i32, &media);
+                        }
+                    }
+                }
+            }
             // Automatic full-text load (Audit 8 G02): a
             // schedule set by selection or reader focus fires
             // once when due, through the Read Full Text
@@ -9686,6 +9942,17 @@ fn main() {
                                     .and_then(|db| db.chapters(&article.id).ok())
                                     .unwrap_or_default();
                                 drop(st);
+                                // No stored chapters: fetch
+                                // them asynchronously (Audit 8
+                                // M12, Python's
+                                // _fetch_chapters_for_player) —
+                                // provider rows, the Podcasting
+                                // 2.0 file, YouTube metadata or
+                                // embedded ID3 upgrade the live
+                                // player when they land.
+                                if chapters.is_empty() {
+                                    spawn_chapter_fetch(&tx_tick, pgen, &article);
+                                }
                                 player::deliver_media(pgen, &article, stream, chapters, headers);
                             }
                             Err(e) => {
@@ -9693,6 +9960,25 @@ fn main() {
                                 player::fail_load(pgen);
                                 frame_tick.set_status_text(&format!("Play: {e}"), 0);
                             }
+                        }
+                    }
+                    Ok(RefreshMsg::ChaptersReady(pgen, id, stamp, chapters)) => {
+                        // A finished chapter fetch (Audit 8
+                        // M12): the pipeline already stored the
+                        // rows; the annotation cache learns the
+                        // chapter count (the title indicator is
+                        // rewritten by the live-progress poll or
+                        // the next render), and the player gate
+                        // decides whether the set still belongs
+                        // to the live item — a stale result is
+                        // refused there.
+                        if !chapters.is_empty() {
+                            state_tick
+                                .borrow_mut()
+                                .row_annotations
+                                .chapter_counts
+                                .insert(id.clone(), chapters.len() as i64);
+                            player::update_chapters_gated(pgen, &id, stamp, chapters);
                         }
                     }
                     Ok(RefreshMsg::MediaInfoReady(pgen, _id, info)) => {
@@ -9708,10 +9994,16 @@ fn main() {
                             && !info.chapters.is_empty()
                         {
                             {
-                                let st = state_tick.borrow();
+                                let mut st = state_tick.borrow_mut();
                                 if let Some(db) = &st.db {
                                     let _ = db.replace_chapters(&_id, &info.chapters);
                                 }
+                                // The row annotation cache
+                                // learns the chapter count too
+                                // (Audit 8 G11 indicator).
+                                st.row_annotations
+                                    .chapter_counts
+                                    .insert(_id.clone(), info.chapters.len() as i64);
                             }
                             player::update_chapters(pgen, info.chapters);
                         }
@@ -10291,6 +10583,10 @@ mod ui_parity_tests {
                 reader_generation: 0,
                 auto_load: None,
                 pending_fulltext: None,
+                row_annotations: RowAnnotations::default(),
+                deferred_title_row: None,
+                live_status_shown: String::new(),
+                media_column: None,
             }
         }
         use blindrss_core::db::ViewScope;

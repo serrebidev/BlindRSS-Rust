@@ -4020,3 +4020,206 @@ Brandon's acceptance — unclaimed here.
 main over 5d2e0e1 with no conflicts. Merged gate: fmt clean,
 clippy clean (workspace and core windows-gnu), 691 passed /
 0 failed, build OK.
+
+## Audit 8 Task 20 resolution — chapters, row annotations and remaining player controls (M12, M13, M15, G11, G19) (2026-11-04)
+
+M12 (chapter upgrades): the chapter pipeline Python runs in
+`core/utils.py::fetch_and_store_chapters` is ported to
+`crates/core/src/chapters.rs` — existing rows first, then the
+Podcasting 2.0 chapter file (source record in the new
+`chapter_sources` table keyed like Python's
+`_chapter_source_key`, 900 s freshness window, conditional
+GET with the stored ETag/Last-Modified, a bare 304 with no
+rows retries once unconditionally, a 304 with rows refreshes
+only `checked_at`, mime/body/document validation with the
+2 MB cap and `version`+`chapters` shape required), then
+YouTube structured chapters, then embedded ID3 chapters.
+Normalization is Python's exactly (10,000-entry cap,
+`toc is False` skipped, start from the first PRESENT of
+startTime/start_time/start, `MM:SS`/`H:MM:SS` string starts
+with sub-minute parts under 60, title from `text`, href from
+the first non-empty of url/link/href, stable sort,
+equal-start dedupe merging missing title/href from later
+duplicates). ID3 CHAP parsing rides the `extract.rs` frame
+walk (Task 14's prologue handling: extended headers,
+unsynchronization, per-frame flags) and reads sub-frames in
+Python's WXXX → WOAR → WCOM → WPUB priority. Hosted rows go
+to the new `chapter_cache` table (Python's split from the
+FK-backed local `chapters` table is preserved). Delivery to
+the live player is gated twice: a fresh load or queue entry
+with no stored chapters stamps a fetch through the session's
+new core `ChapterGate` (per-article stamp; a new activation
+or queue switch invalidates it), and the result applies only
+while the load generation is current AND the gate still
+accepts the stamp for the article the session holds — a
+stale queue result is dropped whole. The toggle branch of
+`begin_play` now also swaps the chapter set when the
+re-activated article's stored chapters differ, closing Task
+18's recorded deviation (1); the yt-dlp metadata path
+(MediaInfoReady) keeps its own generation check.
+
+M13 (player chapter commands/state): selection is now
+preview-only, as in Python — arrowing the chapter list
+records a pending index, Enter/double-click commits it
+through the 350 ms same-index debounce (core
+`chapter_commit_allowed`), the commit seeks through Task
+19's `begin_user_seek` guard. Previous/Next follow Python's
+active-chapter rules (core `chapter_prev_target` /
+`chapter_next_target`): Previous selects the PREVIOUS
+chapter (the old restart-current-after-two-seconds behavior
+is gone), Previous at the first chapter is a no-op, Next
+before the first chapter selects it. Chapter links open
+through Python's `_validated_chapter_href` (http/https,
+host required, no userinfo, no backslash/whitespace/control
+characters) with Python's "Chapter link unavailable"
+fallback. The player gains a Chapters menu bar (Show
+Chapters Ctrl+M, Open Chapter Link Ctrl+Shift+L, Previous
+Ctrl+Shift+Left, Next Ctrl+Shift+Right) whose item
+availability follows Python's refresh rule (Previous needs
+an earlier chapter, Next a later one, Open Link a valid href
+on the selection-or-active chapter), refreshed on the
+player's tick only when the triple changes, and a Chapters
+button opening Python's dynamic popup: an Open Link item
+(enabled only with a valid href), a separator, and one jump
+item per chapter with the active one prefixed "[Current] "
+— no count cap anywhere. Chapter F1 topics are now Python's
+finer set where the controls exist: chapter list and
+Chapters button "chapters", speed picker "playback-speed",
+seek slider / time readout / volume slider
+"player-controls", frame default "player".
+
+M15 (remaining player controls/status): the speed ladder is
+Python's `build_playback_speeds` — 36 values, 0.5–4.0 in 0.1
+steps (core `playback_speeds`/`speed_index`/`speed_step`);
+the Up/Down commands snap the CONFIG value to the nearest
+rung and step (an off-ladder saved value moves to its
+nearest rung first, Python's rule), and a read-only speed
+picker is appended to the player's second button row: a
+saved on-ladder value selects its rung, an off-ladder value
+shows no selection (Python's combo), picking a rung applies
+and persists it. The backend rate readback chain
+(`MediaBackend::get_playback_rate`, `VlcPlayer::rate`, the
+libVLC get-rate FFI entry) was removed — nothing reads the
+rate back any more, the persisted value is the only truth,
+as in Python. Absolute volume is Python's slider + percent
+readout in a new row appended after the chapter list: the
+slider applies to the backend only while Playing (a paused
+volume change unpauses VLC — Python's user-reported rule),
+always persists `volume`, and the tick re-syncs slider and
+readout from the persisted value under a guard so the sync
+never re-enters the handler. The position readout is now
+Python's time-info text (core `seek_summary`: Elapsed /
+Remaining / Total, elapsed-only for unknown length), named
+"Playback Time", keeping its "No media loaded" initial text
+until a stream exists. The main window's status bar is now
+Python's four fields (widths [-2, -1, -1, -1]); field 2
+carries the live playback status from the player's new
+plain-data `PlaybackSnapshot` (core `live_status_text`:
+"Playing: 1:05 / 1:00:00 (58:55 left) — Episode One", empty
+with no media), polled by the 150 ms drain, written only on
+change via set_status_text — focus never moves.
+
+G11 (row annotations): rows compose Python's cells from a
+precomputed cache (`RowAnnotations`): ONE `all_playback_states`
+scan plus ONE grouped `chapter_counts` query per render,
+reused — merged, not recomputed — for every appended Load
+More page; row insertion does no database work. The title
+cell is Python's `_get_display_title` (core `display_title`:
+time suffix — ", {pos} of {total}", ", played, {total}",
+", {total}", ", {pos} played" — plus ", Chapters
+available"), the Media cell is Python's
+`_article_media_label` (playable-media test ported as core
+`article_has_playable_media`, the faithful
+`_should_play_in_player` without downloads: yt-dlp-supported
+article URL with image extensions rejected, canonical media
+type audio/video/podcast, audio-extension enclosures; then
+the shared `playback_time_annotation`: duration, "played" /
+"played {pos}" / "not played"). State lookup follows
+Python's order exactly (`article:{id}` → media_url → url).
+The live poll also merges the snapshot's position/duration
+into the cache (article key and media-URL key, completed
+preserved, snapshot duration wins when known) and rewrites
+the playing row's Media and title cells — except the focused
+row's title, which Python defers until the selection moves
+(NVDA would re-read the whole row); the deferred rewrite
+flushes in the selection handler. Queue dialog rows carry
+the same shared time annotation, fed by one scan at open.
+
+G19 (>16 chapter links): the fixed 16-slot action table is
+deleted. The context menu builds its Chapter Links submenu
+from core `article_chapter_links` (Python's
+`_article_chapter_links`: unusable hrefs skipped, relative
+hrefs resolved with urljoin against the article URL, every
+result validated as a web URL, no count cap), and the frame
+menu handler resolves the reserved id range 2900–3899
+dynamically against the stored link list — chapter 17 and
+beyond stay keyboard reachable. The range sits above every
+fixed menu id (max 2247) and below the dialog ids (5100+),
+so the menu_actions uniqueness rule is untouched.
+
+Tests: `crates/core/tests/audit8_task20_slice.rs` (29 tests,
+written regression-first — the red run failed on the missing
+APIs): speed ladder shape and rungs (1.1/3.5/4.0 present, 36
+entries), off-ladder snapping both directions and at the
+ends, chapter position/previous/next/link-index targets,
+the commit debounce, href validation (userinfo, backslash,
+control characters, hostless URLs — including the WHATWG
+`https:///nohost` case Python's urlparse rejects and Rust's
+parser accepts, now guarded textually), document
+validation, normalization (string starts, toc, dedupe
+merge), the fetch pipeline against a scripted transport
+(fresh 200 stores rows + source, fresh-window reuse makes
+no request, 304 keeps rows and bumps only checked_at, bare
+304 retries unconditionally, failing document falls back to
+embedded ID3), the gate accepting the current stamp and
+refusing stale article/stamp pairs, 25 chapter links all
+exposed (the >16 regression), relative link resolution,
+annotation composition (title suffix per state, media
+label, live status text), and the article playability test.
+`media_slice.rs` gains the cache/source/scan roundtrip
+against its Python-shaped schema; `media_play.rs` gains an
+end-to-end annotation composition test over a real database.
+Gate: fmt clean (run last), clippy clean (workspace
+--all-targets and core x86_64-pc-windows-gnu, -D warnings),
+722 passed / 0 failed (691 at the Task 19 base + 31 new),
+`cargo build -p blindrss` OK.
+
+Deviations, named: (1) Local MP4/M4A/M4B embedded chapters
+are NOT ported — no MP4 chapter-atom reader exists in the
+Rust tree and Python's comes from mutagen; the ID3,
+Podcasting 2.0 and YouTube paths are ported, and a local
+MP4 file simply yields no embedded chapters. (2) ID3 CHAP
+sub-frames are read raw: per-sub-frame
+compression/encryption flags are not applied (top-level
+frames get the full flag handling through the shared walk).
+(3) The YouTube chapter branch uses the yt-dlp info path
+(`chapters_from_info`: info chapters, else the description
+grammar) — Python's watch-next first source is not ported
+anywhere in the Rust tree (inherited from the ytfull port).
+(4) The chapter-document transport rides the app's ureq
+agent with scheme/document validation; Python's
+per-redirect-hop public-HTTP/SSRF validator is not
+replicated. (5) The player menu bar carries the Chapters
+menu only: Python's Playback menu holds only Cast, the Rust
+player has no cast control (casting is a main-window
+surface), and the "casting" F1 topic therefore remains
+unassigned in the player. (6) Chapters-menu availability and
+the snapshot refresh on the player's existing 1 s tick;
+Python refreshes its controls on a finer UI timer. (7) The
+player position readout's accessible name is aligned to
+Python's "Playback Time" (was "Position"), its initial text
+to "No media loaded", and the chapter list's row labels to
+Python's chapter menu-label format ("{timestamp} {title}").
+(8) Queue rows gain the shared time annotation but keep the
+pre-existing "{title} - {feed}" base format; Python's
+"{index}. {title}, from {source}" base was not adopted —
+outside G11's letter. (9) The snapshot's state verb is
+derived from the backend state each tick (Playing/Paused),
+with load/failure/stop texts set at their transitions;
+Python passes its status-line text through verbatim.
+(10) `replace_chapters`/`replace_cached_chapters` keep the
+existing non-transactional DELETE+INSERT (Python wraps in a
+SAVEPOINT) — pre-existing Rust behavior, unchanged here.
+Owner screen-reader acceptance (chapter flows, speed/volume
+controls, live status feel, row annotation wording under
+NVDA) remains Brandon's — unclaimed here.

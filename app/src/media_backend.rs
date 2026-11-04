@@ -214,12 +214,6 @@ impl MediaBackend {
         }
     }
 
-    pub fn get_playback_rate(&self) -> f64 {
-        self.engine().map_or_else(
-            || self.fallback.map_or(1.0, |n| n.get_playback_rate()),
-            |e| e.rate(),
-        )
-    }
     pub fn set_playback_rate(&self, rate: f64) -> bool {
         if let Some(engine) = self.engine() {
             engine.set_rate(rate)

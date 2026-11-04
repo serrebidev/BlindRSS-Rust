@@ -60,7 +60,6 @@ vlc_api! {
     media_player_set_time: unsafe extern "C" fn(Handle, i64),
     media_player_get_length: unsafe extern "C" fn(Handle) -> i64,
     media_player_is_seekable: unsafe extern "C" fn(Handle) -> i32,
-    media_player_get_rate: unsafe extern "C" fn(Handle) -> f32,
     media_player_set_rate: unsafe extern "C" fn(Handle, f32) -> i32,
     audio_get_volume: unsafe extern "C" fn(Handle) -> i32,
     audio_set_volume: unsafe extern "C" fn(Handle, i32) -> i32,
@@ -424,9 +423,6 @@ impl VlcPlayer {
                 (volume.clamp(0.0, 1.0) * 100.0).round() as i32,
             ) == 0
         }
-    }
-    pub fn rate(&self) -> f64 {
-        unsafe { (self.api.media_player_get_rate)(self.player) as f64 }
     }
     pub fn set_rate(&self, rate: f64) -> bool {
         rate.is_finite()

@@ -39,6 +39,23 @@ pub struct PlaybackState {
     pub title: Option<String>,
 }
 
+/// The media fields the chapter pipeline reads for one
+/// article (Audit 8 M12): (media_url, media_type,
+/// chapter_url, article url).
+pub type ArticleMediaFields = (Option<String>, Option<String>, Option<String>, String);
+
+/// A Podcasting 2.0 chapter-file source record (Python's
+/// `chapter_sources` row): where the chapters came from and the
+/// validators / timestamps the revalidation window runs on.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ChapterSource {
+    pub source_url: String,
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
+    pub checked_at: f64,
+    pub fetched_at: f64,
+}
+
 pub struct Category {
     pub id: String,
     pub title: String,
@@ -166,6 +183,15 @@ CREATE TABLE IF NOT EXISTS deleted_articles (feed_id TEXT NOT NULL,
     PRIMARY KEY (feed_id, article_id));
 CREATE TABLE IF NOT EXISTS chapters (id TEXT PRIMARY KEY,
     article_id TEXT, start REAL, title TEXT, href TEXT);
+CREATE TABLE IF NOT EXISTS chapter_cache (id TEXT PRIMARY KEY,
+    cache_key TEXT NOT NULL, start REAL, title TEXT, href TEXT);
+CREATE INDEX IF NOT EXISTS idx_chapter_cache_key_start
+    ON chapter_cache (cache_key, start);
+CREATE TABLE IF NOT EXISTS chapter_sources (cache_key TEXT PRIMARY KEY,
+    source_url TEXT NOT NULL, etag TEXT, last_modified TEXT,
+    checked_at REAL NOT NULL DEFAULT 0, fetched_at REAL NOT NULL DEFAULT 0);
+CREATE INDEX IF NOT EXISTS idx_chapter_sources_checked_at
+    ON chapter_sources (checked_at);
 CREATE TABLE IF NOT EXISTS playback_state (id TEXT PRIMARY KEY,
     position_ms INTEGER, duration_ms INTEGER, updated_at INTEGER,
     completed INTEGER, seek_supported INTEGER, title TEXT);
@@ -1517,6 +1543,171 @@ impl Db {
             )?;
         }
         Ok(())
+    }
+
+    /// Chapters held for a hosted provider's cache key (Python's
+    /// `chapter_cache` side of `_replace_stored_chapters`): hosted
+    /// articles are not mirrored into the local articles table,
+    /// so their chapters cannot live in the article-keyed table.
+    pub fn cached_chapters(&self, cache_key: &str) -> rusqlite::Result<Vec<Chapter>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT start, title, href FROM chapter_cache WHERE cache_key = ?1 ORDER BY start",
+        )?;
+        let rows = stmt.query_map(params![cache_key], |row| {
+            Ok(Chapter {
+                start: row.get(0)?,
+                title: row.get(1)?,
+                href: row.get(2)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// Replace the cached chapters for a hosted cache key.
+    pub fn replace_cached_chapters(
+        &self,
+        cache_key: &str,
+        chapters: &[Chapter],
+    ) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "DELETE FROM chapter_cache WHERE cache_key = ?1",
+            params![cache_key],
+        )?;
+        for (i, ch) in chapters.iter().enumerate() {
+            self.conn.execute(
+                "INSERT INTO chapter_cache (id, cache_key, start, title, href) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![format!("{cache_key}#{i}"), cache_key, ch.start, ch.title, ch.href],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The chapter-source record for a source key (Python
+    /// `_get_chapter_source`).
+    pub fn chapter_source(&self, source_key: &str) -> rusqlite::Result<Option<ChapterSource>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT source_url, etag, last_modified, checked_at, fetched_at \
+             FROM chapter_sources WHERE cache_key = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![source_key], |row| {
+            Ok(ChapterSource {
+                source_url: row.get(0)?,
+                etag: row.get(1)?,
+                last_modified: row.get(2)?,
+                checked_at: row.get::<_, Option<f64>>(3)?.unwrap_or(0.0),
+                fetched_at: row.get::<_, Option<f64>>(4)?.unwrap_or(0.0),
+            })
+        })?;
+        match rows.next() {
+            Some(r) => Ok(Some(r?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Insert or replace a chapter-source record (Python
+    /// `_save_chapter_source`).
+    pub fn save_chapter_source(
+        &self,
+        source_key: &str,
+        source: &ChapterSource,
+    ) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT INTO chapter_sources (cache_key, source_url, etag, last_modified, checked_at, fetched_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+             ON CONFLICT(cache_key) DO UPDATE SET source_url = excluded.source_url, \
+             etag = excluded.etag, last_modified = excluded.last_modified, \
+             checked_at = excluded.checked_at, fetched_at = excluded.fetched_at",
+            params![
+                source_key,
+                source.source_url,
+                source.etag,
+                source.last_modified,
+                source.checked_at,
+                source.fetched_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Chapter counts for a set of articles in one grouped query
+    /// — the article list's ", Chapters available" marker is
+    /// precomputed off the render path from this, never queried
+    /// per row (Audit 8 G11).
+    pub fn chapter_counts(
+        &self,
+        article_ids: &[String],
+    ) -> rusqlite::Result<std::collections::HashMap<String, i64>> {
+        let mut out = std::collections::HashMap::new();
+        if article_ids.is_empty() {
+            return Ok(out);
+        }
+        // Chunked so a full list page stays well under SQLite's
+        // bound-parameter limit.
+        for chunk in article_ids.chunks(400) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let sql = format!(
+                "SELECT article_id, COUNT(*) FROM chapters \
+                 WHERE article_id IN ({placeholders}) GROUP BY article_id"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?;
+            for row in rows {
+                let (id, count) = row?;
+                out.insert(id, count);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Every saved playback state in one scan (Python
+    /// `get_all_playback_states`): the article list refreshes
+    /// its annotation cache from this once per render instead of
+    /// querying per row (Audit 8 G11).
+    pub fn all_playback_states(&self) -> rusqlite::Result<Vec<(String, PlaybackState)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, position_ms, duration_ms, completed, seek_supported, title \
+             FROM playback_state",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                PlaybackState {
+                    position_ms: row.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                    duration_ms: row.get(2)?,
+                    completed: row.get::<_, Option<i64>>(3)?.unwrap_or(0) != 0,
+                    seek_supported: row.get::<_, Option<i64>>(4)?.map(|v| v != 0),
+                    title: row.get(5)?,
+                },
+            ))
+        })?;
+        rows.collect()
+    }
+
+    /// The media fields the chapter pipeline needs for one
+    /// article (Python local provider's SELECT in
+    /// `get_article_chapters`): (media_url, media_type,
+    /// chapter_url, url).
+    pub fn article_media_fields(
+        &self,
+        article_id: &str,
+    ) -> rusqlite::Result<Option<ArticleMediaFields>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT media_url, media_type, chapter_url, url FROM articles WHERE id = ?1 LIMIT 1",
+        )?;
+        let mut rows = stmt.query_map(params![article_id], |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+            ))
+        })?;
+        match rows.next() {
+            Some(r) => Ok(Some(r?)),
+            None => Ok(None),
+        }
     }
 
     /// Saved playback position for a playback id (article id).
