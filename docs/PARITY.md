@@ -101,7 +101,7 @@ Base-interface method groups (54) and where they stand in Rust core:
 | Forum sources (Reddit/Lemmy/Groups.io) | forum_sources.py 551; groups_io.py 448 | **missing** |
 | Rumble / Odysee / NPR / Sky sources | rumble.py 582; odysee.py; npr.py; sky.py | **missing** |
 | SponsorBlock | sponsorblock.py | **done** (v0.1.14: core/sponsorblock.rs — YouTube id extraction, skipSegments fetch + category filter; the player applies segments on its tick with the already-skipped guard and sponsor_skip announcements) |
-| Audio silence detection + skip | audio_silence.py 534 | **partial** (v0.1.14: core/silence.rs — ffmpeg silencedetect with Python's RMS-fallback parameters, merge-gap + padding post-processing; the player analyses on a worker and skips with announcements. Python's primary WebRTC-VAD detector is not ported — no Rust VAD binding exists; the threshold detector is the documented substitute) |
+| Audio silence detection + skip | audio_silence.py 534 | **ported** (Audit 8 Task 21, see the resolution at the end of this file: core/silence.rs streams ffmpeg PCM through the WebRTC VAD — libfvad via the `webrtc-vad` crate, the same detector Python drives — with Python's RMS streaming detector as the fallback; the scan is incremental, paced and cancellable, and the player runs Python's guarded skip policy. The v0.1.14 silencedetect substitute and its shrink-padding are gone) |
 | Playback state persistence | playback_state.py | **done** (slice 7: get/upsert/delete against the Python table) |
 | Equalizer (libVLC 10-band presets) | equalizer.py | **missing** |
 | User agents / fetch identity | user_agents.py 540; http_headers.py | **partial** — all fetches ride the shared http agent with the resolved UA (8 presets + custom + auto=platform preset) and yt-dlp gets the same UA, v0.1.16; installed-browser version detection + per-feed identity + http_headers.py per-channel headers missing |
@@ -1643,7 +1643,9 @@ non-gaps: `max_cached_views` caps Python's per-view list
 cache, which Rust does not need (views re-query cheaply and
 stay fresh); the other silence keys belong to Python's
 WebRTC-VAD incremental scanner, of which the port ships the
-documented ffmpeg fallback position; dead Python keys
+documented ffmpeg fallback position (SUPERSEDED by the
+Audit 8 Task 21 resolution at the end of this file: the
+VAD scanner and the guarded skip policy are now ported); dead Python keys
 (`auto_download_podcasts`, `auto_download_period`) are dead
 on both sides. Tests: `audit7_slice.rs` (feed pages tile the
 view without overlap, category pages/count cover the
@@ -4239,3 +4241,209 @@ depends on the entry ramp; a 10 s deadline keeps a genuinely
 lower cap failing the assertion instead of hanging. Five
 consecutive local suite runs pass. Test-only change; no
 production code touched.
+## Audit 8 Task 21 resolution — incremental, cancellable silence skipping (M09, S17) (2026-11-04)
+
+M09 — the silence subsystem is now a port of Python's, not a
+substitute. The pre-task state blocked on whole-source
+ffmpeg `silencedetect` output, started immediately at load
+with no cancellation, took no headers, and SHRANK ranges
+with padding where Python EXPANDS them.
+
+- Core scanner (`core/audio_silence.py` →
+  `crates/core/src/silence.rs`, rewritten): `scan_silence`
+  spawns ffmpeg with Python's argument shape (`-nostdin
+  -hide_banner -loglevel error`, `-threads` when
+  configured, headers for http(s) sources only — a
+  User-Agent header becomes `-user_agent`, the rest one
+  CRLF `-headers` block; with no headers the app UA from
+  core's user_agents policy is passed, NOT Python's
+  hardcoded Chrome/91 string, per Operational Mandate 1)
+  and streams mono s16le PCM in 64 KB reads. Pacing: with a
+  lead configured (`silence_scan_lead_seconds`, default
+  300 s), reads pause while the scanned position is more
+  than the lead ahead of the playback-position provider;
+  ffmpeg blocks on its full stdout pipe, as in Python.
+  Cancellation: an AtomicBool checked before every read and
+  during pacing sleeps; on abort the child is killed and
+  reaped and the result is `ScanError::Cancelled` — no
+  ffmpeg survives (heartbeat-file regression test). stderr
+  is drained concurrently into a capped shared buffer
+  (Python drains after the loop; concurrent drain cannot
+  stall a chatty ffmpeg on a full pipe, and the drain
+  thread is never joined on an error path — a killed
+  child's own children can hold the pipe open). A nonzero
+  exit yields `ScanError::Ffmpeg` with the stderr tail, the
+  source URL redacted inside it first. Spawn retries
+  ETXTBSY with `dependency::spawn_tool`'s backoff
+  discipline; the scanner owns its child because
+  `dependency::run_tool` captures capped whole-run output
+  and cannot stream PCM.
+- Detectors: `VadSilenceDetector` ports
+  `_detect_vad_ranges` (frame 10/20/30 with 30 coercion,
+  aggressiveness clamped 0..=3, a frame is silent iff the
+  VAD says not-speech AND the frame RMS is at or below the
+  threshold, runs of at least `min_silence_ms`, gap-merged
+  return). `PcmSilenceDetector` ports
+  `StreamingSilenceDetector` exactly, including its
+  quirks: windows are consumed whole, a trailing partial
+  window is dropped at finalize, min windows =
+  ceil(min/window), adjacency-only merge. The millisecond
+  helpers `merge_ranges_ms` / `merge_ranges_with_gap_ms`
+  port `merge_ranges` (+1 ms adjacency) and
+  `merge_ranges_with_gap`; `pad_and_merge_ms` ports the
+  player's publish transform, and `finalize_ranges` now
+  routes through them (padding expands).
+- VAD disposition — PORTED, with evidence (quantified
+  research protocol, 2026-11-04): Python's primary
+  detector is the WebRTC VAD via the `_webrtcvad` C
+  extension (`core/webrtcvad_compat.py` over
+  webrtcvad-wheels). The Rust `webrtc-vad` crate 0.4.0
+  (crates.io; github.com/kaegi/webrtc-vad, MIT) wraps
+  libfvad — the WebRTC VAD C library, the same algorithm
+  and codebase — compiled with the `cc` build dependency
+  (bindings pre-generated, no bindgen at build time). It
+  is now a normal core dependency, used exactly where
+  Python uses its VAD: primary when the scan rate is one
+  of 8000/16000/32000/48000, with the RMS detector as the
+  fallback when the VAD cannot serve the rate — the same
+  fallback Python takes when `webrtcvad` is unavailable.
+  RMS is never labelled equivalent to VAD. Alternatives
+  rejected with reasons: Silero-based crates
+  (`voice_activity_detector`, `silero-vad-rust`) are a
+  different detector, not parity; `wavekat-vad` adds an
+  abstraction layer over the same code. GitHub
+  most-recent/most-stars searches, Codeberg and GitLab
+  were searched for the same claim; the crates.io crate
+  above is the direct libfvad binding. Deterministic
+  fixtures pin the boundary: the VAD fixture separates a
+  voiced harmonic stack from silence, and the RMS
+  fixtures pin level-only behaviour (a −50 dBFS tone
+  counts as silence under a −38 dB threshold).
+- Settings resolution: `SilenceScanSettings::from_config`
+  mirrors the player worker's config reads with
+  `core/config.py` DEFAULT_CONFIG values as the effective
+  defaults (Python's loader merges them into every
+  config; the worker's own literal fallbacks fire only
+  for missing/falsy keys) and applies Python's remote
+  adjustments verbatim: remote = http(s) and not loopback
+  → decode rate `silence_scan_remote_sample_rate` (8000),
+  aggressiveness forced to 0, threshold capped at
+  −52 dB, minimum silence at least 1200 ms, merge gap at
+  most 200 ms, threads 1 (2 local), low priority default
+  on, lead 300 s.
+- Player lifecycle (app/src/player.rs): the scan is
+  QUEUED at deliver and at queue advance
+  (`queue_silence_scan`), STARTED by the 1 s tick only
+  while Playing and after `silence_scan_delay_s`
+  (4.0 s default) has passed since the queue, and only
+  while its load generation is current. Progress sets
+  publish through `pad_and_merge_ms` — padding EXPANDS,
+  `(max(0, start − pad), end + pad)` — and mark the scan
+  ready incrementally, so a paced scan is usable
+  mid-stream; a progress set arriving for a stale
+  generation aborts the scan (Python's publish gate). A
+  failed scan keeps any progress-published ranges; with
+  none, ready stays false (Python's rule).
+  `cancel_silence_scan` runs on every new load
+  (begin_load), queue advance, Stop and window close:
+  abort flag set, channel dropped, ranges, ready flag
+  and the whole skip policy cleared.
+- Skip policy (core `SilenceSkipPolicy`, clock-injected;
+  the tick drives it in Python's order — landing
+  verification, floor ratchet, evaluation). Guards in
+  Python's order: casting (vacuously false — the Rust
+  player has no casting state), seekable `Some(false)`
+  blocks while `None` proceeds, an armed resume verifier
+  blocks, not-ready/empty blocks, the user-seek pause
+  (1.2 s local / 2.5 s remote), slider dragging,
+  position + 500 ms behind the floor, and the post-skip
+  cooldown (2.5 s local / 5.0 s remote). Hit arithmetic:
+  break at pos < start − 1000; containment
+  start − 100 ≤ pos ≤ end − 100; target = end +
+  resume_backoff (remote-capped at 1000 ms); floor
+  refusal; the ±1000 ms same-target loop guard;
+  retrigger cleanups. Landing verification re-seeks ONCE
+  when playback is still short past 700 ms local /
+  1200 ms remote after the 0.35 s / 0.5 s minimum wait,
+  inside a 3 s / 5 s window; a user seek cancels it. The
+  floor ratchets to max(floor, recent app-seek target
+  within 8 s, position), resets to the position after a
+  user seek, and follows the position down inside the
+  3 s allow-backwards window a seek landing more than
+  1200 ms behind opens. Skip seeks go straight to the
+  backend and do NOT enter Task 19's user-seek verifier
+  (the settled Task 19 split); the policy's own landing
+  verification replaces it. Silence no longer rides the
+  SponsorBlock skip channel or its hit test; the
+  SponsorBlock flow is unchanged.
+- Progress delivery on the RMS fallback: Python delivers
+  progress only on its VAD path; the Rust scanner
+  delivers it on both — a deliberate superset the plan's
+  incremental requirement asks for.
+
+S17 — Settings gains Python's `range_cache_debug` toggle:
+a "Verbose range-cache proxy debug logs" checkbox on the
+Media Player page (appended at the page end — deviation
+(1) below), value from config (default false), saved
+beside `skip_silence`. The settings action in main.rs
+retunes the live proxy when the key changes (Python's
+mainframe behaviour; gated loads also retune as before).
+The runtime now consumes `RangeCacheConfig.debug`
+(previously read from config but never used): the origin
+probe emits one diagnostic line — redacted URL, redacted
+final URL, status, accept-ranges, content-range,
+content-type, content-length — and
+`rangecache::redact_url_for_log` ports Python's
+`core/utils.py` redactor exactly (credentials and queries
+stripped, googlevideo paths collapse to
+`/<signed-media-path>`, a `/<token>/proxy|file|transcode`
+path collapses to `/<capability>/<kind>`, scheme/host-less
+input is `<local-or-invalid-url>`). No headers are ever
+logged. Persistence and redaction are pinned by test.
+
+Tests (15 new, regression-first: the red run failed to
+compile on the missing APIs, and the two pre-existing
+finalize tests pinned the wrong shrink semantics before
+being corrected to Python's expansion): audit7_slice
+gains merge/pad arithmetic, both PCM detector fixtures
+(including the finalize quirks), the VAD fixture, four
+fake-ffmpeg scanner tests (incremental progress, headers
+only for http sources, pacing hold + abort release,
+cancellation leaves no surviving ffmpeg by heartbeat),
+five skip-policy tests (guards, hit arithmetic, cooldown
+and user-seek pause, floor and loop guard, landing
+verification) and the redaction/persistence test;
+batch3_slice's finalize expectations updated to
+expansion. Gate: fmt clean (run last), clippy clean
+(workspace --all-targets and core
+x86_64-pc-windows-gnu, -D warnings), 737 passed /
+0 failed (722 at the Task 20 base + 15 new),
+`cargo build -p blindrss` OK.
+
+Deviations, named: (1) The S17 checkbox is appended at
+the END of the Media Player page instead of Python's
+mid-page position after the VLC network-cache control —
+the append-only settings rule (tab order is screen-
+reader muscle memory); parity of function, not position.
+(2) Slider dragging has no true drag-start/end events in
+wxDragon: user slider events mark dragging and the tick
+clears it after 600 ms without one. (3) Low priority:
+Windows gets Python's CREATE_NO_WINDOW |
+BELOW_NORMAL_PRIORITY_CLASS creation flags; on Unix the
+scan does not renice (core carries no libc dependency) —
+pacing already throttles the scan's CPU to the lead
+window. (4) The remote judgement uses the resolved
+stream URL handed to the player (Python uses its
+current_url); loopback range-cache URLs read local
+under both. (5) The skip policy runs on the player's
+1 s tick; Python evaluates on a finer UI timer and arms
+250–4000 ms diagnostic seek probes — the probes are
+diagnostic-only in Python and are not ported; budgets,
+windows and thresholds are Python's, the pacing is
+coarser (the same class as Task 19's verifier
+deviation). (6) ffmpeg stderr is drained concurrently
+rather than after the loop (above): content and use are
+Python's, the timing differs. Owner listening checks
+(VAD versus RMS feel, skip landing accuracy on real
+episodes, remote-stream conservatism) remain Brandon's
+— unclaimed here.

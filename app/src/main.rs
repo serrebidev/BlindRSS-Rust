@@ -6858,6 +6858,9 @@ fn main() {
             let prior_soundcard = blindrss_core::config::Config::load(&config_path())
                 .map(|c| c.get_str("preferred_soundcard", "").to_string())
                 .unwrap_or_default();
+            let prior_range_debug = blindrss_core::config::Config::load(&config_path())
+                .map(|c| c.get_bool("range_cache_debug", false))
+                .unwrap_or(false);
             let intent = settings::show_settings(&frame_set, &config_path());
             apply_http_config();
             // Audit 8 G16: a global image-alt change
@@ -6886,6 +6889,20 @@ fn main() {
                 .unwrap_or_default();
             if now_soundcard != prior_soundcard {
                 crate::player::apply_preferred_soundcard(&now_soundcard);
+            }
+            // Audit 8 S17: a range_cache_debug change retunes
+            // the live range-cache proxy immediately (Python's
+            // mainframe does the same when the key changes in
+            // settings data). New loads also retune on the
+            // gate; this makes the toggle take effect without
+            // waiting for one.
+            let now_range_debug = blindrss_core::config::Config::load(&config_path())
+                .map(|c| c.get_bool("range_cache_debug", false))
+                .unwrap_or(false);
+            if now_range_debug != prior_range_debug
+                && let Ok(cfg_now) = blindrss_core::config::Config::load(&config_path())
+            {
+                blindrss_core::rangecache::retune_from_config(&cfg_now);
             }
             let path = db_path();
             if state_set.borrow().store_path != path {

@@ -429,6 +429,27 @@ impl Entry {
                     .get("content-length")
                     .and_then(|v| v.to_str().ok())
                     .and_then(|v| v.parse::<u64>().ok());
+                if self.cfg.debug {
+                    // S17 diagnostic (Python's HTTP seek probe
+                    // log line): URLs are redacted — signed
+                    // media URLs carry credentials in their
+                    // query strings.
+                    let accept_ranges = resp
+                        .headers()
+                        .get("accept-ranges")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("");
+                    eprintln!(
+                        "[range-cache] probe url={} final={} status={} accept_ranges={} content_range={} content_type={} content_length={}",
+                        redact_url_for_log(&self.url),
+                        redact_url_for_log(&final_url),
+                        status,
+                        accept_ranges,
+                        content_range,
+                        content_type,
+                        content_length.map(|v| v.to_string()).unwrap_or_default()
+                    );
+                }
                 let mut st = self.state.lock().unwrap();
                 if !final_url.is_empty() {
                     st.real_url = Some(final_url);
@@ -1190,6 +1211,56 @@ pub fn retune_from_config(cfg: &crate::config::Config) {
     let p = proxy();
     let new_cfg = RangeCacheConfig::from_app_config(cfg);
     *p.cfg.lock().unwrap() = new_cfg;
+}
+
+/// A diagnostic URL with credentials, queries and signed
+/// paths removed (Python `core/utils.py`
+/// `redact_url_for_log`): scheme + host + port survive, the
+/// query becomes `?<redacted>`, googlevideo paths collapse
+/// to `/<signed-media-path>`, and a capability path segment
+/// (`/<token>/proxy|file|transcode`) collapses to
+/// `/<capability>/<kind>`. Anything without a scheme and
+/// host is `<local-or-invalid-url>`.
+pub fn redact_url_for_log(url: &str) -> String {
+    let parsed = match url::Url::parse(url) {
+        Ok(p) => p,
+        Err(_) => {
+            return if url.contains("://") {
+                "<unparseable-url>".to_string()
+            } else {
+                "<local-or-invalid-url>".to_string()
+            };
+        }
+    };
+    let Some(host) = parsed.host_str() else {
+        return "<local-or-invalid-url>".to_string();
+    };
+    let host = host.to_lowercase();
+    let host_disp = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.clone()
+    };
+    let port = parsed.port().map(|p| format!(":{p}")).unwrap_or_default();
+    let mut path = if parsed.path().is_empty() {
+        "/".to_string()
+    } else {
+        parsed.path().to_string()
+    };
+    if host.ends_with("googlevideo.com") {
+        path = "/<signed-media-path>".to_string();
+    } else {
+        let segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+        if segments.len() >= 2 && matches!(segments[1], "proxy" | "file" | "transcode") {
+            path = format!("/<capability>/{}", segments[1]);
+        }
+    }
+    let suffix = if parsed.query().is_some() {
+        "?<redacted>"
+    } else {
+        ""
+    };
+    format!("{}://{host_disp}{port}{path}{suffix}", parsed.scheme())
 }
 
 // ---------------------------------------------------------------------

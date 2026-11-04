@@ -243,8 +243,13 @@ Python `core/casting.py`, in that order.
 - `equalizer.rs`: 10-band EQ band definitions (31.25 Hz…16 kHz,
   engine-set) and user-preset helpers. Band count and frequencies are
   fixed by the playback engine; do not invent a different grid.
-- `silence.rs`: ffmpeg RMS silence detection for Skip Silence (the
-  WebRTC VAD fallback position from Python; see PARITY.md).
+- `silence.rs`: Skip Silence (Audit 8 Task 21): ffmpeg decodes PCM
+  into the WebRTC VAD detector (libfvad via the `webrtc-vad` crate —
+  the same detector Python drives) with Python's RMS streaming
+  detector as the fallback when the VAD cannot serve the rate; the
+  scan is incremental, paced behind playback and cancellable, and
+  the guarded skip policy (resume/drag/seekable/cooldown/floor/
+  landing verification) lives here too. See PARITY.md.
 - `sponsorblock.rs`: SponsorBlock lookup uses only the hash-prefix
   endpoint (never the bare video id) and returns no segments on any
   failure.

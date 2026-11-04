@@ -1118,6 +1118,18 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
         cfg.get_bool("sounds_enabled", true),
     );
 
+    // Range-cache debug (Audit 8 S17, Python's "Verbose
+    // range-cache proxy debug logs" on its media panel):
+    // appended at the END of the Media Player page rather
+    // than Python's mid-page spot, so no existing control's
+    // tab position moves (append-only rule; see PARITY).
+    let range_cache_debug_cb = add_check(
+        &media.win,
+        &media.sizer,
+        "Verbose range-cache proxy debug logs",
+        cfg.get_bool("range_cache_debug", false),
+    );
+
     // ---- Provider page (Python's order: active provider, then
     // the per-provider panels in Python's panel order) ----
     // Active provider (Python's Provider page + factory.py):
@@ -1791,6 +1803,10 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
                 .collect();
             cfg.set_path("sponsorblock_categories", serde_json::json!(cats));
             cfg.set_path("skip_silence", serde_json::json!(silence_cb.is_checked()));
+            cfg.set_path(
+                "range_cache_debug",
+                serde_json::json!(range_cache_debug_cb.is_checked()),
+            );
             cfg.set_path(
                 "windows_notifications_enabled",
                 serde_json::json!(notif_cb.is_checked()),

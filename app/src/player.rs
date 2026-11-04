@@ -2,7 +2,8 @@
 //! article's media URL (direct or yt-dlp-resolved), with resume
 //! via the Python playback_state table, chapter navigation with
 //! announcements, playback-speed control, and segment skipping
-//! (SponsorBlock for YouTube, ffmpeg silence detection).
+//! (SponsorBlock for YouTube; Skip Silence via core's
+//! incremental, cancellable PCM scan — Audit 8 Task 21).
 //!
 //! Position is saved every second by the window timer, so closing
 //! the window at any point loses at most a second of progress.
@@ -27,6 +28,7 @@ use blindrss_core::playback::{
     chapter_prev_target, playback_speeds, saved_state, speed_index, speed_step,
 };
 use blindrss_core::player_session::{Activation, ChapterGate, PlayerSession, SessionIdentity};
+use blindrss_core::silence::{SilenceScanSettings, SilenceSkipPolicy, SkipContext};
 use blindrss_core::{Article, Db, PlaybackState};
 use std::cell::RefCell;
 use std::collections::HashSet;
@@ -157,10 +159,10 @@ fn dispatch_shortcut_accel(accel: &str) -> bool {
     SHORTCUT_DELEGATE.with(|d| d.borrow().as_ref().is_some_and(|f| f(accel)))
 }
 
-/// A range the player skips over, with its announcement label.
-/// `uuid` is the SponsorBlock segment UUID (empty for silence
-/// ranges): skipped SponsorBlock segments are remembered by
-/// UUID, as Python does, never by start time.
+/// A SponsorBlock range the player skips over, with its
+/// announcement label. Skipped segments are remembered by
+/// UUID, as Python does, never by start time. (Silence
+/// ranges live in the Task 21 policy state, not here.)
 #[derive(Clone)]
 struct SkipRange {
     start_ms: i64,
@@ -169,8 +171,8 @@ struct SkipRange {
     uuid: String,
 }
 
-/// The already-skipped key for a range: the SponsorBlock
-/// UUID when it has one, else its start time.
+/// The already-skipped key for a range: its SponsorBlock
+/// UUID (the start-time fallback is defensive only now).
 fn skip_key(range: &SkipRange) -> String {
     if range.uuid.is_empty() {
         format!("start:{}", range.start_ms)
@@ -218,9 +220,37 @@ struct PlayerState {
     skip_rx: std::sync::mpsc::Receiver<Vec<SkipRange>>,
     /// Ranges already skipped (Python's already-skipped
     /// guard: never skip the same range twice in a session).
-    /// SponsorBlock ranges key by segment UUID, silence
-    /// ranges by start time (see `skip_key`).
+    /// SponsorBlock ranges key by segment UUID (see
+    /// `skip_key`).
     skipped: HashSet<String>,
+    /// Skip Silence (Audit 8 Task 21, M09 — Python's silence
+    /// regions of gui/player.py): the guarded skip policy, the
+    /// published (padded) ranges, and the scan lifecycle. The
+    /// scan is QUEUED at load, started by the tick once
+    /// playback is under way past the configured delay, and
+    /// cancelled (ffmpeg killed and reaped) on every new
+    /// load, stop and close.
+    silence: SilenceSkipPolicy,
+    silence_ranges: Vec<(i64, i64)>,
+    silence_ready: bool,
+    /// Remote-media flag for the current load (Python's
+    /// startswith-http minus loopback test): selects the
+    /// conservative scan settings and skip windows.
+    silence_remote: bool,
+    silence_pending: Option<SilencePending>,
+    silence_scan: Option<SilenceScan>,
+    silence_rx: std::sync::mpsc::Receiver<SilenceScanMsg>,
+    /// Publish tunables resolved when the scan was queued.
+    silence_pad_ms: i64,
+    silence_gap_ms: i64,
+    silence_resume_backoff: i64,
+    silence_retrigger: i64,
+    /// Seek-slider drag state for the policy's drag guard:
+    /// set by user slider events, cleared by the tick after
+    /// a quiet interval (wxDragon exposes no drag-end event;
+    /// see PARITY Task 21).
+    silence_dragging: bool,
+    silence_drag_at: Option<std::time::Instant>,
     /// Chapter index at the last tick, for crossing announcements.
     last_chapter: Option<usize>,
     /// True while the tick sets the seek slider programmatically,
@@ -565,6 +595,12 @@ fn resume_verifier(target_ms: i64, stream: &str) -> SeekVerifier {
 fn begin_user_seek(state: &mut PlayerState, target_ms: i64) {
     state.stopped_needs_resume = false;
     state.seeked = true;
+    // The silence policy hears about user seeks too (Python
+    // `_note_user_seek`): skipping pauses, the position
+    // floor resets, landing verification cancels.
+    state
+        .silence
+        .note_user_seek(std::time::Instant::now(), state.silence_remote);
     let remote = state.stream.starts_with("http://") || state.stream.starts_with("https://");
     state.seek_verify = Some(SeekVerifier::for_user_seek(
         target_ms,
@@ -624,13 +660,139 @@ fn chapter_label(chapters: &[Chapter], idx: usize) -> String {
         .unwrap_or_else(|| format!("Chapter {}", idx + 1))
 }
 
-/// Spawn the SponsorBlock and silence workers for one article
-/// and return the channel their skip ranges arrive on. Called
-/// at open and again on every queue advance.
+/// A queued silence scan (Python's `_silence_scan_pending`):
+/// the stream to scan and the load generation it belongs to.
+struct SilencePending {
+    url: String,
+    generation: u64,
+    queued_at: std::time::Instant,
+}
+
+/// A running silence scan: its cancellation flag (the worker
+/// thread kills and reaps its ffmpeg child by it).
+struct SilenceScan {
+    abort: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Scan results returning from the worker thread, drained by
+/// the tick: incremental progress sets and the final result.
+enum SilenceScanMsg {
+    Progress(u64, Vec<(i64, i64)>),
+    Done(u64, Result<Vec<(i64, i64)>, String>),
+}
+
+/// Python's remote test for silence purposes: an http(s) URL
+/// that is not loopback.
+fn silence_remote(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    (lower.starts_with("http://") || lower.starts_with("https://"))
+        && !lower.contains("127.0.0.1")
+        && !lower.contains("localhost")
+}
+
+/// Queue the silence scan for a fresh load (Python
+/// `_queue_silence_scan`): only when Skip Silence is on and
+/// the URL is non-empty. The publish tunables resolve here,
+/// with the remote adjustments applied.
+fn queue_silence_scan(s: &mut PlayerState, cfg: &blindrss_core::config::Config, url: &str) {
+    if !cfg.get_bool("skip_silence", true) || url.is_empty() {
+        return;
+    }
+    s.silence_remote = silence_remote(url);
+    let settings = SilenceScanSettings::from_config(cfg, s.silence_remote);
+    s.silence_pad_ms = settings.padding_ms;
+    s.silence_gap_ms = settings.scan.merge_gap_ms;
+    s.silence_resume_backoff = settings.resume_backoff_ms;
+    s.silence_retrigger = settings.retrigger_backoff_ms;
+    let generation = SESSION_POLICY.with(|p| p.borrow().generation());
+    s.silence_pending = Some(SilencePending {
+        url: url.to_string(),
+        generation,
+        queued_at: std::time::Instant::now(),
+    });
+}
+
+/// Cancel any running or queued silence scan and clear all
+/// of its state (Python `_cancel_silence_scan`, which also
+/// clears the skip policy's fields).
+fn cancel_silence_scan(s: &mut PlayerState) {
+    if let Some(scan) = &s.silence_scan {
+        scan.abort.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    s.silence_scan = None;
+    let (_, rx) = std::sync::mpsc::channel();
+    s.silence_rx = rx;
+    s.silence_pending = None;
+    s.silence_ranges.clear();
+    s.silence_ready = false;
+    s.silence.reset();
+    s.silence_dragging = false;
+    s.silence_drag_at = None;
+}
+
+/// Start the queued scan on its worker thread (Python
+/// `_start_silence_scan`): ffmpeg decodes the stream and
+/// core's scanner paces behind the playback position,
+/// publishing incremental results on the channel. Playback
+/// request headers ride along, as Python passes them.
+fn start_silence_scan(
+    s: &mut PlayerState,
+    cfg: &blindrss_core::config::Config,
+    seek_pos: &std::sync::Arc<std::sync::atomic::AtomicI64>,
+) {
+    let Some(pending) = s.silence_pending.take() else {
+        return;
+    };
+    let Some(ffmpeg) = blindrss_core::silence::find_ffmpeg() else {
+        return;
+    };
+    let settings = SilenceScanSettings::from_config(cfg, s.silence_remote);
+    let mut scan_cfg = settings.scan;
+    scan_cfg.headers = s.headers.clone();
+    scan_cfg.default_user_agent = blindrss_core::user_agents::resolve_from_config(cfg);
+    let abort = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (tx, rx) = std::sync::mpsc::channel();
+    s.silence_rx = rx;
+    s.silence_scan = Some(SilenceScan {
+        abort: abort.clone(),
+    });
+    let generation = pending.generation;
+    let url = pending.url;
+    let pos = seek_pos.clone();
+    std::thread::spawn(move || {
+        let tx_progress = tx.clone();
+        let mut progress = move |ranges: &[(i64, i64)], _scanned: i64| -> bool {
+            tx_progress
+                .send(SilenceScanMsg::Progress(generation, ranges.to_vec()))
+                .is_ok()
+        };
+        let result = blindrss_core::silence::scan_silence(
+            &ffmpeg,
+            &url,
+            &scan_cfg,
+            &abort,
+            &|| Some(pos.load(std::sync::atomic::Ordering::Relaxed)),
+            &mut progress,
+        );
+        let msg = match result {
+            Ok(ranges) => SilenceScanMsg::Done(generation, Ok(ranges)),
+            Err(blindrss_core::silence::ScanError::Cancelled) => {
+                SilenceScanMsg::Done(generation, Err("cancelled".to_string()))
+            }
+            Err(e) => SilenceScanMsg::Done(generation, Err(format!("{e:?}"))),
+        };
+        let _ = tx.send(msg);
+    });
+}
+
+/// Spawn the SponsorBlock worker for one article and return
+/// the channel its skip ranges arrive on. Called at open and
+/// again on every queue advance. Silence has its own
+/// lifecycle above (Task 21) — it no longer rides this
+/// channel.
 fn spawn_skip_workers(
     cfg: &blindrss_core::config::Config,
     article: &Article,
-    stream_url: &str,
 ) -> std::sync::mpsc::Receiver<Vec<SkipRange>> {
     let (skip_tx, skip_rx) = std::sync::mpsc::channel::<Vec<SkipRange>>();
     // Python skip_categories: empty when SponsorBlock is
@@ -672,37 +834,6 @@ fn spawn_skip_workers(
             });
         }
     }
-    if cfg.get_bool("skip_silence", true) && blindrss_core::silence::find_ffmpeg().is_some() {
-        let threshold = cfg_f64(cfg, "silence_skip_threshold_db", -38.0);
-        let min_silence = cfg.get_i64("silence_skip_min_ms", 700) as f64 / 1000.0;
-        // Python's merge/pad tunables (defaults 260 / 60 ms,
-        // matching core's DEFAULT_* constants).
-        let merge_gap = cfg.get_i64("silence_skip_merge_gap_ms", 260) as f64 / 1000.0;
-        let padding = cfg.get_i64("silence_skip_padding_ms", 60) as f64 / 1000.0;
-        let url = stream_url.to_string();
-        let tx = skip_tx.clone();
-        std::thread::spawn(move || {
-            if let Ok(ranges) = blindrss_core::silence::detect_silence_tuned(
-                &url,
-                threshold,
-                min_silence,
-                merge_gap,
-                padding,
-            ) {
-                let ranges = ranges
-                    .iter()
-                    .map(|(s, e)| SkipRange {
-                        start_ms: (s * 1000.0) as i64,
-                        end_ms: (e * 1000.0) as i64,
-                        label: "Skipped silence".to_string(),
-                        uuid: String::new(),
-                    })
-                    .collect();
-                let _ = tx.send(ranges);
-            }
-        });
-    }
-
     skip_rx
 }
 
@@ -1180,6 +1311,10 @@ impl SessionControl {
             s.headers = Vec::new();
             s.skips.clear();
             s.skipped.clear();
+            // A new load retires the old item's silence scan
+            // (Python cancels at load): kill its ffmpeg, drop
+            // its published ranges, reset the skip policy.
+            cancel_silence_scan(&mut s);
             s.last_chapter = None;
             let (_, rx) = std::sync::mpsc::channel();
             s.skip_rx = rx;
@@ -1245,10 +1380,14 @@ impl SessionControl {
         headers: Vec<(String, String)>,
     ) {
         let cfg = blindrss_core::config::Config::load(&crate::config_path()).unwrap_or_default();
-        let skip_rx = spawn_skip_workers(&cfg, article, &stream_url);
+        let skip_rx = spawn_skip_workers(&cfg, article);
         {
             let mut s = self.state.borrow_mut();
             s.skip_rx = skip_rx;
+            // Queue (do not start) this load's silence scan:
+            // the tick starts it once playback is under way
+            // (Python's queue-then-start scheduling, M09).
+            queue_silence_scan(&mut s, &cfg, &stream_url);
             s.saved_position_ms = Db::open(&s.db_path)
                 .ok()
                 .and_then(|db| saved_state(&db, &article.id, &article.url).ok().flatten())
@@ -1556,6 +1695,7 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
     // starts senderless; the tick's drain treats a disconnected
     // channel as "no ranges yet".
     let (_, skip_rx) = std::sync::mpsc::channel();
+    let (_, silence_rx) = std::sync::mpsc::channel();
     let (chapter_tx, chapter_rx) = std::sync::mpsc::channel();
     let (write_tx, write_confirm_rx) = spawn_write_worker(db_path.clone());
     let state = Rc::new(RefCell::new(PlayerState {
@@ -1578,6 +1718,19 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
         skips: Vec::new(),
         skip_rx,
         skipped: HashSet::new(),
+        silence: SilenceSkipPolicy::new(),
+        silence_ranges: Vec::new(),
+        silence_ready: false,
+        silence_remote: false,
+        silence_pending: None,
+        silence_scan: None,
+        silence_rx,
+        silence_pad_ms: 60,
+        silence_gap_ms: 260,
+        silence_resume_backoff: 360,
+        silence_retrigger: 1400,
+        silence_dragging: false,
+        silence_drag_at: None,
         last_chapter: None,
         slider_guard: false,
         last_playing: None,
@@ -1680,6 +1833,9 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
         m.stop();
         let mut s = st.borrow_mut();
         s.autoplay_active = false;
+        // Stop cancels the silence scan too (Python's stop
+        // path calls `_cancel_silence_scan`).
+        cancel_silence_scan(&mut s);
         if had_stream {
             s.snapshot.state = "Stopped".to_string();
         }
@@ -2248,6 +2404,15 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
             if st.borrow().slider_guard {
                 return;
             }
+            // A user slider event marks a drag in progress
+            // for the silence policy (Python's
+            // `_is_dragging_slider` guard); the tick clears
+            // it after a quiet interval.
+            {
+                let mut s = st.borrow_mut();
+                s.silence_dragging = true;
+                s.silence_drag_at = Some(std::time::Instant::now());
+            }
             let len = m.length();
             if len > 0 {
                 let target = len * ev.get_value() as i64 / 1000;
@@ -2307,6 +2472,7 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
         seek_pos_t.store(pos, std::sync::atomic::Ordering::Relaxed);
         seek_len_t.store(len, std::sync::atomic::Ordering::Relaxed);
         let mut seek_to: Option<(i64, String)> = None;
+        let mut reseek_to: Option<i64> = None;
         let mut queue_load = None;
         let mut queue_error: Option<String> = None;
         {
@@ -2397,13 +2563,18 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
                             };
                             s.skips.clear();
                             s.skipped.clear();
+                            // The advance retires the old
+                            // entry's silence scan and queues
+                            // the new entry's (Task 21).
+                            cancel_silence_scan(&mut s);
                             s.last_chapter = None;
                             let cfg2 = blindrss_core::config::Config::load(&crate::config_path())
                                 .unwrap_or_default();
                             s.resume = ResumePolicy::from_config(&cfg2);
                             s.last_save = std::time::Instant::now();
                             s.last_saved_pos = -1;
-                            s.skip_rx = spawn_skip_workers(&cfg2, &entry, &stream);
+                            s.skip_rx = spawn_skip_workers(&cfg2, &entry);
+                            queue_silence_scan(&mut s, &cfg2, &stream);
                             s.saved_position_ms = Db::open(&s.db_path)
                                 .ok()
                                 .and_then(|db| {
@@ -2452,6 +2623,70 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
             while let Ok(ranges) = s.skip_rx.try_recv() {
                 s.skips.extend(ranges);
             }
+            // Silence scan results (Task 21): progress sets
+            // publish incrementally — padded and gap-merged
+            // exactly like Python's `_publish` — and a set
+            // arriving for a stale generation aborts the scan
+            // instead of applying.
+            while let Ok(msg) = s.silence_rx.try_recv() {
+                match msg {
+                    SilenceScanMsg::Progress(generation, raw) => {
+                        if SESSION_POLICY.with(|p| p.borrow().is_current(generation)) {
+                            s.silence_ranges = blindrss_core::silence::pad_and_merge_ms(
+                                raw,
+                                s.silence_pad_ms,
+                                s.silence_gap_ms,
+                            );
+                            s.silence_ready = true;
+                        } else if let Some(scan) = &s.silence_scan {
+                            scan.abort.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                    SilenceScanMsg::Done(generation, result) => {
+                        s.silence_scan = None;
+                        if SESSION_POLICY.with(|p| p.borrow().is_current(generation)) {
+                            match result {
+                                Ok(raw) => {
+                                    s.silence_ranges = blindrss_core::silence::pad_and_merge_ms(
+                                        raw,
+                                        s.silence_pad_ms,
+                                        s.silence_gap_ms,
+                                    );
+                                    s.silence_ready = true;
+                                }
+                                Err(e) => {
+                                    if e != "cancelled" {
+                                        eprintln!("[silence-scan] {e}");
+                                    }
+                                    // Python keeps any ranges
+                                    // progress already
+                                    // published; with none,
+                                    // ready stays false.
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // Start the queued scan once playback is under
+            // way and the configured delay since the load has
+            // passed (Python `_maybe_start_pending_silence_
+            // scan`); a queue entry whose load has gone stale
+            // is dropped.
+            if s.silence_pending.is_some() && s.silence_scan.is_none() {
+                let pending = s.silence_pending.as_ref().unwrap();
+                let (pending_gen, queued_at) = (pending.generation, pending.queued_at);
+                if !SESSION_POLICY.with(|p| p.borrow().is_current(pending_gen)) {
+                    s.silence_pending = None;
+                } else if m.get_state() == MediaState::Playing {
+                    let cfg_t = blindrss_core::config::Config::load(&crate::config_path())
+                        .unwrap_or_default();
+                    let settings = SilenceScanSettings::from_config(&cfg_t, s.silence_remote);
+                    if queued_at.elapsed().as_secs_f64() >= settings.scan_delay_s {
+                        start_silence_scan(&mut s, &cfg_t, &seek_pos_t);
+                    }
+                }
+            }
             // Verified seek drive (M05): the armed verifier —
             // resume restore or user-seek guard — observes the
             // backend's real position once a second. It waits
@@ -2469,6 +2704,11 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
                 );
                 if let Some(target) = step.seek_to {
                     m.seek(target, SeekMode::FromStart);
+                    // The silence policy's floor hears about
+                    // app seeks too (Python routes them all
+                    // through `_apply_seek_time_ms`).
+                    s.silence
+                        .note_app_seek(target, pos, std::time::Instant::now());
                 }
                 if let Some(supported) = step.learn_seek_supported {
                     queue_seek_supported(&s, supported);
@@ -2490,6 +2730,49 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
                     s.seeked = true;
                 }
             }
+            // Silence skip policy (Task 21, M09): verify the
+            // last skip landed, ratchet the position floor,
+            // then evaluate Python's guards (resume pending,
+            // slider drag, unseekable, cooldown, floor). The
+            // policy's seeks are its own: they do NOT enter
+            // the user-seek guard above (Task 19's settled
+            // split) — the policy verifies landings itself.
+            {
+                let now = std::time::Instant::now();
+                let remote = s.silence_remote;
+                if let Some(target) = s.silence.verify_tick(pos, now, remote) {
+                    s.silence.note_app_seek(target, pos, now);
+                    reseek_to = Some(target);
+                }
+                s.silence.update_floor(pos, now);
+                if s.silence_dragging
+                    && s.silence_drag_at.is_some_and(|t| {
+                        now.duration_since(t) > std::time::Duration::from_millis(600)
+                    })
+                {
+                    s.silence_dragging = false;
+                }
+                if m.get_state() == MediaState::Playing {
+                    let ranges = s.silence_ranges.clone();
+                    let ctx = SkipContext {
+                        ready: s.silence_ready,
+                        seekable: m.is_seekable(),
+                        resume_pending: s
+                            .seek_verify
+                            .as_ref()
+                            .is_some_and(|v| v.kind() == SeekKind::Resume),
+                        dragging: s.silence_dragging,
+                        casting: false,
+                        is_remote: s.silence_remote,
+                        resume_backoff_ms: s.silence_resume_backoff,
+                        retrigger_backoff_ms: s.silence_retrigger,
+                    };
+                    if let Some(target) = s.silence.evaluate(&ranges, pos, now, &ctx) {
+                        s.silence.note_app_seek(target, pos, now);
+                        seek_to = Some((target, "Skipped silence".to_string()));
+                    }
+                }
+            }
             let hit = s
                 .skips
                 .iter()
@@ -2497,7 +2780,7 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
                     // SponsorBlock ranges follow Python's
                     // segment_at: the last half second does
                     // not count, and a segment is done by
-                    // UUID. Silence ranges keep their tail.
+                    // UUID.
                     let tail_ms = if r.uuid.is_empty() { 250 } else { 500 };
                     pos >= r.start_ms
                         && pos < r.end_ms - tail_ms
@@ -2557,6 +2840,12 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
             m.seek(end, SeekMode::FromStart);
             frame_tick.set_status_text(&label, 0);
             crate::announce("sponsor_skip", &label);
+        }
+        if let Some(target) = reseek_to {
+            // The silence policy's landing re-seek: silent,
+            // at most once per skip (Python's
+            // silence_skip_verify seek).
+            m.seek(target, SeekMode::FromStart);
         }
         if let Some((stream, title, headers)) = queue_load {
             // No "Now playing" announcement: the advance is a
@@ -2790,6 +3079,10 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
             if !s.stream.is_empty() {
                 save_position(&s, &media, false);
             }
+            // Shutdown cancels the silence scan (Python's
+            // player shutdown does the same): no ffmpeg
+            // outlives the window.
+            cancel_silence_scan(&mut s);
             // The main window's live status ends with the
             // session: its field clears on the next poll.
             s.snapshot = PlaybackSnapshot::default();

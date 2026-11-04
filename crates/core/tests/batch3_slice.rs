@@ -68,11 +68,17 @@ fn silencedetect_parsing_and_merge() {
 ";
     let raw = parse_silencedetect(stderr);
     assert_eq!(raw, vec![(10.0, 12.0), (12.2, 14.0)]);
-    // The 0.2s gap merges (<= 0.26), then 60ms padding per side.
+    // Python's publish arithmetic (Audit 8 M09): padding
+    // EXPANDS each range by 60 ms per side first, then ranges
+    // separated by at most the 260 ms merge gap merge — the
+    // expanded first two (gap 0.08 after padding) become one.
     let merged = finalize_ranges(raw, 0.26, 0.06);
     assert_eq!(merged.len(), 1);
-    assert!((merged[0].0 - 10.06).abs() < 1e-9);
-    assert!((merged[0].1 - 13.94).abs() < 1e-9);
-    // A 0.7s sliver disappears entirely under padding.
-    assert!(finalize_ranges(vec![(5.0, 5.1)], 0.26, 0.06).is_empty());
+    assert!((merged[0].0 - 9.94).abs() < 1e-9);
+    assert!((merged[0].1 - 14.06).abs() < 1e-9);
+    // A short range grows under padding; it never vanishes.
+    assert_eq!(
+        finalize_ranges(vec![(5.0, 5.1)], 0.26, 0.06),
+        vec![(4.94, 5.16)]
+    );
 }
