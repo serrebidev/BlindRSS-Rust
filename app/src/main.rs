@@ -68,26 +68,75 @@ fn app_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-/// Resolve the data directory the way Python's ConfigManager does:
-/// the user dir wins when config.json exists there, then the app
-/// folder when config.json exists beside the executable, otherwise
-/// the user dir (which may not exist yet).
+/// True for the Program Files Windows installer distribution
+/// (Python's `is_windows_installed_build`): Windows plus the
+/// `.windows-installed` marker beside the executable. The Rust
+/// binary is always a built executable, so `sys.frozen` has no
+/// separate counterpart.
+fn windows_installed_build() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        app_dir().join(".windows-installed").is_file()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        false
+    }
+}
+
+/// Resolve the data directory the way Python's ConfigManager does
+/// (`core/config.py::_resolve_config_path`): installed Windows
+/// builds always use user data; when config.json exists in both
+/// locations the newer one wins; a single existing config wins;
+/// otherwise the platform default (user data on installed Windows
+/// builds and macOS, the app folder elsewhere). Installed Windows
+/// builds first seed the user location from a legacy app-folder
+/// config (Python's `_prepare_windows_installed_data`).
 fn data_dir() -> PathBuf {
-    let user = user_data_dir();
-    if user.join("config.json").exists() {
-        return user;
+    let user_config = user_data_dir().join("config.json");
+    let app_config = app_dir().join("config.json");
+    if windows_installed_build() {
+        blindrss_core::config::copy_file_if_missing(&app_config, &user_config);
     }
-    let app = app_dir();
-    if app.join("config.json").exists() {
-        return app;
-    }
-    user
+    let default_is_user = windows_installed_build() || cfg!(target_os = "macos");
+    let resolved = blindrss_core::config::resolve_config_path(
+        &user_config,
+        &app_config,
+        windows_installed_build(),
+        default_is_user,
+    );
+    resolved
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(user_data_dir)
 }
 
 fn config_path() -> PathBuf {
     std::env::var("BLINDRSS_CONFIG")
         .map(PathBuf::from)
         .unwrap_or_else(|_| data_dir().join("config.json"))
+}
+
+/// Map a stored `last_selected_feed` value (shared Python format,
+/// Audit 8 G20) to the startup state: the Rust tree selection and
+/// the read filter. Python's Favorites and Deleted views have no
+/// node in the Rust tree (Deleted is a dialog), so they restore
+/// as the All view; the stored value itself is left untouched in
+/// the config until the user selects a view.
+fn restored_view_state(raw: &str) -> (Option<String>, u8) {
+    let view = blindrss_core::config::decode_remembered_view(raw);
+    let selected = match view.view_id.as_deref() {
+        Some("favorites:all") | Some("deleted:all") => None,
+        other => other.map(|s| s.to_string()),
+    };
+    (selected, view.read_filter)
+}
+
+/// The shared-format value to store for a tree selection (Audit 8
+/// G20): the inverse of [`restored_view_state`]'s decode, via
+/// core's Python-compatible encoder.
+fn remembered_view_value(selected: Option<&str>, read_filter: u8) -> String {
+    blindrss_core::config::encode_remembered_view(selected, read_filter)
 }
 
 /// Append one line to blindrss.log in the data dir (startup and
@@ -2935,7 +2984,14 @@ fn main() {
             if st.remember_last_feed {
                 let last = cfg.get_str("last_selected_feed", "");
                 if !last.is_empty() {
-                    st.selected_feed = Some(last.to_string());
+                    // Shared-format decode (Audit 8 G20): a
+                    // Python-written `category:` id and an
+                    // `unread:`/`read:` filter prefix restore the
+                    // category view and the read filter instead of
+                    // being treated as a feed id / ignored.
+                    let (selected, read_filter) = restored_view_state(last);
+                    st.selected_feed = selected;
+                    st.read_filter = read_filter;
                 }
             }
         }
@@ -2972,7 +3028,10 @@ fn main() {
             st.selected_feed = filter;
             st.focus_list = false;
             if st.remember_last_feed {
-                let value = st.selected_feed.clone().unwrap_or_default();
+                // Store in the shared Python format (Audit 8
+                // G20), wrapping the current read filter the way
+                // Python's _commit_tree_selection does.
+                let value = remembered_view_value(st.selected_feed.as_deref(), st.read_filter);
                 let path = config_path();
                 let mut cfg = blindrss_core::config::Config::load(&path).unwrap_or_default();
                 if cfg.get_str("last_selected_feed", "") != value {
@@ -8878,6 +8937,31 @@ mod ui_parity_tests {
         );
         assert!(!has_direct_media_link(&a));
         assert_eq!(article_copy_url(&a), a.url);
+    }
+
+    #[test]
+    fn python_remembered_views_restore_through_app_routing() {
+        // Audit 8 G20: Python-written category + filter prefix.
+        let (selected, filter) = restored_view_state("unread:category:News / Tech");
+        assert_eq!(selected.as_deref(), Some("cat:News / Tech"));
+        assert_eq!(filter, 1);
+        let (selected, filter) = restored_view_state("read:feed-42");
+        assert_eq!(selected.as_deref(), Some("feed-42"));
+        assert_eq!(filter, 2);
+        // Python's special views have no Rust tree node: All view,
+        // and the stored value is not rewritten by restoring.
+        let (selected, filter) = restored_view_state("deleted:all");
+        assert_eq!(selected, None);
+        assert_eq!(filter, 0);
+        let (selected, _) = restored_view_state("favorites:all");
+        assert_eq!(selected, None);
+        // Saving a Rust selection writes the Python format.
+        assert_eq!(
+            remembered_view_value(Some("cat:News / Tech"), 1),
+            "unread:category:News / Tech"
+        );
+        assert_eq!(remembered_view_value(None, 0), "all");
+        assert_eq!(remembered_view_value(Some("smart:7"), 1), "smart:7");
     }
 
     #[test]

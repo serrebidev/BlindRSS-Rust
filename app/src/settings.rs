@@ -1317,6 +1317,27 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
         .with_label(&format!("Data folder: {}", crate::data_dir().display()))
         .build();
     storage_group.add(&data_loc, 0, SizerFlag::All, 4);
+    // Storage location picker (Python's Advanced page, Audit 8
+    // S11): the current location is the one the running config
+    // actually resolved to. Saving a different choice moves
+    // config.json (core change_data_location); the database
+    // migrates on the next startup, as in Python.
+    let storage_is_user = config_path.parent() == Some(crate::user_data_dir().as_path());
+    let storage_choice = add_choice(
+        &advanced.win,
+        &storage_group,
+        "Storage Location:",
+        &["User Data Folder", "App Install Folder"],
+        if storage_is_user { 0 } else { 1 },
+    );
+    let storage_paths = StaticText::builder(&advanced.win)
+        .with_label(&format!(
+            "User Data Folder path: {}\nApp Install Folder path: {}",
+            crate::user_data_dir().join("config.json").display(),
+            crate::app_dir().join("config.json").display()
+        ))
+        .build();
+    storage_group.add(&storage_paths, 0, SizerFlag::All, 4);
     let updates_group = advanced.group(&crate::tr("Updates"));
     let auto_install_cb = add_check(
         &advanced.win,
@@ -1477,6 +1498,52 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
         let path_s = cfg_path_buf.clone();
         std::rc::Rc::new(move || {
             let mut cfg = cfg_s.borrow_mut();
+            // Storage relocation first (Audit 8 S11): Python
+            // applies a data_location change before the other
+            // writes so they land in the new file. The database
+            // migrates on the next startup. On failure Python
+            // warns and the remaining settings still save to the
+            // old file.
+            let chosen_location = if storage_choice.get_selection() == Some(0) {
+                "user_data"
+            } else {
+                "app_folder"
+            };
+            let current_location = if path_s.parent() == Some(crate::user_data_dir().as_path()) {
+                "user_data"
+            } else {
+                "app_folder"
+            };
+            let mut save_path = path_s.clone();
+            if chosen_location != current_location {
+                match cfg.change_data_location(
+                    &path_s,
+                    chosen_location,
+                    &crate::user_data_dir().join("config.json"),
+                    &crate::app_dir().join("config.json"),
+                    crate::windows_installed_build(),
+                ) {
+                    Ok(new_path) => {
+                        save_path = new_path;
+                        let md = MessageDialog::builder(
+                            &dialog_s,
+                            "Config has been moved. The feed database will be migrated to the new location the next time BlindRSS starts.",
+                            "Storage Location Changed",
+                        )
+                        .with_style(
+                            MessageDialogStyle::OK | MessageDialogStyle::IconInformation,
+                        )
+                        .build();
+                        md.show_modal();
+                    }
+                    Err(e) => {
+                        let md = MessageDialog::builder(&dialog_s, &e, "Storage Location")
+                            .with_style(MessageDialogStyle::OK | MessageDialogStyle::IconWarning)
+                            .build();
+                        md.show_modal();
+                    }
+                }
+            }
             if let Some(sel) = active_choice.get_selection()
                 && let Some(name) = blindrss_core::provider::PROVIDER_NAMES.get(sel as usize)
             {
@@ -1818,7 +1885,7 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
                 "cache_full_text",
                 serde_json::json!(cache_full_text_cb.is_checked()),
             );
-            let _ = cfg.save(&path_s);
+            let _ = cfg.save(&save_path);
             // Apply the OS registration when the login setting
             // changed (Python applies it on settings save and
             // reverts the stored key when registration fails).
@@ -1827,7 +1894,7 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
                 && let Err(e) = crate::startup::set_enabled(login_new)
             {
                 cfg.set_path("start_on_windows_login", serde_json::json!(startup_was));
-                let _ = cfg.save(&path_s);
+                let _ = cfg.save(&save_path);
                 let md = MessageDialog::builder(
                     &dialog_s,
                     &format!("Could not update the startup setting: {e}"),

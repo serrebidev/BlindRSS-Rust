@@ -1985,3 +1985,74 @@ Before closing an Audit 8 ID, add its failing reproduction, fix, application
 caller coverage and actual check results here. Screen-reader/platform/hardware
 acceptance remains separately pending where required. Historical resolutions
 above are preserved as history and must not override this outstanding register.
+
+### Audit 8 Task 1 resolution — atomic configuration and shared location/view identity (S02, S11, G20)
+
+Reproduction first (recorded before the fix): a regression asserting that a
+blocked sibling temp write fails the save failed against the old direct
+`fs::write` in `Config::save` (the save succeeded and overwrote the live
+file), and the new S11/G20 core APIs did not exist (compile errors for
+`choose_config_path`, `Config::change_data_location`,
+`decode_remembered_view` / `encode_remembered_view`).
+
+- **S02 — closed.** `Config::save` now goes through core
+  `config::atomic_write`, mirroring Python `core/config.py::save_config`:
+  the serialized config is written, flushed and fsynced into a sibling
+  `<path>.tmp`, then renamed over the live file; any failure removes the
+  temp and returns an error, leaving the complete old config in place.
+  Unknown fields survive saves (the raw object is still preserved), and
+  Python's `json.load` reopens a Rust-saved file (verified by hand on the
+  regression fixtures). Every existing `Config::save` caller — settings,
+  tree selection, shortcuts, provider writes — inherits the behaviour.
+- **S11 — closed.** Core gained `choose_config_path` /
+  `resolve_config_path` implementing Python's `_resolve_config_path`
+  (installed Windows builds always user data; both locations present →
+  the newer wins, ties to user data; one present → that one; neither →
+  platform default: user data for installed Windows builds and macOS,
+  app folder otherwise) and `Config::change_data_location` implementing
+  `change_data_location` (sets `data_location`, atomically writes at the
+  new location, removes the old file, leaves everything untouched and
+  returns an error when the write fails, and refuses `app_folder` on
+  installed Windows builds). The app resolves its data directory through
+  `resolve_config_path` (`app/src/main.rs::data_dir`, with the
+  `.windows-installed` marker check and Python's seed-if-missing copy
+  for installed builds via `copy_file_if_missing`); the database keeps
+  its identity through the existing copy-across in `base_db_path` on the
+  next startup, as Python does. Settings' Advanced page now carries
+  Python's Storage Location choice plus both candidate paths (appended
+  inside the existing Data Storage Location group, page/control order
+  otherwise unchanged); saving a different choice relocates first with
+  Python's moved/warning dialogs, and a failed relocation still saves
+  the remaining settings to the old file. The in-config `data_location`
+  key is written by relocation; resolution itself is path/mtime based,
+  exactly like Python's resolver, so no startup rewrite was added.
+- **G20 — closed.** Core `decode_remembered_view` /
+  `encode_remembered_view` implement the shared `last_selected_feed`
+  format from `gui/mainframe.py`: optional `unread:`/`read:` prefix,
+  `category:<path>`, `favorites:all`, `deleted:all`, `smart:<id>`,
+  `all`, or a feed id; the encoder never wraps smart folders or the
+  Deleted view. Legacy Rust values (`cat:<path>`, bare ids) decode too.
+  App routing: startup restore (`restored_view_state`) now restores the
+  category view AND the read filter from a Python-written value instead
+  of treating it as a feed id and resetting the filter, and tree
+  selection saves through `remembered_view_value` so Rust-written
+  state is Python-readable. Python's Favorites and Deleted have no
+  node in the Rust tree (Deleted is a dialog), so those two restore as
+  the All view; the stored value is not rewritten by restoring, only
+  by an actual selection change — recorded here as the one behavioural
+  difference inside this ID.
+
+Evidence: `crates/core/tests/config_compat_slice.rs` (10 tests: blocked
+temp write and failed replace keep the old config, successful save
+leaves no temp and preserves unknown fields, both timestamp orders and
+the tie/single/neither/installed cases for location choice, relocation
+round trip preserving fields, relocation failure keeping the old file
+and key, installed-Windows restriction, seed-copy never overwriting,
+Python view-ID decode and full encode round trips) plus app unit tests
+`python_remembered_views_restore_through_app_routing` in
+`app/src/main.rs`. Gate for this batch: `cargo fmt --all`,
+`cargo clippy --workspace --all-targets -- -D warnings`,
+`cargo test --workspace`, `cargo build -p blindrss` (results in the
+batch commit message / PR notes). A manual restart after a successful
+location change (plan Task 1) remains owner-side acceptance, as does
+the NVDA pass over the Settings Advanced page.
