@@ -226,6 +226,178 @@ fn id3_v24_synchsafe_frames() {
     let _ = std::fs::remove_file(&path);
 }
 
+// ---------------------------------------------------------------------
+// Audit 8 Task 14 investigation: ID3 extended headers and
+// unsynchronisation. Ground truth established against mutagen (the
+// parser Python uses) on these exact byte shapes: extended-header
+// tags and unsynchronised tags both parse fully there.
+// ---------------------------------------------------------------------
+
+fn id3_tag_flagged(body: &[u8], version: u8, flags: u8) -> Vec<u8> {
+    let mut tag = Vec::new();
+    tag.extend_from_slice(b"ID3");
+    tag.push(version);
+    tag.push(0);
+    tag.push(flags);
+    tag.extend_from_slice(&synchsafe(body.len()));
+    tag.extend_from_slice(body);
+    tag
+}
+
+fn unsynchronise(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for b in data {
+        out.push(*b);
+        if *b == 0xFF {
+            out.push(0);
+        }
+    }
+    out
+}
+
+#[test]
+fn id3_v23_extended_header_is_skipped() {
+    // Extended header: 4-byte size (6, excluding itself), 2 flag
+    // bytes, 4 padding-size bytes; frames follow it.
+    let mut body = Vec::new();
+    body.extend_from_slice(&6u32.to_be_bytes());
+    body.extend_from_slice(&[0, 0]);
+    body.extend_from_slice(&[0, 0, 0, 0]);
+    body.extend(text_frame("TIT2", "Ext Episode", false));
+    body.extend(uslt_frame("Notes behind an extended header.", false));
+    let path = temp_mp3(&id3_tag_flagged(&body, 3, 0x40));
+    let (title, _author, content) = id3_metadata(&path).expect("extended-header metadata");
+    assert_eq!(title, "Ext Episode");
+    assert!(
+        content.contains("Notes behind an extended header."),
+        "{content}"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn id3_v24_extended_header_is_skipped() {
+    // v2.4 extended header size is synchsafe and includes itself:
+    // 4 size bytes + 1 flag-count byte + 1 flag byte = 6.
+    let mut body = Vec::new();
+    body.extend_from_slice(&synchsafe(6));
+    body.push(1);
+    body.push(0);
+    body.extend(text_frame("TIT2", "Ext Four", true));
+    body.extend(uslt_frame("Notes in a v24 extended header tag.", true));
+    let path = temp_mp3(&id3_tag_flagged(&body, 4, 0x40));
+    let (title, _author, content) = id3_metadata(&path).expect("v24 extended-header metadata");
+    assert_eq!(title, "Ext Four");
+    assert!(
+        content.contains("Notes in a v24 extended header tag."),
+        "{content}"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn id3_v23_unsynchronised_tag_is_decoded() {
+    // TIT2 in Latin-1: "AÿB" — the 0xFF is stored stuffed as
+    // 0xFF 0x00 under the tag unsynchronisation flag, and the
+    // frame size describes the de-unsynchronised payload.
+    let mut tit2 = Vec::new();
+    tit2.extend_from_slice(b"TIT2");
+    tit2.extend_from_slice(&4u32.to_be_bytes());
+    tit2.extend_from_slice(&[0, 0]);
+    tit2.extend_from_slice(&[0x00, b'A', 0xFF, b'B']);
+    let mut frames = tit2;
+    frames.extend(uslt_frame("Unsync notes here.", false));
+    let stored = unsynchronise(&frames);
+    let path = temp_mp3(&id3_tag_flagged(&stored, 3, 0x80));
+    let (title, _author, content) = id3_metadata(&path).expect("unsync metadata");
+    assert_eq!(title, "A\u{FF}B");
+    assert!(content.contains("Unsync notes here."), "{content}");
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn id3_v24_frame_unsync_and_datalen_flags() {
+    // Per-frame v2.4 flags: second flag byte 0x02 = this frame's
+    // payload is unsynchronised (size counts the stored bytes);
+    // 0x01 = a 4-byte data-length indicator precedes the payload.
+    let payload = vec![0x00, b'A', 0xFF, b'B'];
+    let stored_payload = unsynchronise(&payload);
+    let mut tit2 = Vec::new();
+    tit2.extend_from_slice(b"TIT2");
+    tit2.extend_from_slice(&synchsafe(stored_payload.len()));
+    tit2.extend_from_slice(&[0, 0x02]);
+    tit2.extend_from_slice(&stored_payload);
+    let mut uslt_payload = Vec::new();
+    uslt_payload.extend_from_slice(&[3u8]);
+    uslt_payload.extend_from_slice(b"eng");
+    uslt_payload.push(0);
+    uslt_payload.extend_from_slice(b"Flagged frame notes.");
+    let mut uslt = Vec::new();
+    uslt.extend_from_slice(b"USLT");
+    uslt.extend_from_slice(&synchsafe(uslt_payload.len() + 4));
+    uslt.extend_from_slice(&[0, 0x01]);
+    uslt.extend_from_slice(&(uslt_payload.len() as u32).to_be_bytes());
+    uslt.extend_from_slice(&uslt_payload);
+    let mut frames = tit2;
+    frames.extend(uslt);
+    let path = temp_mp3(&id3_tag_flagged(&frames, 4, 0));
+    let (title, _author, content) = id3_metadata(&path).expect("flagged-frame metadata");
+    assert_eq!(title, "A\u{FF}B");
+    assert!(content.contains("Flagged frame notes."), "{content}");
+    let _ = std::fs::remove_file(&path);
+}
+
+/// zlib stream of the USLT payload [enc=3]["eng"][0]"Compressed
+/// show notes for the episode." — generated once with Python's
+/// zlib (the same codec mutagen uses) and pinned as bytes.
+const COMPRESSED_USLT_ZLIB: &[u8] = &[
+    120, 156, 99, 78, 205, 75, 103, 112, 206, 207, 45, 40, 74, 45, 46, 78, 77, 81, 40, 206, 200,
+    47, 87, 200, 203, 47, 73, 45, 86, 72, 203, 47, 82, 40, 201, 72, 85, 72, 45, 200, 44, 206, 79,
+    73, 213, 3, 0, 78, 44, 15, 124,
+];
+
+#[test]
+fn id3_v24_compressed_frame_is_inflated() {
+    // v2.4 COMPRESS (0x08): a 4-byte data-length indicator, then
+    // the zlib stream; the frame size counts the stored bytes.
+    let mut frame_data = Vec::new();
+    frame_data.extend_from_slice(&synchsafe(43));
+    frame_data.extend_from_slice(COMPRESSED_USLT_ZLIB);
+    let mut uslt = Vec::new();
+    uslt.extend_from_slice(b"USLT");
+    uslt.extend_from_slice(&synchsafe(frame_data.len()));
+    uslt.extend_from_slice(&[0, 0x08]);
+    uslt.extend_from_slice(&frame_data);
+    let path = temp_mp3(&id3_tag_flagged(&uslt, 4, 0));
+    let (_title, _author, content) = id3_metadata(&path).expect("compressed v24 metadata");
+    assert!(
+        content.contains("Compressed show notes for the episode."),
+        "{content}"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn id3_v23_compressed_frame_is_inflated() {
+    // v2.3 COMPRESS (second flag byte 0x80): a 4-byte big-endian
+    // decompressed-size prefix, then the zlib stream.
+    let mut frame_data = Vec::new();
+    frame_data.extend_from_slice(&43u32.to_be_bytes());
+    frame_data.extend_from_slice(COMPRESSED_USLT_ZLIB);
+    let mut uslt = Vec::new();
+    uslt.extend_from_slice(b"USLT");
+    uslt.extend_from_slice(&(frame_data.len() as u32).to_be_bytes());
+    uslt.extend_from_slice(&[0, 0x80]);
+    uslt.extend_from_slice(&frame_data);
+    let path = temp_mp3(&id3_tag_flagged(&uslt, 3, 0));
+    let (_title, _author, content) = id3_metadata(&path).expect("compressed v23 metadata");
+    assert!(
+        content.contains("Compressed show notes for the episode."),
+        "{content}"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
 #[test]
 fn id3_no_notes_is_none() {
     let mut frames = Vec::new();

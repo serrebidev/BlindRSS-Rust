@@ -15,8 +15,7 @@
 //! Deliberate divergences from Python, kept small and listed in
 //! PARITY.md: `data:` URLs are dropped by the scheme allowlist (Python
 //! passes them through; in practice they are tracking pixels and
-//! placeholders), and the socast/forum/publisher reconstructions feed
-//! the text reader only — the rich node pick is the generic one.
+//! placeholders).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
@@ -754,6 +753,166 @@ fn convert_social_embeds(html: &str, base_url: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Body reconstructions (Python _publisher_body_reconstruct /
+// _socast_reconstruct): layouts with no single node holding the
+// whole body are rebuilt before the generic pick.
+// ---------------------------------------------------------------------------
+
+/// Strict containment over the element scan (an element never
+/// contains itself or an identical twin span).
+fn elem_contains(outer: &Elem, inner: &Elem) -> bool {
+    outer.start < inner.start && inner.end <= outer.end
+}
+
+const PUBLISHER_JUNK_CLASSES: &[&str] = &[
+    "ars-interlude-container",
+    "page-anchor-wrapper",
+    "articlesByTag",
+    "google-ad",
+    "wp-block-ziff-davis-exco-video",
+    "zd-disqus",
+    "articleAuthorBioFooter-container",
+    "zd-post-footer-pattern",
+];
+
+const SOCAST_JUNK_TOKENS: &[&str] = &[
+    "items-wrapper",
+    "bnl-pp-happening",
+    "bnl-info",
+    "bnl-title",
+    "bnl-content",
+    "pp-more-wrapper",
+    "wpb_raw",
+    "sc-author",
+    "entry-footer",
+    "entry-meta",
+    "report_an_error",
+    "highlight-text",
+    "scwidgetcontainer",
+    "sc-item-detail",
+    "parallax-breakout",
+    "pp-btn-container",
+];
+
+/// Replace elements carrying `class` by their inner HTML
+/// (BeautifulSoup `unwrap`).
+fn unwrap_class(html: &str, class: &str) -> String {
+    let elems = all_elements(html);
+    let edits: Vec<(usize, usize, String)> = elems
+        .iter()
+        .filter(|e| has_class(e.open(html), class))
+        .map(|e| (e.start, e.end, e.inner(html).to_string()))
+        .collect();
+    apply_edits(html, edits)
+}
+
+/// Python `_publisher_body_reconstruct`: keep verified publisher
+/// body containers instead of heuristic excerpts. The containers
+/// must live inside an <article>; junk widgets inside them are
+/// decomposed and ZDNet's related-stories flow is unwrapped (it
+/// wraps real prose beside a related-video widget).
+fn publisher_body_fragment(html: &str, url: &str) -> Option<String> {
+    let host_full = crate::extract::host_of(url);
+    let host = host_full.split(':').next().unwrap_or("");
+    let host = host.strip_prefix("www.").unwrap_or(host);
+    let (tag, class): (Option<&str>, &str) = match host {
+        "arstechnica.com" => (Some("div"), "post-content"),
+        "theregister.com" | "theregister.co.uk" => (None, "bodytext"),
+        "macrumors.com" => (None, "js-content"),
+        "zdnet.com" => (None, "entry-content"),
+        _ => return None,
+    };
+    let elems = all_elements(html);
+    let article = elems.iter().find(|e| e.name == "article")?;
+    let matched: Vec<&Elem> = elems
+        .iter()
+        .filter(|e| {
+            tag.map(|t| t == e.name).unwrap_or(true)
+                && has_class(e.open(html), class)
+                && elem_contains(article, e)
+        })
+        .collect();
+    // Nested body wrappers belong to their outer section; move
+    // each only once.
+    let parts: Vec<&Elem> = matched
+        .iter()
+        .copied()
+        .filter(|p| !matched.iter().any(|other| elem_contains(other, p)))
+        .collect();
+    if parts.is_empty() {
+        return None;
+    }
+    let mut frag: String = parts.iter().map(|p| &html[p.start..p.end]).collect();
+    frag = drop_elements(&frag, &|open, _, _| {
+        PUBLISHER_JUNK_CLASSES.iter().any(|c| has_class(open, c))
+    });
+    frag = unwrap_class(&frag, "zd-related-stories-flow");
+    if leaf_text(&frag).trim().is_empty() {
+        return None;
+    }
+    Some(format!("<article>{frag}</article>"))
+}
+
+/// Python `_socast_reconstruct`: merge a socast split story body
+/// into one fragment, junk removed. The body is split across
+/// multiple <article class="mainArticle"> elements (lead plus
+/// continuations), plus any lead wrapper that sits outside a
+/// mainArticle in the theme variant layout.
+fn socast_fragment(html: &str) -> Option<String> {
+    let elems = all_elements(html);
+    let is_main_article = |e: &Elem| e.name == "article" && has_class(e.open(html), "mainArticle");
+    let mut candidates: Vec<&Elem> = Vec::new();
+    for lead in elems
+        .iter()
+        .filter(|e| e.name == "div" && has_class(e.open(html), "wpb-content-wrapper"))
+    {
+        let ancestors: Vec<&Elem> = elems.iter().filter(|a| elem_contains(a, lead)).collect();
+        if ancestors.iter().any(|a| is_main_article(a)) {
+            continue;
+        }
+        // find_parent("article"): the nearest article ancestor.
+        let parent = ancestors
+            .iter()
+            .filter(|a| a.name == "article")
+            .max_by_key(|a| a.start)
+            .copied();
+        candidates.push(parent.unwrap_or(lead));
+    }
+    candidates.extend(elems.iter().filter(|e| is_main_article(e)));
+    // Dedup and drop nested containers so nothing is included
+    // twice (a kept ancestor covers its descendants; a later,
+    // larger candidate evicts what it contains).
+    let mut parts: Vec<&Elem> = Vec::new();
+    for el in candidates {
+        if parts
+            .iter()
+            .any(|kept| (kept.start == el.start && kept.end == el.end) || elem_contains(kept, el))
+        {
+            continue;
+        }
+        parts.retain(|kept| !elem_contains(el, kept));
+        parts.push(el);
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    let mut frag: String = parts.iter().map(|p| &html[p.start..p.end]).collect();
+    frag = drop_elements(&frag, &|open, _, _| {
+        let ident = format!(
+            "{} {}",
+            attr_value(open, "class").unwrap_or_default(),
+            attr_value(open, "id").unwrap_or_default()
+        )
+        .to_lowercase();
+        !ident.trim().is_empty() && SOCAST_JUNK_TOKENS.iter().any(|t| ident.contains(t))
+    });
+    if char_len(&leaf_text(&frag)) < 200 {
+        return None;
+    }
+    Some(format!("<article>{frag}</article>"))
+}
+
+// ---------------------------------------------------------------------------
 // Main-node pick (Python _pick_main_node)
 // ---------------------------------------------------------------------------
 
@@ -828,18 +987,47 @@ pub fn clean_article_html(html: &str, url: &str, use_traf_prune: bool) -> String
     if html.is_empty() {
         return String::new();
     }
-    // Forum threads are rebuilt before the generic main-node pick —
-    // a thread is a flat list of sibling posts and the pick lands on
-    // a single one (Python `_forum_reconstruct`). A rebuilt body is
+    // CSS-only quizzes go first: the trafilatura prune below reads
+    // the page too, and its ground-truth text would otherwise
+    // vouch for the quiz's paragraphs (Python does the same).
+    let quiz_stripped = crate::extract::strip_css_quizzes(html);
+    let html = &quiz_stripped;
+    // Some layouts have no single node that holds the whole body,
+    // so it is rebuilt before the generic pick, in Python's order:
+    // publisher body containers, socast/Pattison-portal split
+    // stories, then forum threads (a flat list of sibling posts —
+    // the generic pick lands on a single one). A rebuilt body is
     // exempt from the trafilatura prune, whose keep-text reflects
     // only the part generic extraction picked.
-    let forum_frag = crate::forum_sources::forum_thread_html_for(url, html);
-    let keep_text = if use_traf_prune && forum_frag.is_none() {
+    let url_low = url.to_lowercase();
+    let publisher_frag = if [
+        "arstechnica.com",
+        "theregister.",
+        "macrumors.com",
+        "zdnet.com",
+    ]
+    .iter()
+    .any(|h| url_low.contains(h))
+    {
+        publisher_body_fragment(html, url)
+    } else {
+        None
+    };
+    let rebuilt = publisher_frag
+        .or_else(|| {
+            if crate::extract::is_socast_page(html) {
+                socast_fragment(html)
+            } else {
+                None
+            }
+        })
+        .or_else(|| crate::forum_sources::forum_thread_html_for(url, html));
+    let keep_text = if use_traf_prune && rebuilt.is_none() {
         article_keep_text(html, url)
     } else {
         String::new()
     };
-    let mut frag = forum_frag.unwrap_or_else(|| pick_main_fragment(html));
+    let mut frag = rebuilt.unwrap_or_else(|| pick_main_fragment(html));
 
     // Social embeds first, so the passes below keep the resulting
     // iframe/anchor nodes.
@@ -1091,6 +1279,7 @@ fn normalize_media_srcs(html: &str, base_url: &str) -> String {
             continue;
         }
         let open = &html[tok.start..tok.end];
+        let mut new_open = open.to_string();
         let mut src = attr_value(open, "src");
         if src.as_deref().unwrap_or("").is_empty() {
             src = attr_value(open, "data-src");
@@ -1098,16 +1287,48 @@ fn normalize_media_srcs(html: &str, base_url: &str) -> String {
         if src.as_deref().unwrap_or("").is_empty() && tok.name == "img" {
             src = attr_value(open, "data-lazy-src");
         }
-        let Some(src) = src.filter(|s| !s.trim().is_empty()) else {
-            continue;
-        };
-        let new_src = normalize_media_url(&absolutize(&src, base_url));
-        let new_open = set_attr(open, "src", &new_src);
+        if let Some(src) = src.filter(|s| !s.trim().is_empty()) {
+            let new_src = normalize_media_url(&absolutize(&src, base_url));
+            new_open = set_attr(&new_open, "src", &new_src);
+        }
+        // Python `_absolutize_srcset` in the same attribute pass:
+        // ammonia rewrites href/src against the base but passes
+        // srcset through untouched, so the candidates are
+        // absolutized here (img/source carry the attribute).
+        if matches!(tok.name.as_str(), "img" | "source")
+            && let Some(srcset) = attr_value(open, "srcset").filter(|s| !s.trim().is_empty())
+        {
+            let new_srcset = absolutize_srcset(&srcset, base_url);
+            if new_srcset != srcset {
+                new_open = set_attr(&new_open, "srcset", &new_srcset);
+            }
+        }
         if new_open != open {
             edits.push((tok.start, tok.end, new_open));
         }
     }
     apply_edits(html, edits)
+}
+
+/// Python `_absolutize_srcset`: absolutize each candidate URL,
+/// keeping its descriptor (`480w`, `2x`, ...).
+fn absolutize_srcset(value: &str, base_url: &str) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for chunk in value.split(',') {
+        let chunk = chunk.trim();
+        if chunk.is_empty() {
+            continue;
+        }
+        match chunk.find(|c: char| c.is_whitespace()) {
+            Some(pos) => {
+                let url = absolutize(&chunk[..pos], base_url);
+                let descriptor = chunk[pos..].trim_start();
+                parts.push(format!("{url} {descriptor}"));
+            }
+            None => parts.push(absolutize(chunk, base_url)),
+        }
+    }
+    parts.join(", ")
 }
 
 /// Set attribute `name` to `value` in an open tag's source (replacing

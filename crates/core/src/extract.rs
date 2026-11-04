@@ -17,7 +17,7 @@
 //!   silently dropped (the Heise case Python itself fails today).
 
 use regex::Regex;
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -242,19 +242,164 @@ fn blocks(html: &str, tag: &str, open_hint: &str) -> Vec<String> {
     out
 }
 
+/// Fix `word ,` spacing left by tag-boundary joins (Python's
+/// `re.sub(r"\s+([,.;:!?])", r"\1", ...)` in the fragment readers).
+fn fix_punct_spacing(text: &str) -> String {
+    static PUNCT_RE: OnceLock<Regex> = OnceLock::new();
+    let re = PUNCT_RE.get_or_init(|| Regex::new(r"\s+([,.;:!?])").unwrap());
+    re.replace_all(text, "$1").to_string()
+}
+
+/// Python `_html_fragment_to_text`: convert a trusted CMS HTML
+/// body fragment into paragraph text — leaf block elements
+/// (p/li/headings/blockquote) become paragraphs; embed loaders
+/// and tracking markup never reach the text.
+fn html_fragment_to_text(fragment: &str) -> String {
+    let (cleaned, _) = remove_elements(fragment, &|name, _| {
+        matches!(name, "script" | "style" | "noscript" | "template")
+    });
+    let spans = element_spans(&cleaned);
+    let blocks: Vec<&NamedSpan> = spans
+        .iter()
+        .filter(|s| {
+            matches!(
+                s.name.as_str(),
+                "p" | "li" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "blockquote"
+            )
+        })
+        .collect();
+    let mut paras: Vec<String> = Vec::new();
+    for block in &blocks {
+        // Skip container blocks (a blockquote wrapping <p>s);
+        // keep the leaf blocks.
+        let is_container = spans
+            .iter()
+            .any(|s| (s.name == "p" || s.name == "li") && block.contains(s));
+        if is_container {
+            continue;
+        }
+        let text = fix_punct_spacing(&crate::postprocess::normalize_whitespace(
+            &html_to_text_raw(block.inner(&cleaned), false),
+        ));
+        if !text.is_empty() {
+            paras.push(text);
+        }
+    }
+    if !paras.is_empty() {
+        return paras.join("\n\n");
+    }
+    crate::postprocess::normalize_whitespace(&html_to_text_raw(&cleaned, false))
+}
+
+/// Python `_extract_article_paragraph_text`: the visible <p>
+/// paragraphs of the page's <article> (else <main>), for JSON-LD
+/// lead comparison.
+fn article_paragraph_text(html: &str) -> String {
+    let spans = element_spans(html);
+    let container = spans
+        .iter()
+        .find(|s| s.name == "article")
+        .or_else(|| spans.iter().find(|s| s.name == "main"));
+    let Some(container) = container else {
+        return String::new();
+    };
+    let mut paras: Vec<String> = Vec::new();
+    for p in spans
+        .iter()
+        .filter(|s| s.name == "p" && container.contains(s))
+    {
+        let text = fix_punct_spacing(&crate::postprocess::normalize_whitespace(
+            &html_to_text_raw(p.inner(html), false),
+        ));
+        if !text.is_empty() {
+            paras.push(text);
+        }
+    }
+    paras.join("\n\n")
+}
+
+/// Python `_prepend_missing_lead`: re-attach opening paragraphs
+/// that only `alt` captured to `base`, when `alt` then lines up
+/// with the very start of `base` — the alignment requirement is
+/// what keeps unrelated prose from being prepended.
+fn prepend_missing_lead(base: &str, alt: &str) -> String {
+    let base_norm = para_key(base);
+    if base_norm.is_empty() {
+        return base.to_string();
+    }
+    let base_head: String = base_norm.chars().take(400).collect();
+    let mut leads: Vec<String> = Vec::new();
+    let mut aligned = false;
+    for p in crate::postprocess::split_paragraphs(alt).iter().take(4) {
+        let pn = para_key(p);
+        if pn.is_empty() {
+            continue;
+        }
+        let snippet: String = pn.chars().take(60).collect();
+        if base_head.contains(&snippet) {
+            aligned = true;
+            break;
+        }
+        if base_norm.contains(&pn) {
+            // Present deeper in base: base is not simply missing
+            // its head; don't guess.
+            break;
+        }
+        if leads.len() >= 2 {
+            break;
+        }
+        if !is_reasonable_lead_paragraph(p) {
+            break;
+        }
+        leads.push(p.clone());
+    }
+    if !aligned || leads.is_empty() {
+        return base.to_string();
+    }
+    let mut parts = leads;
+    parts.push(base.to_string());
+    crate::postprocess::normalize_whitespace(&parts.join("\n\n"))
+}
+
+/// Python `_patch_json_ld_missing_lead`.
+fn patch_json_ld_missing_lead(json_text: &str, alts: &[&str]) -> String {
+    let mut patched = crate::postprocess::normalize_whitespace(json_text);
+    for alt in alts {
+        if !alt.is_empty() {
+            let alt_norm = crate::postprocess::normalize_whitespace(alt);
+            patched = prepend_missing_lead(&patched, &alt_norm);
+        }
+    }
+    patched
+}
+
 /// JSON-LD articleBody recovery (Python `_extract_json_ld_text`):
-/// longest `articleBody`/`text` string in any ld+json block, >= 120
-/// chars, markup stripped.
+/// longest `articleBody`/`text` value in any ld+json block, at
+/// least 120 chars. Markup bodies keep their paragraph structure
+/// and any standfirst before the first tag; plain bodies are
+/// entity-decoded; leaked script code is stripped before the
+/// length comparison so junk cannot win on bulk.
 fn json_ld_text(html: &str) -> String {
     fn collect(v: &serde_json::Value, out: &mut Vec<String>) {
         match v {
             serde_json::Value::Object(map) => {
-                for (k, val) in map {
-                    if (k == "articleBody" || k == "text")
-                        && let Some(s) = val.as_str()
-                    {
-                        out.push(s.to_string());
+                for field in ["articleBody", "text"] {
+                    match map.get(field) {
+                        Some(serde_json::Value::String(s)) => out.push(s.clone()),
+                        Some(serde_json::Value::Array(items)) => {
+                            let joined = items
+                                .iter()
+                                .filter_map(|i| i.as_str())
+                                .collect::<Vec<_>>()
+                                .join(" ");
+                            if !joined.is_empty() {
+                                out.push(joined);
+                            }
+                        }
+                        _ => {}
                     }
+                }
+                for val in map.values() {
                     collect(val, out);
                 }
             }
@@ -269,7 +414,9 @@ fn json_ld_text(html: &str) -> String {
     static ESCAPED_BLOCK_RE: OnceLock<Regex> = OnceLock::new();
     let escaped_blocks =
         ESCAPED_BLOCK_RE.get_or_init(|| Regex::new(r"(?i)&lt;/(?:p|h[1-6]|li)&gt;").unwrap());
-    let mut best = String::new();
+    static FIRST_TAG_RE: OnceLock<Regex> = OnceLock::new();
+    let first_tag_re = FIRST_TAG_RE.get_or_init(|| Regex::new(r"(?i)<[a-z][^>]*>").unwrap());
+    let mut cleaned: Vec<String> = Vec::new();
     for raw in blocks(html, "script", "application/ld+json") {
         let Ok(data) = serde_json::from_str::<serde_json::Value>(raw.trim()) else {
             continue;
@@ -277,22 +424,46 @@ fn json_ld_text(html: &str) -> String {
         let mut candidates = Vec::new();
         collect(&data, &mut candidates);
         for mut c in candidates {
-            // Several block closers distinguish escaped markup from prose mentioning a tag.
-            if !tag_tokens(&c).iter().any(|tag| !tag.close)
-                && escaped_blocks.find_iter(&c).take(3).count() == 3
-            {
-                c = unescape_entities(&c);
+            let mut first_tag = first_tag_re.find(&c).map(|m| m.start());
+            if first_tag.is_none() && escaped_blocks.find_iter(&c).take(3).count() == 3 {
+                // The markup itself is entity-escaped; unescaped
+                // once, it is ordinary markup. Several block
+                // closers are required so prose mentioning a tag
+                // stays prose.
+                c = decode_entities_full(&c);
+                first_tag = first_tag_re.find(&c).map(|m| m.start());
             }
-            let text = if c.contains('<') {
-                fragment_to_text(&c)
-            } else {
-                unescape_entities(&c)
+            let c = match first_tag {
+                Some(pos) => {
+                    // Some publishers (notably Sky News) put the
+                    // standfirst directly before the first <p>:
+                    // preserve that leading text, then read the
+                    // fragment as paragraphs.
+                    let prefix =
+                        decode_entities_full(&crate::postprocess::normalize_whitespace(&c[..pos]));
+                    let fragment_text = html_fragment_to_text(&c[pos..]);
+                    [prefix, fragment_text]
+                        .into_iter()
+                        .filter(|p| !p.is_empty())
+                        .collect::<Vec<_>>()
+                        .join("\n\n")
+                }
+                None => decode_entities_full(&c),
             };
-            let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
-            if text.chars().count() >= 120 && text.chars().count() > best.chars().count() {
-                best = text;
+            let t = crate::postprocess::strip_embedded_script_code(
+                &crate::postprocess::normalize_whitespace(&c),
+            );
+            if !t.is_empty() {
+                cleaned.push(t);
             }
         }
+    }
+    let best = cleaned
+        .into_iter()
+        .max_by_key(|t| t.chars().count())
+        .unwrap_or_default();
+    if best.chars().count() < 120 {
+        return String::new();
     }
     best
 }
@@ -553,6 +724,184 @@ pub(crate) fn find_elements(
         }
     }
     out
+}
+
+/// One balanced element (nested included), in the same shape as
+/// article_html's private scanner: byte spans for the whole
+/// element and its inner content. Sorted by (start, end desc), so
+/// an ancestor always precedes its descendants.
+#[derive(Clone)]
+pub(crate) struct NamedSpan {
+    pub(crate) name: String,
+    pub(crate) start: usize,
+    pub(crate) open_end: usize,
+    pub(crate) inner_start: usize,
+    pub(crate) inner_end: usize,
+    pub(crate) end: usize,
+}
+
+impl NamedSpan {
+    pub(crate) fn open<'a>(&self, html: &'a str) -> &'a str {
+        &html[self.start..self.open_end]
+    }
+    pub(crate) fn inner<'a>(&self, html: &'a str) -> &'a str {
+        &html[self.inner_start..self.inner_end]
+    }
+    /// True when `other` lies strictly inside this element.
+    pub(crate) fn contains(&self, other: &NamedSpan) -> bool {
+        self.start <= other.start
+            && other.end <= self.end
+            && (self.start, self.end) != (other.start, other.end)
+    }
+}
+
+/// All elements in the document (BeautifulSoup-shaped view).
+pub(crate) fn element_spans(html: &str) -> Vec<NamedSpan> {
+    let toks = tag_tokens(html);
+    let mut out: Vec<NamedSpan> = Vec::new();
+    let mut stack: Vec<NamedSpan> = Vec::new();
+    for tok in &toks {
+        if tok.close {
+            if let Some(pos) = stack.iter().rposition(|e| e.name == tok.name) {
+                while stack.len() > pos + 1 {
+                    let mut e = stack.pop().unwrap();
+                    e.inner_end = tok.start;
+                    e.end = tok.start;
+                    out.push(e);
+                }
+                let mut e = stack.pop().unwrap();
+                e.inner_end = tok.start;
+                e.end = tok.end;
+                out.push(e);
+            }
+            continue;
+        }
+        let e = NamedSpan {
+            name: tok.name.clone(),
+            start: tok.start,
+            open_end: tok.end,
+            inner_start: tok.end,
+            inner_end: tok.end,
+            end: tok.end,
+        };
+        if tok.self_closing {
+            out.push(e);
+        } else {
+            stack.push(e);
+        }
+    }
+    for mut e in stack {
+        e.inner_end = html.len();
+        e.end = html.len();
+        out.push(e);
+    }
+    out.sort_by_key(|e| (e.start, std::cmp::Reverse(e.end)));
+    out
+}
+
+/// Remove the given (start, end) spans; spans nested inside an
+/// earlier removal are dropped with it.
+pub(crate) fn remove_spans(html: &str, mut spans: Vec<(usize, usize)>) -> String {
+    if spans.is_empty() {
+        return html.to_string();
+    }
+    spans.sort_by_key(|(s, e)| (*s, std::cmp::Reverse(*e)));
+    let mut out = String::with_capacity(html.len());
+    let mut pos = 0usize;
+    for (s, e) in spans {
+        if s < pos {
+            continue;
+        }
+        out.push_str(&html[pos..s]);
+        pos = e;
+    }
+    out.push_str(&html[pos..]);
+    out
+}
+
+// ---------------------------------------------------------------------------
+// CSS-only quiz removal (Python utils.strip_css_quizzes, v2.5.7).
+// These widgets (How-To Geek's div.vq) answer through radio inputs
+// and :checked rules, so every question, explanation and score
+// panel is ordinary section/p text no extractor can tell from
+// prose. Their stable signal is several radio groups in one
+// container. Runs before any extraction in both readers.
+// ---------------------------------------------------------------------------
+
+const QUIZ_MIN_RADIO_GROUPS: usize = 3;
+const QUIZ_PAGE_WRAPPERS: &[&str] = &["html", "body", "main", "article", "form"];
+
+/// Remove embedded CSS-only quizzes from a page. Returns `html`
+/// untouched (byte-identical) when no quiz can be present: fewer
+/// than three distinct radio group names on the page, or every
+/// candidate container is a page wrapper / holds the article.
+pub fn strip_css_quizzes(html: &str) -> String {
+    if html.is_empty() {
+        return html.to_string();
+    }
+    static RADIO_TAG_RE: OnceLock<Regex> = OnceLock::new();
+    let radio_tag_re = RADIO_TAG_RE
+        .get_or_init(|| Regex::new(r#"(?i)<input\b[^>]*\btype\s*=\s*["']?radio\b[^>]*>"#).unwrap());
+    static INPUT_NAME_RE: OnceLock<Regex> = OnceLock::new();
+    let input_name_re =
+        INPUT_NAME_RE.get_or_init(|| Regex::new(r#"(?i)\bname\s*=\s*["']?([^"'\s>]+)"#).unwrap());
+    let mut page_names: HashSet<String> = HashSet::new();
+    for tag in radio_tag_re.find_iter(html) {
+        if let Some(cap) = input_name_re.captures(tag.as_str()) {
+            page_names.insert(cap[1].to_string());
+        }
+    }
+    if page_names.len() < QUIZ_MIN_RADIO_GROUPS {
+        return html.to_string();
+    }
+    let spans = element_spans(html);
+    // Group radio inputs by their direct parent element (the
+    // innermost containing span); radios with no parent element
+    // belong to the document root, a page wrapper by definition.
+    let mut groups: HashMap<Option<usize>, HashSet<String>> = HashMap::new();
+    for input in spans.iter().filter(|s| s.name == "input") {
+        let open = input.open(html);
+        let is_radio = attr_value(open, "type")
+            .map(|t| t.eq_ignore_ascii_case("radio"))
+            .unwrap_or(false);
+        if !is_radio {
+            continue;
+        }
+        let Some(name) = attr_value(open, "name").filter(|n| !n.is_empty()) else {
+            continue;
+        };
+        let parent = spans
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.contains(input))
+            .min_by_key(|(_, s)| s.end - s.start)
+            .map(|(i, _)| i);
+        groups.entry(parent).or_default().insert(name);
+    }
+    let mut removals: Vec<(usize, usize)> = Vec::new();
+    for (parent, names) in &groups {
+        if names.len() < QUIZ_MIN_RADIO_GROUPS {
+            continue;
+        }
+        let Some(parent) = parent.map(|i| &spans[i]) else {
+            continue; // the document root is a page wrapper
+        };
+        if QUIZ_PAGE_WRAPPERS.contains(&parent.name.as_str()) {
+            continue;
+        }
+        // A container holding the article body is not the widget.
+        let holds_article = spans
+            .iter()
+            .any(|s| (s.name == "article" || s.name == "main") && parent.contains(s));
+        if holds_article {
+            continue;
+        }
+        removals.push((parent.start, parent.end));
+    }
+    if removals.is_empty() {
+        return html.to_string();
+    }
+    remove_spans(html, removals)
 }
 
 const VOID_TAGS: &[&str] = &[
@@ -864,7 +1213,7 @@ const SOCAST_JUNK_CLASS_TOKENS: &[&str] = &[
 
 /// Python `_is_socast_page`: socast / Pattison-portals radio-CMS
 /// article pages (split-body layout).
-fn is_socast_page(html: &str) -> bool {
+pub(crate) fn is_socast_page(html: &str) -> bool {
     let low = html.to_lowercase();
     if low.contains("socastsrm.com") {
         return true;
@@ -1538,47 +1887,277 @@ fn para_key(p: &str) -> String {
         .to_lowercase()
 }
 
-/// Python's lead recovery, lean form: when the precision pass
-/// dropped the article's opening paragraphs, the recall pass
-/// usually kept them. Prepend recall paragraphs that come before
-/// the precision text's first paragraph and are absent from it
-/// (at most three, each substantial). Python's full version also
-/// matches the meta description against an allowlist; that depth
-/// stays on the parity list.
-fn recover_lead(precision: &str, recall: &str) -> String {
-    let prec_paras: Vec<&str> = precision
-        .split("\n\n")
-        .map(|p| p.trim())
-        .filter(|p| !p.is_empty())
-        .collect();
-    let rec_paras: Vec<&str> = recall
-        .split("\n\n")
-        .map(|p| p.trim())
-        .filter(|p| !p.is_empty())
-        .collect();
-    let Some(first_prec) = prec_paras.first() else {
-        return precision.to_string();
-    };
-    let first_key = para_key(first_prec);
-    let Some(pos) = rec_paras
-        .iter()
-        .position(|p| para_key(p).starts_with(&first_key[..first_key.len().min(120)]))
-    else {
-        return precision.to_string();
-    };
-    if pos == 0 || pos > 3 {
-        return precision.to_string();
+/// Decode HTML entities in an attribute value (BeautifulSoup
+/// decodes them while parsing; `attr_value` returns raw text).
+fn decode_entities_full(s: &str) -> String {
+    if !s.contains('&') {
+        return s.to_string();
     }
-    let prec_keys: Vec<String> = prec_paras.iter().map(|p| para_key(p)).collect();
-    let lead: Vec<&str> = rec_paras[..pos]
-        .iter()
-        .copied()
-        .filter(|p| p.chars().count() >= 40 && !prec_keys.contains(&para_key(p)))
-        .collect();
-    if lead.is_empty() {
-        return precision.to_string();
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(pos) = rest.find('&') {
+        out.push_str(&rest[..pos]);
+        let tail = &rest[pos + 1..];
+        let Some(end) = tail.find(';') else {
+            out.push('&');
+            rest = tail;
+            continue;
+        };
+        let entity = &tail[..end];
+        match decode_entity(entity) {
+            Some(decoded) => {
+                out.push_str(&decoded);
+                rest = &tail[end + 1..];
+            }
+            None => {
+                out.push('&');
+                rest = tail;
+            }
+        }
     }
-    format!("{}\n\n{}", lead.join("\n\n"), precision)
+    out.push_str(rest);
+    out
+}
+
+/// Python `_extract_meta_content`: the first `<meta>` matching
+/// every (attr, value) pair of the first candidate that yields a
+/// non-empty stripped `content`.
+fn first_meta_content(html: &str, candidates: &[(&str, &str)]) -> String {
+    let spans = element_spans(html);
+    let metas: Vec<&NamedSpan> = spans.iter().filter(|s| s.name == "meta").collect();
+    for (attr, value) in candidates {
+        for meta in &metas {
+            let open = meta.open(html);
+            if attr_value(open, attr).as_deref() == Some(value) {
+                let content = attr_value(open, "content").unwrap_or_default();
+                let content = decode_entities_full(content.trim());
+                if !content.is_empty() {
+                    return content;
+                }
+            }
+        }
+    }
+    String::new()
+}
+
+/// Python `_extract_meta_description`.
+fn meta_description(html: &str) -> String {
+    first_meta_content(
+        html,
+        &[
+            ("property", "og:description"),
+            ("name", "description"),
+            ("name", "twitter:description"),
+        ],
+    )
+}
+
+/// Python `_extract_page_title`: meta title, else the <title> text.
+fn page_title(html: &str) -> String {
+    let meta = first_meta_content(
+        html,
+        &[
+            ("property", "og:title"),
+            ("name", "twitter:title"),
+            ("name", "title"),
+        ],
+    );
+    if !meta.is_empty() {
+        return meta;
+    }
+    element_spans(html)
+        .iter()
+        .find(|s| s.name == "title")
+        .map(|s| fragment_text(s.inner(html)))
+        .unwrap_or_default()
+}
+
+/// Python `_strip_title_suffix`: drop a site-name suffix/prefix
+/// at the first separator that occurs, keeping the longest side.
+fn strip_title_suffix(title: &str) -> String {
+    let t = title.trim();
+    for sep in [" | ", " \u{2014} ", " \u{2013} "] {
+        if t.contains(sep) {
+            let mut parts = t.rsplitn(2, sep);
+            let tail = parts.next().unwrap_or("");
+            let head = parts.next().unwrap_or("");
+            return if tail.chars().count() >= head.chars().count() {
+                tail.trim().to_string()
+            } else {
+                head.trim().to_string()
+            };
+        }
+    }
+    t.to_string()
+}
+
+/// Python `_strip_trailing_ellipsis`.
+fn strip_trailing_ellipsis(text: &str) -> String {
+    static ELLIPSIS_RE: OnceLock<Regex> = OnceLock::new();
+    let re = ELLIPSIS_RE.get_or_init(|| Regex::new(r"(?:\.\.\.|…)\s*$").unwrap());
+    re.replace(text.trim(), "").trim().to_string()
+}
+
+/// Python `_is_reasonable_lead_paragraph`: 40..=800 chars, and
+/// either sentence punctuation or at least 120 chars.
+fn is_reasonable_lead_paragraph(text: &str) -> bool {
+    let t = text.trim();
+    let len = t.chars().count();
+    if !(40..=800).contains(&len) {
+        return false;
+    }
+    if t.contains(['.', '!', '?']) {
+        return true;
+    }
+    len >= 120
+}
+
+/// Hosts whose lead recovery is enabled (Python
+/// `_LEAD_RECOVERY_ALLOWED_NETLOC_SUFFIXES`): sites with a
+/// meaningful lead/intro the precision pass may skip.
+const LEAD_RECOVERY_SUFFIXES: &[&str] = &["wirtualnemedia.pl"];
+
+/// Python `_lead_recovery_enabled`.
+fn lead_recovery_enabled(url: &str) -> bool {
+    if url.is_empty() {
+        return false;
+    }
+    let host = host_of(url);
+    let host = host.split(':').next().unwrap_or("");
+    LEAD_RECOVERY_SUFFIXES
+        .iter()
+        .any(|d| host == *d || host.ends_with(&format!(".{d}")))
+}
+
+/// Python `_extract_allowlisted_lead_from_html`: the
+/// wirtualnemedia.pl header lead node, when present.
+fn allowlisted_lead_from_html(html: &str, url: &str) -> String {
+    let host = host_of(url);
+    let host = host.split(':').next().unwrap_or("");
+    if host == "wirtualnemedia.pl" || host.ends_with(".wirtualnemedia.pl") {
+        let spans = element_spans(html);
+        if let Some(node) = spans
+            .iter()
+            .find(|s| s.name == "div" && has_class(s.open(html), "wm-article-header-lead"))
+        {
+            return fragment_text(node.inner(html));
+        }
+    }
+    String::new()
+}
+
+/// Python `_recover_intro_paragraphs`: scan the recall opening
+/// for reasonable paragraphs absent from the precision text, but
+/// only trust them when one of them overlaps the meta
+/// description's hit snippet — the guard that keeps unrelated
+/// prose out.
+fn recover_intro_paragraphs(
+    recall_text: &str,
+    precision_paras_norm: &HashSet<String>,
+    page_title_norm: &str,
+    desc_hit_snippet: &str,
+) -> Vec<String> {
+    let mut intro: Vec<String> = Vec::new();
+    let mut desc_hit = false;
+    for p in crate::postprocess::split_paragraphs(recall_text)
+        .iter()
+        .take(8)
+    {
+        let pn = para_key(p);
+        if pn.is_empty() {
+            continue;
+        }
+        if precision_paras_norm.contains(&pn) {
+            break;
+        }
+        if !page_title_norm.is_empty() && pn == page_title_norm {
+            continue;
+        }
+        if !is_reasonable_lead_paragraph(p) {
+            continue;
+        }
+        if !desc_hit_snippet.is_empty() && pn.contains(desc_hit_snippet) {
+            desc_hit = true;
+        }
+        intro.push(p.clone());
+        if intro.len() >= 2 {
+            break;
+        }
+    }
+    if intro.is_empty() || !desc_hit {
+        return Vec::new();
+    }
+    intro
+}
+
+/// Python `_attempt_lead_recovery`, with the recall text already
+/// in hand (Python extracts it lazily through `do_extract` after
+/// the description gates pass; the result is the same text).
+/// Returns the recovered full text, or None to keep precision.
+fn attempt_lead_recovery(
+    html: &str,
+    url: &str,
+    precision_text: &str,
+    recall_text: &str,
+) -> Option<String> {
+    if !lead_recovery_enabled(url) {
+        return None;
+    }
+    let desc = strip_trailing_ellipsis(&meta_description(html));
+    let desc_norm = para_key(&desc);
+    if desc_norm.is_empty() || desc_norm.chars().count() < 60 {
+        return None;
+    }
+    let desc_snippet: String = desc_norm.chars().take(120).collect();
+    let desc_hit_snippet: String = desc_norm.chars().take(80).collect();
+    let precision_norm = para_key(precision_text);
+    if precision_norm.contains(&desc_snippet) {
+        return None;
+    }
+    let fallback_prepend = |desc: &str| -> Option<String> {
+        // Python `_fallback_prepend_meta_desc`: prepend the
+        // cleaned meta description itself (allowlist-only,
+        // intentionally conservative).
+        if !is_reasonable_lead_paragraph(desc) {
+            return None;
+        }
+        Some(format!("{desc}\n\n{precision_text}").trim().to_string())
+    };
+    let lead_html = allowlisted_lead_from_html(html, url);
+    let lead_norm = para_key(&lead_html);
+    if !lead_norm.is_empty()
+        && lead_norm.contains(&desc_hit_snippet)
+        && !precision_norm.contains(&lead_norm)
+        && is_reasonable_lead_paragraph(&lead_html)
+    {
+        return Some(
+            format!("{lead_html}\n\n{precision_text}")
+                .trim()
+                .to_string(),
+        );
+    }
+    let rec = recall_text.trim();
+    if rec.is_empty() {
+        return fallback_prepend(&desc);
+    }
+    let rec_head: String = rec.chars().take(8000).collect();
+    if !para_key(&rec_head).contains(&desc_snippet) {
+        return fallback_prepend(&desc);
+    }
+    let title_norm = para_key(&strip_title_suffix(&page_title(html)));
+    let precision_paras_norm: HashSet<String> =
+        crate::postprocess::split_paragraphs(precision_text)
+            .iter()
+            .map(|p| para_key(p))
+            .collect();
+    let intro =
+        recover_intro_paragraphs(rec, &precision_paras_norm, &title_norm, &desc_hit_snippet);
+    if intro.is_empty() {
+        return fallback_prepend(&desc);
+    }
+    let mut parts = intro;
+    parts.push(precision_text.to_string());
+    Some(parts.join("\n\n").trim().to_string())
 }
 
 /// Run the cascade over a fetched page.
@@ -1744,6 +2323,11 @@ pub fn extract_article_opts(
     feed_text: Option<&str>,
     keep_alt: bool,
 ) -> ExtractOutcome {
+    // CSS-only quizzes are removed before any extraction pass
+    // reads the page (Python `_extract_text_any` does the same —
+    // their prose otherwise vouches for itself everywhere).
+    let quiz_stripped = strip_css_quizzes(html_in);
+    let html_in = &quiz_stripped;
     // GSMArena's battery table arrives in the wrong order
     // (its sorter is a script we do not run); normalize first.
     let gsm_normalized;
@@ -1831,7 +2415,10 @@ fn extract_article_impl(
         } else {
             prec.0.clone()
         };
-        (title, recover_lead(&prec.1, &rec.1))
+        (
+            title,
+            attempt_lead_recovery(html, url, &prec.1, &rec.1).unwrap_or_else(|| prec.1.clone()),
+        )
     } else if char_count(&rec.1) > char_count(&prec.1) {
         rec
     } else {
@@ -1945,7 +2532,14 @@ fn extract_article_impl(
     let (title, mut text, source) = if !site_text.is_empty() {
         (base.0.clone(), site_text, "site")
     } else if char_count(&jsonld) > base_chars.max(second_chars) {
-        (base.0.clone(), jsonld, "jsonld")
+        // JSON-LD is never trusted alone (Python `_extract_text_any`
+        // step 1): some CMSes omit paragraphs from articleBody —
+        // Wired/Conde Nast drops the lede when it uses styled
+        // lead-in markup — so re-attach a missing lead from the
+        // trafilatura text or the DOM paragraphs before serving it.
+        let article_paras = article_paragraph_text(html);
+        let patched = patch_json_ld_missing_lead(&jsonld, &[&base.1, &article_paras]);
+        (base.0.clone(), patched, "jsonld")
     } else if second_chars > base_chars.saturating_add(base_chars / 4) {
         (second.0, second.1, "second")
     } else {
@@ -2455,6 +3049,59 @@ fn id3_split_descriptor(enc: u8, bytes: &[u8]) -> Option<(String, &[u8])> {
     }
 }
 
+/// ID3 unsynchronisation decoding (mutagen `unsynch.decode`): a
+/// 0x00 stuffed after a 0xFF is removed.
+fn deunsynchronise(data: &[u8]) -> Vec<u8> {
+    if !data.contains(&0xFF) {
+        return data.to_vec();
+    }
+    let mut out = Vec::with_capacity(data.len());
+    let mut i = 0;
+    while i < data.len() {
+        out.push(data[i]);
+        if data[i] == 0xFF && i + 1 < data.len() && data[i + 1] == 0x00 {
+            i += 1;
+        }
+        i += 1;
+    }
+    out
+}
+
+/// zlib-decompress a compressed ID3 frame payload (mutagen
+/// decompresses FLAG_COMPRESS frames the same way). Output is
+/// capped: real show notes never approach it, and the cap keeps a
+/// hostile tag from inflating without bound.
+fn id3_zlib_decompress(data: &[u8]) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut out = Vec::new();
+    flate2::read::ZlibDecoder::new(data)
+        .take(4_000_001)
+        .read_to_end(&mut out)
+        .ok()?;
+    if out.len() > 4_000_000 {
+        return None;
+    }
+    Some(out)
+}
+
+/// Mutagen's extended-header heuristic: the frame IDs a real tag
+/// body can start with — any Txxx text frame or Wxxx URL frame by
+/// spec, plus the named non-text frames.
+fn is_known_frame_id(id: &[u8]) -> bool {
+    if id.len() != 4 || !id.iter().all(|b| b.is_ascii_alphanumeric()) {
+        return false;
+    }
+    if id[0] == b'T' || id[0] == b'W' {
+        return true;
+    }
+    const NAMED: &[&[u8]] = &[
+        b"AENC", b"APIC", b"ASPI", b"CHAP", b"COMM", b"COMR", b"CTOC", b"ENCR", b"EQU2", b"ETCO",
+        b"GEOB", b"GRID", b"LINK", b"MCDI", b"MLLT", b"OWNE", b"PCNT", b"POPM", b"POSS", b"PRIV",
+        b"RBUF", b"RVA2", b"RVRB", b"SEEK", b"SIGN", b"SYLT", b"SYTC", b"UFID", b"USER", b"USLT",
+    ];
+    NAMED.contains(&id)
+}
+
 /// (title, author, content) from an MP3's embedded ID3 tag, or None
 /// when the tag carries no show-note text. Content candidates are
 /// USLT and COMM frames plus TXXX frames described as description /
@@ -2479,42 +3126,153 @@ pub fn id3_metadata(url: &str) -> Option<(String, String, String)> {
     if tag.len() < total || &tag[0..3] != b"ID3" {
         return None;
     }
+    // Frame region: the tag body after any extended header.
+    // Mutagen skips the extended header; starting the scan at
+    // offset 10 unconditionally (the previous behaviour) landed
+    // inside its size bytes and lost every frame of the tag.
+    let tag_end = (10 + tag_size).min(tag.len());
+    let mut region_start = 10usize;
+    if flags & 0x40 != 0 {
+        if tag_end < 14 {
+            return None;
+        }
+        // Mutagen heuristic: some taggers set the extended-header
+        // flag without writing one — if the bytes at the frame
+        // offset already decode as a known frame ID, the frames
+        // follow immediately and there is nothing to skip.
+        if !is_known_frame_id(&tag[10..14]) {
+            let skip = if version == 4 {
+                // Synchsafe size of the whole extended header,
+                // including its 4 size bytes.
+                if tag[10..14].iter().any(|b| b & 0x80 != 0) {
+                    return None;
+                }
+                (((tag[10] & 0x7F) as usize) << 21)
+                    | (((tag[11] & 0x7F) as usize) << 14)
+                    | (((tag[12] & 0x7F) as usize) << 7)
+                    | ((tag[13] & 0x7F) as usize)
+            } else {
+                // Big-endian size excluding the 4 size bytes.
+                4 + u32::from_be_bytes([tag[10], tag[11], tag[12], tag[13]]) as usize
+            };
+            if skip == 0 || 10 + skip > tag_end {
+                return None;
+            }
+            region_start = 10 + skip;
+        }
+    }
+    // ID3v2.3 tag unsynchronisation: the frame region is stored
+    // stuffed (0xFF 0x00 for 0xFF) and frame sizes describe the
+    // decoded bytes, so decode before scanning, as mutagen does.
+    // v2.4 never does this at tag level; it flags frames instead.
+    let decoded_region;
+    let frames: &[u8] = if version == 3 && flags & 0x80 != 0 {
+        decoded_region = deunsynchronise(&tag[region_start..tag_end]);
+        &decoded_region
+    } else {
+        &tag[region_start..tag_end]
+    };
     let mut title = String::new();
     let mut author = String::new();
     let mut author2 = String::new();
     let mut candidates: Vec<String> = Vec::new();
-    let mut pos = 10usize;
-    while pos + 10 <= tag.len() {
-        let id = &tag[pos..pos + 4];
+    let mut pos = 0usize;
+    while pos + 10 <= frames.len() {
+        let id = &frames[pos..pos + 4];
         if id.iter().all(|b| *b == 0) {
             break; // padding
         }
-        if !id.iter().all(|b| b.is_ascii_alphanumeric()) {
-            break;
-        }
-        let id_str = std::str::from_utf8(id).unwrap_or("").to_string();
         let size = if version == 4 {
-            (((tag[pos + 4] & 0x7F) as usize) << 21)
-                | (((tag[pos + 5] & 0x7F) as usize) << 14)
-                | (((tag[pos + 6] & 0x7F) as usize) << 7)
-                | ((tag[pos + 7] & 0x7F) as usize)
+            (((frames[pos + 4] & 0x7F) as usize) << 21)
+                | (((frames[pos + 5] & 0x7F) as usize) << 14)
+                | (((frames[pos + 6] & 0x7F) as usize) << 7)
+                | ((frames[pos + 7] & 0x7F) as usize)
         } else {
-            u32::from_be_bytes([tag[pos + 4], tag[pos + 5], tag[pos + 6], tag[pos + 7]]) as usize
+            u32::from_be_bytes([
+                frames[pos + 4],
+                frames[pos + 5],
+                frames[pos + 6],
+                frames[pos + 7],
+            ]) as usize
         };
         let start = pos + 10;
-        let end = (start + size).min(tag.len());
+        let end = (start + size).min(frames.len());
+        if !id.iter().all(|b| b.is_ascii_alphanumeric()) {
+            // Mutagen skips an unparseable frame and keeps
+            // scanning; a hard stop would lose every later frame.
+            pos = end.max(start);
+            continue;
+        }
+        if size == 0 {
+            pos = start; // mutagen drops empty frames
+            continue;
+        }
         if start >= end {
             break;
         }
-        let payload = &tag[start..end];
-        match id_str.as_str() {
+        let flag2 = frames[pos + 9];
+        // Per-frame flag handling, in mutagen's _fromData order:
+        // data-length prefix, unsynchronisation, encryption
+        // (unsupported — the frame is skipped), compression.
+        let mut payload: &[u8] = &frames[start..end];
+        let mut skip_frame = false;
+        let mut unsynced: Option<Vec<u8>> = None;
+        let mut inflated: Option<Vec<u8>> = None;
+        if version == 4 {
+            if flag2 & 0x09 != 0 && payload.len() >= 4 {
+                // DATALEN (0x01) and COMPRESS (0x08) both prefix a
+                // 4-byte data-length indicator.
+                payload = &payload[4..];
+            }
+            if flag2 & 0x02 != 0 || flags & 0x80 != 0 {
+                unsynced = Some(deunsynchronise(payload));
+            }
+            if let Some(u) = &unsynced {
+                payload = u;
+            }
+            if flag2 & 0x04 != 0 {
+                skip_frame = true; // encrypted
+            } else if flag2 & 0x08 != 0 {
+                match id3_zlib_decompress(payload) {
+                    Some(data) => inflated = Some(data),
+                    None => skip_frame = true,
+                }
+                if let Some(d) = &inflated {
+                    payload = d;
+                }
+            }
+        } else if version == 3 {
+            if flag2 & 0x40 != 0 {
+                skip_frame = true; // encrypted
+            } else if flag2 & 0x80 != 0 {
+                // COMPRESS: a 4-byte decompressed-size prefix,
+                // then the zlib stream.
+                if payload.len() < 4 {
+                    skip_frame = true;
+                } else {
+                    match id3_zlib_decompress(&payload[4..]) {
+                        Some(data) => inflated = Some(data),
+                        None => skip_frame = true,
+                    }
+                    if let Some(d) = &inflated {
+                        payload = d;
+                    }
+                }
+            }
+        }
+        if skip_frame {
+            pos = end;
+            continue;
+        }
+        let id_str = std::str::from_utf8(id).unwrap_or("");
+        match id_str {
             "TIT2" | "TPE1" | "TPE2" => {
                 if !payload.is_empty() {
                     let text = id3_decode_text(payload[0], &payload[1..])
                         .replace('\0', " ")
                         .trim()
                         .to_string();
-                    match id_str.as_str() {
+                    match id_str {
                         "TIT2" if title.is_empty() => title = text,
                         "TPE1" if author.is_empty() => author = text,
                         "TPE2" if author2.is_empty() => author2 = text,
@@ -2779,8 +3537,401 @@ fn normalize_merged_whitespace(text: &str) -> String {
 
 // --- Sky Flourish tables (Python _expand_sky_flourish_tables) ---
 
+const FLOURISH_DATE_MS_KEY: &str = "__blindrss_flourish_date_ms__";
+const FLOURISH_ROWS_PER_TABLE: usize = 100;
+
+/// Python `_extract_balanced_js_value`: the JSON-like object or
+/// array assigned to a JavaScript variable. A non-greedy regex
+/// cannot stop at the right nested closing brace, so this scanner
+/// tracks brackets while ignoring them inside quoted strings.
+fn extract_balanced_js_value(source: &str, variable: &str) -> String {
+    let bytes = source.as_bytes();
+    let mut search_from = 0usize;
+    let start = loop {
+        let Some(rel) = source[search_from..].find(variable) else {
+            return String::new();
+        };
+        let name_start = search_from + rel;
+        let before_ok = name_start == 0 || {
+            let prev = bytes[name_start - 1];
+            !(prev.is_ascii_alphanumeric() || prev == b'_' || prev == b'$')
+        };
+        let mut i = name_start + variable.len();
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if before_ok && i < bytes.len() && bytes[i] == b'=' {
+            i += 1;
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            if i < bytes.len() && (bytes[i] == b'{' || bytes[i] == b'[') {
+                break i;
+            }
+        }
+        search_from = name_start + variable.len();
+    };
+    let mut stack: Vec<u8> = Vec::new();
+    let mut quote: Option<u8> = None;
+    let mut escaped = false;
+    let mut i = start;
+    while i < bytes.len() {
+        let ch = bytes[i];
+        if let Some(q) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == b'\\' {
+                escaped = true;
+            } else if ch == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        match ch {
+            b'"' | b'\'' => quote = Some(ch),
+            b'{' => stack.push(b'}'),
+            b'[' => stack.push(b']'),
+            b'}' | b']' => {
+                if stack.pop() != Some(ch) {
+                    return String::new();
+                }
+                if stack.is_empty() {
+                    return source[start..=i].to_string();
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    String::new()
+}
+
+/// Python `_flourish_json_value`: parse one embedded Flourish
+/// data variable without executing JavaScript. Published datasets
+/// are JSON apart from typed `new Date(...)` cells; only tokens
+/// outside JSON strings are replaced, so authored cell text
+/// containing those words stays untouched.
+fn flourish_json_value(source: &str, variable: &str) -> Option<serde_json::Value> {
+    let raw = extract_balanced_js_value(source, variable);
+    if raw.is_empty() {
+        return None;
+    }
+    static DATE_RE: OnceLock<Regex> = OnceLock::new();
+    let date_re = DATE_RE.get_or_init(|| Regex::new(r"^new\s+Date\(\s*(-?\d+)\s*\)").unwrap());
+    let bytes = raw.as_bytes();
+    let mut out = String::with_capacity(raw.len());
+    let mut i = 0usize;
+    let mut quoted = false;
+    let mut escaped = false;
+    while i < bytes.len() {
+        // Delimiters are ASCII; UTF-8 continuation bytes never
+        // equal them, so whole characters pass through untouched.
+        let first = bytes[i];
+        let ch_len = raw[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+        if quoted {
+            out.push_str(&raw[i..i + ch_len]);
+            if escaped {
+                escaped = false;
+            } else if first == b'\\' {
+                escaped = true;
+            } else if first == b'"' {
+                quoted = false;
+            }
+            i += ch_len;
+            continue;
+        }
+        if first == b'"' {
+            quoted = true;
+            out.push_str(&raw[i..i + ch_len]);
+            i += ch_len;
+            continue;
+        }
+        if first == b'n'
+            && let Some(cap) = date_re.captures(&raw[i..])
+        {
+            out.push_str(&format!("{{\"{FLOURISH_DATE_MS_KEY}\":{}}}", &cap[1]));
+            i += cap.get(0).unwrap().end();
+            continue;
+        }
+        out.push_str(&raw[i..i + ch_len]);
+        i += ch_len;
+    }
+    serde_json::from_str(&out).ok()
+}
+
+/// Days-from-epoch to (year, month, day) — Howard Hinnant's
+/// civil-from-days algorithm, valid for pre-1970 dates too.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// Python `_format_flourish_datetime`: format a Flourish typed
+/// date using its published d3-style format. Epoch arithmetic is
+/// used (not the platform clock) so pre-1970 time-only values
+/// work on every OS.
+fn format_flourish_datetime(milliseconds: i64, metadata: &serde_json::Value) -> String {
+    let days = milliseconds.div_euclid(86_400_000);
+    let rem = milliseconds.rem_euclid(86_400_000);
+    let (year, month, day) = civil_from_days(days);
+    let hour = rem / 3_600_000;
+    let minute = (rem % 3_600_000) / 60_000;
+    let second = (rem % 60_000) / 1000;
+    let millis = rem % 1000;
+    let format_id = metadata
+        .get("output_format_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let date_format = format_id.split_once('$').map(|(_, f)| f).unwrap_or("");
+    if date_format.is_empty() {
+        let base = format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}");
+        return if millis != 0 {
+            format!("{base}.{:06}Z", millis * 1000)
+        } else {
+            format!("{base}Z")
+        };
+    }
+    let weekday = ((days % 7) + 7 + 4) % 7; // 1970-01-01 was a Thursday; 0 = Sunday
+    const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    const WEEKDAYS_FULL: [&str; 7] = [
+        "Sunday",
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday",
+        "Saturday",
+    ];
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    const MONTHS_FULL: [&str; 12] = [
+        "January",
+        "February",
+        "March",
+        "April",
+        "May",
+        "June",
+        "July",
+        "August",
+        "September",
+        "October",
+        "November",
+        "December",
+    ];
+    let hour12 = if hour % 12 == 0 { 12 } else { hour % 12 };
+    let token_value = |token: &str| -> Option<String> {
+        Some(match token {
+            "Y" => format!("{year:04}"),
+            "y" => format!("{:02}", year % 100),
+            "m" => format!("{month:02}"),
+            "d" => format!("{day:02}"),
+            "e" => format!("{day:2}"),
+            "H" => format!("{hour:02}"),
+            "I" => format!("{hour12:02}"),
+            "M" => format!("{minute:02}"),
+            "S" => format!("{second:02}"),
+            "L" => format!("{millis:03}"),
+            "p" => if hour < 12 { "AM" } else { "PM" }.to_string(),
+            "a" => WEEKDAYS[weekday as usize].to_string(),
+            "A" => WEEKDAYS_FULL[weekday as usize].to_string(),
+            "b" => MONTHS[(month - 1) as usize].to_string(),
+            "B" => MONTHS_FULL[(month - 1) as usize].to_string(),
+            "%" => "%".to_string(),
+            _ => return None,
+        })
+    };
+    static TOKEN_RE: OnceLock<Regex> = OnceLock::new();
+    let token_re = TOKEN_RE.get_or_init(|| Regex::new(r"%(-?)([A-Za-z%])").unwrap());
+    token_re
+        .replace_all(date_format, |caps: &regex::Captures| {
+            let token = &caps[2];
+            match token_value(token) {
+                Some(rendered) => {
+                    if !caps[1].is_empty() && matches!(token, "m" | "d" | "H" | "I") {
+                        let stripped = rendered.trim_start_matches('0');
+                        if stripped.is_empty() {
+                            "0".to_string()
+                        } else {
+                            stripped.to_string()
+                        }
+                    } else {
+                        rendered
+                    }
+                }
+                None => caps[0].to_string(),
+            }
+        })
+        .to_string()
+}
+
+/// Python `_format_flourish_cell`.
+fn format_flourish_cell(value: &serde_json::Value, metadata: &serde_json::Value) -> String {
+    if let Some(obj) = value.as_object()
+        && obj.len() == 1
+        && let Some(ms) = obj.get(FLOURISH_DATE_MS_KEY)
+    {
+        let ms = ms
+            .as_i64()
+            .or_else(|| ms.as_f64().map(|f| f as i64))
+            .unwrap_or(0);
+        return format_flourish_datetime(ms, metadata);
+    }
+    match value {
+        serde_json::Value::Null => String::new(),
+        serde_json::Value::Bool(b) => if *b { "true" } else { "false" }.to_string(),
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Object(_) | serde_json::Value::Array(_) => {
+            serde_json::to_string(value).unwrap_or_default()
+        }
+        other => other.to_string(),
+    }
+}
+
+/// Escape text-node content the way BeautifulSoup serializes it.
+fn esc_html_text(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// Python `_flourish_table_nodes`, serialized: build the semantic
+/// HTML tables of a published Flourish table embed from its
+/// `_Flourish_data`, `_Flourish_data_column_names` and
+/// `_Flourish_data_metadata` variables. Datasets with fewer than
+/// two columns or no rows are skipped; tables split every 100
+/// rows with a part caption. Returns "" when nothing decodes.
+pub fn flourish_tables_html(embed_html: &str) -> String {
+    let Some(data) = flourish_json_value(embed_html, "_Flourish_data") else {
+        return String::new();
+    };
+    let Some(column_names) = flourish_json_value(embed_html, "_Flourish_data_column_names") else {
+        return String::new();
+    };
+    let metadata = flourish_json_value(embed_html, "_Flourish_data_metadata")
+        .unwrap_or(serde_json::Value::Null);
+    let (Some(data), Some(column_names)) = (data.as_object(), column_names.as_object()) else {
+        return String::new();
+    };
+    let mut out = String::new();
+    for (dataset_name, raw_rows) in data {
+        let Some(raw_rows) = raw_rows.as_array().filter(|r| !r.is_empty()) else {
+            continue;
+        };
+        let Some(names) = column_names.get(dataset_name).and_then(|n| n.as_object()) else {
+            continue;
+        };
+        let (headers, row_values): (Vec<serde_json::Value>, Vec<Vec<serde_json::Value>>) =
+            if let Some(cols) = names.get("columns").and_then(|c| c.as_array()) {
+                let mut rows_out = Vec::new();
+                for row in raw_rows {
+                    if let Some(cols) = row.get("columns").and_then(|c| c.as_array()) {
+                        rows_out.push(cols.clone());
+                    }
+                }
+                (cols.clone(), rows_out)
+            } else {
+                // Some templates expose rows as ordinary objects and
+                // map binding keys to human-readable column names.
+                let keys: Vec<&String> = names
+                    .keys()
+                    .filter(|k| names.get(*k).map(|v| v.is_string()).unwrap_or(false))
+                    .collect();
+                let headers_out = keys
+                    .iter()
+                    .map(|k| names.get(*k).cloned().unwrap_or(serde_json::Value::Null))
+                    .collect();
+                let mut rows_out = Vec::new();
+                for row in raw_rows {
+                    if row.is_object() {
+                        rows_out.push(
+                            keys.iter()
+                                .map(|k| row.get(*k).cloned().unwrap_or(serde_json::Value::Null))
+                                .collect(),
+                        );
+                    }
+                }
+                (headers_out, rows_out)
+            };
+        if headers.len() < 2 || row_values.is_empty() {
+            continue;
+        }
+        let max_columns = row_values
+            .iter()
+            .map(|r| r.len())
+            .max()
+            .unwrap_or(0)
+            .max(headers.len());
+        let mut clean_headers: Vec<String> = headers
+            .iter()
+            .map(|h| match h {
+                serde_json::Value::String(s) => s.trim().to_string(),
+                serde_json::Value::Null => String::new(),
+                other => other.to_string().trim_matches('"').trim().to_string(),
+            })
+            .collect();
+        for index in clean_headers.len() + 1..=max_columns {
+            clean_headers.push(format!("Column {index}"));
+        }
+        let empty_obj = serde_json::Value::Null;
+        let dataset_metadata = metadata.get(dataset_name).unwrap_or(&empty_obj);
+        let column_metadata = dataset_metadata
+            .get("columns")
+            .and_then(|c| c.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let part_count = row_values.len().div_ceil(FLOURISH_ROWS_PER_TABLE);
+        for part_index in 0..part_count {
+            out.push_str("<table>");
+            if part_count > 1 {
+                out.push_str(&format!(
+                    "<caption>Table, part {} of {}</caption>",
+                    part_index + 1,
+                    part_count
+                ));
+            }
+            out.push_str("<thead><tr>");
+            for heading in &clean_headers {
+                out.push_str(&format!(
+                    "<th scope=\"col\">{}</th>",
+                    esc_html_text(heading)
+                ));
+            }
+            out.push_str("</tr></thead><tbody>");
+            let start = part_index * FLOURISH_ROWS_PER_TABLE;
+            for row in &row_values[start..(start + FLOURISH_ROWS_PER_TABLE).min(row_values.len())] {
+                out.push_str("<tr>");
+                for column_index in 0..max_columns {
+                    let cell_metadata = column_metadata
+                        .get(column_index)
+                        .filter(|m| m.is_object())
+                        .unwrap_or(&empty_obj);
+                    let cell = row.get(column_index).unwrap_or(&empty_obj);
+                    out.push_str(&format!(
+                        "<td>{}</td>",
+                        esc_html_text(&format_flourish_cell(cell, cell_metadata))
+                    ));
+                }
+                out.push_str("</tr>");
+            }
+            out.push_str("</tbody></table>");
+        }
+    }
+    out
+}
+
 /// Replace Sky's script-hydrated Flourish tables with the semantic
-/// tables from the Flourish embed, so extraction can see the cells.
+/// tables decoded from the Flourish embed's published dataset, so
+/// extraction can see the cells.
 pub fn expand_sky_flourish_tables(html: &str, url: &str) -> String {
     if html.is_empty() || host_of(url) != "news.sky.com" {
         return html.to_string();
@@ -2825,15 +3976,11 @@ pub fn expand_sky_flourish_tables(html: &str, url: &str) -> String {
             continue;
         }
         let embed_html = String::from_utf8_lossy(&bytes).to_string();
-        let tables = find_elements(&embed_html, Some("table"), &|_| true);
+        let tables = flourish_tables_html(&embed_html);
         if tables.is_empty() {
             continue;
         }
-        let container: String = tables
-            .iter()
-            .map(|t| embed_html[t.start..t.end].to_string())
-            .collect::<Vec<_>>()
-            .join("");
+        let container = format!("<div>{tables}</div>");
         // Replace the sdc-article-widget wrapper when the widget
         // sits inside one (trafilatura discards that wrapper).
         let target = wrappers
@@ -3440,5 +4587,24 @@ mod parity_recovery_tests {
             serde_json::json!({"articleBody": body})
         );
         assert!(json_ld_text(&page).contains("Use </p> to close a paragraph."));
+    }
+
+    #[test]
+    fn json_ld_candidate_strips_leaked_script_code() {
+        // Task 14 (R08): the candidate is cleaned — leaked script
+        // source stripped — before it competes on length, exactly
+        // as Python's _collect_json_ld_text does; the code must
+        // not survive into the candidate however long it is.
+        let prose = "This is a substantial paragraph of article body text that goes on for a while to make the point clearly and completely for the reader who is following along at home today.";
+        let code = "let cbeScripts = {};\ndocument.querySelectorAll('.cbe').forEach(function (item) {\n  new cbeScriptObserver(item, cbeScripts[item]);\n});\nwindow.addEventListener('load', function () { console.log('ready'); });";
+        let body = format!("{prose}\n{prose}\n{code}");
+        let page = format!(
+            "<script type='application/ld+json'>{}</script>",
+            serde_json::json!({"@type": "NewsArticle", "articleBody": body})
+        );
+        let text = json_ld_text(&page);
+        assert!(text.contains("substantial paragraph"), "{text}");
+        assert!(!text.contains("cbeScriptObserver"), "JS leaked: {text}");
+        assert!(!text.contains("querySelectorAll"), "JS leaked: {text}");
     }
 }

@@ -3385,3 +3385,178 @@ Deviations, named honestly:
 - Owner screen-reader acceptance is NOT claimed: NVDA/JAWS/
   VoiceOver passes over the rebuilt Reddit/Lemmy documents in both
   readers remain Brandon's manual gate, per the house rules.
+## Audit 8 Task 14 resolution — publisher reconstruction, quiz removal, lead fidelity (R05, R06, R07, R08, R09) (2026-11-04)
+
+**R05 (Sky Flourish tables) — decoded, not copied.** The embed
+expansion no longer lifts literal `<table>` elements out of the
+Flourish embed page; it decodes the published dataset the way
+Python does (`_flourish_table_nodes`): a balanced-bracket scanner
+extracts `_Flourish_data`, `_Flourish_data_column_names` and
+`_Flourish_data_metadata` without executing JavaScript,
+`new Date(<ms>)` tokens outside strings become typed date cells,
+and tables are built from the data — the "columns" shape and the
+binding-keys shape, headers padded with "Column N", datasets
+with fewer than two columns or no rows skipped, parts of 100
+rows with a "Table, part X of Y" caption when split. Dates are
+formatted with epoch arithmetic (portable for pre-1970 values)
+using the metadata's d3-style output format, ISO with `Z` when no
+format is published. All of Python's guards stand (news.sky.com
+only, the "flourish-table" marker, the data-src shape, at most
+12 widgets, the article URL as Referer, the 8 MB embed cap); a
+widget whose embed decodes to nothing is left unchanged —
+Python has no literal-table fallback, and the old Rust fallback
+is removed to match. Fixtures are ported from
+`tests/test_sky_flourish_tables.py`, including the pre-1970
+datetimes (-2208923100000 with `%-I.%M%p` reads "6.15PM") and
+the classic linearization ("Table with 3 rows and 3 columns.",
+"Row 1: Stage: First contact; Norwich: 6.15PM; ...").
+
+**R06 (rich-reader reconstruction) — ported.** `clean_article_html`
+now runs Python's reconstruction order before the generic
+main-node pick: publisher body reconstruction (URL-substring
+detect for arstechnica.com / theregister. / macrumors.com /
+zdnet.com; host map to `div.post-content`, `.bodytext`,
+`.js-content`, `.entry-content`; containers must sit inside the
+first `<article>`; nested containers dropped; the junk classes
+decomposed; `.zd-related-stories-flow` unwrapped because it
+wraps real prose beside a widget; empty result falls through),
+then socast reconstruction (lead `div.wpb-content-wrapper`
+articles that are not inside a mainArticle, merged with every
+`article.mainArticle`, nested candidates deduped, junk-token
+elements stripped, under-200-chars result rejected), then the
+forum rebuild. Any successful reconstruction blanks the
+trafilatura keep-text, so a rebuilt body is exempt from the
+prune — previously only the forum rebuild was exempt, and the
+publisher/socast reconstructions fed only the plain-text
+reader. The article_html module doc no longer lists that
+divergence. Regression tests in `structure_parity.rs` cover
+Ars Technica, ZDNet, MacRumors, The Register and both socast
+shapes.
+
+**R07 (CSS-only quizzes) — ported with the guards.** `strip_css_quizzes`
+is a direct port of Python's `utils.strip_css_quizzes`: the
+regex fast path collects distinct radio group names and returns
+the input byte-identical below three groups; radio inputs are
+grouped by direct parent; a parent holding three or more groups
+is removed unless it is a page wrapper (html/body/main/article/
+form) or contains an article/main descendant; when nothing is
+removed the original string is returned untouched. It is wired
+at both Python call sites — the head of article extraction and
+the head of `clean_article_html` — so a quiz can neither reach
+the reader nor be vouched for by the prune's ground-truth text.
+Fixtures mirror `tests/test_article_quiz_removal.py` (the
+How-To Geek vignette quiz is removed end to end; one-group tabs,
+polls, and body/form-direct radios are preserved).
+
+**R08 (JSON-LD fidelity) — ported.** `json_ld_text` is rewritten
+to Python's `_collect_json_ld_text` / `_extract_json_ld_text`:
+list-valued `articleBody`/`text` fields are collected (joined
+with a space) alongside string values; entity-escaped markup is
+unescaped once when at least three escaped block closers mark it
+as real markup; a markup body keeps the standfirst text before
+the first tag and its leaf-block paragraph structure
+(`_html_fragment_to_text`: script/style/noscript/template
+removed, p/li/heading/blockquote leaf blocks as paragraphs,
+punctuation spacing fixed); a plain body is fully
+entity-decoded. Every candidate passes
+`_strip_embedded_script_code` and `_normalize_whitespace`
+BEFORE the longest-wins comparison, so leaked script source
+cannot win on bulk; the 120-char minimum stands. When the
+JSON-LD candidate is the one served, it is patched with
+`_patch_json_ld_missing_lead` (Python `_prepend_missing_lead`:
+at most four alternative paragraphs scanned, at most two leads,
+a 60-char alignment snippet against the base head's 400 chars,
+reasonable-paragraph rules) against the cascade's base text and
+the DOM article paragraphs (`_extract_article_paragraph_text`),
+re-attaching a CMS-dropped lede exactly once. Arbitration
+deviation, named: Python compares JSON-LD only against
+trafilatura (it wins at >1.1x) inside `_extract_text_any`; the
+Rust hybrid cascade keeps its own gate — the candidate must
+beat both the base and the second-opinion text — and the patch
+applies whenever the jsonld candidate is served. Recorded
+engine divergence: on a body-less synthetic page,
+rust-trafilatura mines the ld+json body itself, flattens it to
+a single line (measured: source=base, no newlines, 547 chars
+against the stripped candidate's ~345) and wins on bulk;
+Python trafilatura preserves line structure, so Python's final
+postprocess strip removes the leaked code run from the winning
+text, while the line-based strip cannot fire on a single-line
+text. The candidate layer is pinned by the unit test
+`json_ld_candidate_strips_leaked_script_code`; the flattening
+itself is base-engine behaviour, outside this task's files.
+
+**R09 (lead recovery) — the lean invention replaced by the
+faithful port.** The old `recover_lead` prepended up to three
+recall paragraphs on EVERY host — behaviour Python never had,
+which could prepend unrelated prose — and sliced the first
+paragraph's match key at byte 120, which panics when a
+multibyte character straddles that byte. It is replaced by
+`attempt_lead_recovery`, a port of `_attempt_lead_recovery` and
+its helpers: the wirtualnemedia.pl host allowlist
+(`_lead_recovery_enabled`); the meta description in
+og:/name/twitter order with trailing-ellipsis stripping; the
+60-normalized-char minimum; the description-snippet absence
+gate against the precision text; the allowlisted
+`div.wm-article-header-lead` node path; the recall path, which
+requires the description snippet inside the first 8000
+normalized recall chars and a description hit among the
+recovered intro paragraphs (at most 8 scanned, at most 2 kept,
+page-title and precision-paragraph guards); and the
+meta-description fallback prepend. All slicing is char-based.
+Tests pin the allowlist gate both ways (same page on another
+host recovers nothing), the lead-node path, the unrelated-lead
+guard, and survival of a multibyte character at byte 120.
+
+**Investigation — ID3 extended/unsynchronized frames:
+demonstrated loss, fixed.** Ground truth was established
+against mutagen (the parser Python uses, run locally) on
+synthetic byte shapes: tags carrying the 0x40 extended-header
+flag and unsynchronised tags/frames parse fully there. The
+Rust reader started its frame scan at offset 10
+unconditionally — landing inside the extended header's size
+bytes and losing every frame — and never de-unsynchronised,
+mangling text and misaligning frames. `id3_metadata` now
+mirrors mutagen: the extended header is skipped with mutagen's
+own heuristic (bytes at the frame offset that decode as a
+known frame ID mean the flag is bogus and nothing is skipped;
+the v2.3 size is big-endian excluding itself, the v2.4 size
+synchsafe including itself, non-synchsafe v2.4 sizes rejected);
+v2.3 tag-level unsynchronisation is decoded before scanning;
+v2.4 per-frame flags are handled in mutagen's `_fromData`
+order — the 4-byte data-length prefix for DATALEN/COMPRESS,
+per-frame or header unsynchronisation, encrypted frames
+skipped as unsupported, COMPRESS frames zlib-inflated (flate2,
+already in the workspace lock; output capped at 4 MB where
+mutagen is uncapped); an unparseable frame is skipped rather
+than ending the scan, and empty frames are dropped, both as
+mutagen does. Six fixtures in `batch35b_slice.rs` pin the
+shapes (both extended headers, the v2.3 unsync tag, v2.4 frame
+unsync + data-length, and compressed USLT in both versions
+against a pinned Python-zlib byte stream). Remaining named
+gap: mutagen's `determine_bpi` heuristic for iTunes-era v2.4
+tags written with plain (non-synchsafe) frame sizes is not
+ported — the reader keeps synchsafe v2.4 sizes, as it did
+before this task.
+
+**Investigation — relative srcset: demonstrated gap, fixed.**
+Ammonia's `UrlRelative::RewriteWithBase` rewrites `src`/`href`
+but passes `srcset` through untouched (measured: the `src` was
+absolutized, the candidates were not), so relative candidates
+reached the WebView unresolved — Python absolutizes them in
+its final attribute pass (`_absolutize_srcset`). That pass is
+now ported into `normalize_media_srcs` for img/source:
+candidates are split on commas, each URL absolutized against
+the article URL, descriptors preserved. Pinned by
+`rich_srcset_candidates_are_absolutized` in
+`structure_parity.rs` (relative, root-relative and absolute
+candidates). An earlier draft of this section claimed verified
+equivalence from a truncated test log; the full run proved
+otherwise and the claim is corrected here.
+
+Gate in this tree: `cargo test --workspace` 616 passed / 0
+failed (baseline 589 at 6da89d0; +27 Task 14 tests across
+`extract_parity.rs`, `structure_parity.rs`, `batch35b_slice.rs`
+and the extract.rs unit tests), clippy `--workspace
+--all-targets -D warnings` clean, `cargo build -p blindrss`
+OK, `cargo fmt --all` run last. No cfg(windows) code was
+touched, so the windows-gnu clippy leg was not required.

@@ -32,7 +32,7 @@ pub fn normalize_whitespace(text: &str) -> String {
 
 /// Python `_split_paragraphs`: split by blank lines first, then by
 /// single newlines, keeping non-empty trimmed lines as paragraphs.
-fn split_paragraphs(text: &str) -> Vec<String> {
+pub(crate) fn split_paragraphs(text: &str) -> Vec<String> {
     let t = normalize_whitespace(text);
     if t.is_empty() {
         return Vec::new();

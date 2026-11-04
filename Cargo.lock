@@ -171,6 +171,7 @@ dependencies = [
  "dom_smoothie",
  "encoding_rs",
  "feed-rs",
+ "flate2",
  "opml",
  "pbkdf2",
  "pulldown-cmark",
