@@ -332,7 +332,6 @@ fn inoreader_listener_connect(
 pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> {
     let cfg = Config::load(config_path).unwrap_or_default();
     let dialog = Dialog::builder(frame, "BlindRSS Settings").build();
-    crate::dialogs::bind_f1(frame, &dialog, "SettingsDialog");
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let notebook = Notebook::builder(&dialog).build();
     sizer.add(&notebook, 1, SizerFlag::Expand | SizerFlag::All, 4);
@@ -364,6 +363,28 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
         &crate::tr("CAPTCHA Solving"),
         false,
         None,
+    );
+    // F1 resolves through the current page (Audit 8 S06): the
+    // English source titles, in add_page order, key core's
+    // NOTEBOOK_PAGE_TOPICS exactly as Python's per-page
+    // attributes do, whatever locale the tabs display in.
+    crate::dialogs::bind_f1_notebook(
+        frame,
+        &dialog,
+        "SettingsDialog",
+        &notebook,
+        &[
+            "General",
+            "Feeds && Articles",
+            "YouTube",
+            "Media Player",
+            "Provider",
+            "Notifications",
+            "Translate",
+            "List Headers",
+            "Advanced",
+            "CAPTCHA Solving",
+        ],
     );
 
     // ---- General page (Python's General tab, in its order) ----

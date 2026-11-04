@@ -1592,6 +1592,10 @@ struct State {
     auto_load: Option<(u64, std::time::Instant)>,
 }
 
+/// Registry dispatch shared by the main frame's char hook and
+/// the player window: (accelerator, apply_text_guard) -> handled.
+type ShortcutDispatch = std::rc::Rc<dyn Fn(&str, bool) -> bool>;
+
 /// A resolved playback stream: URL and request headers. The
 /// yt-dlp metadata lookup is NOT part of the resolution any
 /// more (Audit 8 M11): it travels separately as
@@ -2051,28 +2055,13 @@ fn feeds_in_category(feeds: &[Feed], path: &str) -> Vec<Feed> {
         .collect()
 }
 
-/// Build the live shortcut map: effective accelerator string ->
+/// Build the live shortcut map: canonical accelerator string ->
 /// command id, from the registry plus the user's
-/// `keyboard_shortcuts` overrides. Empty accelerators are skipped.
+/// `keyboard_shortcuts` overrides (core's resolve + invert, in
+/// command-table order so conflicts resolve as Python's do).
 fn build_keymap() -> std::collections::HashMap<String, String> {
     let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
-    let mut overrides = std::collections::HashMap::new();
-    if let Some(obj) = cfg
-        .raw()
-        .get("keyboard_shortcuts")
-        .and_then(|v| v.as_object())
-    {
-        for (k, v) in obj {
-            if let Some(s) = v.as_str() {
-                overrides.insert(k.clone(), s.to_string());
-            }
-        }
-    }
-    blindrss_core::shortcuts::effective(&overrides)
-        .into_iter()
-        .filter(|(_, accel)| !accel.is_empty())
-        .map(|(id, accel)| (accel, id))
-        .collect()
+    blindrss_core::shortcuts::accel_map(&blindrss_core::shortcuts::overrides_from_config(&cfg))
 }
 
 /// Case-insensitive substring search over chars, starting at
@@ -9030,6 +9019,68 @@ fn main() {
             activate_mouse();
         });
 
+        // Shared registry dispatch (Python's
+        // MainFrame.dispatch_shortcut): the frame's char hook
+        // calls it with the text guard on; the player window
+        // delegates to it with the guard off (Audit 8 M14). The
+        // closure reads the live keymap, so edits made in the
+        // shortcuts dialog apply as soon as it closes (the
+        // dialog-close refresh below rebuilds the same map).
+        let dispatch_accel: ShortcutDispatch = {
+            let keymap_d = keymap.clone();
+            let state_d = state.clone();
+            let frame_d = frame;
+            let search_d = search_box;
+            let play_d = act_play.clone();
+            std::rc::Rc::new(move |accel: &str, apply_text_guard: bool| -> bool {
+                let cmd = keymap_d.borrow().get(accel).cloned();
+                let Some(command) = cmd.as_deref() else {
+                    return false;
+                };
+                // Text guard (Python _SHORTCUT_TEXT_GUARDED):
+                // transport/filter keys defer to an editable
+                // text field being edited.
+                if apply_text_guard
+                    && blindrss_core::shortcuts::text_guarded(command)
+                    && state_d.borrow().search_focused
+                {
+                    return false;
+                }
+                match command {
+                    "view.focus_search" => {
+                        search_d.set_focus();
+                        true
+                    }
+                    // One smart route for feed / category / smart
+                    // folder (Audit 8 G15): act_edit_selected
+                    // already branches on the selection kind.
+                    "feeds.edit_selected" => frame_d.process_menu_command(M_EDIT_SELECTED),
+                    "tools.announce_version" => {
+                        announce(
+                            "general",
+                            &format!("BlindRSS {}", env!("CARGO_PKG_VERSION")),
+                        );
+                        true
+                    }
+                    c if c.starts_with("player.") || c.starts_with("speed.") => {
+                        if player::dispatch_command(c) {
+                            true
+                        } else if c == "player.play_pause" {
+                            play_d();
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    c => shortcut_menu_id(c).is_some_and(|id| frame_d.process_menu_command(id)),
+                }
+            })
+        };
+        player::set_shortcut_delegate({
+            let d = dispatch_accel.clone();
+            std::rc::Rc::new(move |accel: &str| d(accel, false))
+        });
+
         // Keyboard dispatch (PARITY 7.5): a frame-level char hook
         // resolves keys through the shortcut registry (defaults +
         // user overrides), exactly Python's model. Handled keys are
@@ -9037,9 +9088,9 @@ fn main() {
         {
             let state_hook = state.clone();
             let keymap_hook = keymap.clone();
+            let dispatch_hook = dispatch_accel.clone();
             let h_toggle_read = act_toggle_read.clone();
             let h_activate = act_activate.clone();
-            let h_play = act_play.clone();
             let h_find = act_find.clone();
             let h_find_next = act_find_next.clone();
             let f1_frame = frame;
@@ -9050,17 +9101,31 @@ fn main() {
             let f1_search = search_box.get_handle() as usize;
             frame.bind_internal(EventType::CHAR_HOOK, move |ev| {
                 let code = ev.get_key_code().unwrap_or(0);
-                let ctrl = ev.control_down() || ev.cmd_down();
-                let shift = ev.shift_down();
-                if ev.alt_down() {
-                    ev.skip(true);
-                    return;
-                }
-                // F1: context help for the control that has focus
+                // One shared bridge forms the accelerator
+                // (Python gui/shortcut_keys.py): Alt is a real
+                // modifier, Cmd/Meta is distinct from Ctrl, and
+                // named/navigation keys, numpad digits and
+                // F13-F24 all resolve (Audit 8 S04).
+                let mods = blindrss_core::shortcuts::KeyModifiers {
+                    ctrl: ev.control_down(),
+                    alt: ev.alt_down(),
+                    shift: ev.shift_down(),
+                    cmd: ev.meta_down(),
+                };
+                let accel = blindrss_core::shortcuts::event_accel(code, mods, true);
+                // Context help for the control that has focus
                 // (Python's help_topics resolution, main-window
                 // subset: the registry's dialog/menu/command maps
-                // ride along in core for the dialogs' own F1 keys).
-                if code == 340 && !ctrl && !shift {
+                // ride along in core for the dialogs' own F1
+                // keys) — but only when the binding-aware rule
+                // says this press is a help press (Audit 8 S06):
+                // the User Guide binding, or F1 while F1 itself
+                // is unbound. A rebound F1 falls through and
+                // dispatches its command below.
+                if let Some(a) = &accel
+                    && blindrss_core::shortcuts::help_key_action(a, &keymap_hook.borrow())
+                        == blindrss_core::shortcuts::HelpKeyAction::ContextHelp
+                {
                     let focused = ev
                         .get_event_object()
                         .map(|w| w.get_handle() as usize)
@@ -9086,7 +9151,7 @@ fn main() {
                 // double-click; this covers the keyboard, and
                 // vetoing the key keeps wx from also firing
                 // ITEM_ACTIVATED for it).
-                if code == 13 && !ctrl && !shift {
+                if code == 13 && !mods.any() {
                     let cfg =
                         blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
                     if reader.has_focus()
@@ -9111,7 +9176,7 @@ fn main() {
                 // Plain Backspace in the article list toggles
                 // read state (Python's binding); elsewhere it is
                 // ordinary editing/navigation.
-                if code == 8 && !ctrl && !shift {
+                if code == 8 && !mods.any() {
                     let in_list = {
                         let st = state_hook.borrow();
                         st.focus_list && !st.search_focused
@@ -9124,82 +9189,25 @@ fn main() {
                     }
                     return;
                 }
-                let key_name: Option<String> = if (340..=351).contains(&code) {
-                    Some(format!("F{}", code - 339))
-                } else {
-                    let uni = ev.get_unicode_key().unwrap_or(0);
-                    let c = if (32..127).contains(&uni) { uni } else { code };
-                    if (33..127).contains(&c) {
-                        char::from_u32(c as u32).map(|ch| ch.to_uppercase().collect::<String>())
-                    } else {
-                        None
-                    }
-                };
-                let Some(key_name) = key_name else {
+                // No accelerator (plain typing/navigation, or a
+                // key outside the bridge): leave it to the
+                // focused control.
+                let Some(accel) = accel else {
                     ev.skip(true);
                     return;
                 };
-                let mut combo = String::new();
-                if ctrl {
-                    combo.push_str("Ctrl+");
-                }
-                if shift {
-                    combo.push_str("Shift+");
-                }
-                combo.push_str(&key_name);
                 // Find pair: reader-local, not registry commands.
-                if combo == "Ctrl+F" {
+                if accel == "Ctrl+F" {
                     h_find();
                     ev.skip(false);
                     return;
                 }
-                if combo == "F3" || combo == "Ctrl+G" {
+                if accel == "F3" || accel == "Ctrl+G" {
                     h_find_next();
                     ev.skip(false);
                     return;
                 }
-                let cmd = keymap_hook.borrow().get(&combo).cloned();
-                let handled = match cmd.as_deref() {
-                    Some("view.focus_search") => {
-                        search_box.set_focus();
-                        true
-                    }
-                    Some("feeds.edit_selected") => {
-                        let category = state_hook
-                            .borrow()
-                            .selected_feed
-                            .as_deref()
-                            .is_some_and(|id| id.starts_with("cat:"));
-                        frame.process_menu_command(if category {
-                            M_RENAME_CAT
-                        } else {
-                            M_EDIT_FEED
-                        })
-                    }
-                    Some("tools.announce_version") => {
-                        announce(
-                            "general",
-                            &format!("BlindRSS {}", env!("CARGO_PKG_VERSION")),
-                        );
-                        true
-                    }
-                    Some(command)
-                        if command.starts_with("player.") || command.starts_with("speed.") =>
-                    {
-                        if player::dispatch_command(command) {
-                            true
-                        } else if command == "player.play_pause" {
-                            h_play();
-                            true
-                        } else {
-                            false
-                        }
-                    }
-                    Some(command) => {
-                        shortcut_menu_id(command).is_some_and(|id| frame.process_menu_command(id))
-                    }
-                    None => false,
-                };
+                let handled = dispatch_hook(&accel, true);
                 ev.skip(!handled);
             });
         }

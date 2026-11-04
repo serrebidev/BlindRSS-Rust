@@ -370,27 +370,84 @@ pub fn edit_filter_rule(
 /// list, New / Edit / Delete, Move Up / Down (the pipeline
 /// order), and Apply to Existing Articles. Works directly on
 /// the database; modal and self-contained.
+/// The guide topic for a dialog kind: a Python dialog class
+/// name when DIALOG_TOPICS has it, else a guide topic id used
+/// directly.
+fn dialog_topic(kind: &str) -> &'static str {
+    blindrss_core::help_topics::topic_for_dialog(kind).unwrap_or_else(|| {
+        blindrss_core::help_topics::TOPICS
+            .iter()
+            .find(|(id, _)| *id == kind)
+            .map(|(id, _)| *id)
+            .unwrap_or(blindrss_core::help_topics::DEFAULT_TOPIC)
+    })
+}
+
 /// F1 inside a dialog opens the guide at the section documenting
 /// that dialog (Python's DIALOG_TOPICS; the kind strings are the
-/// Python class names, reused verbatim).
+/// Python class names, reused verbatim). The key is
+/// binding-aware (Audit 8 S06, Python's HelpKeyFilter): help
+/// opens only when the press is the accelerator bound to User
+/// Guide, or F1 while F1 itself is unbound (the platform help
+/// key). When the user has given F1 to another command, the
+/// press is left alone — no help intercept.
 pub fn bind_f1(frame: &Frame, dialog: &Dialog, kind: &'static str) {
+    bind_f1_impl(frame, dialog, kind, None);
+}
+
+/// bind_f1 for a dialog built around a Notebook: the topic
+/// resolves through the CURRENT page first (Python's per-page
+/// `_help_topic` attributes), named by its English page title,
+/// falling back to the dialog topic.
+pub fn bind_f1_notebook(
+    frame: &Frame,
+    dialog: &Dialog,
+    kind: &'static str,
+    notebook: &Notebook,
+    page_titles: &'static [&'static str],
+) {
+    bind_f1_impl(frame, dialog, kind, Some((*notebook, page_titles)));
+}
+
+fn bind_f1_impl(
+    frame: &Frame,
+    dialog: &Dialog,
+    kind: &'static str,
+    notebook: Option<(Notebook, &'static [&'static str])>,
+) {
     let parent = *frame;
     dialog.bind_internal(EventType::CHAR_HOOK, move |ev| {
-        if ev.get_key_code() == Some(340) {
-            // Kind is a Python dialog class name when DIALOG_TOPICS
-            // has it, else a guide topic id used directly.
-            let topic = blindrss_core::help_topics::topic_for_dialog(kind).unwrap_or_else(|| {
-                blindrss_core::help_topics::TOPICS
-                    .iter()
-                    .find(|(id, _)| *id == kind)
-                    .map(|(id, _)| *id)
-                    .unwrap_or(blindrss_core::help_topics::DEFAULT_TOPIC)
-            });
-            crate::help::show_help_topic(&parent, &crate::ui_language(), Some(topic));
-            ev.skip(false);
-        } else {
+        let code = ev.get_key_code().unwrap_or(0);
+        let mods = blindrss_core::shortcuts::KeyModifiers {
+            ctrl: ev.control_down(),
+            alt: ev.alt_down(),
+            shift: ev.shift_down(),
+            cmd: ev.meta_down(),
+        };
+        let Some(accel) = blindrss_core::shortcuts::event_accel(code, mods, true) else {
             ev.skip(true);
+            return;
+        };
+        let cfg = blindrss_core::config::Config::load(&crate::config_path()).unwrap_or_default();
+        let map = blindrss_core::shortcuts::accel_map(
+            &blindrss_core::shortcuts::overrides_from_config(&cfg),
+        );
+        if blindrss_core::shortcuts::help_key_action(&accel, &map)
+            != blindrss_core::shortcuts::HelpKeyAction::ContextHelp
+        {
+            ev.skip(true);
+            return;
         }
+        let topic = notebook
+            .and_then(|(nb, titles)| {
+                let idx = nb.selection().max(0) as usize;
+                titles
+                    .get(idx)
+                    .and_then(|t| blindrss_core::help_topics::topic_for_notebook_page(kind, t))
+            })
+            .unwrap_or_else(|| dialog_topic(kind));
+        crate::help::show_help_topic(&parent, &crate::ui_language(), Some(topic));
+        ev.skip(false);
     });
 }
 

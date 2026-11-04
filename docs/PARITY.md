@@ -3726,3 +3726,138 @@ killed by PID; the re-run finished clean), `cargo build
 -p blindrss` OK, `cargo fmt --all` run last and `--check`
 clean. No cfg(windows) code was touched, so the windows-gnu
 clippy leg was not required.
+## Audit 8 Task 17 resolution — shared keyboard normalization + editor semantics (S01, S04, S05, S06, G15, M14) (2026-11-04)
+
+**S01 — shortcut edits round-trip.** The editor wrote
+overrides through `Config::set_path("keyboard_shortcuts.<dotted
+id>")`, which nested `{"feeds": {"refresh_all": ...}}` where
+Python stores one flat `{"feeds.refresh_all": ...}` map; the
+dispatch rebuild reads only flat string values, so every edit
+was silently ignored after the dialog closed and at relaunch.
+Core now owns the shape: `shortcuts::overrides_from_config`
+reads the flat map (non-string values ignored, as Python's
+resolve ignores them) and `shortcuts::store_overrides`
+replaces the whole object flat, in command-table order. The
+dialog applies through that store; the main window's
+`build_keymap` is core's `accel_map` over the same read.
+Pinned by `overrides_round_trip_flat`: flat shape on disk, F6
+resolves after reload, an explicit "" unbind survives the
+round trip, an empty map restores defaults.
+
+**S04 — one strict normalization + one event bridge.**
+`normalize_accelerator` is now a faithful port of Python's
+`parse_accel`/`format_accel`: F1–F24 only, an unknown modifier
+or multi-char key invalidates the whole string, duplicate
+modifiers collapse, the literal '+' key special case
+("Ctrl+Shift++") parses, canonical Ctrl/Alt/Shift/Cmd order.
+The wx event bridge (Python `gui/shortcut_keys.py`) lives in
+core as `event_accel`/`keycode_token`: Control/Alt/Shift/Meta
+map 1:1 (Cmd is never merged into Ctrl), named/navigation
+keys, numpad digits as digits, numpad Enter as Enter, shifted
+punctuation as its unshifted token, F1–F24. Dispatch and
+capture both require a modifier, bare function keys excepted
+— Python's `event_to_accel(require_modifier=True)`. The main
+frame hook no longer blanket-skips Alt and no longer folds
+Cmd into Ctrl; bindings resolve through
+`resolve_bindings`/`accel_map`, which iterate the command
+table in order so a conflict's winner is Python's (the old
+inversion iterated a HashMap and picked an arbitrary winner).
+
+**S05 — the editor is Python's dialog.** Columns
+Category/Command/Shortcut at Python's widths, "(none)" for
+unbound, the list named "Keyboard shortcuts", buttons
+"&Change Shortcut...", "&Remove Shortcut", "Reset All to
+&Defaults", Close. The free-text Edit path is gone (Python
+has none): Change opens the capture dialog — a prompt naming
+the command, the candidate in a readout whose accessible name
+is "Captured keyboard shortcut", OK disabled until a valid
+combination is captured, Escape cancels, Enter confirms.
+Changes apply immediately (the whole flat map per edit); a
+conflicting accelerator asks YES/NO "… is already assigned
+to … Reassign it to …?" and YES unbinds the other command;
+Remove writes an explicit "" unbind and is enabled only on a
+bound command row; Reset All confirms, then clears all
+overrides. The 12 fixed-keys rows (core `fixed_key_rows`,
+Python's table verbatim) append as read-only rows with
+Change/Remove disabled. The dialog's working state is the
+overrides map itself, re-resolved after every change — the
+old dialog edited against a stale pre-dialog snapshot of the
+effective map. Focus returns to the list after each
+operation, as Python restores it.
+
+**S06 — binding-aware F1 everywhere.** Core `help_key_action`
+ports `HelpKeyFilter._is_help_key`: the accelerator bound to
+`help.user_guide` opens context help; F1 opens context help
+while F1 itself is unbound; F1 given to another command
+dispatches that command. The main frame's hard F1 intercept
+(which ignored rebinding) and every dialog's fixed-topic F1
+now route through it: the main frame keeps its
+focused-control topics (tree/list/reader/search), dialogs
+keep their DIALOG_TOPICS kind, Settings resolves the current
+page through NOTEBOOK_PAGE_TOPICS keyed by the English source
+page titles (locale-independent), and the shortcuts capture
+dialog binds no F1 at all — F1 is capturable input there, as
+Python skips its help filter while capturing.
+
+**G15 — Edit Selected is one smart route.** The char hook
+special-cased `feeds.edit_selected` into category-rename vs
+feed-edit, so smart folders wrongly opened feed editing.
+Dispatch now sends the command to M_EDIT_SELECTED, whose
+`act_edit_selected` already branches cat:/smart:/feed
+correctly.
+
+**M14 — the player takes the whole registry.** The player
+hook no longer drops every Ctrl/Cmd/Alt event. Order, as
+Python's `player.on_char_hook`: Enter in the chapter list
+commits (any modifiers); then the bridge accelerator goes
+through the help rule (chapter list → "chapters", else
+"player"); then it delegates to the main frame's dispatch
+with the text guard off — the main frame installs an Rc
+delegate (`player::set_shortcut_delegate`) over its shared
+dispatch closure, which reads the live keymap; then media
+arrows resolve (Ctrl+Arrow everywhere, Alt+Arrow on macOS
+only, Shift/Cmd/Ctrl+Alt disqualify) onto the existing
+seek/volume actions. Unclaimed modified keys pass through to
+the focused control. The main frame calls the same dispatch
+closure with the text guard on: Python's
+`_SHORTCUT_TEXT_GUARDED` set (player.play_pause/stop,
+queue.next/prev, the six filter.* commands) defers while the
+search field is being edited, via `state.search_focused`.
+
+**Deviations, named.** (1) Python's app-wide event filter
+(wx.App.AddFilter) also keeps Ctrl+P and the media arrows
+live while a modal dialog has focus; wxDragon exposes no
+event-filter API, so dialog-focus transport is not
+replicated — delegation covers the two top-level windows
+(main frame, player) and dialogs keep their own keys.
+(2) Python's menu-highlight F1 route (WM_HELP on a
+highlighted menu item → that item's topic) has no wxDragon
+equivalent; F1 pressed over a menu falls back to the
+frame/dialog topic. (3) Player F1 topics cover the chapter
+list ("chapters") and the frame default ("player"); Python's
+finer per-control topics (player-controls, playback-speed,
+casting) need focused-control identities the Rust player does
+not tag, so the seek/volume controls, speed combo and cast
+button answer with "player".
+
+**Regression evidence.** `crates/core/tests/audit8_task17_slice.rs`,
+11 tests (strict normalize, resolve/accel_map order, flat
+round-trip, bridge key families, media arrows, the help rule,
+the text-guard set, fixed rows), written before the
+implementation; the strict-normalize pins were also run
+against the pre-task core and failed there as pinned (it
+returned "F25" where Python yields unbound). The app-side
+routing (G15's menu target, M14's delegate, S05's dialog
+flow) is wiring over these pinned decisions and is covered by
+the workspace gate, not GUI automation (none exists in this
+repo). The pre-existing shortcut suites (i18n_help_slice,
+batch9c_slice) stay green. Platform/screen-reader acceptance
+of the reworked dialogs and player keys remains Brandon's.
+
+Gate in this tree: `cargo test --workspace` 657 passed / 0
+failed (baseline 646 at 76cbe5a on the clean tree; +11, all
+of them the Task 17 slice), clippy `--workspace
+--all-targets -D warnings` clean, clippy `-p blindrss-core
+--all-targets --target x86_64-pc-windows-gnu -D warnings`
+clean (this task touches Windows-facing key handling),
+`cargo build -p blindrss` OK, `cargo fmt --all` run last.

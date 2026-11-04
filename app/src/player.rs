@@ -130,6 +130,25 @@ fn volume_step() -> f64 {
     let cfg = blindrss_core::config::Config::load(&crate::config_path()).unwrap_or_default();
     (cfg.get_i64("volume_step", 5) as f64 / 100.0).clamp(0.01, 0.5)
 }
+thread_local! {
+    /// Main-frame shortcut dispatch shared with this window
+    /// (Audit 8 M14): Python's player delegates every modified
+    /// key to the main frame's `dispatch_shortcut` with the text
+    /// guard off, so the whole registry works while the player
+    /// has focus. Installed by the main window when it is built;
+    /// the delegate reads the live keymap, so shortcut edits
+    /// apply without reopening the player.
+    static SHORTCUT_DELEGATE: RefCell<Option<PlayerCommand>> = const { RefCell::new(None) };
+}
+
+/// Install the main frame's shortcut dispatch (accel -> handled).
+pub fn set_shortcut_delegate(delegate: PlayerCommand) {
+    SHORTCUT_DELEGATE.with(|d| *d.borrow_mut() = Some(delegate));
+}
+
+fn dispatch_shortcut_accel(accel: &str) -> bool {
+    SHORTCUT_DELEGATE.with(|d| d.borrow().as_ref().is_some_and(|f| f(accel)))
+}
 
 /// A range the player skips over, with its announcement label.
 /// `uuid` is the SponsorBlock segment UUID (empty for silence
@@ -1322,10 +1341,6 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
         let slider_h = seek_slider.get_handle() as usize;
         let list_h = chapter_list.get_handle() as usize;
         frame.bind_internal(EventType::CHAR_HOOK, move |ev| {
-            if ev.control_down() || ev.cmd_down() || ev.alt_down() {
-                ev.skip(true);
-                return;
-            }
             let code = ev.get_key_code().unwrap_or(0);
             let focused = ev
                 .get_event_object()
@@ -1334,17 +1349,91 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
             let on_button = btn_handles.contains(&focused);
             let on_slider = focused == slider_h;
             let on_list = focused == list_h;
+            // Enter in the chapter list commits the selection —
+            // checked first, with any modifiers (Python
+            // player.on_char_hook order).
+            if code == 13 && on_list {
+                chapter_seek();
+                ev.skip(false);
+                return;
+            }
+            // Configurable shortcuts (Audit 8 M14): the shared
+            // bridge forms the accelerator. F1 follows the
+            // binding-aware help rule; registry commands delegate
+            // to the main frame with the text guard off, exactly
+            // Python's player delegation; media arrows resolve
+            // when no command claimed the chord. A modified key
+            // nobody claims passes on to the focused control.
+            let mods = blindrss_core::shortcuts::KeyModifiers {
+                ctrl: ev.control_down(),
+                alt: ev.alt_down(),
+                shift: ev.shift_down(),
+                cmd: ev.meta_down(),
+            };
+            if let Some(accel) = blindrss_core::shortcuts::event_accel(code, mods, true) {
+                let cfg =
+                    blindrss_core::config::Config::load(&crate::config_path()).unwrap_or_default();
+                let map = blindrss_core::shortcuts::accel_map(
+                    &blindrss_core::shortcuts::overrides_from_config(&cfg),
+                );
+                if blindrss_core::shortcuts::help_key_action(&accel, &map)
+                    == blindrss_core::shortcuts::HelpKeyAction::ContextHelp
+                {
+                    let topic = if on_list { "chapters" } else { "player" };
+                    crate::help::show_help_topic(&frame_k, &crate::ui_language(), Some(topic));
+                    ev.skip(false);
+                    return;
+                }
+                if dispatch_shortcut_accel(&accel) {
+                    ev.skip(false);
+                    return;
+                }
+                let media_handled = match blindrss_core::shortcuts::media_arrow_action(
+                    cfg!(target_os = "macos"),
+                    mods,
+                    code,
+                ) {
+                    Some("seek_back") => {
+                        m.seek(-seek_back_ms, SeekMode::FromCurrent);
+                        true
+                    }
+                    Some("seek_forward") => {
+                        m.seek(seek_fwd_ms, SeekMode::FromCurrent);
+                        true
+                    }
+                    Some("volume_up") => {
+                        let v = (m.get_volume() + volume_step()).min(1.0);
+                        m.set_volume(v);
+                        persist_volume(v);
+                        crate::announce(
+                            "general",
+                            &format!("Volume {}%", (v * 100.0).round() as i64),
+                        );
+                        true
+                    }
+                    Some("volume_down") => {
+                        let v = (m.get_volume() - volume_step()).max(0.0);
+                        m.set_volume(v);
+                        persist_volume(v);
+                        crate::announce(
+                            "general",
+                            &format!("Volume {}%", (v * 100.0).round() as i64),
+                        );
+                        true
+                    }
+                    _ => false,
+                };
+                ev.skip(!media_handled);
+                return;
+            }
             match code {
                 // Escape closes the player.
                 27 => {
                     frame_k.close(false);
                     ev.skip(false);
                 }
-                // Enter in the chapter list seeks to the chapter.
-                13 if on_list => {
-                    chapter_seek();
-                    ev.skip(false);
-                }
+                // (Enter in the chapter list is handled above,
+                // before shortcut delegation.)
                 // Space toggles play/pause anywhere a button
                 // does not already own it — the same closure
                 // the Play/Pause button runs.
