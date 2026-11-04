@@ -260,8 +260,9 @@ Python `core/casting.py`, in that order.
   drives ship-shape (see §6 Updates).
 - `discovery.rs`, `takeout.rs`, `opml.rs`, `download.rs`,
   `archive.rs` (podcast archive recovery), `enrich.rs` (page-metadata
-  enrichment — fills only empty author fields, unions tags, never
-  issues its own network requests), `shortcuts.rs` (the pure,
+  enrichment — fills empty/placeholder author fields, unions
+  tags losslessly, never issues its own network requests),
+  `shortcuts.rs` (the pure,
   GUI-free shortcut registry), `windows_shortcuts.rs` (the
   PowerShell/WScript.Shell `.lnk` creation port behind the
   Add Shortcuts dialog), `single_instance.rs`, `startup.rs`

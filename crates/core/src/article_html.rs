@@ -1302,7 +1302,7 @@ pub fn render_rich_article(
 ) -> Option<String> {
     let url = url.trim();
     let mut title = fallback_title.to_string();
-    let author = fallback_author.to_string();
+    let mut author = fallback_author.to_string();
     let mut body = String::new();
     let mut page_lang: Option<String> = None;
     let mut metered_preview = false;
@@ -1320,10 +1320,15 @@ pub fn render_rich_article(
         && !url.is_empty()
         && crate::extract::looks_like_id3_media_url(url)
         && fallback_html.trim().is_empty()
-        && let Some((t, _a, content)) = crate::extract::id3_metadata(url)
+        && let Some((t, a, content)) = crate::extract::id3_metadata(url)
     {
-        if title.is_empty() {
+        // Python article_html: resolved ID3 metadata overrides
+        // the fallback header whenever it is non-empty.
+        if !t.is_empty() {
             title = t;
+        }
+        if !a.is_empty() {
+            author = a;
         }
         body = clean_article_html(&content, url, false);
     }
@@ -1335,10 +1340,15 @@ pub fn render_rich_article(
         && !url.is_empty()
         && !crate::extract::looks_like_media_url(url)
         && crate::ytfull::is_youtube_video_url(url)
-        && let Some((t, _a, text)) = crate::ytfull::extract_article(url)
+        && let Some((t, a, text)) = crate::ytfull::extract_article(url)
     {
-        if title.is_empty() {
+        // Same precedence as the ID3 path (Python
+        // article_html): non-empty resolved metadata wins.
+        if !t.is_empty() {
             title = t;
+        }
+        if !a.is_empty() {
+            author = a;
         }
         body = structured_youtube_html(&text);
     }
@@ -1350,12 +1360,15 @@ pub fn render_rich_article(
         let page_html = crate::extract::decode_bytes(&bytes, &content_type, "");
         page_lang = crate::article_lang::lang_from_page_html(&page_html);
         metered_preview = crate::extract::looks_like_metered_preview(&page_html);
+        // Python article_html: on the ordinary fetched-page
+        // path the feed/fallback header wins and the page's
+        // own <title> / author meta only fill gaps.
+        let (t, a) = crate::extract::title_author_from_meta(&page_html);
         if title.is_empty() {
-            let (t, _) = extract_focus(
-                &page_html,
-                rust_trafilatura::ExtractionFocus::FavorPrecision,
-            );
             title = t;
+        }
+        if author.is_empty() {
+            author = a;
         }
         // Sky Flourish + GSMArena expansions, then multi-page
         // following with whole-page dedupe (Python's page loop).

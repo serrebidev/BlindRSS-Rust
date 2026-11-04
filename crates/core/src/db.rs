@@ -2830,26 +2830,56 @@ impl Db {
     }
 
     /// Apply fetched-page metadata to a stored article
-    /// (metadata_enrich.py): fill a missing author, merge tags.
+    /// (Python `enrich_stored_article`): a real author is
+    /// never replaced — only an empty or "unknown" placeholder
+    /// is filled — and the tag merge is lossless, preserving
+    /// every stored tag and capping only additions. The
+    /// section joins the stored tags, as in Python. A missing
+    /// row (a hosted-provider article) is a no-op.
     pub fn apply_enrichment(
         &self,
         article_id: &str,
         meta: &crate::enrich::EnrichMeta,
     ) -> rusqlite::Result<()> {
-        if !meta.author.is_empty() {
+        let mut found_tags: Vec<String> = meta.tags.clone();
+        if !meta.section.is_empty() {
+            found_tags.push(meta.section.clone());
+        }
+        if meta.author.is_empty() && found_tags.is_empty() {
+            return Ok(());
+        }
+        let stored: Option<(Option<String>, Option<String>)> = self
+            .conn
+            .query_row(
+                "SELECT author, tags FROM articles WHERE id = ?1",
+                params![article_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .ok();
+        let Some((stored_author, stored_tags)) = stored else {
+            return Ok(());
+        };
+        if !meta.author.is_empty()
+            && crate::enrich::author_is_placeholder(stored_author.as_deref().unwrap_or(""))
+        {
             self.conn.execute(
-                "UPDATE articles SET author = ?2 WHERE id = ?1 \
-                 AND (author IS NULL OR author = '')",
+                "UPDATE articles SET author = ?2 WHERE id = ?1",
                 params![article_id, meta.author],
             )?;
         }
-        if !meta.tags.is_empty() {
-            let existing = self.article_tags(article_id)?;
-            let merged = crate::enrich::merge_tags(existing, &meta.tags);
-            self.conn.execute(
-                "UPDATE articles SET tags = ?2 WHERE id = ?1",
-                params![article_id, merged.join("\n")],
-            )?;
+        if !found_tags.is_empty() {
+            let raw = stored_tags.as_deref().unwrap_or("");
+            let stored_lines: Vec<String> = raw.split('\n').map(str::to_string).collect();
+            let merged = crate::enrich::merge_tag_string(&stored_lines, &found_tags);
+            // Python writes when the merged string differs
+            // from the merely-trimmed stored string, so a
+            // whitespace-messy stored list is normalized too.
+            if merged.join("\n") != raw.trim() {
+                self.conn.execute(
+                    "UPDATE articles SET tags = ?2 WHERE id = ?1",
+                    params![article_id, merged.join("\n")],
+                )?;
+            }
         }
         Ok(())
     }

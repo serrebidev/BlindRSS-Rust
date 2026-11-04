@@ -3223,3 +3223,71 @@ failed roughly 1 in 10 before); full gate after the fix: cargo
 fmt clean, clippy clean (workspace and core
 `x86_64-pc-windows-gnu`), `cargo test --workspace` 589 passed /
 0 failed, `cargo build -p blindrss` OK.
+
+**Audit 8 Task 13 — lossless metadata enrichment (R01, R13,
+R14; 2026-11-04):** `crates/core/src/enrich.rs` rewritten as a
+faithful port of Python `core/metadata_enrich.py`, in Python's
+source order: JSON-LD restricted to Article-family `@type`s
+(first matching node wins; `@graph` flattened breadth-first;
+author arrays join up to three names; keyword objects read
+their `name`; a list `articleSection` joins through the
+keyword list), then Article-family microdata, then OpenGraph
+`article:*` (repeated tags kept, profile-URL authors
+rejected), then the rust-trafilatura metadata fallback
+(author plus tags and categories). Extraction-side cleaning
+now dedupes with Unicode `to_lowercase` and caps only the
+extracted list (20 tags, 80 code points per tag); the old
+code deduped ASCII-only, favoured generic meta tags over
+JSON-LD, and capped the merged stored union at 12. R01:
+`Db::apply_enrichment` merges through the new
+`merge_tag_string` port — every stored tag survives (20- and
+45-tag regressions pinned), additions append only below the
+40-tag total ceiling, and the write happens only when the
+merged string differs from the trimmed stored string,
+matching Python's comparison. R13: placeholder authors
+(empty, `Unknown`, `(Unknown)`) are filled and real authors
+are never replaced; the section is appended to the found
+tags at apply time; a missing local row (hosted-provider
+article) is a no-op. R14: `render_rich_article` headers
+carry resolved metadata with Python's per-path precedence —
+ID3 and YouTube structured metadata now override a stale
+non-empty fallback whenever non-empty (the author was
+previously discarded outright), and on the ordinary
+fetched-page path the fallback wins while the new
+`extract::title_author_from_meta` (a port of
+`_extract_title_author_from_meta`: `<title>` element text
+only, author-meta candidates byl, author, article:author,
+parsely-author, sailthru.author, `By ` prefix stripped, URL
+authors rejected) fills title and author gaps — previously
+the author was never filled from the page at all and the
+title came from trafilatura's metadata. Enrichment still
+issues no network requests: it consumes only the page HTML
+the app already fetched; the app caller passes the article
+URL (the microdata resolution base) and no longer skips
+section-only metadata. Behaviour verified against the
+Python implementation running on this box with the spec
+libraries (extruct 0.18.0, trafilatura 2.3.1; the Python
+app tracks trafilatura from upstream master): for the
+common nested-Person microdata shape the extruct stage
+yields no author (the name sits under the item's
+`properties` and `_person_name` reads only a top-level
+`name`) while the trafilatura fallback supplies it from the
+`itemprop="author"` element text; the port reproduces both
+stages and a regression pins the combined result. Recorded
+scope notes: (1) `merge_tags` is unchanged and still serves
+feed-ingest categories in `feeds.rs` — Python's ingest path
+is not `merge_tag_string`, and the audit did not flag it;
+(2) the reconstructed-source render path keeps its existing
+title precedence — R14's Python evidence covers the ID3,
+YouTube and ordinary page paths; (3) the YouTube header
+change has no offline test (it runs a yt-dlp subprocess);
+it is the same precedence shape as the ID3 path, which is
+regression-tested with local MP3 fixtures. Tests: new
+`crates/core/tests/audit8_task13_slice.rs` (14 tests; 12
+failed before the fix, all pass after) plus 2 new enrich
+unit tests. Gate in this tree: `cargo test --workspace`
+604 passed / 0 failed (589 at the Wave 2 base plus the 15
+net new tests), clippy `--workspace --all-targets
+-D warnings` clean on the Linux target and for
+`blindrss-core` on `x86_64-pc-windows-gnu`, `cargo build -p
+blindrss` OK, `cargo fmt --all` run last.

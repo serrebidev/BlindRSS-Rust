@@ -3265,6 +3265,72 @@ fn collect_descriptions(value: &serde_json::Value, out: &mut Vec<String>) {
     }
 }
 
+/// Python `_extract_title_author_from_meta`
+/// (article_extractor.py): the title is the `<title>`
+/// element's text only (never og:title or a heading — forum
+/// and thread pages put the first post's heading where
+/// trafilatura looks), and the author is the first non-empty
+/// candidate from the author-meta priority list, with a
+/// leading "By " stripped and profile URLs rejected (a URL
+/// is never a byline).
+pub fn title_author_from_meta(html: &str) -> (String, String) {
+    let lower = html.to_lowercase();
+    let mut title = String::new();
+    if let Some(pos) = lower.find("<title")
+        && let Some(gt) = lower[pos..].find('>')
+    {
+        let start = pos + gt + 1;
+        if let Some(end) = lower[start..].find("</title") {
+            title = unescape_entities(&html[start..start + end])
+                .trim()
+                .to_string();
+        }
+    }
+    let mut author = String::new();
+    for name in [
+        "byl",
+        "author",
+        "article:author",
+        "parsely-author",
+        "sailthru.author",
+    ] {
+        if let Some(raw) = meta_content(html, name) {
+            let value = unescape_entities(&raw);
+            if !value.trim().is_empty() {
+                author = value.trim().to_string();
+                break;
+            }
+        }
+    }
+    if !author.is_empty() {
+        author = strip_by_prefix(&author);
+        let lowered = author.to_lowercase();
+        if lowered.starts_with("//")
+            || lowered.starts_with("http://")
+            || lowered.starts_with("https://")
+        {
+            author = String::new();
+        }
+    }
+    (title, author)
+}
+
+/// Python's `(?i)^\s*by[\s:]+` prefix strip for bylines.
+fn strip_by_prefix(author: &str) -> String {
+    let s = author.trim_start();
+    let bytes = s.as_bytes();
+    if bytes.len() >= 3
+        && bytes[0].eq_ignore_ascii_case(&b'b')
+        && bytes[1].eq_ignore_ascii_case(&b'y')
+        && (bytes[2] == b':' || bytes[2].is_ascii_whitespace())
+    {
+        return s[2..]
+            .trim_start_matches(|c: char| c == ':' || c.is_whitespace())
+            .to_string();
+    }
+    s.to_string()
+}
+
 /// Read a <meta name/property="..." content="..."> value with
 /// a tolerant hand scan (attribute order varies).
 pub fn meta_content(html: &str, name: &str) -> Option<String> {

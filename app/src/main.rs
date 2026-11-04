@@ -9495,8 +9495,12 @@ fn main() {
                         if let (Some(article), Some(html)) = (&article, &first_html)
                             && let Some(db) = st.db.as_ref()
                         {
-                            let meta = blindrss_core::enrich::extract_metadata(html);
-                            if !meta.author.is_empty() || !meta.tags.is_empty() {
+                            let meta =
+                                blindrss_core::enrich::extract_metadata(html, &article.url);
+                            if !meta.author.is_empty()
+                                || !meta.tags.is_empty()
+                                || !meta.section.is_empty()
+                            {
                                 let _ = db.apply_enrichment(&article.id, &meta);
                             }
                         }
