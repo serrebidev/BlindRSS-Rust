@@ -3713,13 +3713,14 @@ fn main() {
             // remote failure surfaces in the status bar.
             // View-id mapping: the All Feeds root (no filter)
             // is the provider-wide mark (None); a feed node is
-            // that feed; a category node fans out to one
-            // provider mark per feed in the category (the
-            // trait's per-feed remote endpoints — GReader feed
-            // streams, Miniflux feed endpoints — plus each
-            // feed's cache rows). Smart-folder and
-            // Recommendations views have no server stream and
-            // keep the local path below.
+            // that feed; a category node goes through
+            // provider.mark_category_read, which marks by
+            // server category membership (GReader label
+            // stream, Miniflux category endpoint) so articles
+            // labeled/moved into the category from outside
+            // feeds are covered (Audit 8 D23). Smart-folder
+            // and Recommendations views have no server stream
+            // and keep the local path below.
             {
                 let st = state_ma.borrow();
                 let filter = st.selected_feed.clone();
@@ -3733,7 +3734,6 @@ fn main() {
                     let cfg =
                         blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
                     if blindrss_core::provider::active_name(&cfg) != "local" {
-                        let feeds = st.feeds.clone();
                         drop(st);
                         frame_ma.set_status_text("Marking all read...", 0);
                         let tx = tx_ma.clone();
@@ -3743,25 +3743,8 @@ fn main() {
                             let provider = blindrss_core::provider::get_provider(&cfg, db_path());
                             let result = match filter.as_deref() {
                                 None => provider.mark_all_read(None),
-                                Some(view) if view.starts_with("cat:") => {
-                                    let path = view.strip_prefix("cat:").unwrap_or("");
-                                    let mut total = 0usize;
-                                    let mut first_err: Option<String> = None;
-                                    for feed in feeds_in_category(&feeds, path) {
-                                        match provider.mark_all_read(Some(&feed.id)) {
-                                            Ok(n) => total += n,
-                                            Err(e) => {
-                                                if first_err.is_none() {
-                                                    first_err = Some(e);
-                                                }
-                                            }
-                                        }
-                                    }
-                                    match first_err {
-                                        Some(e) => Err(e),
-                                        None => Ok(total),
-                                    }
-                                }
+                                Some(view) if view.starts_with("cat:") => provider
+                                    .mark_category_read(view.strip_prefix("cat:").unwrap_or("")),
                                 Some(feed_id) => provider.mark_all_read(Some(feed_id)),
                             };
                             let _ = tx.send(RefreshMsg::ProviderAction(
@@ -4214,9 +4197,31 @@ fn main() {
                     let _ = tx.send(RefreshMsg::ProviderDone(key.to_string(), result));
                 });
             }
-            if let Some(section) = providers.get("inoreader") {
-                let token = get(section, "token");
-                if !token.is_empty() {
+            if let Some(_section) = providers.get("inoreader") {
+                // The background sync runs the same OAuth
+                // refresh lifecycle as the active provider
+                // (Audit 8 D07): a stale token is refreshed
+                // first and the rotation persisted; a revoked
+                // grant is cleared and skipped, a transient
+                // failure skips this round with the stored
+                // tokens untouched.
+                let mut auth = blindrss_core::oauth::InoreaderAuth::from_config(&cfg);
+                let mut usable = !auth.access_token.is_empty() || !auth.refresh_token.is_empty();
+                if usable && auth.has_app_credentials() {
+                    match auth.ensure_fresh_now() {
+                        Ok(blindrss_core::oauth::TokenAction::Fresh) => {}
+                        Ok(action) => {
+                            let mut cfg2 = cfg.clone();
+                            auth.apply_to_config(&mut cfg2);
+                            let _ = cfg2.save_to_source();
+                            if action == blindrss_core::oauth::TokenAction::Revoked {
+                                usable = false;
+                            }
+                        }
+                        Err(_) => usable = false,
+                    }
+                }
+                if usable && !auth.access_token.is_empty() {
                     started += 1;
                     let tx = tx_sync.clone();
                     let path = blindrss_core::provider::db_path_for_provider(
@@ -4225,12 +4230,18 @@ fn main() {
                         "inoreader",
                     );
                     let page_size = blindrss_core::providers::page_size_from_config(&cfg);
+                    let (token, app_id, app_key) = (
+                        auth.access_token.clone(),
+                        auth.app_id.clone(),
+                        auth.app_key.clone(),
+                    );
                     std::thread::spawn(move || {
                         let result = Db::open(&path).map_err(|e| format!("{e}")).and_then(|db| {
                             blindrss_core::providers::GReaderClient::with_oauth(
                                 blindrss_core::providers::GReaderService::Inoreader,
                                 &token,
                             )
+                            .with_app_credentials(&app_id, &app_key)
                             .with_article_page_size(page_size)
                             .sync(&db, 100)
                         });

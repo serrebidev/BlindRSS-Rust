@@ -55,6 +55,11 @@ pub struct GReaderClient {
     password: String,
     /// OAuth bearer token (Inoreader). When set, ClientLogin is skipped.
     pub oauth_token: Option<String>,
+    /// Inoreader app credentials, sent as AppId/AppKey headers
+    /// on every request (Python `providers/inoreader.py`
+    /// `_headers`; Audit 8 D08). Never sent for other services.
+    app_id: String,
+    app_key: String,
     token: RefCell<Option<String>>,
     /// Inoreader quota caches (providers/inoreader.py):
     /// subscription metadata and per-stream article lists are
@@ -70,6 +75,8 @@ pub struct GReaderClient {
 static INOREADER_META_CACHE: std::sync::Mutex<
     Option<(String, std::time::Instant, Vec<RemoteFeed>)>,
 > = std::sync::Mutex::new(None);
+static INOREADER_LABEL_CACHE: std::sync::Mutex<Option<(String, std::time::Instant, Vec<String>)>> =
+    std::sync::Mutex::new(None);
 type ArticleCacheMap = std::collections::HashMap<String, (std::time::Instant, Vec<Article>)>;
 
 static INOREADER_ARTICLE_CACHE: std::sync::OnceLock<std::sync::Mutex<ArticleCacheMap>> =
@@ -203,6 +210,8 @@ impl GReaderClient {
             email: email.to_string(),
             password: password.to_string(),
             oauth_token: None,
+            app_id: String::new(),
+            app_key: String::new(),
             token: RefCell::new(None),
             meta_ttl: std::time::Duration::from_secs(3600),
             article_ttl: std::time::Duration::from_secs(90),
@@ -214,6 +223,30 @@ impl GReaderClient {
         let mut c = Self::new(service, "", "");
         c.oauth_token = Some(token.to_string());
         c
+    }
+
+    /// Set the Inoreader app credentials (providers.inoreader
+    /// `app_id` / `app_key`). Stored on every GReader client but
+    /// only ever sent for Inoreader (see `with_app_headers`).
+    pub fn with_app_credentials(mut self, app_id: &str, app_key: &str) -> Self {
+        self.app_id = app_id.trim().to_string();
+        self.app_key = app_key.trim().to_string();
+        self
+    }
+
+    /// Add the Inoreader AppId/AppKey headers to a request
+    /// (Python `_headers`: both, each only when configured).
+    /// A no-op for the other services and when unconfigured.
+    fn with_app_headers<B>(&self, mut req: ureq::RequestBuilder<B>) -> ureq::RequestBuilder<B> {
+        if self.service == GReaderService::Inoreader {
+            if !self.app_id.is_empty() {
+                req = req.header("AppId", &self.app_id);
+            }
+            if !self.app_key.is_empty() {
+                req = req.header("AppKey", &self.app_key);
+            }
+        }
+        req
     }
 
     /// Set the Inoreader cache TTLs from config
@@ -258,6 +291,13 @@ impl GReaderClient {
             .unwrap_or_else(|p| p.into_inner());
         if metadata.as_ref().is_some_and(|(key, _, _)| key == &scope) {
             *metadata = None;
+        }
+        drop(metadata);
+        let mut labels = INOREADER_LABEL_CACHE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if labels.as_ref().is_some_and(|(key, _, _)| key == &scope) {
+            *labels = None;
         }
         article_cache().retain(|key, _| !key.starts_with(&format!("{scope}|")));
     }
@@ -328,8 +368,8 @@ impl GReaderClient {
         // Status-aware agent + one Retry-After retry: Inoreader
         // quotas answer 429 (Python backs off the same way).
         let (status, text) = crate::http::with_rate_limit_backoff(|| {
-            let mut resp = crate::http::status_agent()
-                .get(&url)
+            let mut resp = self
+                .with_app_headers(crate::http::status_agent().get(&url))
                 .header("Authorization", &auth)
                 .call()
                 .map_err(|e| format!("GET {path} failed: {e}"))?;
@@ -387,6 +427,62 @@ impl GReaderClient {
                 Some((self.cache_scope(), std::time::Instant::now(), feeds.clone()));
         }
         Ok(feeds)
+    }
+
+    /// The account's full label (category) inventory,
+    /// including labels no subscription carries (Python
+    /// `providers/inoreader.py::get_categories` reads the same
+    /// `/tag/list`; Audit 8 D10). Sorted case-insensitively,
+    /// like Python.
+    pub fn labels(&self) -> Result<Vec<String>, String> {
+        // Inoreader's inventory rides the metadata cache like
+        // the subscription list (Python caches categories
+        // with the feeds): /tag/list on every sync would burn
+        // the small app quota.
+        if self.service == GReaderService::Inoreader {
+            let cache = INOREADER_LABEL_CACHE
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if let Some((scope, at, labels)) = &*cache
+                && scope == &self.cache_scope()
+                && at.elapsed() < self.meta_ttl
+            {
+                return Ok(labels.clone());
+            }
+            drop(cache);
+        }
+        #[derive(Deserialize)]
+        struct TagList {
+            #[serde(default)]
+            tags: Vec<Tag>,
+        }
+        #[derive(Deserialize)]
+        struct Tag {
+            #[serde(default)]
+            id: String,
+        }
+        let list: TagList = self.get_json("/tag/list?output=json")?;
+        let mut labels: Vec<String> = list
+            .tags
+            .into_iter()
+            .filter_map(|t| {
+                t.id.split_once("/label/")
+                    .map(|(_, label)| label.to_string())
+            })
+            .filter(|l| !l.is_empty())
+            .collect();
+        labels.sort_by_key(|l| l.to_lowercase());
+        labels.dedup();
+        if self.service == GReaderService::Inoreader {
+            *INOREADER_LABEL_CACHE
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = Some((
+                self.cache_scope(),
+                std::time::Instant::now(),
+                labels.clone(),
+            ));
+        }
+        Ok(labels)
     }
 
     /// Fetch a stream's items as articles (not yet stored).
@@ -504,8 +600,8 @@ impl GReaderClient {
     /// Set one item's read state on the server: edit-tag adds the
     /// read state to mark read, removes it to mark unread.
     pub fn set_read_remote(&self, item_id: &str, read: bool) -> Result<(), String> {
-        let mut token_resp = crate::http::agent()
-            .get(&format!("{}/token", self.api_base))
+        let mut token_resp = self
+            .with_app_headers(crate::http::agent().get(&format!("{}/token", self.api_base)))
             .header("Authorization", &self.auth_header()?)
             .call()
             .map_err(|e| format!("token fetch failed: {e}"))?;
@@ -518,8 +614,7 @@ impl GReaderClient {
         } else {
             ("r", "user/-/state/com.google/read")
         };
-        crate::http::agent()
-            .post(&format!("{}/edit-tag", self.api_base))
+        self.with_app_headers(crate::http::agent().post(&format!("{}/edit-tag", self.api_base)))
             .header("Authorization", &self.auth_header()?)
             .send_form([("i", item_id), (verb, state), ("T", edit_token.trim())])
             .map_err(|e| format!("edit-tag failed: {e}"))?;
@@ -529,8 +624,8 @@ impl GReaderClient {
     /// Set one item's starred state on the server (the GReader
     /// starred state is the hosted favorite).
     pub fn set_starred_remote(&self, item_id: &str, starred: bool) -> Result<(), String> {
-        let mut token_resp = crate::http::agent()
-            .get(&format!("{}/token", self.api_base))
+        let mut token_resp = self
+            .with_app_headers(crate::http::agent().get(&format!("{}/token", self.api_base)))
             .header("Authorization", &self.auth_header()?)
             .call()
             .map_err(|e| format!("token fetch failed: {e}"))?;
@@ -543,8 +638,7 @@ impl GReaderClient {
         } else {
             ("r", "user/-/state/com.google/starred")
         };
-        crate::http::agent()
-            .post(&format!("{}/edit-tag", self.api_base))
+        self.with_app_headers(crate::http::agent().post(&format!("{}/edit-tag", self.api_base)))
             .header("Authorization", &self.auth_header()?)
             .send_form([("i", item_id), (verb, state), ("T", edit_token.trim())])
             .map_err(|e| format!("edit-tag failed: {e}"))?;
@@ -563,8 +657,8 @@ impl GReaderClient {
     }
 
     fn subscription_edit(&self, stream: &str, action: &str) -> Result<(), String> {
-        let mut token_resp = crate::http::agent()
-            .get(&format!("{}/token", self.api_base))
+        let mut token_resp = self
+            .with_app_headers(crate::http::agent().get(&format!("{}/token", self.api_base)))
             .header("Authorization", &self.auth_header()?)
             .call()
             .map_err(|e| format!("token fetch failed: {e}"))?;
@@ -572,11 +666,12 @@ impl GReaderClient {
             .body_mut()
             .read_to_string()
             .map_err(|e| format!("token read failed: {e}"))?;
-        crate::http::agent()
-            .post(&format!("{}/subscription/edit", self.api_base))
-            .header("Authorization", &self.auth_header()?)
-            .send_form([("s", stream), ("ac", action), ("T", edit_token.trim())])
-            .map_err(|e| format!("subscription edit failed: {e}"))?;
+        self.with_app_headers(
+            crate::http::agent().post(&format!("{}/subscription/edit", self.api_base)),
+        )
+        .header("Authorization", &self.auth_header()?)
+        .send_form([("s", stream), ("ac", action), ("T", edit_token.trim())])
+        .map_err(|e| format!("subscription edit failed: {e}"))?;
         Ok(())
     }
 
@@ -621,8 +716,8 @@ impl GReaderClient {
         stream_id: &str,
         category: Option<&str>,
     ) -> Result<(), String> {
-        let mut token_resp = crate::http::agent()
-            .get(&format!("{}/token", self.api_base))
+        let mut token_resp = self
+            .with_app_headers(crate::http::agent().get(&format!("{}/token", self.api_base)))
             .header("Authorization", &self.auth_header()?)
             .call()
             .map_err(|e| format!("token fetch failed: {e}"))?;
@@ -637,11 +732,12 @@ impl GReaderClient {
             label = format!("user/-/label/{cat}");
             form.push(("a", &label));
         }
-        crate::http::agent()
-            .post(&format!("{}/subscription/edit", self.api_base))
-            .header("Authorization", &self.auth_header()?)
-            .send_form(form)
-            .map_err(|e| format!("subscription edit failed: {e}"))?;
+        self.with_app_headers(
+            crate::http::agent().post(&format!("{}/subscription/edit", self.api_base)),
+        )
+        .header("Authorization", &self.auth_header()?)
+        .send_form(form)
+        .map_err(|e| format!("subscription edit failed: {e}"))?;
         Ok(())
     }
 
@@ -656,8 +752,8 @@ impl GReaderClient {
         if url.is_some() {
             return Err("This provider does not support changing subscription URLs".to_string());
         }
-        let mut token = crate::http::agent()
-            .get(&format!("{}/token", self.api_base))
+        let mut token = self
+            .with_app_headers(crate::http::agent().get(&format!("{}/token", self.api_base)))
             .header("Authorization", &self.auth_header()?)
             .call()
             .map_err(|e| format!("token fetch failed: {e}"))?;
@@ -681,11 +777,12 @@ impl GReaderClient {
                 form.push(("a", new));
             }
         }
-        crate::http::agent()
-            .post(&format!("{}/subscription/edit", self.api_base))
-            .header("Authorization", &self.auth_header()?)
-            .send_form(form)
-            .map_err(|e| format!("subscription edit failed: {e}"))?;
+        self.with_app_headers(
+            crate::http::agent().post(&format!("{}/subscription/edit", self.api_base)),
+        )
+        .header("Authorization", &self.auth_header()?)
+        .send_form(form)
+        .map_err(|e| format!("subscription edit failed: {e}"))?;
         self.invalidate_caches();
         Ok(())
     }
@@ -697,8 +794,7 @@ impl GReaderClient {
     pub fn rename_label_remote(&self, old_title: &str, new_title: &str) -> Result<(), String> {
         let source = format!("user/-/label/{old_title}");
         let dest = format!("user/-/label/{new_title}");
-        crate::http::agent()
-            .post(&format!("{}/rename-tag", self.api_base))
+        self.with_app_headers(crate::http::agent().post(&format!("{}/rename-tag", self.api_base)))
             .header("Authorization", &self.auth_header()?)
             .send_form([("s", source.as_str()), ("dest", dest.as_str())])
             .map_err(|e| format!("rename-tag failed: {e}"))?;
@@ -711,8 +807,7 @@ impl GReaderClient {
     /// delete_category). The subscriptions themselves stay.
     pub fn disable_label_remote(&self, title: &str) -> Result<(), String> {
         let tag = format!("user/-/label/{title}");
-        crate::http::agent()
-            .post(&format!("{}/disable-tag", self.api_base))
+        self.with_app_headers(crate::http::agent().post(&format!("{}/disable-tag", self.api_base)))
             .header("Authorization", &self.auth_header()?)
             .send_form([("s", tag.as_str())])
             .map_err(|e| format!("disable-tag failed: {e}"))?;
@@ -721,8 +816,8 @@ impl GReaderClient {
     }
 
     pub fn mark_all_read_remote(&self, feed_id: Option<&str>) -> Result<(), String> {
-        let mut token = crate::http::agent()
-            .get(&format!("{}/token", self.api_base))
+        let mut token = self
+            .with_app_headers(crate::http::agent().get(&format!("{}/token", self.api_base)))
             .header("Authorization", &self.auth_header()?)
             .call()
             .map_err(|e| format!("token fetch failed: {e}"))?;
@@ -730,17 +825,18 @@ impl GReaderClient {
             .body_mut()
             .read_to_string()
             .map_err(|e| e.to_string())?;
-        crate::http::agent()
-            .post(&format!("{}/mark-all-as-read", self.api_base))
-            .header("Authorization", &self.auth_header()?)
-            .send_form([
-                (
-                    "s",
-                    feed_id.unwrap_or("user/-/state/com.google/reading-list"),
-                ),
-                ("T", token.trim()),
-            ])
-            .map_err(|e| format!("mark all read failed: {e}"))?;
+        self.with_app_headers(
+            crate::http::agent().post(&format!("{}/mark-all-as-read", self.api_base)),
+        )
+        .header("Authorization", &self.auth_header()?)
+        .send_form([
+            (
+                "s",
+                feed_id.unwrap_or("user/-/state/com.google/reading-list"),
+            ),
+            ("T", token.trim()),
+        ])
+        .map_err(|e| format!("mark all read failed: {e}"))?;
         self.invalidate_caches();
         Ok(())
     }
@@ -752,6 +848,16 @@ impl GReaderClient {
             self.set_read_remote(id, true)?;
         }
         Ok(())
+    }
+
+    /// Mark a whole category read through the label stream
+    /// (Python's GReader-family `mark_all_read` resolves a
+    /// category view to `user/-/label/<category>`; Audit 8
+    /// D23). Server-side label membership covers articles
+    /// labeled into the category from feeds outside it, which
+    /// a per-feed fan-out cannot see.
+    pub fn mark_category_read_remote(&self, category: &str) -> Result<(), String> {
+        self.mark_all_read_remote(Some(&format!("user/-/label/{category}")))
     }
 
     /// Full sync: import subscriptions as local feeds, then store the
@@ -784,6 +890,46 @@ impl GReaderClient {
                     new_articles += 1;
                 }
             }
+        }
+        // Reconcile only now, with the complete inventory in
+        // hand (Audit 8 D09): every fetch above either
+        // succeeded or returned early, so a failed or partial
+        // sync never reaches this point and cannot delete a
+        // feed. Python's providers read through to the server,
+        // so a subscription removed there simply stops
+        // appearing; the cache has to drop it explicitly. Only
+        // this provider's own id shape is eligible — local
+        // feeds in the same file are not the server's business.
+        let remote: std::collections::HashSet<&str> =
+            subs.iter().map(|s| s.stream_id.as_str()).collect();
+        let stale: Vec<String> = db
+            .feeds()
+            .map_err(|e| format!("feed list failed: {e}"))?
+            .into_iter()
+            .map(|f| f.id)
+            .filter(|id| id.starts_with("feed/") && !remote.contains(id.as_str()))
+            .collect();
+        if !stale.is_empty() {
+            let refs: Vec<&str> = stale.iter().map(|s| s.as_str()).collect();
+            db.remove_hosted_feeds(&refs)
+                .map_err(|e| format!("feed reconcile failed: {e}"))?;
+        }
+        // Category inventory (Audit 8 D10): labels with no
+        // subscription exist remotely too. When /tag/list
+        // cannot be read the category table is left exactly
+        // as it was — pruning from a partial inventory would
+        // delete real categories.
+        if let Ok(labels) = self.labels() {
+            let mut inventory: Vec<String> = labels;
+            for sub in &subs {
+                if let Some(cat) = &sub.category
+                    && !inventory.contains(cat)
+                {
+                    inventory.push(cat.clone());
+                }
+            }
+            db.reconcile_hosted_categories(&inventory)
+                .map_err(|e| format!("category reconcile failed: {e}"))?;
         }
         Ok((subs.len(), new_articles))
     }
@@ -1226,6 +1372,28 @@ impl MinifluxClient {
         Ok(())
     }
 
+    /// Mark a whole category read through the server category
+    /// endpoint (Python `providers/miniflux.py::mark_all_read`
+    /// resolves a category view to its id and PUTs
+    /// /v1/categories/{id}/mark-all-as-read; Audit 8 D23).
+    /// Server-side membership covers every entry in the
+    /// category, not just the feeds the local tree groups
+    /// under it.
+    pub fn mark_category_read_remote(&self, category: &str) -> Result<(), String> {
+        let Some(id) = self.category_id(category)? else {
+            return Err(format!("Miniflux category not found: {category}"));
+        };
+        crate::http::agent()
+            .put(&format!(
+                "{}/v1/categories/{id}/mark-all-as-read",
+                self.base_url
+            ))
+            .header("X-Auth-Token", &self.api_key)
+            .send_empty()
+            .map_err(|e| format!("mark category read failed: {e}"))?;
+        Ok(())
+    }
+
     /// Test the connection (GET /v1/me): returns the account's
     /// username. Powers the Settings "Test" button.
     pub fn test_connection(&self) -> Result<String, String> {
@@ -1583,6 +1751,41 @@ impl MinifluxClient {
                     new_articles += 1;
                 }
             }
+        }
+        // Reconcile only after every feed and entry page
+        // succeeded (Audit 8 D09): a feed the server no
+        // longer carries leaves the cache, with its entries;
+        // any failure above returned early and changed
+        // nothing beyond upserts.
+        let remote: std::collections::HashSet<String> =
+            feeds.iter().map(|f| format!("miniflux:{}", f.id)).collect();
+        let stale: Vec<String> = db
+            .feeds()
+            .map_err(|e| format!("feed list failed: {e}"))?
+            .into_iter()
+            .map(|f| f.id)
+            .filter(|id| id.starts_with("miniflux:") && !remote.contains(id))
+            .collect();
+        if !stale.is_empty() {
+            let refs: Vec<&str> = stale.iter().map(|s| s.as_str()).collect();
+            db.remove_hosted_feeds(&refs)
+                .map_err(|e| format!("feed reconcile failed: {e}"))?;
+        }
+        // Category inventory (Audit 8 D10): an empty remote
+        // category syncs like any other, and one removed
+        // remotely is pruned when unreferenced. A failed
+        // inventory read skips this entirely.
+        if let Ok(cats) = self.categories_remote() {
+            let mut inventory: Vec<String> = cats.into_iter().map(|(_, title)| title).collect();
+            for f in &feeds {
+                if let Some(cat) = &f.category
+                    && !inventory.contains(&cat.title)
+                {
+                    inventory.push(cat.title.clone());
+                }
+            }
+            db.reconcile_hosted_categories(&inventory)
+                .map_err(|e| format!("category reconcile failed: {e}"))?;
         }
         Ok((feeds.len(), new_articles))
     }

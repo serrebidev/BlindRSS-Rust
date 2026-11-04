@@ -156,21 +156,41 @@ fn open_url(url: &str) {
     let _ = std::process::Command::new("xdg-open").arg(url).spawn();
 }
 
+/// The Redirect URI field's effective value: the trimmed
+/// field text, or the loopback default when blank (Python's
+/// worker applies the same fallback before building the
+/// authorization URL and exchanging the code).
+fn trimmed_redirect(field: &TextCtrl) -> String {
+    let value = field.get_value();
+    let value = value.trim();
+    if value.is_empty() {
+        blindrss_core::oauth::DEFAULT_REDIRECT.to_string()
+    } else {
+        value.to_string()
+    }
+}
+
 /// Inoreader sign-in through the local HTTPS listener
 /// (Python's local-server OAuth variant): a self-signed
 /// server on 127.0.0.1:18423 waits for the browser redirect
 /// (the browser warns about the self-signed certificate —
 /// the redirect target registered with Inoreader is this
 /// https URL). The code is exchanged and the tokens saved,
-/// exactly like the paste-the-URL flow.
-fn inoreader_listener_connect(frame: &Dialog, config_path: &Path, app_id: String, app_key: String) {
+/// exactly like the paste-the-URL flow. The configured
+/// Redirect URI (Audit 8 S15) is used for the authorization
+/// URL and the exchange in both flows; the listener itself
+/// can only receive redirects aimed at the default loopback
+/// address, so a custom URI belongs with the paste flow.
+fn inoreader_listener_connect(
+    frame: &Dialog,
+    config_path: &Path,
+    app_id: String,
+    app_key: String,
+    redirect_uri: String,
+) {
     use std::io::{Read, Write};
     let state = format!("blindrss{}", std::process::id());
-    let url = blindrss_core::oauth::authorization_url(
-        &app_id,
-        blindrss_core::oauth::DEFAULT_REDIRECT,
-        &state,
-    );
+    let url = blindrss_core::oauth::authorization_url(&app_id, &redirect_uri, &state);
     let (tx, rx) = std::sync::mpsc::channel::<Result<String, String>>();
     std::thread::spawn(move || {
         let send = |r: Result<String, String>| {
@@ -251,12 +271,7 @@ fn inoreader_listener_connect(frame: &Dialog, config_path: &Path, app_id: String
         if let Ok(result) = rx.try_recv() {
             let d = dialog2;
             match result.and_then(|code| {
-                blindrss_core::oauth::exchange_code(
-                    &app_id,
-                    &app_key,
-                    &code,
-                    blindrss_core::oauth::DEFAULT_REDIRECT,
-                )
+                blindrss_core::oauth::exchange_code(&app_id, &app_key, &code, &redirect_uri)
             }) {
                 Ok(tokens) => {
                     let mut cfg2 = Config::load(&path).unwrap_or_default();
@@ -273,7 +288,9 @@ fn inoreader_listener_connect(frame: &Dialog, config_path: &Path, app_id: String
                             .unwrap_or(0);
                         cfg2.set_path(
                             "providers.inoreader.token_expires_at",
-                            serde_json::json!(now + exp),
+                            serde_json::json!(blindrss_core::oauth::token_expires_at_from(
+                                exp, now
+                            )),
                         );
                     }
                     cfg2.set_path("providers.inoreader.app_id", serde_json::json!(app_id));
@@ -1148,6 +1165,17 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
         &get_path(&cfg, "providers.bazqux.password"),
         true,
     );
+    // Inoreader custom Redirect URI (Audit 8 S15; appended at
+    // the end of the provider fields per the append-only
+    // control rule). Python's dialog supplies this URI to
+    // both OAuth flows; empty means the loopback default.
+    let ino_redirect = add_field(
+        &provider.win,
+        &provider.sizer,
+        "Inoreader Redirect URI:",
+        &blindrss_core::oauth::redirect_uri_from_config(&cfg),
+        false,
+    );
     let provider_btn_row = BoxSizer::builder(Orientation::Horizontal).build();
     let connect_btn = Button::builder(&provider.win)
         .with_label(&crate::tr("Connect Inoreader..."))
@@ -1581,6 +1609,10 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
                 "providers.inoreader.app_key",
                 serde_json::json!(ino_key.get_value()),
             );
+            cfg.set_path(
+                "providers.inoreader.redirect_uri",
+                serde_json::json!(ino_redirect.get_value()),
+            );
             cfg.set_path("download_path", serde_json::json!(dl_path.get_value()));
             cfg.set_path(
                 "global_show_hide_hotkey",
@@ -1979,7 +2011,8 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
                 md.show_modal();
                 return;
             }
-            inoreader_listener_connect(&frame_ls, &path_ls, app_id, app_key);
+            let redirect_uri = trimmed_redirect(&ino_redirect);
+            inoreader_listener_connect(&frame_ls, &path_ls, app_id, app_key, redirect_uri);
         });
     }
     test_notif_btn.on_click(move |_| test_notify());
@@ -2088,11 +2121,8 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
             return;
         }
         let state = format!("blindrss{}", std::process::id());
-        let url = blindrss_core::oauth::authorization_url(
-            &app_id,
-            blindrss_core::oauth::DEFAULT_REDIRECT,
-            &state,
-        );
+        let redirect_uri = trimmed_redirect(&ino_redirect);
+        let url = blindrss_core::oauth::authorization_url(&app_id, &redirect_uri, &state);
         open_url(&url);
         let entry = TextEntryDialog::builder(
             &dialog_connect,
@@ -2118,12 +2148,7 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
             md.show_modal();
             return;
         };
-        match blindrss_core::oauth::exchange_code(
-            &app_id,
-            &app_key,
-            &code,
-            blindrss_core::oauth::DEFAULT_REDIRECT,
-        ) {
+        match blindrss_core::oauth::exchange_code(&app_id, &app_key, &code, &redirect_uri) {
             Ok(tokens) => {
                 let mut cfg2 = Config::load(&cfg_path_connect).unwrap_or_default();
                 if let Some(t) = tokens.get("access_token") {
@@ -2139,7 +2164,7 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
                         .unwrap_or(0);
                     cfg2.set_path(
                         "providers.inoreader.token_expires_at",
-                        serde_json::json!(now + exp),
+                        serde_json::json!(blindrss_core::oauth::token_expires_at_from(exp, now)),
                     );
                 }
                 cfg2.set_path("providers.inoreader.app_id", serde_json::json!(app_id));

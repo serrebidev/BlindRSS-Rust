@@ -1012,6 +1012,44 @@ impl Db {
         Ok(removed)
     }
 
+    /// Remove specific hosted feeds and everything that
+    /// belongs to their articles (chapters, labels, versions,
+    /// playback state), in one transaction. The hosted sync
+    /// reconciliation (Audit 8 D09) passes only ids the
+    /// server's complete current inventory no longer carries;
+    /// local feeds are never in that set. Returns the number
+    /// of feeds removed.
+    pub fn remove_hosted_feeds(&self, feed_ids: &[&str]) -> rusqlite::Result<usize> {
+        if feed_ids.is_empty() {
+            return Ok(0);
+        }
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let mut removed = 0;
+        for id in feed_ids {
+            for table in ["chapters", "article_labels", "article_versions"] {
+                tx.execute(
+                    &format!(
+                        "DELETE FROM {table} WHERE article_id IN \
+                         (SELECT id FROM articles WHERE feed_id = ?1)"
+                    ),
+                    params![id],
+                )?;
+            }
+            tx.execute(
+                "DELETE FROM playback_state WHERE id IN \
+                 (SELECT id FROM articles WHERE feed_id = ?1)",
+                params![id],
+            )?;
+            tx.execute("DELETE FROM articles WHERE feed_id = ?1", params![id])?;
+            removed += tx.execute("DELETE FROM feeds WHERE id = ?1", params![id])?;
+        }
+        tx.commit()?;
+        Ok(removed)
+    }
+
     /// Chapters for an article, ordered by start (seconds).
     pub fn chapters(&self, article_id: &str) -> rusqlite::Result<Vec<Chapter>> {
         let mut stmt = self.conn.prepare(
@@ -1603,6 +1641,67 @@ impl Db {
             parent_id = Some(id);
         }
         Ok(parent_id.unwrap_or_default())
+    }
+
+    /// Bring the categories table in line with a hosted
+    /// provider's current category inventory (Audit 8 D10;
+    /// Python's providers return the server inventory from
+    /// `get_categories`, so an empty remote category exists in
+    /// the UI and one deleted remotely disappears): every
+    /// inventory title and its ancestors are ensured, and a
+    /// stored category the server no longer carries is removed
+    /// when nothing local references it — no feed carries it,
+    /// no article is labeled or overridden into it. The
+    /// Uncategorized sentinel row is never removed here: it is
+    /// the local "no category" bucket whatever the server
+    /// calls its own categories. Returns the number removed.
+    /// Call only after a complete successful inventory fetch.
+    pub fn reconcile_hosted_categories(&self, inventory: &[String]) -> rusqlite::Result<usize> {
+        let mut keep: Vec<String> = Vec::new();
+        for title in inventory {
+            let mut cur = String::new();
+            for seg in title.split(CATEGORY_PATH_SEP) {
+                let leaf = sanitize_category_leaf(seg);
+                if leaf.is_empty() {
+                    continue;
+                }
+                cur = make_category_path(
+                    if cur.is_empty() {
+                        None
+                    } else {
+                        Some(cur.as_str())
+                    },
+                    &leaf,
+                );
+                if !keep.contains(&cur) {
+                    keep.push(cur.clone());
+                }
+            }
+        }
+        for title in &keep {
+            self.ensure_category_path(title)?;
+        }
+        let mut removed = 0;
+        for cat in self.categories()? {
+            let title = &cat.title;
+            if keep.iter().any(|k| k == title) || title.trim().eq_ignore_ascii_case("uncategorized")
+            {
+                continue;
+            }
+            let referenced = self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM feeds WHERE category = ?1) \
+                 OR EXISTS(SELECT 1 FROM article_labels WHERE category = ?1) \
+                 OR EXISTS(SELECT 1 FROM articles WHERE category_override = ?1)",
+                params![title],
+                |r| r.get::<_, i64>(0),
+            )? != 0;
+            if !referenced {
+                self.conn
+                    .execute("DELETE FROM categories WHERE id = ?1", params![cat.id])?;
+                removed += 1;
+            }
+        }
+        Ok(removed)
     }
 
     /// Delete a category by full path (Python
@@ -2566,6 +2665,31 @@ impl Db {
             params![feed_id],
         )?;
         Ok(n)
+    }
+
+    /// Mark every unread article in a category view read,
+    /// using the ported membership clause (the feed's category
+    /// minus moved-away, plus `category_override`, plus
+    /// `article_labels`): the cache half of provider category
+    /// Mark All Read (Audit 8 D23), matching what the category
+    /// view displays — including articles labeled into the
+    /// category from a feed outside it.
+    pub fn mark_category_read(&self, path: &str) -> rusqlite::Result<usize> {
+        let (where_sql, names, uncat) = self.category_membership(path)?;
+        let sql = format!(
+            "UPDATE articles SET is_read = 1 WHERE is_read = 0 AND id IN \
+             (SELECT a.id FROM articles a JOIN feeds f ON f.id = a.feed_id \
+             WHERE {where_sql})"
+        );
+        let mut params: Vec<&dyn rusqlite::ToSql> = Vec::new();
+        if !uncat {
+            for _ in 0..3 {
+                for n in &names {
+                    params.push(n as &dyn rusqlite::ToSql);
+                }
+            }
+        }
+        self.conn.execute(&sql, params.as_slice())
     }
 
     pub fn favorites(&self, limit: usize) -> rusqlite::Result<Vec<Article>> {

@@ -2723,3 +2723,131 @@ includes slow media feeds (the plan's manual check) — the
 loopback test proves the work executes inside the worker call;
 the screen-reader verdict stays Brandon's, as with all refresh
 work.
+### Audit 8 Task 9 resolution — hosted account and authentication lifecycle (D07, D08, D09, D10, D23, S15) (2026-11-03)
+
+All six findings are closed. Reproductions were written first as
+failing loopback-fixture tests in `crates/core/tests/audit8_task9_slice.rs`
+(19 tests), `crates/core/tests/oauth_slice.rs` (extended) and the
+`provider.rs` unit tests; each failed or could not compile against the
+pre-fix tree (the refresh helper had no production caller, the clients
+sent no AppId/AppKey headers, sync never removed a row, the category
+table only ever learned categories from feeds, category Mark All Read
+was a per-feed fan-out, and Settings had no Redirect URI field).
+
+D07 — Inoreader token refresh is reachable. `crates/core/src/oauth.rs`
+now carries `InoreaderAuth`, a port of Python
+`providers/inoreader.py`'s credential lifecycle (`_set_tokens`,
+`_token_is_stale`, `_has_required_auth`): staleness is "no token, or
+now ≥ stored expiry − 60 s" with no recorded expiry taken at face
+value; a successful refresh stores the new access token, a rotated
+refresh token when the server sends one, and an expiry of
+now + expires_in − 60; an `invalid_grant` response clears all three
+(the account then reports "Inoreader is not connected" instead of
+looping); any other failure — HTTP 500, connection refused — returns
+an error with the stored tokens untouched, and a response without an
+access token changes nothing (Python falls through to the old token).
+`HostedProvider` builds its Inoreader client through this lifecycle
+on every operation and writes rotations back through
+`Config::save_to_source` (Config now remembers the file it was loaded
+from; a hand-built config skips write-back). A revocation that turns
+out to be superseded — the file already carries a different refresh
+token, so another flow rotated first — adopts the file's credentials
+instead of clearing them. The app's background "sync all providers"
+action runs the same lifecycle (and the D08 app credentials) instead
+of presenting the stored token raw. Token values are never logged.
+Supporting fix: `provider::db_path_for_provider` now keys an
+Inoreader account's cache file to its refresh token when one is
+stored (Python's `_podcast_archive_account_identity` preference),
+because keying it to the access token would orphan the whole cache at
+the first rotation once refresh became reachable; sections without a
+refresh token keep the previous key, and a stored-token-only account
+sees one cache rebuild, the same one-time cost the per-account paths
+themselves introduced.
+
+D08 — `GReaderClient::with_app_credentials` carries
+`providers.inoreader.app_id` / `app_key`, and every GReader request
+construction (reads through `get_json`, the token fetch and POST of
+every edit endpoint, rename/disable-tag, mark-all-as-read) passes
+through `with_app_headers`, which adds `AppId`/`AppKey` for Inoreader
+only, each only when configured — Python `_headers` exactly. The
+fixture tests assert the headers on a subscription read and an
+edit-tag pair, and their absence for The Old Reader.
+
+D09 — both hosted syncs reconcile, and only on complete success.
+`GReaderClient::sync` and `MinifluxClient::sync` previously only
+upserted, so a subscription removed on the server stayed in the
+cache forever (`provider.rs` then served it from `feeds()`). Now,
+after every subscription and every article page has been fetched and
+stored without error — any failure returns early, before this point —
+feeds in this provider's own id shape (`feed/…`, `miniflux:…`) that
+the current inventory no longer carries are removed with their
+articles and dependent rows through the new
+`Db::remove_hosted_feeds`. Local feeds in the same file are never
+eligible. Tests: A+B then A-only removes B (feed and articles) for
+both providers; a failed subscription fetch and a mid-sync failed
+stream fetch both leave B in place.
+
+D10 — category inventories sync. GReader gained `labels()`
+(`/tag/list`, Python `get_categories`), cached process-wide under the
+same scope/TTL rules as the Inoreader subscription cache so the small
+app quota is not burned per sync; Miniflux reuses
+`categories_remote()` (`/v1/categories`). After a successful sync the
+new `Db::reconcile_hosted_categories` ensures every inventory title
+(and its ancestors) and prunes a stored category the server no longer
+carries when nothing local references it (no feed carries it, no
+article is labeled or overridden into it); the Uncategorized sentinel
+row is never pruned. When the inventory read fails, the category
+table is left exactly as it was. Tests: an empty Miniflux category
+and an empty GReader label survive sync and appear in
+`Db::categories()`; the empty Miniflux category takes a feed
+assignment (the edit resolves its server id); a removed,
+unreferenced category is pruned while a feed-carrying one is not.
+
+D23 — hosted category Mark All Read uses provider membership. The
+trait gained `Provider::mark_category_read`; the gap-2 record above
+(the per-feed fan-out and its labeled-article divergence) is
+superseded for the hosted path. GReader marks through
+`mark_category_read_remote` — `mark-all-as-read` on the
+`user/-/label/<path>` stream, Python's `_resolve_stream_id` mapping —
+and Miniflux through the new `mark_category_read_remote`
+(`PUT /v1/categories/{id}/mark-all-as-read`, Python's Miniflux
+mapping); the cache then applies the new `Db::mark_category_read`,
+which marks through the same membership clause the category view
+displays (feed category minus moved-away, plus `category_override`,
+plus `article_labels`). `act_markall`'s hosted category arm calls the
+trait method instead of fanning out per feed. Tests assert the
+GReader label-stream request shape, and at provider level that the
+Miniflux category endpoint is hit (no per-feed marks) and that an
+article labeled into the category from an outside feed becomes read
+remotely and in the cache.
+
+S15 — the Settings Provider page has an "Inoreader Redirect URI:"
+field (appended after the existing provider fields, per the
+append-only control rule), prefilled with
+`oauth::redirect_uri_from_config` (configured value or the loopback
+default) and saved to `providers.inoreader.redirect_uri`. Both
+connect flows — the paste-the-URL flow and the browser sign-in
+listener flow — take the field's value (trimmed, default when blank)
+and use that one URI for the authorization URL and the code exchange,
+as Python's dialog worker does. Both flows also store token expiry
+through `oauth::token_expires_at_from`, so the value D07's staleness
+check reads is the Python `_set_tokens` value in both paths.
+Recorded limit: the local listener can only receive redirects aimed
+at the default loopback address; a custom URI belongs with the paste
+flow (Python's listener variant likewise only serves its own
+loopback HTTP shape).
+
+Evidence: `crates/core/tests/audit8_task9_slice.rs` (19 tests),
+`crates/core/tests/oauth_slice.rs` (5), `provider.rs` unit tests (3:
+refresh-and-persist, revoked-clears, transient-keeps, all against a
+loopback token endpoint and a real config file), plus the existing
+hosted suites (`hosted_parity`, `providers_full_parity`,
+`hosted_gui_slice`, `miniflux_refresh`) unchanged and green. Full
+workspace gate on the final tree: `cargo fmt --all` clean,
+`cargo clippy --workspace --all-targets -- -D warnings` exit 0,
+`cargo test --workspace` exit 0 (69 test binaries ok, 525 tests
+passed, 0 failed), `cargo build -p blindrss` exit 0.
+Owner acceptance with real hosted accounts (refresh of a genuinely
+expired token, remote unsubscribe/category changes appearing after
+sync, category mark-all against a live account) remains pending as
+platform acceptance, as with all hosted work.

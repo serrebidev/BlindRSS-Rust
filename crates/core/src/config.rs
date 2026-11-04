@@ -211,6 +211,12 @@ pub fn encode_remembered_view(view_id: Option<&str>, read_filter: u8) -> String 
 #[derive(Debug, Clone, Default)]
 pub struct Config {
     raw: Value,
+    /// The file this config was loaded from, when it was.
+    /// Lets long-lived credential state (OAuth token rotation,
+    /// Audit 8 D07) write itself back without every call site
+    /// threading the path through; `Config::default()` and
+    /// hand-built configs have none and skip write-back.
+    source_path: Option<PathBuf>,
 }
 
 impl Config {
@@ -232,11 +238,42 @@ impl Config {
                         Value::Null
                     }
                 };
-                Ok(Self { raw })
+                Ok(Self {
+                    raw,
+                    source_path: Some(path.to_path_buf()),
+                })
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self {
+                source_path: Some(path.to_path_buf()),
+                ..Self::default()
+            }),
             Err(e) => Err(e),
         }
+    }
+
+    /// The file this config was loaded from, if it was.
+    pub fn source_path(&self) -> Option<&Path> {
+        self.source_path.as_deref()
+    }
+
+    /// Save back to the file this config was loaded from.
+    /// Fails when the config has no source file, or when it
+    /// holds no object shape (an unreadable load must never be
+    /// written back over the user's file).
+    pub fn save_to_source(&self) -> std::io::Result<()> {
+        let Some(path) = &self.source_path else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "config has no source file",
+            ));
+        };
+        if !self.raw.is_object() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "config has no object shape to save",
+            ));
+        }
+        self.save(path)
     }
 
     pub fn get_bool(&self, key: &str, default: bool) -> bool {
@@ -345,6 +382,7 @@ impl Config {
         if new_path != old_path {
             let _ = std::fs::remove_file(old_path);
         }
+        self.source_path = Some(new_path.clone());
         Ok(new_path)
     }
 }

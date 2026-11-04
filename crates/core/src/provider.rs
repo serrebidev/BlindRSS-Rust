@@ -55,6 +55,16 @@ pub trait Provider {
         category: Option<&str>,
     ) -> Result<(), String>;
     fn mark_all_read(&self, feed_id: Option<&str>) -> Result<usize, String>;
+    /// Mark a whole category view read. Python's providers
+    /// resolve the view to server category membership (a
+    /// GReader label stream, a Miniflux category endpoint),
+    /// so articles labeled or moved into the category from a
+    /// feed outside it are marked too — a per-feed fan-out
+    /// over the category's own feeds cannot see them
+    /// (Audit 8 D23). Local applies the same membership
+    /// clause the category view displays. Returns the number
+    /// of cache rows marked.
+    fn mark_category_read(&self, category: &str) -> Result<usize, String>;
     /// Python `providers/base.py::uncategorized_is_real_category`:
     /// true when this provider's "Uncategorized" is an ordinary,
     /// deletable category rather than the synthetic "no category"
@@ -151,6 +161,11 @@ impl Provider for LocalProvider {
     fn mark_all_read(&self, feed_id: Option<&str>) -> Result<usize, String> {
         self.db()?.mark_all_read(feed_id).map_err(|e| e.to_string())
     }
+    fn mark_category_read(&self, category: &str) -> Result<usize, String> {
+        self.db()?
+            .mark_category_read(category)
+            .map_err(|e| e.to_string())
+    }
     fn refresh(&self) -> Result<String, String> {
         // The app runs local refresh through its worker pool
         // (progress + cancel); the trait path does the same
@@ -175,6 +190,9 @@ pub struct HostedProvider {
     kind: HostedKind,
     db_path: PathBuf,
     cfg: Config,
+    /// Inoreader OAuth token endpoint (tests override it with
+    /// a loopback URL, like GReaderClient's api_base).
+    inoreader_token_url: String,
 }
 
 impl HostedProvider {
@@ -195,25 +213,93 @@ impl HostedProvider {
             .to_string()
     }
 
+    /// Build the Inoreader client, running the OAuth refresh
+    /// lifecycle first (Audit 8 D07; Python
+    /// `providers/inoreader.py::_has_required_auth`): an
+    /// expired access token is refreshed through the stored
+    /// refresh token, rotated tokens are written back to the
+    /// config file, a revoked grant clears them (the account
+    /// then reads as not connected), and a transient refresh
+    /// failure fails this call with the stored tokens — and
+    /// the account cache — untouched.
+    fn inoreader_client(&self, service: GReaderService) -> Result<GReaderClient, String> {
+        let mut auth = crate::oauth::InoreaderAuth::from_config(&self.cfg);
+        auth.token_url = self.inoreader_token_url.clone();
+        if auth.access_token.is_empty() && auth.refresh_token.is_empty() {
+            return Err("Inoreader is not connected".to_string());
+        }
+        if auth.has_app_credentials() {
+            let attempted_refresh = auth.refresh_token.clone();
+            match auth.ensure_fresh_now() {
+                Ok(crate::oauth::TokenAction::Fresh) => {}
+                Ok(action) => {
+                    if let Some(adopted) =
+                        self.persist_inoreader_auth(&auth, &attempted_refresh, action)
+                    {
+                        // The revocation was superseded: the
+                        // config file already carries a newer
+                        // grant from another flow. Continue
+                        // with it instead of clearing anything.
+                        auth = adopted;
+                    } else if action == crate::oauth::TokenAction::Revoked {
+                        return Err("Inoreader is not connected".to_string());
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        if auth.access_token.is_empty() {
+            return Err("Inoreader is not connected".to_string());
+        }
+        let meta_ttl = self
+            .cred("metadata_cache_ttl_seconds")
+            .parse::<i64>()
+            .unwrap_or(3600);
+        let article_ttl = self
+            .cred("article_cache_ttl_seconds")
+            .parse::<i64>()
+            .unwrap_or(90);
+        Ok(GReaderClient::with_oauth(service, &auth.access_token)
+            .with_app_credentials(&auth.app_id, &auth.app_key)
+            .with_cache_ttls(meta_ttl, article_ttl)
+            .with_article_page_size(crate::providers::page_size_from_config(&self.cfg)))
+    }
+
+    /// Write Inoreader token state back to the file this
+    /// provider's config was loaded from (Python's
+    /// `_update_provider_config` writes through the shared
+    /// config; best-effort — a config with no source file
+    /// keeps the state in memory only). Returns the fresher
+    /// on-disk credential set when a `Revoked` turns out to be
+    /// superseded: the file already carries a different
+    /// refresh token than the one just proved revoked, so
+    /// another flow rotated first and nothing may be cleared.
+    fn persist_inoreader_auth(
+        &self,
+        auth: &crate::oauth::InoreaderAuth,
+        attempted_refresh: &str,
+        action: crate::oauth::TokenAction,
+    ) -> Option<crate::oauth::InoreaderAuth> {
+        if action == crate::oauth::TokenAction::Revoked
+            && let Some(path) = self.cfg.source_path()
+            && let Ok(on_disk) = Config::load(path)
+        {
+            let disk_auth = crate::oauth::InoreaderAuth::from_config(&on_disk);
+            if !disk_auth.refresh_token.is_empty() && disk_auth.refresh_token != attempted_refresh {
+                return Some(disk_auth);
+            }
+        }
+        let mut cfg = self.cfg.clone();
+        auth.apply_to_config(&mut cfg);
+        let _ = cfg.save_to_source();
+        None
+    }
+
     fn greader(&self) -> Result<GReaderClient, String> {
         match self.kind {
             HostedKind::GReader(service) => {
                 if service == GReaderService::Inoreader {
-                    let token = self.cred("token");
-                    if token.is_empty() {
-                        return Err("Inoreader is not connected".to_string());
-                    }
-                    let meta_ttl = self
-                        .cred("metadata_cache_ttl_seconds")
-                        .parse::<i64>()
-                        .unwrap_or(3600);
-                    let article_ttl = self
-                        .cred("article_cache_ttl_seconds")
-                        .parse::<i64>()
-                        .unwrap_or(90);
-                    Ok(GReaderClient::with_oauth(service, &token)
-                        .with_cache_ttls(meta_ttl, article_ttl)
-                        .with_article_page_size(crate::providers::page_size_from_config(&self.cfg)))
+                    self.inoreader_client(service)
                 } else {
                     let (email, password) = (self.cred("email"), self.cred("password"));
                     if email.is_empty() || password.is_empty() {
@@ -431,6 +517,20 @@ impl Provider for HostedProvider {
         }
         self.db()?.mark_all_read(feed_id).map_err(|e| e.to_string())
     }
+    fn mark_category_read(&self, category: &str) -> Result<usize, String> {
+        // Remote first (Python's providers mark on the server,
+        // the cache follows): the server applies its own
+        // category membership, then the cache applies the
+        // displayed membership clause, so labeled-in articles
+        // are marked on both sides (Audit 8 D23).
+        match self.kind {
+            HostedKind::Miniflux => self.miniflux()?.mark_category_read_remote(category)?,
+            HostedKind::GReader(_) => self.greader()?.mark_category_read_remote(category)?,
+        }
+        self.db()?
+            .mark_category_read(category)
+            .map_err(|e| e.to_string())
+    }
     fn refresh(&self) -> Result<String, String> {
         self.refresh_with_updates(true, Box::new(|_| {}))
     }
@@ -469,6 +569,7 @@ pub fn get_provider(cfg: &Config, db_path: PathBuf) -> Box<dyn Provider + Send> 
             kind,
             db_path: hosted_path.clone(),
             cfg: cfg.clone(),
+            inoreader_token_url: crate::oauth::TOKEN_URL.to_string(),
         })
     };
     match name.as_str() {
@@ -543,16 +644,158 @@ pub fn db_path_for_provider(cfg: &Config, base: &Path, name: &str) -> PathBuf {
             .unwrap_or("")
     };
     let url = cred("url").trim_end_matches('/').trim_end_matches("/v1");
+    // The stable account key: Inoreader's refresh token when
+    // one is stored (Python's `_podcast_archive_account_identity`
+    // prefers it for the same reason) — the access token
+    // rotates on every refresh, so keying the cache file to it
+    // would orphan the account's whole cache at the first
+    // rotation once refresh became reachable (Audit 8 D07).
+    // Sections without a refresh token keep the previous key.
+    let token_key = if cred("refresh_token").is_empty() {
+        cred("token")
+    } else {
+        cred("refresh_token")
+    };
     let identity = serde_json::json!([
         name,
         url,
         cred("email").to_lowercase(),
         cred("api_key"),
-        cred("token")
+        token_key
     ]);
     let hash: String = sha2::Sha256::digest(identity.to_string())
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect();
     base.with_file_name(format!("{stem}.hosted-{name}-{hash}.{extension}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    /// One-shot loopback token endpoint: answers the first
+    /// request with the given status/body, records the raw
+    /// request, then stops.
+    fn token_server(status: u16, body: &'static str) -> (String, std::thread::JoinHandle<String>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/oauth2/token", listener.local_addr().unwrap());
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+            let mut data = Vec::new();
+            let mut chunk = [0; 4096];
+            loop {
+                let head_end = data
+                    .windows(4)
+                    .position(|w| w == b"\r\n\r\n")
+                    .map(|p| p + 4);
+                if let Some(end) = head_end {
+                    let head = String::from_utf8_lossy(&data[..end]).into_owned();
+                    let len: usize = head
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|v| v.trim().parse().ok())
+                        })
+                        .unwrap_or(0);
+                    if data.len() >= end + len {
+                        break;
+                    }
+                }
+                match stream.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => data.extend_from_slice(&chunk[..n]),
+                    Err(_) => break,
+                }
+            }
+            let _ = write!(
+                stream,
+                "HTTP/1.1 {status} Reply\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            String::from_utf8_lossy(&data).into_owned()
+        });
+        (url, handle)
+    }
+
+    fn inoreader_setup(token_url: &str) -> (HostedProvider, PathBuf, PathBuf) {
+        let dir =
+            std::env::temp_dir().join(format!("blindrss_provider_test_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config.json");
+        // An access token that expired long ago, a refresh
+        // token, and the app credentials Python requires.
+        std::fs::write(
+            &config_path,
+            r#"{"providers":{"inoreader":{"app_id":"app-id","app_key":"app-key","token":"old-access","refresh_token":"old-refresh","token_expires_at":1000}}}"#,
+        )
+        .unwrap();
+        let cfg = Config::load(&config_path).unwrap();
+        let provider = HostedProvider {
+            name: "inoreader",
+            kind: HostedKind::GReader(GReaderService::Inoreader),
+            db_path: dir.join("rss.db"),
+            cfg,
+            inoreader_token_url: token_url.to_string(),
+        };
+        (provider, config_path, dir)
+    }
+
+    #[test]
+    fn d07_expired_token_refreshes_and_persists_rotation() {
+        let (url, server) = token_server(
+            200,
+            r#"{"access_token":"new-access","refresh_token":"new-refresh","expires_in":3600}"#,
+        );
+        let (provider, config_path, dir) = inoreader_setup(&url);
+        let client = provider
+            .inoreader_client(GReaderService::Inoreader)
+            .unwrap();
+        assert_eq!(client.oauth_token.as_deref(), Some("new-access"));
+        let request = server.join().unwrap();
+        assert!(request.contains("grant_type=refresh_token"), "{request}");
+        assert!(request.contains("refresh_token=old-refresh"), "{request}");
+        // The rotation reached the config file (Python's
+        // _update_provider_config), tokens included.
+        let saved = std::fs::read_to_string(&config_path).unwrap();
+        assert!(saved.contains("new-access"), "{saved}");
+        assert!(saved.contains("new-refresh"), "{saved}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn d07_revoked_grant_clears_tokens_and_disconnects() {
+        let (url, server) = token_server(400, r#"{"error":"invalid_grant"}"#);
+        let (provider, config_path, dir) = inoreader_setup(&url);
+        let err = provider
+            .inoreader_client(GReaderService::Inoreader)
+            .err()
+            .expect("revoked grant must fail the client build");
+        assert_eq!(err, "Inoreader is not connected");
+        let _ = server.join().unwrap();
+        let saved = std::fs::read_to_string(&config_path).unwrap();
+        assert!(!saved.contains("old-access"), "{saved}");
+        assert!(!saved.contains("old-refresh"), "{saved}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn d07_transient_refresh_failure_keeps_stored_tokens() {
+        let (url, server) = token_server(500, r#"{"error":"server_error"}"#);
+        let (provider, config_path, dir) = inoreader_setup(&url);
+        assert!(
+            provider
+                .inoreader_client(GReaderService::Inoreader)
+                .is_err()
+        );
+        let _ = server.join().unwrap();
+        let saved = std::fs::read_to_string(&config_path).unwrap();
+        assert!(saved.contains("old-access"), "{saved}");
+        assert!(saved.contains("old-refresh"), "{saved}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
