@@ -4228,3 +4228,14 @@ NVDA) remains Brandon's — unclaimed here.
 main over fa81968 with no conflicts. Merged gate: fmt clean,
 clippy clean (workspace and core windows-gnu), 722 passed /
 0 failed, build OK.
+
+**Miniflux worker-cap flake hardened (2026-11-04):** the
+`worker_configuration_has_a_hard_cap_of_thirty_two` test
+flaked again on the macOS CI leg (peak 31 of 32) after the
+2026-11-02 delay widening. The test server now holds each
+targeted request at a barrier until all 32 workers are in
+flight before the delay starts, so the peak no longer
+depends on the entry ramp; a 10 s deadline keeps a genuinely
+lower cap failing the assertion instead of hanging. Five
+consecutive local suite runs pass. Test-only change; no
+production code touched.

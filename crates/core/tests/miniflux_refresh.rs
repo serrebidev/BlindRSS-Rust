@@ -17,6 +17,21 @@ fn server_with_feeds(
     delay: Duration,
     count: i64,
 ) -> (String, Arc<Mutex<Vec<String>>>, Arc<AtomicUsize>) {
+    server_with_feeds_held(status, delay, count, 0)
+}
+
+/// With `hold > 0`, a targeted request waits until `hold`
+/// requests are concurrently in flight before its delay even
+/// starts — a barrier, so a concurrency-peak measurement does
+/// not depend on the client entry ramp outrunning the delay.
+/// The 10 s deadline keeps a genuinely lower cap failing the
+/// assertion instead of hanging the suite.
+fn server_with_feeds_held(
+    status: u16,
+    delay: Duration,
+    count: i64,
+    hold: usize,
+) -> (String, Arc<Mutex<Vec<String>>>, Arc<AtomicUsize>) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let log = Arc::new(Mutex::new(Vec::new()));
@@ -53,6 +68,12 @@ fn server_with_feeds(
                 let (code, body) = if targeted {
                     let n = active.fetch_add(1, Ordering::SeqCst) + 1;
                     peak.fetch_max(n, Ordering::SeqCst);
+                    if hold > 0 {
+                        let deadline = Instant::now() + Duration::from_secs(10);
+                        while active.load(Ordering::SeqCst) < hold && Instant::now() < deadline {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                    }
                     std::thread::sleep(delay);
                     active.fetch_sub(1, Ordering::SeqCst);
                     if status < 300 {
@@ -204,12 +225,14 @@ fn scheduled_refresh_only_recovers_overdue_feeds_with_fifteen_feed_budget() {
 
 #[test]
 fn worker_configuration_has_a_hard_cap_of_thirty_two() {
-    // 500 ms (was 50): the peak is only observable while all
-    // 32 workers are inside the delay together; at 50 ms the
-    // entry ramp on a loaded machine can miss the overlap
-    // and the observed peak lands at 27-31 (flake seen on
-    // this VM and on GitHub's Windows runner, 2026-11-02).
-    let (base, _, peak) = server_with_feeds(204, Duration::from_millis(500), 40);
+    // The server holds each request at a barrier until all
+    // 32 workers are in flight, so the peak no longer depends
+    // on the entry ramp outrunning a fixed delay — the delay
+    // version of this test flaked at 27-31 on this VM and on
+    // GitHub's Windows runner (2026-11-02, delay widened
+    // 50 -> 500 ms) and again at 31 on the macOS runner
+    // (2026-11-04) despite the widening.
+    let (base, _, peak) = server_with_feeds_held(204, Duration::from_millis(500), 40, 32);
     let mut cfg = config();
     cfg.set_path("miniflux_targeted_refresh_workers", serde_json::json!(128));
     MinifluxClient::new(&base, "secret")
