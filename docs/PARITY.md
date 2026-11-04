@@ -3176,3 +3176,21 @@ Gate in this tree: `cargo test --workspace` 580 passed / 0 failed
 policy tests, 3 new article-window unit tests), clippy
 `--workspace --all-targets -D warnings` clean, `cargo build -p
 blindrss` OK, `cargo fmt --all` run last.
+
+**Audit 8 Wave 2 integration (2026-11-04):** Tasks 23, 8, 9, 10,
+11 and 12 cherry-picked onto main in dependency order. Two merge
+points needed hand work in `app/src/main.rs`: (1) Task 10's
+recommendations mark runs beside Task 9's hosted category mark in
+`act_markall` (both, not either/or — Python's wrapper marks
+recommendations locally beside the remote mark); (2) Task 12 was
+branched before Task 11 landed, so its selection handler still
+carried the pre-G01 mark-on-select block — dropped at integration:
+selection marks nothing, Task 11's reader-focus marking stands,
+and Task 12's automatic full-text scheduling was kept in the
+selection handler. Two mechanical casualties of the same merge
+(a dropped closing brace in the focus handler and Task 11's test
+`State` initializer missing Task 12's `auto_load` field) were
+fixed in follow-up integration commits. Merged gate: cargo fmt
+clean, clippy `--workspace --all-targets -D warnings` clean,
+`cargo test --workspace` 588 passed / 0 failed, `cargo build -p
+blindrss` OK. Ships as v0.1.56.
