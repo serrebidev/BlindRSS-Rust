@@ -2936,3 +2936,118 @@ Gate in this tree: `cargo test --workspace` 509 passed / 0 failed
 (500 at Wave 1 integration + 7 new core tests + 2 new app tests),
 clippy `--workspace --all-targets -D warnings` clean,
 `cargo fmt --all` run last.
+
+## Audit 8 Task 11 resolution — preview, paging, search and explicit mark scope (G01, G03, G04, G05) (2026-11-03)
+
+Reproduction first: the new core suite
+`crates/core/tests/audit8_task11_slice.rs` failed to compile against
+the pre-fix tree (the unified view query `ArticleQuery` /
+`ViewScope`, `articles_view_page` / `articles_view_count` and
+`mark_view_read` did not exist), and source inspection confirmed the
+underlying defects — the app's list-selection handler marked the
+selected row read and opened, paging existed only for the unfiltered
+date-descending view (`view_pages` gate) with hard caps elsewhere
+(300 feed/All, 500 category, 1000 favorites), search ran a global
+single-phrase query capped at 300 that replaced the current view,
+and Mark All Read used the selected node's scope with no
+confirmation (and, on the local path, passed the raw view string to
+`Db::mark_all_read`, which treats any `Some(x)` as a feed id, so
+category/smart/favorites scopes silently marked nothing in the
+database). All six core tests pass after the fix; the app gained two
+policy tests (`mark_all_prompts_distinguish_global_and_node_scopes`,
+`view_query_maps_tree_values_to_scopes`).
+
+- **G01 (preview vs mark triggers) — resolved.** Python's
+  `on_article_select` only previews; marking happens on content
+  focus (`on_content_focus`) and on activation
+  (`on_article_activate` → `_open_article` → `_mark_article_opened`).
+  The Rust selection handler is now preview-only (the `mark_opened`
+  call and the mark-read-on-select block are removed). A shared
+  `mark_selected_read_opened` helper runs from the reader pane's
+  focus handler and from the rich WebView's focus handler when
+  present, and activation records the opened mark before the
+  existing open/play flow. Opened state again backs the Smart
+  Folders "opened" criterion.
+- **G03 (paging) — resolved.** Core gained a unified view query:
+  `ArticleQuery` (scope, read filter, media filter, sort,
+  direction, search terms) composed by `Db::view_where` over the
+  view's scope — All, one feed, a category subtree under the ported
+  membership clause, favorites, or a smart folder's rule matches —
+  with `articles_view_page` / `articles_view_count` paging it in
+  actual display order at the Python page size (400). Ordering is
+  Python's `_sort_articles_for_display`: the primary key in the
+  chosen direction with recency (date DESC, id DESC) as the stable
+  tiebreak in both directions; the date sort keys on (date, id) in
+  the chosen direction. The app's `view_pages` gate and the
+  300/500/1000 caps are deleted; every non-merged view pages
+  through the unified query with the trailing "Load more items
+  (Enter)" placeholder armed from the view count. Regression tests
+  tile filtered, category, media-filtered, alphabetical (both
+  directions, duplicate titles) and ascending-date views page by
+  page and compare against one full page — every matching row
+  exactly once, in order.
+- **G04 (search) — resolved.** Search is now an in-view filter,
+  not a global replacement query. `Db::search_terms` reproduces
+  Python's `_filter_articles` term split (lowercase,
+  whitespace-split); every term must appear in the article's
+  combined search text (title, content, description, author,
+  article URL, media URL and feed title — title only in
+  `title_only` mode), composed into the view query's WHERE clause
+  with LIKE-wildcard escaping, so search preserves the current
+  scope, the read/media filters and the display sort, and pages
+  like any other view. Whole-load (merged-recommendation) views
+  apply the same term rule in memory via `article_matches_terms`.
+  The search box also fires on Enter (Python's `on_search_enter`);
+  an empty query clears the search. Tests pin terms split across
+  fields, scope exclusion, the `title_only` contrast, and
+  search + filter + sort paging.
+- **G05 (Mark All Read scope + confirmation) — resolved.** The
+  File menu / toolbar / shortcut action is now explicitly global
+  (Python's `on_mark_all_read`), and the tree context menu carries
+  its own action id (`M_MARKALL_CTX`) with the node scope and
+  prompt stashed when the menu is built. Both paths confirm first
+  with Python's exact prompts (`Mark all items in all feeds as
+  read?`, `Mark all items in category "{path}" as read?`,
+  `Mark all items in "{feed}" as read?`, falling back to
+  `Mark all items in this feed as read?`) under the "Mark All as
+  Read" title; Cancel returns before any state change. Execution
+  (`run_mark_all`) keeps the hosted routing from Tasks 9/10
+  (provider mark-all / `mark_category_read`, recommendations in
+  scope marked locally first via `recommendations_mark_scope`) and
+  the local path now goes through `Db::mark_view_read`, which
+  resolves `cat:` paths through `mark_category_read`, favorites to
+  unread favorites only, smart folders through their rule matches,
+  the recommendations pseudo-feed to a no-op (routed by callers),
+  and anything else as a feed id — fixing the silent no-op above.
+  `mark_view_read` is covered per scope by the core suite,
+  including a category-labeled article and the recommendations
+  pseudo-feed returning 0.
+
+Recorded deviations: (1) Python's local provider pages canonically
+(date DESC, id DESC) and the GUI re-sorts only the loaded subset in
+memory; per the Task 11 plan, the Rust view query pages in actual
+display order directly, so the Rust order is display-true at every
+page boundary and full traversal still reaches every matching row
+exactly once. (2) Python search filters the view's already-loaded
+base, so older matches surface only after paging the unfiltered
+base in; the Rust search runs over the whole view scope, a superset
+in which older matches are reachable through the search's own
+paging. (3) SQL description ordering uses the raw description
+column (`LOWER(COALESCE(a.description, ''))`) where Python's key is
+a text preview; plain-text descriptions order identically and
+HTML-heavy descriptions are an approximation. SQLite `LOWER` /
+`LIKE` are ASCII-oriented where Python lowering is Unicode — the
+same class of approximation the pre-existing search already had.
+(4) Merged-recommendation views remain whole-load by Task 10's D19
+design; Task 11 only removed their 300/500 base caps. (5) G01's
+event wiring (selection / focus / activation) has no headless
+widget test — wxdragon widgets need a display — so its regression
+evidence is the code-level separation plus the core suites; owner
+NVDA acceptance of the preview/focus behaviour, paging and the
+confirmation prompts remains pending as platform acceptance, as
+with all GUI work.
+
+Gate in this tree: `cargo test --workspace` 568 passed /
+0 failed (6 new core tests + 2 new app tests in this task),
+clippy `--workspace --all-targets -D warnings` clean,
+`cargo build -p blindrss` green, `cargo fmt --all` run last.

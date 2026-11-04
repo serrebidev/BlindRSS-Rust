@@ -362,6 +362,34 @@ pub(crate) fn mark_article_read(
     }
 }
 
+/// Mark the currently selected article read and opened —
+/// Python's two mark triggers are the reader gaining focus
+/// (`on_content_focus`) and activation (`on_article_activate`);
+/// list selection alone only previews (Audit 8 G01). Opened is
+/// recorded unconditionally (it backs the Smart Folders
+/// "opened" criterion); read only flips when the article was
+/// unread. Returns the article when its read state changed,
+/// so the caller can propagate to a hosted provider after
+/// releasing the state borrow.
+fn mark_selected_read_opened(st: &mut State, frame: &Frame) -> Option<Article> {
+    let idx = st.selected_article?;
+    let a = st.articles.get(idx)?.clone();
+    if let Some(db) = st.db.as_ref() {
+        let _ = db.mark_opened(&a.id);
+    }
+    if a.is_read {
+        return None;
+    }
+    if let Some(db) = st.db.as_ref() {
+        mark_article_read(db, &a, true);
+    }
+    if let Some(slot) = st.articles.get_mut(idx) {
+        slot.is_read = true;
+    }
+    frame.set_status_text(&format!("Read: {}", a.title), 0);
+    Some(a)
+}
+
 pub(crate) fn mark_article_favorite(
     db: &blindrss_core::db::Db,
     article: &blindrss_core::db::Article,
@@ -1355,6 +1383,21 @@ struct State {
     /// one extra trailing row, Python's "Load more items
     /// (Enter)" placeholder, at index `articles.len()`.
     view_total: i64,
+    /// Active in-view search (Audit 8 G04): whitespace-split AND
+    /// terms over the CURRENT view, empty = no search. Python
+    /// keeps the filter applied across refills and view switches
+    /// until the user clears it, so it lives in state rather
+    /// than being a one-shot list replacement.
+    search_terms: Vec<String>,
+    /// Search mode at the time the search was run (config
+    /// `search_mode`): true = titles only.
+    search_title_only: bool,
+    /// Tree context menu's Mark All Read target (Audit 8 G05):
+    /// the (view, prompt) the context builder stashed for the
+    /// node the menu was opened on, consumed by the scoped
+    /// mark-all handler. The main command never reads this —
+    /// its scope is global by construction.
+    ctx_mark: Option<(Option<String>, String)>,
     /// Last find-in-article query (Ctrl+F / F3 repeat it).
     find_query: String,
     /// True while the search text box has keyboard focus; the
@@ -1582,6 +1625,7 @@ const M_ANNOUNCE_VERSION: i32 = 2242;
 const M_RESET_TITLE: i32 = 2243;
 const M_EDIT_CAT: i32 = 2244;
 const M_EQUALIZER: i32 = 2245;
+const M_MARKALL_CTX: i32 = 2247;
 /// Chapter Links submenu slots (Batch 41a): the article list
 /// context menu fills `chapter_link_urls` with the selected
 /// article's chapter hrefs and appends up to this many items.
@@ -2190,17 +2234,122 @@ fn article_cell(
 /// Article-list page size (Python's `article_page_size`).
 const ARTICLE_PAGE: usize = 400;
 
-/// Whether the current view pages (Audit 7 Finding A): SQL
-/// pages line up with display rows only when the in-memory
-/// sort/filter pipeline in `finish_refill` is a no-op, so
-/// paging applies to the default view — date sort, newest
-/// first, no read or media filter. Other views keep the
-/// capped loads they have today.
-fn view_pages(state: &State) -> bool {
-    state.read_filter == 0
-        && state.media_filter == 0
-        && state.sort_by == "date"
-        && !state.sort_ascending
+/// The current article-list view as a core query (Audit 8
+/// Task 11): tree scope + read/media filters + display sort +
+/// active search, composed in SQL by
+/// `Db::articles_view_page`, so every view pages in actual
+/// display order — the Audit 7 gate that only let the
+/// unfiltered date-descending view page is gone (G03/G04).
+fn view_query(state: &State) -> blindrss_core::db::ArticleQuery {
+    use blindrss_core::db::ViewScope;
+    let scope = match state.selected_feed.as_deref() {
+        None => ViewScope::All,
+        Some("favorites:all") => ViewScope::Favorites,
+        Some(f) => match f.strip_prefix("cat:") {
+            Some(path) => ViewScope::Category(path.to_string()),
+            None => match f.strip_prefix("smart:") {
+                Some(id) => ViewScope::Smart(id.to_string()),
+                None => ViewScope::Feed(f.to_string()),
+            },
+        },
+    };
+    blindrss_core::db::ArticleQuery {
+        scope,
+        read_filter: state.read_filter,
+        media_filter: state.media_filter,
+        sort_by: state.sort_by.clone(),
+        ascending: state.sort_ascending,
+        search_terms: state.search_terms.clone(),
+        search_title_only: state.search_title_only,
+    }
+}
+
+/// Python's `_article_search_text` + `_filter_articles` as an
+/// in-memory predicate, for the whole-load views (merged
+/// recommendations, the recommendations view) that bypass the
+/// SQL view query: EVERY term must appear in the title, body,
+/// description, author, article/media URLs or feed title —
+/// titles only in title_only mode.
+fn article_matches_terms(
+    a: &Article,
+    terms: &[String],
+    title_only: bool,
+    feed_titles: &std::collections::HashMap<&str, &str>,
+) -> bool {
+    if terms.is_empty() {
+        return true;
+    }
+    let title = a.title.to_lowercase();
+    if title_only {
+        return terms.iter().all(|t| title.contains(t.as_str()));
+    }
+    let mut text = title;
+    for part in [
+        a.content.as_deref(),
+        a.description.as_deref(),
+        a.author.as_deref(),
+        Some(a.url.as_str()),
+        a.media_url.as_deref(),
+        feed_titles.get(a.feed_id.as_str()).copied(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        text.push(' ');
+        text.push_str(&part.to_lowercase());
+    }
+    terms.iter().all(|t| text.contains(t.as_str()))
+}
+
+/// Display-order sort for whole-load views (merged
+/// recommendations, the recommendations view): Python's
+/// `_sort_articles_for_display` — stabilize by recency
+/// (date DESC, id DESC), then a STABLE primary-key sort whose
+/// direction flips only the key comparison, so ties keep
+/// recency order in both directions. (The old code reversed
+/// the whole vec for descending, flipping ties too.) Paged
+/// views never come through here: their order is the SQL
+/// ORDER BY in core, which encodes the same rule.
+fn sort_for_display(
+    loaded: &mut [Article],
+    sort_by: &str,
+    ascending: bool,
+    feed_titles: &std::collections::HashMap<&str, &str>,
+) {
+    loaded.sort_by(|a, b| b.date.cmp(&a.date).then_with(|| b.id.cmp(&a.id)));
+    fn keyed(loaded: &mut [Article], ascending: bool, key: impl Fn(&Article) -> String) {
+        if ascending {
+            loaded.sort_by_key(&key);
+        } else {
+            loaded.sort_by_key(|a| std::cmp::Reverse(key(a)));
+        }
+    }
+    match sort_by {
+        "date" => {
+            if ascending {
+                loaded.sort_by(|a, b| a.date.cmp(&b.date).then_with(|| a.id.cmp(&b.id)));
+            }
+        }
+        "name" => keyed(loaded, ascending, |a| a.title.trim().to_lowercase()),
+        "author" => keyed(loaded, ascending, |a| {
+            a.author.as_deref().unwrap_or("").trim().to_lowercase()
+        }),
+        "description" => keyed(loaded, ascending, |a| {
+            article_cell(a, "description", feed_titles).to_lowercase()
+        }),
+        "status" => keyed(loaded, ascending, |a| {
+            if a.is_read { "read" } else { "unread" }.to_string()
+        }),
+        "feed" => keyed(loaded, ascending, |a| {
+            feed_titles
+                .get(a.feed_id.as_str())
+                .copied()
+                .unwrap_or("")
+                .trim()
+                .to_lowercase()
+        }),
+        _ => {}
+    }
 }
 
 /// Insert list rows for `rows` starting at display index
@@ -2230,15 +2379,12 @@ fn load_more_articles(state: &mut State, list: &ListCtrl) {
         return;
     }
     let Some(db) = state.db.as_ref() else { return };
-    let filter = state.selected_feed.clone().unwrap_or_default();
-    let page = if let Some(path) = filter.strip_prefix("cat:") {
-        db.articles_for_category_light_page(path, ARTICLE_PAGE, offset)
-    } else if filter.is_empty() {
-        db.articles_light_page(None, ARTICLE_PAGE, offset)
-    } else {
-        db.articles_light_page(Some(&filter), ARTICLE_PAGE, offset)
-    }
-    .unwrap_or_default();
+    // The same composed view query as the refill: the next page
+    // continues the exact display order the first page started,
+    // whatever filter/sort/search is active (Audit 8 G03/G04).
+    let page = db
+        .articles_view_page(&view_query(state), ARTICLE_PAGE, offset)
+        .unwrap_or_default();
     list.freeze();
     // The placeholder row sits at `offset`; it goes first.
     list.delete_item(offset as i64);
@@ -2319,6 +2465,120 @@ fn recommendations_mark_scope(
     }
 }
 
+/// The confirmation prompt for a Mark All Read wrapper
+/// (Python's `_confirm_and_mark_all_read` call sites): the
+/// main command asks globally; tree context commands name
+/// their node — the feed variant falls back to "this feed"
+/// when the feed has no title.
+fn mark_all_prompt(view: Option<&str>, feed_title: Option<&str>) -> String {
+    match view {
+        None => "Mark all items in all feeds as read?".to_string(),
+        Some(v) => match v.strip_prefix("cat:") {
+            Some(path) => format!("Mark all items in category \"{path}\" as read?"),
+            None => match feed_title {
+                Some(title) if !title.trim().is_empty() => {
+                    format!("Mark all items in \"{title}\" as read?")
+                }
+                _ => "Mark all items in this feed as read?".to_string(),
+            },
+        },
+    }
+}
+
+/// Python's Mark All confirmation (wx.MessageBox YES_NO,
+/// title "Mark All as Read"): anything but Yes cancels, and
+/// the wrappers run this before touching any state, so a
+/// cancel provably changes nothing (Audit 8 G05).
+fn confirm_mark_all(frame: &Frame, prompt: &str) -> bool {
+    let md = MessageDialog::builder(frame, prompt, "Mark All as Read")
+        .with_style(MessageDialogStyle::YesNo | MessageDialogStyle::IconQuestion)
+        .build();
+    let answer = md.show_modal();
+    md.destroy();
+    answer == ID_YES
+}
+
+/// The single Mark All Read operation behind the wrappers
+/// (Audit 8 G05): marks exactly the given view scope — None is
+/// the global scope. Hosted providers mark remotely on a
+/// worker first (feed/category/global route through the
+/// provider trait, Audit 8 D23); every other scope, and the
+/// local provider entirely, resolves in core
+/// (`Db::mark_view_read`), with the recommendations in scope
+/// marked in their own table beside it (Audit 8 D20).
+fn run_mark_all(
+    state: &Rc<RefCell<State>>,
+    frame: &Frame,
+    tx: &Sender<RefreshMsg>,
+    view: Option<String>,
+) {
+    {
+        let st = state.borrow();
+        let filter = view.clone();
+        let is_feed_view = filter.as_deref().is_some_and(|f| {
+            !f.starts_with("cat:")
+                && !f.starts_with("smart:")
+                && f != "favorites:all"
+                && f != blindrss_core::youtube_account::RECOMMENDATIONS_FEED_ID
+        });
+        let is_cat_view = filter.as_deref().is_some_and(|f| f.starts_with("cat:"));
+        if filter.is_none() || is_feed_view || is_cat_view {
+            let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+            if blindrss_core::provider::active_name(&cfg) != "local" {
+                // Recommendations are local-only even under a
+                // hosted provider (Python's wrapper marks them
+                // beside the remote mark — Audit 8 D20).
+                if let Some(db) = st.db.as_ref()
+                    && let Some((account, favorites_only)) =
+                        recommendations_mark_scope(&cfg, filter.as_deref())
+                {
+                    let _ = db.mark_recommendations_read(&account, favorites_only);
+                }
+                drop(st);
+                frame.set_status_text("Marking all read...", 0);
+                let tx = tx.clone();
+                std::thread::spawn(move || {
+                    let cfg =
+                        blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+                    let provider = blindrss_core::provider::get_provider(&cfg, db_path());
+                    let result = match filter.as_deref() {
+                        None => provider.mark_all_read(None),
+                        Some(view) if view.starts_with("cat:") => {
+                            provider.mark_category_read(view.strip_prefix("cat:").unwrap_or(""))
+                        }
+                        Some(feed_id) => provider.mark_all_read(Some(feed_id)),
+                    };
+                    let _ = tx.send(RefreshMsg::ProviderAction(
+                        result.map(|n| format!("Marked {n} articles read")),
+                    ));
+                });
+                return;
+            }
+        }
+    }
+    let mut st = state.borrow_mut();
+    let mut count = 0;
+    if let Some(db) = st.db.as_ref() {
+        count = db.mark_view_read(view.as_deref()).unwrap_or(0);
+        // Recommendations in scope are marked in their own
+        // table, persisted (Audit 8 D20 — Python's wrapper
+        // mark_all_read).
+        let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+        if let Some((account, favorites_only)) = recommendations_mark_scope(&cfg, view.as_deref()) {
+            count += db
+                .mark_recommendations_read(&account, favorites_only)
+                .unwrap_or(0);
+        }
+        // The wrappers' scopes always cover the displayed view
+        // (global covers everything; the context scope IS the
+        // current view), so the shown rows flip with the store.
+        for a in st.articles.iter_mut() {
+            a.is_read = true;
+        }
+    }
+    frame.set_status_text(&format!("Marked {count} articles read"), 0);
+}
+
 /// Merge recommendation rows into an article list and put the
 /// whole list in the standard display order (date DESC, id
 /// DESC — the order the SQL queries return). Python's wrapper
@@ -2365,42 +2625,13 @@ fn refill_inner(state: &mut State, list: &ListCtrl) {
     }
     state.articles.clear();
     // Paging state belongs to the view being built; only the
-    // standard feed / category paths below re-arm it.
+    // paged paths below re-arm it.
     state.view_total = -1;
     let Some(db) = state.db.as_ref() else { return };
     let filter = state.selected_feed.as_deref();
-    let mut loaded: Vec<Article> = Vec::new();
-    // Smart folder selection: evaluate the folder's rule over all
-    // articles instead of a feed filter.
-    if let Some(smart_id) = filter.and_then(|f| f.strip_prefix("smart:"))
-        && !smart_id.is_empty()
-    {
-        let folders = db.smart_folders().unwrap_or_default();
-        if let Some((_, _, rule_json, _)) = folders.iter().find(|(id, ..)| id == smart_id) {
-            let rule: serde_json::Value =
-                serde_json::from_str(rule_json).unwrap_or(serde_json::Value::Null);
-            // The whole library, paged: a smart folder must not
-            // silently ignore matches beyond a row ceiling
-            // (Audit 8 D21).
-            if let Ok(matched) = db.articles_matching_rule(&rule) {
-                loaded = matched;
-            }
-        }
-        return finish_refill(state, list, loaded);
-    }
-    // Built-in Favorites view (Audit 8 G06): favorite articles
-    // plus the account's favorite recommendations — including
-    // favorites that fell out of the latest snapshot (D19).
-    if filter == Some("favorites:all") {
-        let mut loaded = db.favorites(1000).unwrap_or_default();
-        let account = youtube_account_key(&cfg);
-        if !account.is_empty() {
-            let favs = db.favorite_recommendations(&account).unwrap_or_default();
-            loaded = merge_recommendations(loaded, favs);
-        }
-        return finish_refill(state, list, loaded);
-    }
-    // YouTube Recommendations virtual feed.
+    // YouTube Recommendations virtual feed: its rows live in
+    // their own table, so it keeps the whole-load path (with
+    // the in-memory filter/sort/search pipeline).
     if filter == Some(blindrss_core::youtube_account::RECOMMENDATIONS_FEED_ID) {
         let token = blindrss_core::config::Config::load(&config_path())
             .unwrap_or_default()
@@ -2410,62 +2641,76 @@ fn refill_inner(state: &mut State, list: &ListCtrl) {
         let loaded = db.recommendations(&account).unwrap_or_default();
         return finish_refill(state, list, loaded);
     }
-    // Category selection: Python's membership clause — subtree
-    // feeds, minus articles moved elsewhere, plus articles moved
-    // or labeled into the subtree.
-    if let Some(path) = filter.and_then(|f| f.strip_prefix("cat:")) {
-        // Recommendations merge into the account category and
-        // its ancestors (Audit 8 D19); a merged view loads whole
-        // and date-sorts like Python's, so it does not page.
-        let account = youtube_account_key(&cfg);
-        if !account.is_empty()
+    // Merged-recommendation views (Audit 8 D19) load whole and
+    // date-sort like Python's wrapper, so they do not page; the
+    // merge base is no longer capped either (Audit 8 G03) — the
+    // whole view loads, then finish_refill's pipeline applies
+    // search/filters/sort in memory, recommendations included.
+    let account = youtube_account_key(&cfg);
+    // Favorites merge whenever favorite recommendations exist
+    // (Audit 8 G06/D19 — including favorites that fell out of
+    // the latest snapshot, so no snapshot gate here).
+    if filter == Some("favorites:all") && !account.is_empty() {
+        let favs = db.favorite_recommendations(&account).unwrap_or_default();
+        if !favs.is_empty() {
+            let loaded = db.favorites(WHOLE_VIEW).unwrap_or_default();
+            return finish_refill(state, list, merge_recommendations(loaded, favs));
+        }
+    }
+    if !account.is_empty() && db.has_recommendation_snapshot(&account).unwrap_or(false) {
+        if let Some(path) = filter.and_then(|f| f.strip_prefix("cat:"))
             && category_includes_recommendations(&cfg, path)
-            && db.has_recommendation_snapshot(&account).unwrap_or(false)
         {
             let loaded = db
-                .articles_for_category_light(path, 500)
+                .articles_for_category_light(path, WHOLE_VIEW)
                 .unwrap_or_default();
             let recs = db.recommendations_merged(&account).unwrap_or_default();
             return finish_refill(state, list, merge_recommendations(loaded, recs));
         }
-        if view_pages(state) {
-            state.view_total = db.articles_for_category_count(path).unwrap_or(-1);
-            let loaded = db
-                .articles_for_category_light_page(path, ARTICLE_PAGE, 0)
-                .unwrap_or_default();
-            return finish_refill(state, list, loaded);
+        if filter.is_none() {
+            let loaded = db.articles_light(None, WHOLE_VIEW).unwrap_or_default();
+            let recs = db.recommendations_merged(&account).unwrap_or_default();
+            if !recs.is_empty() {
+                return finish_refill(state, list, merge_recommendations(loaded, recs));
+            }
         }
-        let loaded = db
-            .articles_for_category_light(path, 500)
-            .unwrap_or_default();
-        return finish_refill(state, list, loaded);
     }
-    // All view: recommendations merge in too (Audit 8 D19).
-    // A merged view loads whole and date-sorts, so it does not
-    // page; unmerged views keep the paged path.
-    let account = youtube_account_key(&cfg);
-    let merged_recs = if filter.is_none() && !account.is_empty() {
-        db.recommendations_merged(&account).unwrap_or_default()
-    } else {
-        Vec::new()
-    };
-    if view_pages(state) && merged_recs.is_empty() {
-        state.view_total = db.articles_count(filter).unwrap_or(-1);
-        let loaded = db
-            .articles_light_page(filter, ARTICLE_PAGE, 0)
-            .unwrap_or_default();
-        return finish_refill(state, list, loaded);
-    }
-    let cap = if merged_recs.is_empty() { 300 } else { 500 };
-    let loaded = db.articles_light(filter, cap).unwrap_or_default();
-    let loaded = merge_recommendations(loaded, merged_recs);
-    finish_refill(state, list, loaded);
+    // Every other view — All, feed, category (Python's
+    // membership clause lives in the core query), favorites,
+    // smart folder — pages through the unified view query in
+    // actual display order (Audit 8 G03/G04).
+    let query = view_query(state);
+    state.view_total = db.articles_view_count(&query).unwrap_or(-1);
+    let loaded = db
+        .articles_view_page(&query, ARTICLE_PAGE, 0)
+        .unwrap_or_default();
+    finish_refill_ordered(state, list, loaded);
 }
 
-/// Apply the view filters (read + media) and the sort, then render.
-/// Python applies the same two filter groups (Ctrl+1..6) over
-/// whatever the current view loaded.
+/// Whole-view load bound for the merged-recommendation paths:
+/// deliberately not a display cap (Audit 8 G03 removed the
+/// 300/500 ceilings) — merged views load whole by design
+/// (Audit 8 D19), and this only guards against a pathological
+/// unbounded read.
+const WHOLE_VIEW: usize = 10_000_000;
+
+/// Whole-load pipeline: the in-view search, the view filters
+/// (read + media, Python's Ctrl+1..6) and the display sort run
+/// in memory over the fully loaded view. Used by the views
+/// that load whole (merged recommendations, the
+/// recommendations view); paged views compose all of it in
+/// SQL instead (`finish_refill_ordered`).
 fn finish_refill(state: &mut State, list: &ListCtrl, mut loaded: Vec<Article>) {
+    let feed_titles: std::collections::HashMap<&str, &str> = state
+        .feeds
+        .iter()
+        .map(|f| (f.id.as_str(), f.title.as_str()))
+        .collect();
+    if !state.search_terms.is_empty() {
+        let terms = state.search_terms.clone();
+        let title_only = state.search_title_only;
+        loaded.retain(|a| article_matches_terms(a, &terms, title_only, &feed_titles));
+    }
     match state.read_filter {
         1 => loaded.retain(|a| !a.is_read),
         2 => loaded.retain(|a| a.is_read),
@@ -2476,41 +2721,35 @@ fn finish_refill(state: &mut State, list: &ListCtrl, mut loaded: Vec<Article>) {
         2 => loaded.retain(|a| a.media_url.as_deref().is_none_or(|m| m.is_empty())),
         _ => {}
     }
+    sort_for_display(
+        &mut loaded,
+        &state.sort_by,
+        state.sort_ascending,
+        &feed_titles,
+    );
+    render_refill_rows(state, list, loaded);
+}
+
+/// Paged pipeline: the core view query already applied scope,
+/// search, filters and display order — render rows as
+/// returned, no second in-memory pass (a second pass over one
+/// page would corrupt the cross-page order).
+fn finish_refill_ordered(state: &mut State, list: &ListCtrl, loaded: Vec<Article>) {
+    render_refill_rows(state, list, loaded);
+}
+
+/// Render a finished article set into the list and arm the
+/// paging placeholder when the view has more rows.
+fn render_refill_rows(state: &mut State, list: &ListCtrl, loaded: Vec<Article>) {
+    let layout = blindrss_core::article_columns::layout_from_config(
+        &blindrss_core::config::Config::load(&config_path()).unwrap_or_default(),
+    );
+    let visible = blindrss_core::article_columns::visible_columns(&layout);
     let feed_titles: std::collections::HashMap<&str, &str> = state
         .feeds
         .iter()
         .map(|f| (f.id.as_str(), f.title.as_str()))
         .collect();
-    match state.sort_by.as_str() {
-        "name" => loaded.sort_by_key(|a| a.title.to_lowercase()),
-        "author" => loaded.sort_by_key(|a| a.author.as_deref().unwrap_or("").to_lowercase()),
-        "description" => {
-            loaded.sort_by_key(|a| article_cell(a, "description", &feed_titles).to_lowercase())
-        }
-        "status" => loaded.sort_by_key(|a| if a.is_read { "read" } else { "unread" }),
-        "feed" => loaded.sort_by_key(|a| {
-            feed_titles
-                .get(a.feed_id.as_str())
-                .copied()
-                .unwrap_or("")
-                .to_lowercase()
-        }),
-        _ => {} // "date": the queries already return newest first.
-    }
-    // Non-date sorts are built ascending and flipped when the
-    // direction is descending; the stored date order is already
-    // descending, so ascending flips it instead.
-    if state.sort_by == "date" {
-        if state.sort_ascending {
-            loaded.reverse();
-        }
-    } else if !state.sort_ascending {
-        loaded.reverse();
-    }
-    let layout = blindrss_core::article_columns::layout_from_config(
-        &blindrss_core::config::Config::load(&config_path()).unwrap_or_default(),
-    );
-    let visible = blindrss_core::article_columns::visible_columns(&layout);
     insert_article_rows(list, &loaded, 0, &feed_titles, &visible);
     state.articles = loaded;
     // Paged view with rows still unloaded: Python's trailing
@@ -2891,7 +3130,9 @@ fn main() {
             .build();
         let markall_btn = Button::builder(&frame).with_label("Mark All Read").build();
         let deleted_btn = Button::builder(&frame).with_label("Deleted...").build();
-        let search_box = TextCtrl::builder(&frame).build();
+        let search_box = TextCtrl::builder(&frame)
+            .with_style(TextCtrlStyle::ProcessEnter)
+            .build();
         msaa_names::set_name(&search_box, &tr("Search"));
         let search_btn = Button::builder(&frame).with_label("Search").build();
         let fulltext_btn = Button::builder(&frame).with_label("Read Full Text").build();
@@ -3049,6 +3290,9 @@ fn main() {
             sort_by: "date".to_string(),
             sort_ascending: false,
             view_total: -1,
+            search_terms: Vec::new(),
+            search_title_only: false,
+            ctx_mark: None,
             find_query: String::new(),
             pending_play: None,
             pending_queue: None,
@@ -3202,8 +3446,11 @@ fn main() {
             }
         });
 
-        // Selecting an article shows it and marks it read (Python marks
-        // read on open as well).
+        // Selecting an article only PREVIEWS it (Python's
+        // on_article_select): no read/opened marking happens
+        // here — arrowing across unread rows must leave them
+        // unread. Marking belongs to reader focus and to
+        // activation (Audit 8 G01).
         let state_list = state.clone();
         let frame_list = frame;
         let rich_view_sel = rich_view.clone();
@@ -3228,9 +3475,6 @@ fn main() {
             ensure_content(st.db.as_ref(), &mut a);
             if let Some(row) = st.articles.get_mut(idx as usize) {
                 row.content = a.content.clone();
-            }
-            if let Some(db) = st.db.as_ref() {
-                let _ = db.mark_opened(&a.id);
             }
             let body = a
                 .content
@@ -3291,16 +3535,36 @@ fn main() {
                 }
                 reader.show(true);
             }
-            if !a.is_read {
-                if let Some(db) = st.db.as_ref() {
-                    mark_article_read(db, &a, true);
-                }
-                if let Some(slot) = st.articles.get_mut(idx as usize) {
-                    slot.is_read = true;
-                }
-                frame_list.set_status_text(&format!("Read: {}", a.title), 0);
+        });
+
+        // Reader focus marks the selected article read +
+        // opened (Python's on_content_focus; Audit 8 G01).
+        // The rich WebView reader carries the same trigger
+        // (Python's _on_rich_view_focus marks identically).
+        let state_rf = state.clone();
+        let frame_rf = frame;
+        reader.on_set_focus(move |_| {
+            let marked = {
+                let mut st = state_rf.borrow_mut();
+                mark_selected_read_opened(&mut st, &frame_rf)
+            };
+            if let Some(a) = marked {
+                propagate_read_state(&a, true);
             }
         });
+        if let Some(wv) = rich_view.as_ref() {
+            let state_wf = state.clone();
+            let frame_wf = frame;
+            wv.on_set_focus(move |_| {
+                let marked = {
+                    let mut st = state_wf.borrow_mut();
+                    mark_selected_read_opened(&mut st, &frame_wf)
+                };
+                if let Some(a) = marked {
+                    propagate_read_state(&a, true);
+                }
+            });
+        }
 
         // Refresh: worker threads fetch + parse; results return over a
         // channel; a timer drains them on the main thread, which owns
@@ -3842,90 +4106,32 @@ fn main() {
         let state_ma = state.clone();
         let frame_ma = frame;
         let tx_ma = tx.clone();
+        // Mark All Read (Audit 8 G05): ONE operation
+        // (run_mark_all over an explicit scope) behind distinct
+        // wrappers, like Python — the main command (File menu,
+        // button, feeds.mark_all_read shortcut) is GLOBAL and
+        // confirms with the global prompt; the tree context
+        // command is scoped to the node its menu was opened on
+        // and confirms with that node's prompt. A cancelled
+        // confirmation changes no state at all: the dialog runs
+        // before anything is borrowed, marked or announced.
         let act_markall: Rc<dyn Fn()> = Rc::new(move || {
-            // Hosted provider: Mark All Read must reach the
-            // server, not just the local cache. Route it
-            // through provider.mark_all_read on a worker (the
-            // trait does the remote mark first, then the cache
-            // update); the completion reloads the view and a
-            // remote failure surfaces in the status bar.
-            // View-id mapping: the All Feeds root (no filter)
-            // is the provider-wide mark (None); a feed node is
-            // that feed; a category node goes through
-            // provider.mark_category_read, which marks by
-            // server category membership (GReader label
-            // stream, Miniflux category endpoint) so articles
-            // labeled/moved into the category from outside
-            // feeds are covered (Audit 8 D23). Smart-folder
-            // and Recommendations views have no server stream
-            // and keep the local path below.
-            {
-                let st = state_ma.borrow();
-                let filter = st.selected_feed.clone();
-                let is_feed_view = filter.as_deref().is_some_and(|f| {
-                    !f.starts_with("cat:")
-                        && !f.starts_with("smart:")
-                        && f != "favorites:all"
-                        && f != blindrss_core::youtube_account::RECOMMENDATIONS_FEED_ID
-                });
-                let is_cat_view = filter.as_deref().is_some_and(|f| f.starts_with("cat:"));
-                if filter.is_none() || is_feed_view || is_cat_view {
-                    let cfg =
-                        blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
-                    if blindrss_core::provider::active_name(&cfg) != "local" {
-                        // Recommendations are local-only even
-                        // under a hosted provider (Python's
-                        // wrapper marks them beside the remote
-                        // mark — Audit 8 D20).
-                        if let Some(db) = st.db.as_ref()
-                            && let Some((account, favorites_only)) =
-                                recommendations_mark_scope(&cfg, filter.as_deref())
-                        {
-                            let _ = db.mark_recommendations_read(&account, favorites_only);
-                        }
-                        drop(st);
-                        frame_ma.set_status_text("Marking all read...", 0);
-                        let tx = tx_ma.clone();
-                        std::thread::spawn(move || {
-                            let cfg = blindrss_core::config::Config::load(&config_path())
-                                .unwrap_or_default();
-                            let provider = blindrss_core::provider::get_provider(&cfg, db_path());
-                            let result = match filter.as_deref() {
-                                None => provider.mark_all_read(None),
-                                Some(view) if view.starts_with("cat:") => provider
-                                    .mark_category_read(view.strip_prefix("cat:").unwrap_or("")),
-                                Some(feed_id) => provider.mark_all_read(Some(feed_id)),
-                            };
-                            let _ = tx.send(RefreshMsg::ProviderAction(
-                                result.map(|n| format!("Marked {n} articles read")),
-                            ));
-                        });
-                        return;
-                    }
-                }
+            if !confirm_mark_all(&frame_ma, &mark_all_prompt(None, None)) {
+                return;
             }
-            let mut st = state_ma.borrow_mut();
-            let filter = st.selected_feed.clone();
-            let mut count = 0;
-            if let Some(db) = st.db.as_ref() {
-                count = db.mark_all_read(filter.as_deref()).unwrap_or(0);
-                // Recommendations in scope are marked in their
-                // own table, persisted (Audit 8 D20 — Python's
-                // wrapper mark_all_read); the pre-fix code only
-                // flipped the displayed flags below.
-                let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
-                if let Some((account, favorites_only)) =
-                    recommendations_mark_scope(&cfg, filter.as_deref())
-                {
-                    count += db
-                        .mark_recommendations_read(&account, favorites_only)
-                        .unwrap_or(0);
-                }
-                for a in st.articles.iter_mut() {
-                    a.is_read = true;
-                }
+            run_mark_all(&state_ma, &frame_ma, &tx_ma, None);
+        });
+        let state_mc = state.clone();
+        let frame_mc = frame;
+        let tx_mc = tx.clone();
+        let act_markall_ctx: Rc<dyn Fn()> = Rc::new(move || {
+            let Some((view, prompt)) = state_mc.borrow_mut().ctx_mark.take() else {
+                return;
+            };
+            if !confirm_mark_all(&frame_mc, &prompt) {
+                return;
             }
-            frame_ma.set_status_text(&format!("Marked {count} articles read"), 0);
+            run_mark_all(&state_mc, &frame_mc, &tx_mc, view);
         });
         {
             let a = act_markall.clone();
@@ -3935,51 +4141,38 @@ fn main() {
         let state_s = state.clone();
         let frame_s = frame;
         let act_search: Rc<dyn Fn()> = Rc::new(move || {
+            // In-view search (Audit 8 G04): the terms become
+            // state and the ordinary refill pipeline applies
+            // them to the CURRENT view — scope, read/media
+            // filters and sort preserved, and the results page
+            // like the view itself. (The old code ran one
+            // global phrase search capped at 300 and replaced
+            // the list outright.) An empty box clears the
+            // filter, Python's on_search_enter behaviour.
             let query = search_box.get_value();
             let mut st = state_s.borrow_mut();
-            if query.trim().is_empty() {
-                refill_articles(&mut st, &list);
-                return;
-            }
-            let Some(db) = st.db.as_ref() else { return };
-            let title_only = blindrss_core::config::Config::load(&config_path())
+            st.search_terms = blindrss_core::db::search_terms(&query);
+            st.search_title_only = blindrss_core::config::Config::load(&config_path())
                 .map(|c| c.get_str("search_mode", "title_content") == "title_only")
                 .unwrap_or(false);
-            match db.search_articles_mode_light(query.trim(), 300, title_only) {
-                Ok(results) => {
-                    setup_article_columns(&list);
-                    let feed_titles: std::collections::HashMap<&str, &str> = st
-                        .feeds
-                        .iter()
-                        .map(|f| (f.id.as_str(), f.title.as_str()))
-                        .collect();
-                    let layout = blindrss_core::article_columns::layout_from_config(
-                        &blindrss_core::config::Config::load(&config_path()).unwrap_or_default(),
-                    );
-                    let visible = blindrss_core::article_columns::visible_columns(&layout);
-                    // Same Freeze/Thaw batching as refill_articles:
-                    // unbatched inserts repaint per row.
-                    list.freeze();
-                    for (i, a) in results.iter().enumerate() {
-                        list.insert_item(i as i64, &a.title, None);
-                        for (col_idx, col) in visible.iter().enumerate().skip(1) {
-                            let cell = article_cell(a, &col.key, &feed_titles);
-                            list.set_item_text_by_column(i as i64, col_idx as i32, &cell);
-                        }
-                    }
-                    list.thaw();
-                    let n = results.len();
-                    st.articles = results;
-                    st.view_total = -1;
-                    st.selected_article = None;
-                    frame_s.set_status_text(&format!("{n} matches"), 0);
-                }
-                Err(e) => frame_s.set_status_text(&format!("Search failed: {e}"), 0),
+            let searching = !st.search_terms.is_empty();
+            refill_articles(&mut st, &list);
+            if searching {
+                let n = if st.view_total >= 0 {
+                    st.view_total
+                } else {
+                    st.articles.len() as i64
+                };
+                frame_s.set_status_text(&format!("{n} matches"), 0);
             }
         });
         {
             let a = act_search.clone();
             search_btn.on_click(move |_| a());
+            // Enter in the field runs the search too (Python's
+            // on_search_enter on EVT_TEXT_ENTER).
+            let a = act_search.clone();
+            search_box.on_enter_pressed(move |_| a());
         }
 
         let state_deleted = state.clone();
@@ -5093,6 +5286,12 @@ fn main() {
             // The activation decision's last step detects media
             // in the body; list rows are light, so resolve it.
             ensure_content(st.db.as_ref(), &mut article);
+            // Activation records the article opened (Python's
+            // _open_article -> _mark_article_opened; Audit 8
+            // G01) — read marking follows below.
+            if let Some(db) = &st.db {
+                let _ = db.mark_opened(&article.id);
+            }
             let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
             let playable = blindrss_core::download::downloaded_media_path(&cfg, &article).is_some()
                 || article.media_url.as_deref().is_some_and(|u| {
@@ -8051,6 +8250,7 @@ fn main() {
             (M_HISTORY, act_history.clone()),
             (M_FAVORITE, act_fav.clone()),
             (M_MARKALL, act_markall.clone()),
+            (M_MARKALL_CTX, act_markall_ctx.clone()),
             (M_DELETE_ARTICLE, act_delete.clone()),
             (M_DELETED, act_deleted.clone()),
             (M_PLAY, act_play.clone()),
@@ -8173,12 +8373,30 @@ fn main() {
                 Some(_) => "feed",
                 None => "all",
             };
+            // Scoped Mark All (Audit 8 G05): the context item
+            // dispatches M_MARKALL_CTX, whose handler consumes
+            // the (view, prompt) stashed here for THIS node —
+            // the main command's global scope is never reused
+            // for a node's menu.
+            if matches!(kind, "category" | "feed") {
+                let feed_title = {
+                    let st = state_ctx_tree.borrow();
+                    selected.as_ref().and_then(|sel| {
+                        st.feeds
+                            .iter()
+                            .find(|f| &f.id == sel)
+                            .map(|f| f.title.clone())
+                    })
+                };
+                let prompt = mark_all_prompt(selected.as_deref(), feed_title.as_deref());
+                state_ctx_tree.borrow_mut().ctx_mark = Some((selected.clone(), prompt));
+            }
             let mut builder = Menu::builder();
             match kind {
                 "category" => {
                     builder = builder
                         .append_item(M_REFRESH_CAT, "Refresh Category", "")
-                        .append_item(M_MARKALL, "Mark All Items as Read", "")
+                        .append_item(M_MARKALL_CTX, "Mark All Items as Read", "")
                         .append_item(M_ADD_CAT, "Add Subcategory", "")
                         .append_item(M_EDIT_CAT, "Edit Category", "")
                         .append_item(M_DEL_CAT, "Remove Category", "")
@@ -8189,7 +8407,7 @@ fn main() {
                 "feed" => {
                     builder = builder
                         .append_item(M_REFRESH_FEED, "Refresh Feed", "")
-                        .append_item(M_MARKALL, "Mark All Items as Read", "")
+                        .append_item(M_MARKALL_CTX, "Mark All Items as Read", "")
                         .append_item(M_EDIT_FEED, "Edit Feed...", "")
                         .append_item(M_RESET_TITLE, "Reset Title to Feed Default", "")
                         .append_item(M_COPY_FEED_URL, "Copy Feed URL", "")
@@ -9534,6 +9752,102 @@ mod ui_parity_tests {
         // Signed out: no scope anywhere.
         let cfg = blindrss_core::config::Config::default();
         assert!(recommendations_mark_scope(&cfg, None).is_none());
+    }
+
+    #[test]
+    fn mark_all_prompts_distinguish_global_and_node_scopes() {
+        // Audit 8 G05: Python's main command asks globally,
+        // tree context commands name their node (feed title
+        // when known, category path, "this feed" fallback).
+        assert_eq!(
+            mark_all_prompt(None, None),
+            "Mark all items in all feeds as read?"
+        );
+        assert_eq!(
+            mark_all_prompt(Some("cat:News / Tech"), None),
+            "Mark all items in category \"News / Tech\" as read?"
+        );
+        assert_eq!(
+            mark_all_prompt(Some("feed-42"), Some("Daily Show")),
+            "Mark all items in \"Daily Show\" as read?"
+        );
+        assert_eq!(
+            mark_all_prompt(Some("feed-42"), None),
+            "Mark all items in this feed as read?"
+        );
+        assert_eq!(
+            mark_all_prompt(Some("feed-42"), Some("  ")),
+            "Mark all items in this feed as read?"
+        );
+    }
+
+    #[test]
+    fn view_query_maps_tree_values_to_scopes() {
+        // Audit 8 G03/G04: the tree's data values become core
+        // scopes, and the filter/sort/search state rides along.
+        fn base_state() -> State {
+            State {
+                db: None,
+                store_path: PathBuf::new(),
+                feeds: Vec::new(),
+                articles: Vec::new(),
+                selected_feed: None,
+                selected_article: None,
+                refreshing: false,
+                focus_list: false,
+                remember_last_feed: false,
+                cancel_refresh: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                refresh_stopped: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                last_refresh_end: None,
+                refresh_paused_until: None,
+                read_filter: 1,
+                media_filter: 2,
+                sort_by: "name".to_string(),
+                sort_ascending: true,
+                view_total: -1,
+                search_terms: vec!["rust".to_string()],
+                search_title_only: true,
+                ctx_mark: None,
+                find_query: String::new(),
+                search_focused: false,
+                expanded_cats: std::collections::HashSet::new(),
+                collapsed_cats: std::collections::HashSet::new(),
+                cols_sig: String::new(),
+                refill_pending: false,
+                refresh_new: Vec::new(),
+                refresh_failed: false,
+                pending_play: None,
+                pending_queue: None,
+                reader_cache: blindrss_core::reader_cache::ReaderCache::default(),
+                reader_generation: 0,
+                pending_fulltext: None,
+            }
+        }
+        use blindrss_core::db::ViewScope;
+        let mut st = base_state();
+        let q = view_query(&st);
+        assert_eq!(q.scope, ViewScope::All);
+        assert_eq!(q.read_filter, 1);
+        assert_eq!(q.media_filter, 2);
+        assert_eq!(q.sort_by, "name");
+        assert!(q.ascending);
+        assert_eq!(q.search_terms, ["rust"]);
+        assert!(q.search_title_only);
+
+        st.selected_feed = Some("cat:News / Tech".to_string());
+        assert_eq!(
+            view_query(&st).scope,
+            ViewScope::Category("News / Tech".to_string())
+        );
+        st.selected_feed = Some("smart:7".to_string());
+        assert_eq!(view_query(&st).scope, ViewScope::Smart("7".to_string()));
+        st.selected_feed = Some("favorites:all".to_string());
+        assert_eq!(view_query(&st).scope, ViewScope::Favorites);
+        st.selected_feed = Some("feed-42".to_string());
+        assert_eq!(
+            view_query(&st).scope,
+            ViewScope::Feed("feed-42".to_string())
+        );
     }
 
     #[test]

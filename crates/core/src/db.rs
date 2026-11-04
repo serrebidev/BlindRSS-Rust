@@ -230,6 +230,77 @@ const MIGRATION_COLUMNS: [(&str, &str, &str); 13] = [
     ("feeds", "show_images", "INTEGER"),
 ];
 
+/// Scope of an article-list view for the unified view query
+/// (Audit 8 Task 11): the tree node's target, before filters,
+/// sort and search apply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ViewScope {
+    /// Every article in the library (the All Feeds root).
+    All,
+    /// One feed's articles.
+    Feed(String),
+    /// A category subtree under the ported membership clause.
+    Category(String),
+    /// Favourite articles across feeds.
+    Favorites,
+    /// A smart folder's rule matches (folder id).
+    Smart(String),
+}
+
+/// A full article-list view specification: scope, the
+/// Ctrl+1..6 read/media filters, the display sort and the
+/// in-view search terms. `Db::articles_view_page` /
+/// `articles_view_count` compose all of it in SQL so filtered,
+/// sorted and searched views page exactly like the plain one
+/// (Audit 8 G03/G04; Python gui/mainframe.py applies the same
+/// pipeline over the current view).
+#[derive(Debug, Clone)]
+pub struct ArticleQuery {
+    pub scope: ViewScope,
+    /// 0 = all, 1 = unread only, 2 = read only.
+    pub read_filter: u8,
+    /// 0 = all, 1 = with media, 2 = without media.
+    pub media_filter: u8,
+    /// Config `article_sort_by`: date/name/author/description/
+    /// feed/status (anything else behaves as date).
+    pub sort_by: String,
+    /// Config `article_sort_ascending`.
+    pub ascending: bool,
+    /// Search terms (whitespace-split, lowercased): EVERY term
+    /// must appear in the article's search text (Python
+    /// `_filter_articles`). Empty = no search.
+    pub search_terms: Vec<String>,
+    /// Config `search_mode` == title_only: match titles only.
+    pub search_title_only: bool,
+}
+
+/// Split a search box query into Python's term list
+/// (`_filter_articles`: whitespace split, lowercased, empties
+/// dropped).
+pub fn search_terms(query: &str) -> Vec<String> {
+    query
+        .to_lowercase()
+        .split_whitespace()
+        .map(str::to_string)
+        .collect()
+}
+
+/// ORDER BY for an `ArticleQuery` (see `articles_view_page`).
+fn view_order(query: &ArticleQuery) -> String {
+    let dir = if query.ascending { "ASC" } else { "DESC" };
+    let recency = "COALESCE(a.date, '') DESC, a.id DESC";
+    match query.sort_by.as_str() {
+        "name" => format!("LOWER(TRIM(a.title)) {dir}, {recency}"),
+        "author" => format!("LOWER(TRIM(COALESCE(a.author, ''))) {dir}, {recency}"),
+        "description" => format!("LOWER(COALESCE(a.description, '')) {dir}, {recency}"),
+        "feed" => format!("LOWER(TRIM(COALESCE(f.title, ''))) {dir}, {recency}"),
+        "status" => {
+            format!("(CASE WHEN a.is_read THEN 'read' ELSE 'unread' END) {dir}, {recency}")
+        }
+        _ => format!("COALESCE(a.date, '') {dir}, a.id {dir}"),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Article {
     pub id: String,
@@ -850,6 +921,152 @@ impl Db {
                 rows.collect()
             }
         }
+    }
+
+    /// One page of light rows for a full article-list view
+    /// (Audit 8 Task 11, G03/G04): scope + read/media filters +
+    /// search + display sort composed in SQL, so EVERY view
+    /// pages at the caller's page size in actual display order
+    /// instead of only the unfiltered date-descending one. The
+    /// order is Python's `_sort_articles_for_display`: the
+    /// sort's primary key in the chosen direction, with recency
+    /// (date DESC, id DESC) as the stable tiebreak in BOTH
+    /// directions (Python's stable sort keeps equal keys in
+    /// recency order even when reversed); the date sort keys on
+    /// (date, id) in the chosen direction outright.
+    pub fn articles_view_page(
+        &self,
+        query: &ArticleQuery,
+        limit: usize,
+        offset: usize,
+    ) -> rusqlite::Result<Vec<Article>> {
+        let (where_sql, values) = self.view_where(query)?;
+        let order = view_order(query);
+        let sql = format!(
+            "SELECT a.id, a.feed_id, a.title, a.url, NULL, a.description, a.date, \
+             a.author, a.is_read, a.is_favorite, a.media_url, a.media_type \
+             FROM articles a LEFT JOIN feeds f ON f.id = a.feed_id \
+             WHERE {where_sql} ORDER BY {order} LIMIT ? OFFSET ?"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut params: Vec<&dyn rusqlite::ToSql> = values.iter().map(|v| v as _).collect();
+        let (limit_i, offset_i) = (limit as i64, offset as i64);
+        params.push(&limit_i);
+        params.push(&offset_i);
+        let rows = stmt.query_map(params.as_slice(), article_row)?;
+        rows.collect()
+    }
+
+    /// Total rows matching an `ArticleQuery`; pairs with
+    /// `articles_view_page` (the app arms Python's "Load more
+    /// items (Enter)" placeholder from it).
+    pub fn articles_view_count(&self, query: &ArticleQuery) -> rusqlite::Result<i64> {
+        let (where_sql, values) = self.view_where(query)?;
+        let sql = format!(
+            "SELECT COUNT(*) FROM articles a LEFT JOIN feeds f ON f.id = a.feed_id \
+             WHERE {where_sql}"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::ToSql> = values.iter().map(|v| v as _).collect();
+        stmt.query_row(params.as_slice(), |r| r.get(0))
+    }
+
+    /// The WHERE body (over aliases `a` = articles, `f` = feeds)
+    /// and bind values for an `ArticleQuery`: scope, read/media
+    /// filters, then one AND group per search term.
+    fn view_where(&self, query: &ArticleQuery) -> rusqlite::Result<(String, Vec<String>)> {
+        let mut clauses: Vec<String> = Vec::new();
+        let mut values: Vec<String> = Vec::new();
+        match &query.scope {
+            ViewScope::All => {}
+            ViewScope::Feed(feed) => {
+                clauses.push("a.feed_id = ?".to_string());
+                values.push(feed.clone());
+            }
+            ViewScope::Category(path) => {
+                let (clause, names, uncat) = self.category_membership(path)?;
+                clauses.push(clause);
+                if !uncat {
+                    for _ in 0..3 {
+                        values.extend(names.iter().cloned());
+                    }
+                }
+            }
+            ViewScope::Favorites => clauses.push("a.is_favorite = 1".to_string()),
+            ViewScope::Smart(folder_id) => {
+                // Smart folders evaluate their rule over full
+                // rows (bodies included); the view then pages
+                // over the matched id set.
+                let folders = self.smart_folders()?;
+                let matched: Vec<String> = match folders.iter().find(|(id, ..)| id == folder_id) {
+                    Some((_, _, rule_json, _)) => {
+                        let rule: serde_json::Value =
+                            serde_json::from_str(rule_json).unwrap_or(serde_json::Value::Null);
+                        self.articles_matching_rule(&rule)?
+                            .into_iter()
+                            .map(|a| a.id)
+                            .collect()
+                    }
+                    None => Vec::new(),
+                };
+                if matched.is_empty() {
+                    clauses.push("1 = 0".to_string());
+                } else {
+                    let groups: Vec<String> = matched
+                        .chunks(900)
+                        .map(|chunk| {
+                            format!(
+                                "a.id IN ({})",
+                                chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",")
+                            )
+                        })
+                        .collect();
+                    clauses.push(format!("({})", groups.join(" OR ")));
+                    values.extend(matched);
+                }
+            }
+        }
+        match query.read_filter {
+            1 => clauses.push("a.is_read = 0".to_string()),
+            2 => clauses.push("a.is_read = 1".to_string()),
+            _ => {}
+        }
+        match query.media_filter {
+            1 => clauses.push("(a.media_url IS NOT NULL AND a.media_url <> '')".to_string()),
+            2 => clauses.push("(a.media_url IS NULL OR a.media_url = '')".to_string()),
+            _ => {}
+        }
+        for term in &query.search_terms {
+            let like = format!(
+                "%{}%",
+                term.replace('\\', "\\\\")
+                    .replace('%', "\\%")
+                    .replace('_', "\\_")
+            );
+            if query.search_title_only {
+                clauses.push("(a.title LIKE ? ESCAPE '\\')".to_string());
+                values.push(like);
+            } else {
+                // Python `_article_search_text`: title, body,
+                // description, author, article URL, media URL
+                // and the feed's title — a term found in ANY of
+                // them counts; EVERY term must count somewhere.
+                clauses.push(
+                    "(a.title LIKE ? ESCAPE '\\' OR a.content LIKE ? ESCAPE '\\' \
+                     OR a.description LIKE ? ESCAPE '\\' OR a.author LIKE ? ESCAPE '\\' \
+                     OR a.url LIKE ? ESCAPE '\\' OR a.media_url LIKE ? ESCAPE '\\' \
+                     OR f.title LIKE ? ESCAPE '\\')"
+                        .to_string(),
+                );
+                for _ in 0..7 {
+                    values.push(like.clone());
+                }
+            }
+        }
+        if clauses.is_empty() {
+            clauses.push("1 = 1".to_string());
+        }
+        Ok((clauses.join(" AND "), values))
     }
 
     pub fn unread_count(&self, feed_id: Option<&str>) -> rusqlite::Result<i64> {
@@ -2911,6 +3128,57 @@ impl Db {
             }
         }
         self.conn.execute(&sql, params.as_slice())
+    }
+
+    /// Mark All Read over one explicit view (Audit 8 G05): the
+    /// single operation behind the global main command (None)
+    /// and the scoped tree-context commands. The view string is
+    /// the tree's data value — a feed id, `cat:<path>`,
+    /// `smart:<id>` or `favorites:all`. Category membership,
+    /// smart-folder rules and the favorites set resolve here in
+    /// core; the old app path passed the raw string to a feed-id
+    /// update, so non-feed scopes silently marked nothing. The
+    /// recommendations pseudo-feed is not a local scope (its
+    /// state lives in its own table; callers route it through
+    /// `mark_recommendations_read`) and marks 0 here.
+    pub fn mark_view_read(&self, view: Option<&str>) -> rusqlite::Result<usize> {
+        match view {
+            None => self.mark_all_read(None),
+            Some("favorites:all") => self.conn.execute(
+                "UPDATE articles SET is_read = 1 WHERE is_read = 0 AND is_favorite = 1",
+                [],
+            ),
+            Some(v) if v == crate::youtube_account::RECOMMENDATIONS_FEED_ID => Ok(0),
+            Some(v) => {
+                if let Some(path) = v.strip_prefix("cat:") {
+                    return self.mark_category_read(path);
+                }
+                if let Some(folder_id) = v.strip_prefix("smart:") {
+                    let folders = self.smart_folders()?;
+                    let Some((_, _, rule_json, _)) =
+                        folders.iter().find(|(id, ..)| id == folder_id)
+                    else {
+                        return Ok(0);
+                    };
+                    let rule: serde_json::Value =
+                        serde_json::from_str(rule_json).unwrap_or(serde_json::Value::Null);
+                    let matched = self.articles_matching_rule(&rule)?;
+                    let mut total = 0;
+                    for chunk in matched.chunks(900) {
+                        let marks = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+                        let sql = format!(
+                            "UPDATE articles SET is_read = 1 WHERE is_read = 0 \
+                             AND id IN ({marks})"
+                        );
+                        let params: Vec<&dyn rusqlite::ToSql> =
+                            chunk.iter().map(|a| &a.id as _).collect();
+                        total += self.conn.execute(&sql, params.as_slice())?;
+                    }
+                    return Ok(total);
+                }
+                self.mark_all_read(Some(v))
+            }
+        }
     }
 
     pub fn favorites(&self, limit: usize) -> rusqlite::Result<Vec<Article>> {
