@@ -237,6 +237,32 @@ fn run_tool_captures_output_and_bounds_it() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn run_tool_executes_freshly_written_files_repeatedly() {
+    // Regression (Audit 8 Task 23 flake, root-caused 2026-11-04):
+    // executing a file that was written and closed moments
+    // earlier can fail with ETXTBSY ("Text file busy") for tens
+    // to a few hundred milliseconds under load. That made the
+    // nightly tests fail intermittently (a just-downloaded
+    // yt-dlp staging copy probed as "did not run", a healthy
+    // managed copy probed as broken) and failed one CI run.
+    // run_tool's spawn absorbs the busy window; write-then-run
+    // must simply work, fifty fresh files in a row.
+    let dir = unique_dir("freshx");
+    for i in 0..50 {
+        let exe = write_exe(
+            &dir,
+            &format!("fresh{i}"),
+            "#!/bin/sh\necho fresh-version\n",
+        );
+        let run = run_tool(&exe, &[], Duration::from_secs(10))
+            .unwrap_or_else(|e| panic!("fresh file {i} must run: {e}"));
+        assert!(run.success, "fresh file {i} must exit 0");
+        assert_eq!(run.stdout.trim(), "fresh-version");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // O06: nightly yt-dlp maintenance — current/stale/throttle/failure-safe.
 // ---------------------------------------------------------------------------

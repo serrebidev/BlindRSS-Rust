@@ -195,6 +195,51 @@ fn read_capped<R: std::io::Read + Send + 'static>(
     })
 }
 
+/// Spawn `exe`, absorbing the transient ETXTBSY window that
+/// follows writing an executable file: executing a file that
+/// was written and closed moments earlier can fail with "Text
+/// file busy" for tens to a few hundred milliseconds under
+/// load (measured on the CI-class Linux setup: roughly 1 in 3
+/// immediate execs busy, worst window ~155 ms — and one real
+/// CI failure of the nightly-download probe). That is exactly
+/// the download-then-probe shape of the managed yt-dlp
+/// install, so the spawn retries with backoff inside a budget
+/// of min(timeout, 2 s). Any other spawn error is immediate.
+fn spawn_tool(
+    exe: &std::path::Path,
+    args: &[&str],
+    timeout: std::time::Duration,
+) -> Result<std::process::Child, String> {
+    // ETXTBSY is 26 on both Linux and macOS.
+    #[cfg(unix)]
+    const ETXTBSY: i32 = 26;
+    let budget = timeout.min(std::time::Duration::from_secs(2));
+    let started = std::time::Instant::now();
+    let mut backoff = std::time::Duration::from_millis(10);
+    loop {
+        let result = std::process::Command::new(exe)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn();
+        match result {
+            Ok(child) => return Ok(child),
+            Err(e) => {
+                #[cfg(unix)]
+                let busy = e.raw_os_error() == Some(ETXTBSY);
+                #[cfg(not(unix))]
+                let busy = false;
+                if !busy || started.elapsed() + backoff > budget {
+                    return Err(format!("{} failed to start: {e}", exe.display()));
+                }
+                std::thread::sleep(backoff);
+                backoff = (backoff * 2).min(std::time::Duration::from_millis(100));
+            }
+        }
+    }
+}
+
 /// Run `exe` with `args`, returning its capped output, or an
 /// error when it cannot start or exceeds `timeout` (in which
 /// case it is killed and reaped before this returns).
@@ -203,13 +248,7 @@ pub fn run_tool(
     args: &[&str],
     timeout: std::time::Duration,
 ) -> Result<ToolRun, String> {
-    let mut child = std::process::Command::new(exe)
-        .args(args)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("{} failed to start: {e}", exe.display()))?;
+    let mut child = spawn_tool(exe, args, timeout)?;
     let out_reader = child.stdout.take().map(read_capped);
     let err_reader = child.stderr.take().map(read_capped);
     let deadline = std::time::Instant::now() + timeout;

@@ -3194,3 +3194,32 @@ fixed in follow-up integration commits. Merged gate: cargo fmt
 clean, clippy `--workspace --all-targets -D warnings` clean,
 `cargo test --workspace` 588 passed / 0 failed, `cargo build -p
 blindrss` OK. Ships as v0.1.56.
+
+**Wave 2 flake root cause and fix (2026-11-04):** The first CI
+runs for the Wave 2 tree also failed intermittently in
+`dependency_parity` (besides the Windows Clippy failure, fixed
+in 65344d3): `nightly_stale_copy_falls_back_to_verified_download`
+reported `KeptExistingAfterFailure` instead of `Downloaded` on
+Ubuntu CI, and a local run reported `InstalledNew` instead of
+`AlreadyCurrent`. Root cause, reproduced locally under CPU load
+and captured verbatim in a panic from
+`run_tool_captures_output_and_bounds_it`: spawning a
+just-written executable fails with ETXTBSY ("Text file busy",
+os error 26) for a short window after the file is written and
+closed — measured at roughly 1 in 3 immediate execs under load,
+worst window ~155 ms, on both tmpfs and disk. The nightly flow
+is exactly write-then-exec (download to staging, then probe),
+and `probe_version`'s single immediate retry often landed
+inside the same busy window, so a healthy copy probed as
+broken. Fix: `run_tool`'s spawn (`spawn_tool` in
+`crates/core/src/dependency.rs`) retries ETXTBSY with backoff
+inside a budget of min(timeout, 2 s); other spawn errors stay
+immediate, and a tool that runs and fails is still never
+retried. Regression test
+`run_tool_executes_freshly_written_files_repeatedly` runs fifty
+freshly written scripts back to back. Proof: dependency suite
+12/12 full runs under six-way CPU saturation after the fix (it
+failed roughly 1 in 10 before); full gate after the fix: cargo
+fmt clean, clippy clean (workspace and core
+`x86_64-pc-windows-gnu`), `cargo test --workspace` 589 passed /
+0 failed, `cargo build -p blindrss` OK.
