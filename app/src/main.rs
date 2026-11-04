@@ -138,6 +138,8 @@ fn restored_view_state(raw: &str) -> (Option<String>, u8) {
 /// core's Python-compatible encoder.
 fn remembered_view_value(selected: Option<&str>, read_filter: u8) -> String {
     blindrss_core::config::encode_remembered_view(selected, read_filter)
+}
+
 /// The retention boundary ingestion must not insert past (Python
 /// issue #106): the `YYYY-MM-DD` cutoff for the configured
 /// `article_retention`, or None when retention is unlimited.

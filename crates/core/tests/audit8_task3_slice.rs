@@ -64,11 +64,21 @@ fn cross_feed_guid_collision_keeps_independent_articles() {
     let mut ea = entry("1", "A one", "https://a.example/1");
     ea.media_url = Some("https://a.example/ep.mp3".to_string());
     ea.media_type = Some("audio/mpeg".to_string());
-    assert_eq!(store_parsed(&db, &feed_a, &parsed(vec![ea]), "deleted").unwrap().inserted, 1);
+    assert_eq!(
+        store_parsed(&db, &feed_a, &parsed(vec![ea]), "deleted")
+            .unwrap()
+            .inserted,
+        1
+    );
 
     let eb = entry("1", "B one", "https://b.example/1");
     // Today this stores 0: the raw id is already taken by feed A.
-    assert_eq!(store_parsed(&db, &feed_b, &parsed(vec![eb]), "deleted").unwrap().inserted, 1);
+    assert_eq!(
+        store_parsed(&db, &feed_b, &parsed(vec![eb]), "deleted")
+            .unwrap()
+            .inserted,
+        1
+    );
 
     let a = db.article_by_id("1").unwrap().unwrap();
     assert_eq!(a.feed_id, feed_a.id);
@@ -101,8 +111,18 @@ fn cross_feed_guid_collision_keeps_independent_articles() {
     // Re-refresh of both feeds stores nothing new.
     let ea = entry("1", "A one", "https://a.example/1");
     let eb = entry("1", "B one", "https://b.example/1");
-    assert_eq!(store_parsed(&db, &feed_a, &parsed(vec![ea]), "deleted").unwrap().inserted, 0);
-    assert_eq!(store_parsed(&db, &feed_b, &parsed(vec![eb]), "deleted").unwrap().inserted, 0);
+    assert_eq!(
+        store_parsed(&db, &feed_a, &parsed(vec![ea]), "deleted")
+            .unwrap()
+            .inserted,
+        0
+    );
+    assert_eq!(
+        store_parsed(&db, &feed_b, &parsed(vec![eb]), "deleted")
+            .unwrap()
+            .inserted,
+        0
+    );
 
     // Independent deletion: deleting B's twin leaves A's row.
     assert!(db.delete_article(&scoped).unwrap());
@@ -121,22 +141,42 @@ fn tombstone_matches_feed_scoped_url_and_id() {
     let feed_b = add_feed(&db, "https://b.example/feed");
 
     let e = entry("g1", "Story", "https://a.example/story");
-    assert_eq!(store_parsed(&db, &feed_a, &parsed(vec![e]), "deleted").unwrap().inserted, 1);
+    assert_eq!(
+        store_parsed(&db, &feed_a, &parsed(vec![e]), "deleted")
+            .unwrap()
+            .inserted,
+        1
+    );
     assert!(db.delete_article("g1").unwrap());
 
     // Same feed, changed GUID, same URL: stays deleted.
     let e = entry("g2", "Story", "https://a.example/story");
-    assert_eq!(store_parsed(&db, &feed_a, &parsed(vec![e]), "deleted").unwrap().inserted, 0);
+    assert_eq!(
+        store_parsed(&db, &feed_a, &parsed(vec![e]), "deleted")
+            .unwrap()
+            .inserted,
+        0
+    );
     assert!(db.article_by_id("g2").unwrap().is_none());
 
     // Same feed, original GUID, new URL: stays deleted (id match).
     let e = entry("g1", "Story", "https://a.example/other");
-    assert_eq!(store_parsed(&db, &feed_a, &parsed(vec![e]), "deleted").unwrap().inserted, 0);
+    assert_eq!(
+        store_parsed(&db, &feed_a, &parsed(vec![e]), "deleted")
+            .unwrap()
+            .inserted,
+        0
+    );
 
     // Different feed, same GUID, its own URL: NOT suppressed by
     // feed A's tombstone.
     let e = entry("g1", "Story", "https://b.example/story");
-    assert_eq!(store_parsed(&db, &feed_b, &parsed(vec![e]), "deleted").unwrap().inserted, 1);
+    assert_eq!(
+        store_parsed(&db, &feed_b, &parsed(vec![e]), "deleted")
+            .unwrap()
+            .inserted,
+        1
+    );
     let b = db.article_by_id("g1").unwrap().unwrap();
     assert_eq!(b.feed_id, feed_b.id);
 
@@ -155,7 +195,12 @@ fn publisher_metadata_correction_updates_existing_row() {
     e.content_text = "FULL EXTRACTED TEXT".to_string();
     e.summary = "first summary".to_string();
     e.date = Some("2026-10-01 10:00:00".to_string());
-    assert_eq!(store_parsed(&db, &feed, &parsed(vec![e]), "deleted").unwrap().inserted, 1);
+    assert_eq!(
+        store_parsed(&db, &feed, &parsed(vec![e]), "deleted")
+            .unwrap()
+            .inserted,
+        1
+    );
 
     db.mark_read("m1", true).unwrap();
     db.set_favorite("m1", true).unwrap();
@@ -168,7 +213,12 @@ fn publisher_metadata_correction_updates_existing_row() {
     e.date = Some("2026-10-02 10:00:00".to_string());
     e.media_url = Some("https://cdn.example/ep.mp3".to_string());
     e.media_type = Some("audio/mpeg".to_string());
-    assert_eq!(store_parsed(&db, &feed, &parsed(vec![e]), "deleted").unwrap().inserted, 0);
+    assert_eq!(
+        store_parsed(&db, &feed, &parsed(vec![e]), "deleted")
+            .unwrap()
+            .inserted,
+        0
+    );
 
     let a = db.article_by_id("m1").unwrap().unwrap();
     assert_eq!(a.url, "https://a.example/new");
@@ -271,7 +321,9 @@ fn refresh_respects_retention_boundary() {
     let mut e = entry("old", "Old", "https://a.example/old");
     e.date = Some("2020-01-01 00:00:00".to_string());
     assert_eq!(
-        store_parsed_with_retention(&db, &feed, &parsed(vec![e]), "deleted", Some(&cutoff)).unwrap().inserted,
+        store_parsed_with_retention(&db, &feed, &parsed(vec![e]), "deleted", Some(&cutoff))
+            .unwrap()
+            .inserted,
         0
     );
     assert!(db.article_by_id("old").unwrap().is_none());
@@ -280,13 +332,17 @@ fn refresh_respects_retention_boundary() {
     let mut e = entry("undated", "Undated", "https://a.example/u");
     e.date = Some("0001-01-01 00:00:00".to_string());
     assert_eq!(
-        store_parsed_with_retention(&db, &feed, &parsed(vec![e]), "deleted", Some(&cutoff)).unwrap().inserted,
+        store_parsed_with_retention(&db, &feed, &parsed(vec![e]), "deleted", Some(&cutoff))
+            .unwrap()
+            .inserted,
         1
     );
     let mut e = entry("nodate", "NoDate", "https://a.example/n");
     e.date = None;
     assert_eq!(
-        store_parsed_with_retention(&db, &feed, &parsed(vec![e]), "deleted", Some(&cutoff)).unwrap().inserted,
+        store_parsed_with_retention(&db, &feed, &parsed(vec![e]), "deleted", Some(&cutoff))
+            .unwrap()
+            .inserted,
         1
     );
 
@@ -294,7 +350,9 @@ fn refresh_respects_retention_boundary() {
     let mut e = entry("edge", "Edge", "https://a.example/e");
     e.date = Some(format!("{cutoff} 00:00:00"));
     assert_eq!(
-        store_parsed_with_retention(&db, &feed, &parsed(vec![e]), "deleted", Some(&cutoff)).unwrap().inserted,
+        store_parsed_with_retention(&db, &feed, &parsed(vec![e]), "deleted", Some(&cutoff))
+            .unwrap()
+            .inserted,
         1
     );
 
@@ -303,14 +361,18 @@ fn refresh_respects_retention_boundary() {
     let mut e = entry("zombie", "Zombie", "https://a.example/z");
     e.date = Some("2020-01-01 00:00:00".to_string());
     assert_eq!(
-        store_parsed(&db, &feed, &parsed(vec![e.clone()]), "deleted").unwrap().inserted,
+        store_parsed(&db, &feed, &parsed(vec![e.clone()]), "deleted")
+            .unwrap()
+            .inserted,
         1
     );
     db.prune_old_articles(7).unwrap();
     assert!(db.article_by_id("zombie").unwrap().is_none());
     let unread_before = db.unread_count(None).unwrap();
     assert_eq!(
-        store_parsed_with_retention(&db, &feed, &parsed(vec![e]), "deleted", Some(&cutoff)).unwrap().inserted,
+        store_parsed_with_retention(&db, &feed, &parsed(vec![e]), "deleted", Some(&cutoff))
+            .unwrap()
+            .inserted,
         0
     );
     assert!(db.article_by_id("zombie").unwrap().is_none());
@@ -327,7 +389,12 @@ fn prune_never_deletes_tombstones() {
     let (db, path) = scratch_db();
     let feed = add_feed(&db, "https://a.example/feed");
     let e = entry("t1", "Gone", "https://a.example/gone");
-    assert_eq!(store_parsed(&db, &feed, &parsed(vec![e]), "deleted").unwrap().inserted, 1);
+    assert_eq!(
+        store_parsed(&db, &feed, &parsed(vec![e]), "deleted")
+            .unwrap()
+            .inserted,
+        1
+    );
     assert!(db.delete_article("t1").unwrap());
     assert!(db.deleted_article_ids().unwrap().contains("t1"));
 

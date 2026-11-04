@@ -2471,3 +2471,20 @@ User-Agent, that empty categories produce zero fixture hits, and that
 updated to the prefix-response shape. Owner NVDA acceptance of skip
 announcements remains pending as platform acceptance, as with all
 player work.
+
+## Audit 8 Wave 1 integration (2026-11-03)
+
+Wave 1 (Tasks 1-7) integrated onto main in dependency order and
+released as v0.1.54. Integration merges worth recording: the store
+path now carries both Task 3's retention boundary and Task 4's
+StoreOutcome — `store_parsed_with_retention` takes the feed's
+effective delete behavior AND the retention cutoff and returns the
+outcome, and the app's refresh drain counts notification-eligible
+articles (D13) from that call; Task 3's slice tests were re-pointed
+at the merged signatures (`.inserted`). In maintenance.rs, Task 5's
+backup/restore rewrite and Task 6's updater deletion were merged by
+keeping the backup lifecycle and the ship-shape pointer, dropping
+the hand-rolled update functions. Task 6's follow-up (owner decision
+2026-11-03) switched release packaging to the fixed ship-shape asset
+names, so this is the first release whose assets the ship-shape
+updater can find.
