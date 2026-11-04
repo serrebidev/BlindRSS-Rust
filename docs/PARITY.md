@@ -3560,3 +3560,16 @@ and the extract.rs unit tests), clippy `--workspace
 --all-targets -D warnings` clean, `cargo build -p blindrss`
 OK, `cargo fmt --all` run last. No cfg(windows) code was
 touched, so the windows-gnu clippy leg was not required.
+
+**Audit 8 Wave 3 batch 1 integration (2026-11-04):** Tasks 13,
+14 and 15 cherry-picked onto main in task order (ee707e6,
+b433a0d, 76cbe5a). The only conflicts were append-only
+collisions in this file (Tasks 15 and 14 against the Task 13
+paragraph), union-resolved so every resolution stands.
+`extract.rs` was touched by all three workers in disjoint
+regions and auto-merged; the merged tree was gated as a whole
+rather than trusting the three per-tree gates: cargo fmt
+clean, clippy `--workspace --all-targets -D warnings` clean,
+clippy for `blindrss-core` on `x86_64-pc-windows-gnu` clean,
+`cargo test --workspace` 646 passed / 0 failed, `cargo build
+-p blindrss` OK. Ships with the Wave 3 release.
