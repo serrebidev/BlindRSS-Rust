@@ -4447,3 +4447,9 @@ Python's, the timing differs. Owner listening checks
 (VAD versus RMS feel, skip landing accuracy on real
 episodes, remote-stream conservatism) remain Brandon's
 — unclaimed here.
+
+**Task 21 integration gate (2026-11-04):** cherry-picked onto
+main over 37f8ae9; the only conflict was the append-only
+PARITY region (union). Merged gate: fmt clean, clippy clean
+(workspace and core windows-gnu), 737 passed / 0 failed,
+build OK.
