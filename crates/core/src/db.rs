@@ -1541,7 +1541,13 @@ impl Db {
     }
 
     /// Insert or update a playback position (Python
-    /// `upsert_playback_state`); updated_at is unix seconds.
+    /// `upsert_playback_state`); updated_at is unix seconds. The
+    /// optional shared fields (duration, seek support, title) are
+    /// preserved when the incoming write carries None — Python's
+    /// ON CONFLICT CASE form — so a bare position save cannot erase
+    /// what another write learned (Audit 8 M06). Position clamps to
+    /// zero or above and a non-positive duration counts as absent,
+    /// matching Python's sanitization.
     pub fn upsert_playback_state(
         &self,
         playback_id: &str,
@@ -1551,20 +1557,53 @@ impl Db {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
+        let duration_ms = state.duration_ms.filter(|d| *d > 0);
         self.conn.execute(
             "INSERT INTO playback_state (id, position_ms, duration_ms, updated_at, completed, seek_supported, title) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
-             ON CONFLICT(id) DO UPDATE SET position_ms = ?2, duration_ms = ?3, \
-             updated_at = ?4, completed = ?5, seek_supported = ?6, title = ?7",
+             ON CONFLICT(id) DO UPDATE SET position_ms = excluded.position_ms, \
+             duration_ms = CASE WHEN excluded.duration_ms IS NOT NULL THEN excluded.duration_ms ELSE playback_state.duration_ms END, \
+             updated_at = excluded.updated_at, completed = excluded.completed, \
+             seek_supported = CASE WHEN excluded.seek_supported IS NOT NULL THEN excluded.seek_supported ELSE playback_state.seek_supported END, \
+             title = CASE WHEN excluded.title IS NOT NULL THEN excluded.title ELSE playback_state.title END",
             params![
                 playback_id,
-                state.position_ms,
-                state.duration_ms,
+                state.position_ms.max(0),
+                duration_ms,
                 now,
                 state.completed as i64,
                 state.seek_supported.map(|b| b as i64),
                 state.title
             ],
+        )?;
+        Ok(())
+    }
+
+    /// Set this connection's SQLite busy timeout. Python's
+    /// playback-state writes run with a 500 ms timeout so a locked
+    /// database fails fast and the write is retried from the
+    /// pending queue instead of blocking the caller (Audit 8 M07);
+    /// the schema-init default on the connection is 5000 ms.
+    pub fn set_busy_timeout_ms(&self, ms: i64) -> rusqlite::Result<()> {
+        self.conn
+            .execute_batch(&format!("PRAGMA busy_timeout={};", ms.max(0)))
+    }
+
+    /// Record learned seek support for an existing playback row
+    /// (Python `set_seek_supported`): a plain UPDATE — no row, no
+    /// insert, so a stray learn event never creates state.
+    pub fn set_seek_supported(
+        &self,
+        playback_id: &str,
+        seek_supported: bool,
+    ) -> rusqlite::Result<()> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        self.conn.execute(
+            "UPDATE playback_state SET seek_supported = ?1, updated_at = ?2 WHERE id = ?3",
+            params![seek_supported as i64, now, playback_id],
         )?;
         Ok(())
     }

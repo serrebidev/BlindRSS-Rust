@@ -98,6 +98,10 @@ impl MediaBackend {
     }
 
     pub fn load_uri(&self, url: &str) -> bool {
+        self.load_uri_inner(url, &referer_for_load(url, &[]))
+    }
+
+    fn load_uri_inner(&self, url: &str, referer: &str) -> bool {
         if let Some(engine) = self.engine() {
             // Re-attach on every load: at construction the surface may
             // not be realized yet (on wxGTK its X11 window id does not
@@ -106,8 +110,13 @@ impl MediaBackend {
             let cfg = Config::load(&crate::config_path()).unwrap_or_default();
             let jar = blindrss_core::cookies::load_jar_beside(&crate::config_path());
             let cookie = blindrss_core::cookies::cookie_header_for(&jar, url);
-            let options =
-                vlc::media_options(&cfg, url, &blindrss_core::http::user_agent(), "", &cookie);
+            let options = vlc::media_options(
+                &cfg,
+                url,
+                &blindrss_core::http::user_agent(),
+                referer,
+                &cookie,
+            );
             ENGINES.with(|registry| {
                 if let Some(entry) = registry.borrow_mut().get_mut(&self.id) {
                     entry.ended = false;
@@ -122,8 +131,13 @@ impl MediaBackend {
 
     pub fn load_uri_with_headers(&self, url: &str, headers: &[(String, String)]) -> bool {
         // VLC only supports a subset of channel headers; the existing HTTP relay supports all.
+        // The referer additionally goes into the VLC media options,
+        // as Python's load_vlc_url does (`:http-referrer`) — the
+        // relay applies it on its own fetch too, so both paths
+        // carry it (Audit 8 Task 19, deferred from Task 18).
+        let referer = referer_for_load(url, headers);
         let target = blindrss_core::http_headers::protected_media_url(url, headers);
-        self.load_uri(&target)
+        self.load_uri_inner(&target, &referer)
     }
 
     pub fn play(&self) -> bool {
@@ -231,6 +245,49 @@ impl MediaBackend {
             .is_some_and(|engine| engine.apply_equalizer(config))
     }
 
+    /// Apply an output-device (soundcard) choice to the LIVE
+    /// session (Audit 8 M21, Python's `apply_preferred_soundcard`
+    /// via `gui/mainframe.py`): the engine's audio output moves
+    /// without reloading the media, so playback position and the
+    /// loaded stream are untouched. The wx MediaCtrl fallback has
+    /// no device selection and reports false.
+    pub fn apply_soundcard(&self, device: &str) -> bool {
+        match self.engine() {
+            Some(engine) => {
+                engine.set_output(device);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Stream phase for the seek verifier (Audit 8 M05): VLC's
+    /// Opening (1) / Buffering (2) states mean a seek landing
+    /// cannot be judged yet. `get_state` collapses those to
+    /// Stopped, so the verifier reads this instead. The fallback
+    /// has no opening signal; a stopped backend with no length
+    /// yet counts as still opening.
+    pub fn stream_phase(&self) -> blindrss_core::playback::StreamPhase {
+        use blindrss_core::playback::StreamPhase;
+        if let Some(engine) = self.engine() {
+            match engine.state() {
+                1 | 2 => StreamPhase::Opening,
+                _ => StreamPhase::Ready,
+            }
+        } else if self.get_state() == MediaState::Stopped && self.length() <= 0 {
+            StreamPhase::Opening
+        } else {
+            StreamPhase::Ready
+        }
+    }
+
+    /// Whether the backend itself reports the current input
+    /// seekable, when it can say (libVLC can; the fallback
+    /// cannot, hence None rather than a guess).
+    pub fn is_seekable(&self) -> Option<bool> {
+        self.engine().map(|engine| engine.is_seekable())
+    }
+
     pub fn on_finished(&self, callback: impl Fn(()) + 'static) {
         let callback: Rc<dyn Fn(())> = Rc::new(callback);
         if let Some(native) = self.fallback {
@@ -280,5 +337,85 @@ impl MediaBackend {
         // Drop outside the registry borrow: libVLC shutdown may wait for worker threads.
         let entry = ENGINES.with(|registry| registry.borrow_mut().remove(&self.id));
         drop(entry);
+    }
+}
+
+/// The referer a VLC load carries (Audit 8 Task 19): the
+/// playback headers' explicit `referer` when the load has them
+/// (channel value or the same-origin/origin-root default
+/// `playback_headers` computed), else Python's `referer_for_url`
+/// default — the media origin root — for remote http(s) URLs.
+/// Loopback (the local proxies) and non-http inputs get none:
+/// their own fetches already carry the article's headers.
+fn referer_for_load(url: &str, headers: &[(String, String)]) -> String {
+    if let Some((_, value)) = headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("referer"))
+    {
+        return value.clone();
+    }
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return String::new();
+    };
+    if scheme != "http" && scheme != "https" {
+        return String::new();
+    }
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = authority
+        .rsplit('@')
+        .next()
+        .unwrap_or("")
+        .split(':')
+        .next()
+        .unwrap_or("");
+    if authority.is_empty() || matches!(host, "127.0.0.1" | "localhost" | "::1" | "[::1]") {
+        return String::new();
+    }
+    format!("{scheme}://{authority}/")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::referer_for_load;
+
+    #[test]
+    fn referer_header_wins_over_default() {
+        let headers = vec![(
+            "referer".to_string(),
+            "https://blog.example/post".to_string(),
+        )];
+        assert_eq!(
+            referer_for_load("https://cdn.example/ep.mp3", &headers),
+            "https://blog.example/post"
+        );
+        // Header names match case-insensitively.
+        let headers = vec![("Referer".to_string(), "https://blog.example/".to_string())];
+        assert_eq!(
+            referer_for_load("https://cdn.example/ep.mp3", &headers),
+            "https://blog.example/"
+        );
+    }
+
+    #[test]
+    fn referer_defaults_to_media_origin_root() {
+        assert_eq!(
+            referer_for_load("https://cdn.example:8443/a/ep.mp3?x=1", &[]),
+            "https://cdn.example:8443/"
+        );
+        assert_eq!(
+            referer_for_load("http://media.example/ep.mp3", &[]),
+            "http://media.example/"
+        );
+    }
+
+    #[test]
+    fn referer_absent_for_loopback_and_local_inputs() {
+        assert_eq!(
+            referer_for_load("http://127.0.0.1:8765/media?id=1", &[]),
+            ""
+        );
+        assert_eq!(referer_for_load("http://localhost:8765/play?u=x", &[]), "");
+        assert_eq!(referer_for_load("/home/user/ep.mp3", &[]), "");
+        assert_eq!(referer_for_load("file:///home/user/ep.mp3", &[]), "");
     }
 }

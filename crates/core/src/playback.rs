@@ -107,6 +107,308 @@ impl ResumePolicy {
     }
 }
 
+/// Backend stream phase as the seek verifier needs it. Python's
+/// guard waits while VLC reports Opening (1) or Buffering (2);
+/// every other state counts as ready to judge a landing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StreamPhase {
+    Opening,
+    Ready,
+}
+
+/// Which seek a [`SeekVerifier`] is watching: an automatic resume
+/// restore (Python's `_maybe_restore_playback_position` tick) or a
+/// user seek (Python's seek guard, `_start_seek_guard` /
+/// `_seek_guard_tick`). The two share one landing/tolerance model
+/// but differ in retry budget and failure behaviour.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SeekKind {
+    Resume,
+    User,
+}
+
+/// What one verifier observation decided. `seek_to` asks the
+/// caller to issue (or re-issue) a backend seek; `landed` ends the
+/// verification successfully; `learn_seek_supported` carries a
+/// seek-support fact the caller must persist; `announce_failure`
+/// is set exactly once, when a user seek gives up far from its
+/// target (Python's `_announce_seek_not_reached` discipline).
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct SeekStep {
+    pub seek_to: Option<i64>,
+    pub landed: bool,
+    pub learn_seek_supported: Option<bool>,
+    pub announce_failure: bool,
+    pub active: bool,
+}
+
+/// Verified seek state (Audit 8 M05). A seek request is never
+/// assumed to have landed: the verifier watches the backend's
+/// real position, waits through opening/buffering, retries within
+/// a bounded budget, learns seek support from the outcome, and
+/// reports failure at most once. Pure and clock-injected so the
+/// whole policy is unit-testable without a media backend.
+///
+/// Python's numbers, kept: resume landing tolerance 1500 ms;
+/// resume issues at most one seek and gives up silently after
+/// 8 s, marking the stream unseekable only when the backend
+/// itself reports unseekable and the input does not look
+/// seekable; the user-seek guard has 10 attempts and 3 reapplies,
+/// tolerance 3000 ms local / 5000 ms remote, remote gives up once
+/// attempts drop below 7, progress toward the target within the
+/// last 0.9 s pauses the budget, and the failure announcement
+/// fires only when the remaining gap is at least 8000 ms.
+pub struct SeekVerifier {
+    kind: SeekKind,
+    target_ms: i64,
+    remote: bool,
+    seekable_looking: bool,
+    started: std::time::Instant,
+    attempts_made: u32,
+    guard_attempts_left: u32,
+    reapplies_left: u32,
+    best_distance_ms: i64,
+    last_progress_at: std::time::Instant,
+    done: bool,
+}
+
+impl SeekVerifier {
+    pub fn for_resume(
+        target_ms: i64,
+        remote: bool,
+        seekable_looking: bool,
+        now: std::time::Instant,
+    ) -> Self {
+        Self {
+            kind: SeekKind::Resume,
+            target_ms: target_ms.max(0),
+            remote,
+            seekable_looking,
+            started: now,
+            attempts_made: 0,
+            guard_attempts_left: 0,
+            reapplies_left: 0,
+            best_distance_ms: i64::MAX,
+            last_progress_at: now,
+            done: false,
+        }
+    }
+
+    pub fn for_user_seek(target_ms: i64, remote: bool, now: std::time::Instant) -> Self {
+        Self {
+            kind: SeekKind::User,
+            target_ms: target_ms.max(0),
+            remote,
+            seekable_looking: true,
+            started: now,
+            attempts_made: 1, // the caller issues the seek itself
+            guard_attempts_left: 10,
+            reapplies_left: 3,
+            best_distance_ms: i64::MAX,
+            last_progress_at: now,
+            done: false,
+        }
+    }
+
+    pub fn kind(&self) -> SeekKind {
+        self.kind
+    }
+
+    pub fn target_ms(&self) -> i64 {
+        self.target_ms
+    }
+
+    pub fn is_active(&self) -> bool {
+        !self.done
+    }
+
+    /// Abandon verification (a user seek supersedes a pending
+    /// resume — Python `_note_user_seek`; a new load supersedes
+    /// both). No landing, no learning, no announcement.
+    pub fn cancel(&mut self) {
+        self.done = true;
+    }
+
+    pub fn observe(
+        &mut self,
+        now: std::time::Instant,
+        phase: StreamPhase,
+        position_ms: i64,
+        backend_seekable: Option<bool>,
+    ) -> SeekStep {
+        let mut step = SeekStep {
+            active: !self.done,
+            ..SeekStep::default()
+        };
+        if self.done || phase == StreamPhase::Opening {
+            return step;
+        }
+        match self.kind {
+            SeekKind::Resume => self.observe_resume(now, position_ms, backend_seekable, &mut step),
+            SeekKind::User => self.observe_user(now, position_ms, &mut step),
+        }
+        step.active = !self.done;
+        step
+    }
+
+    fn observe_resume(
+        &mut self,
+        now: std::time::Instant,
+        position_ms: i64,
+        backend_seekable: Option<bool>,
+        step: &mut SeekStep,
+    ) {
+        if position_ms >= 0 && (position_ms - self.target_ms).abs() <= 1_500 {
+            self.done = true;
+            step.landed = true;
+            step.learn_seek_supported = Some(true);
+            return;
+        }
+        if self.attempts_made == 0 {
+            step.seek_to = Some(self.target_ms);
+            self.attempts_made = 1;
+            return;
+        }
+        // One bounded attempt (Python resume_max_attempts = 1);
+        // after 8 s without landing, give up silently — unless
+        // the backend itself says the stream cannot seek and the
+        // input never looked seekable, which is learned.
+        if now.duration_since(self.started) >= std::time::Duration::from_secs(8) {
+            self.done = true;
+            if backend_seekable == Some(false) && !self.seekable_looking {
+                step.learn_seek_supported = Some(false);
+            }
+        }
+    }
+
+    fn observe_user(&mut self, now: std::time::Instant, position_ms: i64, step: &mut SeekStep) {
+        let tolerance = if self.remote { 5_000 } else { 3_000 };
+        let distance = if position_ms >= 0 {
+            (position_ms - self.target_ms).abs()
+        } else {
+            i64::MAX
+        };
+        if position_ms >= 0 && distance <= tolerance {
+            self.done = true;
+            step.landed = true;
+            return;
+        }
+        // Progress toward the target (> 200 ms closer) resets the
+        // stall clock; while progress is fresh (< 0.9 s) the guard
+        // waits instead of spending attempts.
+        if position_ms >= 0 && distance <= self.best_distance_ms - 200 {
+            self.best_distance_ms = distance;
+            self.last_progress_at = now;
+        }
+        if self.attempts_made > 0
+            && now.duration_since(self.last_progress_at) < std::time::Duration::from_millis(900)
+            && self.best_distance_ms != i64::MAX
+        {
+            return;
+        }
+        if self.guard_attempts_left == 0 || (self.remote && self.guard_attempts_left < 7) {
+            self.done = true;
+            step.announce_failure = position_ms >= 0 && distance >= 8_000;
+            return;
+        }
+        self.guard_attempts_left -= 1;
+        // Re-apply only when Python would (`_should_reapply_seek`):
+        // retries remain and the position is unknown or outside
+        // tolerance.
+        if self.reapplies_left > 0 && (position_ms < 0 || distance > tolerance) {
+            self.reapplies_left -= 1;
+            self.attempts_made += 1;
+            step.seek_to = Some(self.target_ms);
+        }
+    }
+}
+
+/// Latest-wins queue of playback-state writes (Audit 8 M07),
+/// modelling Python's `_pending_resume_db_upserts` /
+/// `_pending_seek_supported_updates` dicts. The player enqueues
+/// instead of writing on the UI thread; a worker flushes through
+/// [`PendingPlaybackWrites::flush`]. A write that fails (a locked
+/// database above all) stays queued for the next flush — it is
+/// never dropped — and flush reports exactly which saves landed
+/// so the caller advances its save bookkeeping only past written
+/// state.
+#[derive(Default)]
+pub struct PendingPlaybackWrites {
+    saves: std::collections::HashMap<String, PendingSave>,
+    seek_support: std::collections::HashMap<String, bool>,
+}
+
+#[derive(Clone)]
+struct PendingSave {
+    article_id: String,
+    url: String,
+    state: PlaybackState,
+}
+
+impl PendingPlaybackWrites {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Queue a position save for an article; a newer save for the
+    /// same article replaces the queued one (latest wins).
+    pub fn queue_save(&mut self, article_id: &str, url: &str, state: PlaybackState) {
+        self.saves.insert(
+            playback_id(article_id),
+            PendingSave {
+                article_id: article_id.to_string(),
+                url: url.to_string(),
+                state,
+            },
+        );
+    }
+
+    /// Queue a learned seek-support update, keyed by playback id.
+    pub fn queue_seek_supported(&mut self, playback_id: &str, supported: bool) {
+        self.seek_support.insert(playback_id.to_string(), supported);
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.saves.is_empty() && self.seek_support.is_empty()
+    }
+
+    pub fn pending_len(&self) -> usize {
+        self.saves.len() + self.seek_support.len()
+    }
+
+    /// Attempt every queued write against `db`. Completed writes
+    /// (including saves the policy deliberately skips, which are
+    /// decisions, not failures) are removed and the saves among
+    /// them returned as (playback id, state); failed writes stay
+    /// queued for the next flush.
+    pub fn flush(&mut self, db: &Db, policy: &ResumePolicy) -> Vec<(String, PlaybackState)> {
+        let mut written = Vec::new();
+        let save_ids: Vec<String> = self.saves.keys().cloned().collect();
+        for id in save_ids {
+            let Some(save) = self.saves.get(&id).cloned() else {
+                continue;
+            };
+            match policy.save_state(db, &save.article_id, &save.url, &save.state) {
+                Ok(_) => {
+                    self.saves.remove(&id);
+                    written.push((id, save.state));
+                }
+                Err(_) => { /* stays queued; retried on the next flush */ }
+            }
+        }
+        let support_ids: Vec<String> = self.seek_support.keys().cloned().collect();
+        for id in support_ids {
+            let Some(supported) = self.seek_support.get(&id).copied() else {
+                continue;
+            };
+            if db.set_seek_supported(&id, supported).is_ok() {
+                self.seek_support.remove(&id);
+            }
+        }
+        written
+    }
+}
+
 /// Format a millisecond position the way Python's player does
 /// (`_format_time` → `_format_chapter_timestamp`): `H:MM:SS`
 /// once an hour is reached, else `MM:SS`.
@@ -287,6 +589,159 @@ mod tests {
         assert_eq!(done.position_ms, 0);
         assert!(!policy.save_state(&db, "42", "", &state(0)).unwrap());
         assert!(db.playback_state("article:42").unwrap().unwrap().completed);
+    }
+
+    // ---- SeekVerifier (M05) ------------------------------------
+
+    fn at(base: std::time::Instant, ms: u64) -> std::time::Instant {
+        base + std::time::Duration::from_millis(ms)
+    }
+
+    #[test]
+    fn resume_waits_through_buffering_then_seeks_once() {
+        // Delayed length/Buffering: while the backend reports
+        // Opening the verifier must not seek at all; once ready it
+        // issues exactly one seek (Python resume_max_attempts = 1).
+        let t0 = std::time::Instant::now();
+        let mut v = SeekVerifier::for_resume(600_000, false, true, t0);
+        for ms in [0, 400, 900] {
+            let step = v.observe(at(t0, ms), StreamPhase::Opening, -1, None);
+            assert_eq!(step.seek_to, None, "seeked while opening at {ms} ms");
+            assert!(step.active);
+        }
+        let step = v.observe(at(t0, 1_200), StreamPhase::Ready, 0, None);
+        assert_eq!(step.seek_to, Some(600_000));
+        // The fake backend rejects the seek (position stays at 0):
+        // no second attempt is ever issued.
+        for ms in [2_000, 4_000, 7_000] {
+            let step = v.observe(at(t0, ms), StreamPhase::Ready, 0, None);
+            assert_eq!(step.seek_to, None, "resume re-sought at {ms} ms");
+            assert!(step.active, "gave up before 8 s at {ms} ms");
+        }
+    }
+
+    #[test]
+    fn resume_landing_within_tolerance_learns_seekable() {
+        let t0 = std::time::Instant::now();
+        let mut v = SeekVerifier::for_resume(600_000, false, true, t0);
+        let step = v.observe(at(t0, 100), StreamPhase::Ready, 0, None);
+        assert_eq!(step.seek_to, Some(600_000));
+        let step = v.observe(at(t0, 900), StreamPhase::Ready, 599_000, None);
+        assert!(step.landed);
+        assert_eq!(step.learn_seek_supported, Some(true));
+        assert!(!step.active);
+        assert!(!v.is_active());
+    }
+
+    #[test]
+    fn resume_gives_up_after_eight_seconds_and_learns_unseekable() {
+        // Fake rejected seek + backend reports unseekable + input
+        // never looked seekable: after 8 s the restore ends and
+        // seek support is learned as false (Python's stall rule).
+        let t0 = std::time::Instant::now();
+        let mut v = SeekVerifier::for_resume(600_000, false, false, t0);
+        let step = v.observe(at(t0, 100), StreamPhase::Ready, 0, Some(false));
+        assert_eq!(step.seek_to, Some(600_000));
+        let step = v.observe(at(t0, 8_500), StreamPhase::Ready, 0, Some(false));
+        assert!(!step.active);
+        assert!(!step.landed);
+        assert_eq!(step.learn_seek_supported, Some(false));
+        assert!(!step.announce_failure, "resume give-up is silent");
+    }
+
+    #[test]
+    fn resume_never_marks_seekable_looking_input_unseekable() {
+        let t0 = std::time::Instant::now();
+        let mut v = SeekVerifier::for_resume(600_000, false, true, t0);
+        v.observe(at(t0, 100), StreamPhase::Ready, 0, Some(false));
+        let step = v.observe(at(t0, 9_000), StreamPhase::Ready, 0, Some(false));
+        assert!(!step.active);
+        assert_eq!(step.learn_seek_supported, None);
+    }
+
+    #[test]
+    fn user_seek_cancels_a_pending_resume() {
+        // Python `_note_user_seek`: a user seek while a restore is
+        // inflight resets the restore — the verifier goes inactive
+        // and never seeks, lands or learns again.
+        let t0 = std::time::Instant::now();
+        let mut v = SeekVerifier::for_resume(600_000, false, true, t0);
+        v.cancel();
+        assert!(!v.is_active());
+        let step = v.observe(at(t0, 100), StreamPhase::Ready, 600_000, None);
+        assert_eq!(step, SeekStep::default());
+    }
+
+    #[test]
+    fn user_seek_guard_reapplies_boundedly_then_speaks_once() {
+        // Fake rejected user seek: the guard re-applies at most 3
+        // times, spends at most 10 attempts, then reports failure
+        // exactly once because the gap is far over 8000 ms.
+        let t0 = std::time::Instant::now();
+        let mut v = SeekVerifier::for_user_seek(300_000, false, t0);
+        let mut reapplies = 0;
+        let mut failure_at = None;
+        for i in 0..40u64 {
+            let step = v.observe(at(t0, i * 1_000), StreamPhase::Ready, 0, None);
+            if step.seek_to.is_some() {
+                reapplies += 1;
+            }
+            if step.announce_failure {
+                failure_at = Some(i);
+                break;
+            }
+            assert!(!step.landed);
+        }
+        assert_eq!(reapplies, 3, "guard must re-apply exactly 3 times");
+        assert!(failure_at.is_some(), "guard never reported failure");
+        // Failure is once: the verifier is done afterwards.
+        let step = v.observe(at(t0, 60_000), StreamPhase::Ready, 0, None);
+        assert_eq!(step, SeekStep::default());
+    }
+
+    #[test]
+    fn user_seek_guard_lands_within_remote_tolerance() {
+        let t0 = std::time::Instant::now();
+        let mut v = SeekVerifier::for_user_seek(300_000, true, t0);
+        // 4.5 s short of the target: outside the 3000 ms local
+        // tolerance but inside the 5000 ms remote one.
+        let step = v.observe(at(t0, 100), StreamPhase::Ready, 295_500, None);
+        assert!(step.landed);
+        assert!(!step.active);
+    }
+
+    #[test]
+    fn user_seek_guard_quiet_when_failure_gap_is_small() {
+        // Budget exhausted but the position ended within 8000 ms
+        // of the target: Python stays silent.
+        let t0 = std::time::Instant::now();
+        let mut v = SeekVerifier::for_user_seek(300_000, false, t0);
+        let mut announced = false;
+        for i in 0..40u64 {
+            let step = v.observe(at(t0, i * 1_000), StreamPhase::Ready, 294_000, None);
+            announced |= step.announce_failure;
+            if !step.active {
+                break;
+            }
+        }
+        assert!(!announced);
+        assert!(!v.is_active());
+    }
+
+    #[test]
+    fn stop_then_play_target_is_saved_position_minus_rewind() {
+        // M08's policy half: Play after Stop re-runs the restore
+        // against the saved row — ten minutes saved, configured
+        // 30 s rewind, restarts at 9:30.
+        let mut cfg = Config::default();
+        cfg.set_path("resume_back_ms", serde_json::json!(30_000));
+        let policy = ResumePolicy::from_config(&cfg);
+        let mut saved = state(600_000);
+        saved.duration_ms = Some(3_600_000);
+        assert_eq!(
+            policy.resume_target(&saved, "https://example.test/media.mp3"),
+            570_000
+        );
     }
 
     #[test]

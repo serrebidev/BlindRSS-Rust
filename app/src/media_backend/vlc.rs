@@ -59,6 +59,7 @@ vlc_api! {
     media_player_get_time: unsafe extern "C" fn(Handle) -> i64,
     media_player_set_time: unsafe extern "C" fn(Handle, i64),
     media_player_get_length: unsafe extern "C" fn(Handle) -> i64,
+    media_player_is_seekable: unsafe extern "C" fn(Handle) -> i32,
     media_player_get_rate: unsafe extern "C" fn(Handle) -> f32,
     media_player_set_rate: unsafe extern "C" fn(Handle, f32) -> i32,
     audio_get_volume: unsafe extern "C" fn(Handle) -> i32,
@@ -407,6 +408,11 @@ impl VlcPlayer {
     }
     pub fn seek(&self, time: i64) {
         unsafe { (self.api.media_player_set_time)(self.player, time.max(0)) }
+    }
+    /// Whether the current input reports itself seekable
+    /// (Python's `is_seekable()` in the resume/seek guards).
+    pub fn is_seekable(&self) -> bool {
+        unsafe { (self.api.media_player_is_seekable)(self.player) != 0 }
     }
     pub fn volume(&self) -> f64 {
         unsafe { (self.api.audio_get_volume)(self.player) }.max(0) as f64 / 100.0

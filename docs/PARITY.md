@@ -3878,3 +3878,140 @@ sites. Merged gate: fmt clean, clippy clean (workspace and
 core windows-gnu), 673 passed / 0 failed, build OK. The count
 reconciles: 646 (batch 1) + 1 (Windows-path regression test)
 + 15 (Task 18) + 11 (Task 17).
+
+## Audit 8 Task 19 resolution — verified seek/resume and asynchronous persistence (M05, M06, M07, M08, M21) (2026-11-04)
+
+M05 (seeks verify landing): seeks are no longer assumed to
+have landed. Core gains `SeekVerifier`
+(`crates/core/src/playback.rs`), a pure clock-injected state
+machine carrying Python's two mechanisms in one model: the
+resume restore (landing tolerance 1500 ms, at most one seek
+issued, silent give-up after 8 s, seek support learned false
+only when the backend itself reports unseekable and the input
+does not look seekable, learned true on landing) and the
+user-seek guard (10 attempts, 3 reapplies, tolerance 3000 ms
+local / 5000 ms remote, remote gives up below 7 attempts,
+progress toward the target within 0.9 s pauses the budget,
+failure announced only when the remaining gap is at least
+8000 ms). The player tick drives the armed verifier once a
+second; delivery and queue advance arm the Resume form,
+every user seek (buttons, slider, chapter buttons, chapter
+list commit, char-hook arrows, media-arrow shortcuts) routes
+through `begin_user_seek`, which cancels a pending resume
+(Python `_note_user_seek`), clears the stopped-resume flag,
+marks the stream seek-supported and arms the guard on the
+backend's computed target. The failure speaks exactly once —
+the verifier ends when it reports — as "Could not seek
+there. Position …" through the general announce channel.
+The tick reads the phase through a new
+`MediaBackend::stream_phase` (VLC Opening/Buffering states
+1/2, which `get_state` collapses to Stopped and so could not
+express "wait") and seekability through a new
+`MediaBackend::is_seekable` (new `libvlc_media_player_is_seekable`
+FFI entry); learned support persists through the M07 write
+queue.
+
+M06 (writes preserve optional shared fields):
+`Db::upsert_playback_state` now uses Python's ON CONFLICT
+CASE form — stored duration / seek_supported / title survive
+a write carrying None, explicit values replace — with
+Python's sanitization (position clamps at zero, a
+non-positive duration counts as absent). New
+`Db::set_seek_supported` is a plain UPDATE (no row, no
+insert), and `Db::set_busy_timeout_ms` exposes the timeout
+the M07 worker needs.
+
+M07 (persistence off the UI thread): position saves and
+seek-support updates no longer open or write the database
+from player code. A per-session persistence worker thread
+owns its own connection (500 ms busy timeout, Python's
+playback-write timeout), receives saves over a channel into
+core's `PendingPlaybackWrites` latest-wins queue, and
+flushes on a 450 ms cadence; a failed write — a locked
+database above all — stays queued and is retried, never
+dropped. The worker reports each landed save back, and only
+then do the tick's `last_saved_pos` / `last_save` advance:
+bookkeeping can no longer run ahead of unwritten state. If
+the worker's own open ever fails, `save_position` keeps the
+old synchronous path rather than lose persistence. The
+locked-database regression test holds BEGIN EXCLUSIVE on a
+second connection: the flush reports nothing written, keeps
+the save queued, and lands it after the lock clears.
+
+M08 (Stop then Play resumes): Stop sets
+`stopped_needs_resume` (only when media actually loaded)
+and ends any pending verification; every Play path — the
+Play/Pause closure and both `toggle_or_reload` branches —
+first runs `resume_after_stop`, which re-reads the saved
+row, recomputes the target through `ResumePolicy`
+(saved position minus the configured rewind), arms the
+verified restore, and clears the flag whether or not a
+restore applied (Python's finally-clear).
+
+M21 (soundcard changes reach the live session): new
+`MediaBackend::apply_soundcard` calls the engine's
+`set_output` on the running session — no reload, position
+untouched. The settings action in `main.rs` compares
+`preferred_soundcard` before and after the dialog (the same
+prior/now pattern as the image-alt dispatch) and routes a
+change through `player::apply_preferred_soundcard`.
+
+Referer (the adjacent item Task 18 left, above):
+`MediaBackend::load_uri` no longer passes an empty referer.
+`load_uri_with_headers` extracts the playback headers'
+`referer` and threads it into `vlc::media_options`, so
+`:http-referrer` is emitted as Python's `load_vlc_url`
+emits it (the range-cache relay also still applies it on
+its own fetch); plain `load_uri` falls back to Python's
+`referer_for_url` default — the media origin root for
+remote http(s) URLs, nothing for loopback or local inputs.
+
+Tests: new `crates/core/tests/audit8_task19_slice.rs`
+(6: upsert preserves on None, explicit replaces and bad
+values sanitize, policy save preserves learned support,
+set_seek_supported updates only, pending writes latest-wins
+and report-written, locked-DB survival and recovery), 9 new
+playback unit tests (resume waits through Buffering then
+seeks once, landing learns seekable, rejected seek gives up
+at 8 s and learns unseekable, seekable-looking input never
+learned unseekable, user seek cancels a pending resume,
+guard reapplies exactly 3 times then speaks once, remote
+tolerance landing, small-gap failure stays silent,
+Stop→Play target is saved minus configured rewind), 3 new
+media_backend referer tests. Gate in this tree:
+`cargo test --workspace` 691 passed / 0 failed (baseline
+673 on 5d2e0e1; +18, reconciling as 9 + 6 + 3), clippy
+`--workspace --all-targets -D warnings` clean, clippy
+`-p blindrss-core --all-targets --target
+x86_64-pc-windows-gnu -D warnings` clean, `cargo build -p
+blindrss` OK, `cargo fmt --all` run last.
+
+Deviations, named: (1) The VLC backend's `time()` clamps
+libVLC's -1 to 0, so the verifier sees position 0 rather
+than "unknown" on the VLC path; the guard's
+unknown-position reapply branch never fires there —
+reapplies still happen through the distance rule. Python
+reads the raw time. (2) The verifier runs on the player's
+existing 1 s tick, not Python's 200–500 ms guard timer:
+budgets and attempt counts are Python's, wall-clock pacing
+is coarser (a landing is confirmed up to ~1 s late, the
+same order as Task 18's tick-paced readiness note).
+(3) The wx MediaCtrl fallback has no seekable report (the
+verifier gets None, so a resume there can never learn
+unseekable), no output-device selection (M21's dispatch
+returns false; the saved choice applies at the next load,
+which reads the config), and no referer option — all three
+are libVLC-path capabilities, and Python has no non-VLC
+path. There is no automated test of a real device switch:
+the dispatch is a direct engine call with no branch logic
+to exercise headlessly. (4) The worker flushes on its own
+cadence rather than Python's UI-timer CallLater; the final
+save on window close is queued to the worker, so an abrupt
+process exit in the same instant can still lose that last
+save — the same exposure as Python's pending flush on a
+hard exit. (5) The verifier's remote tolerance is judged
+from the raw stream URL, where Python judges the URL its
+backend actually loaded (possibly a loopback proxy URL,
+hence local tolerance). (6) The plan's manual confirmation
+of resume and soundcard behavior with real libVLC remains
+Brandon's acceptance — unclaimed here.

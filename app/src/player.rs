@@ -21,7 +21,9 @@
 use crate::media_backend::MediaBackend;
 use blindrss_core::announce::HiddenAnnouncer;
 use blindrss_core::db::Chapter;
-use blindrss_core::playback::{ResumePolicy, saved_state};
+use blindrss_core::playback::{
+    PendingPlaybackWrites, ResumePolicy, SeekKind, SeekVerifier, saved_state,
+};
 use blindrss_core::player_session::{Activation, PlayerSession, SessionIdentity};
 use blindrss_core::{Article, Db, PlaybackState};
 use std::cell::RefCell;
@@ -181,6 +183,30 @@ struct PlayerState {
     last_save: std::time::Instant,
     seeked: bool,
     saved_position_ms: i64,
+    /// Verified seek state (Audit 8 M05): armed by a resume
+    /// restore or a user seek, driven by the tick, cancelled by
+    /// a superseding seek, a new load or a stop. While a Resume
+    /// verifier is armed, `seeked` stays false and position
+    /// saves are held, exactly Python's restore-inflight rule.
+    seek_verify: Option<SeekVerifier>,
+    /// Stop then Play resumes (Audit 8 M08): set by Stop,
+    /// consumed (and always cleared) by the next Play, which
+    /// re-runs the resume restore against the saved row —
+    /// Python's `_stopped_needs_resume`.
+    stopped_needs_resume: bool,
+    /// Position most recently handed to the persistence
+    /// worker. Save bookkeeping (`last_saved_pos`/`last_save`)
+    /// advances only when the worker confirms the write
+    /// landed (M07) — never when it was merely queued.
+    last_queued_pos: i64,
+    /// Persistence worker channel (M07): position saves and
+    /// learned seek-support updates leave the UI thread on
+    /// this; confirmations of landed saves return on
+    /// `write_confirm_rx`. None only when the worker could
+    /// not be started, in which case saves fall back to the
+    /// old synchronous path rather than being lost.
+    write_tx: Option<std::sync::mpsc::Sender<WriteMsg>>,
+    write_confirm_rx: std::sync::mpsc::Receiver<Vec<(String, PlaybackState)>>,
     /// Skip ranges delivered by the SponsorBlock / silence
     /// workers on `skip_rx`, drained by the tick.
     skips: Vec<SkipRange>,
@@ -324,28 +350,210 @@ fn reached_end(pos: i64, len: i64, threshold: i64) -> bool {
     len > 0 && pos > 0 && len.saturating_sub(pos) <= threshold
 }
 
+/// One message for the persistence worker (M07).
+enum WriteMsg {
+    Save {
+        article_id: String,
+        url: String,
+        state: PlaybackState,
+        policy: ResumePolicy,
+    },
+    SeekSupported {
+        playback_id: String,
+        supported: bool,
+    },
+}
+
+fn apply_write_msg(queue: &mut PendingPlaybackWrites, policy: &mut ResumePolicy, msg: WriteMsg) {
+    match msg {
+        WriteMsg::Save {
+            article_id,
+            url,
+            state,
+            policy: save_policy,
+        } => {
+            *policy = save_policy;
+            queue.queue_save(&article_id, &url, state);
+        }
+        WriteMsg::SeekSupported {
+            playback_id,
+            supported,
+        } => queue.queue_seek_supported(&playback_id, supported),
+    }
+}
+
+/// Spawn the playback-persistence worker (Audit 8 M07): the
+/// player's position writes used to open/schema-init the
+/// database synchronously on the UI thread and silently drop
+/// failures. The worker owns its own connection with Python's
+/// 500 ms busy timeout, coalesces queued saves latest-wins,
+/// flushes on Python's cadence (first attempt promptly, locked
+/// writes retried — never dropped), and reports each landed
+/// save back so the tick advances save bookkeeping only past
+/// written state.
+fn spawn_write_worker(
+    db_path: PathBuf,
+) -> (
+    std::sync::mpsc::Sender<WriteMsg>,
+    std::sync::mpsc::Receiver<Vec<(String, PlaybackState)>>,
+) {
+    let (tx, rx) = std::sync::mpsc::channel::<WriteMsg>();
+    let (confirm_tx, confirm_rx) = std::sync::mpsc::channel::<Vec<(String, PlaybackState)>>();
+    std::thread::spawn(move || {
+        let Ok(db) = Db::open_or_create(&db_path) else {
+            return;
+        };
+        // Python's playback writes fail fast on a locked
+        // database and retry from the pending queue.
+        let _ = db.set_busy_timeout_ms(500);
+        let mut queue = PendingPlaybackWrites::new();
+        let mut policy = ResumePolicy::from_config(
+            &blindrss_core::config::Config::load(&crate::config_path()).unwrap_or_default(),
+        );
+        let mut last_flush: Option<std::time::Instant> = None;
+        loop {
+            let disconnected = match rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                Ok(msg) => {
+                    apply_write_msg(&mut queue, &mut policy, msg);
+                    while let Ok(msg) = rx.try_recv() {
+                        apply_write_msg(&mut queue, &mut policy, msg);
+                    }
+                    false
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => false,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => true,
+            };
+            if !queue.is_empty()
+                && last_flush.is_none_or(|t| t.elapsed() >= std::time::Duration::from_millis(450))
+            {
+                last_flush = Some(std::time::Instant::now());
+                let written = queue.flush(&db, &policy);
+                if !written.is_empty() {
+                    let _ = confirm_tx.send(written);
+                }
+            }
+            if disconnected {
+                break;
+            }
+        }
+    });
+    (tx, confirm_rx)
+}
+
+/// Queue a learned seek-support update for the worker (M05's
+/// learning half): support facts persist through the same
+/// never-drop queue as position saves.
+fn queue_seek_supported(state: &PlayerState, supported: bool) {
+    if state.article_id.is_empty() {
+        return;
+    }
+    let playback_id = blindrss_core::playback::playback_id(&state.article_id);
+    if let Some(tx) = &state.write_tx {
+        let _ = tx.send(WriteMsg::SeekSupported {
+            playback_id,
+            supported,
+        });
+    } else if let Ok(db) = Db::open(&state.db_path) {
+        let _ = db.set_seek_supported(&playback_id, supported);
+    }
+}
+
 fn save_position(state: &PlayerState, media: &MediaBackend, force_completed: bool) {
     if !state.resume.enabled || !state.seeked && !force_completed {
         return;
     }
-    let Ok(db) = Db::open(&state.db_path) else {
-        return;
-    };
     let pos = media.tell();
     let len = media.length();
     let completed = force_completed || reached_end(pos, len, state.resume.complete_threshold_ms);
-    let _ = state.resume.save_state(
-        &db,
-        &state.article_id,
-        &state.article_url,
-        &PlaybackState {
-            position_ms: pos,
-            duration_ms: if len > 0 { Some(len) } else { None },
-            completed,
-            seek_supported: None,
-            title: Some(state.title.clone()),
-        },
-    );
+    let outgoing = PlaybackState {
+        position_ms: pos,
+        duration_ms: if len > 0 { Some(len) } else { None },
+        completed,
+        seek_supported: None,
+        title: Some(state.title.clone()),
+    };
+    // M07: the write leaves the UI thread. Failures are the
+    // worker's problem to retry, never a silent drop here.
+    if let Some(tx) = &state.write_tx {
+        let _ = tx.send(WriteMsg::Save {
+            article_id: state.article_id.clone(),
+            url: state.article_url.clone(),
+            state: outgoing,
+            policy: state.resume,
+        });
+        return;
+    }
+    // No worker (its spawn-time open failed): keep the old
+    // synchronous path rather than lose persistence entirely.
+    if let Ok(db) = Db::open(&state.db_path) {
+        let _ = state
+            .resume
+            .save_state(&db, &state.article_id, &state.article_url, &outgoing);
+    }
+}
+
+/// Build the resume-restore verifier for a saved target
+/// (M05): remote inputs get the wider landing tolerance, and
+/// seek support can only be learned against an input that
+/// does not look seekable, mirroring `ResumePolicy`.
+fn resume_verifier(target_ms: i64, stream: &str) -> SeekVerifier {
+    let remote = stream.starts_with("http://") || stream.starts_with("https://");
+    let seekable_looking = blindrss_core::media::is_media_file_url(stream)
+        && !stream.to_ascii_lowercase().contains(".m3u8");
+    SeekVerifier::for_resume(
+        target_ms,
+        remote,
+        seekable_looking,
+        std::time::Instant::now(),
+    )
+}
+
+/// Python's `_note_user_seek`: a user seek cancels any pending
+/// resume restore, clears the stopped-resume flag, marks the
+/// stream seek-supported, and starts the seek guard on the
+/// target actually requested (the backend's computed target,
+/// not the raw delta).
+fn begin_user_seek(state: &mut PlayerState, target_ms: i64) {
+    state.stopped_needs_resume = false;
+    state.seeked = true;
+    let remote = state.stream.starts_with("http://") || state.stream.starts_with("https://");
+    state.seek_verify = Some(SeekVerifier::for_user_seek(
+        target_ms,
+        remote,
+        std::time::Instant::now(),
+    ));
+    queue_seek_supported(state, true);
+}
+
+/// Stop then Play (M08): re-run the resume restore against the
+/// saved row — the saved position with the configured rewind —
+/// and arm the verified restore. The stopped flag is cleared
+/// whether or not a restore applies, as Python's `play()` does
+/// in its finally block.
+fn resume_after_stop(state: &Rc<RefCell<PlayerState>>) {
+    let target = {
+        let s = state.borrow();
+        if !s.stopped_needs_resume {
+            return;
+        }
+        Db::open(&s.db_path)
+            .ok()
+            .and_then(|db| {
+                saved_state(&db, &s.article_id, &s.article_url)
+                    .ok()
+                    .flatten()
+            })
+            .map(|saved| s.resume.resume_target(&saved, &s.stream))
+            .unwrap_or(0)
+    };
+    let mut s = state.borrow_mut();
+    s.stopped_needs_resume = false;
+    if target > 0 {
+        s.saved_position_ms = target;
+        s.seeked = false;
+        let stream = s.stream.clone();
+        s.seek_verify = Some(resume_verifier(target, &stream));
+    }
 }
 
 fn cfg_f64(cfg: &blindrss_core::config::Config, key: &str, default: f64) -> f64 {
@@ -706,6 +914,18 @@ pub fn fail_load(generation: u64) {
     control.fail();
 }
 
+/// Apply a soundcard (output-device) change to the live
+/// session (Audit 8 M21): the settings dialog's
+/// `preferred_soundcard` change reaches the playing backend
+/// immediately, without reloading the media — Python's
+/// `mainframe` calls `apply_preferred_soundcard()` on the live
+/// player window the same way. False when no session is live
+/// or the backend cannot select a device (the choice still
+/// applies at the next load, which reads the config).
+pub fn apply_preferred_soundcard(device: &str) -> bool {
+    session_control().is_some_and(|control| control.media.apply_soundcard(device))
+}
+
 /// Replace the session's chapters (metadata that arrived after
 /// the audio started — M11 keeps it off the critical path).
 /// Refused for a stale generation.
@@ -757,6 +977,9 @@ impl SessionControl {
             s.skip_rx = rx;
             s.saved_position_ms = 0;
             s.seeked = true;
+            s.seek_verify = None;
+            s.stopped_needs_resume = false;
+            s.last_queued_pos = -1;
             s.last_saved_pos = -1;
             s.last_save = std::time::Instant::now();
             s.resume = ResumePolicy::from_config(&cfg);
@@ -824,6 +1047,12 @@ impl SessionControl {
                 .map(|saved| s.resume.resume_target(&saved, &stream_url))
                 .unwrap_or(0);
             s.seeked = s.saved_position_ms <= 0;
+            if s.saved_position_ms > 0 {
+                // Verified restore (M05): the tick issues the
+                // seek once the backend is ready and confirms
+                // the landing — it is not assumed here.
+                s.seek_verify = Some(resume_verifier(s.saved_position_ms, &stream_url));
+            }
         }
         self.set_chapters(chapters);
         if start_loaded_stream(
@@ -881,6 +1110,11 @@ impl SessionControl {
                     &stream,
                     headers,
                 ) {
+                    // The reload restarts the stream; Play
+                    // after Stop resumes from the saved
+                    // position with the configured rewind
+                    // (M08).
+                    resume_after_stop(&self.state);
                     crate::announce("general", "Playing");
                     let mut s = self.state.borrow_mut();
                     note_announced(&mut s, "Playing");
@@ -891,6 +1125,7 @@ impl SessionControl {
                 }
             }
             _ => {
+                resume_after_stop(&self.state);
                 self.media.play();
                 crate::announce("general", "Playing");
                 let mut s = self.state.borrow_mut();
@@ -1049,6 +1284,7 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
     // starts senderless; the tick's drain treats a disconnected
     // channel as "no ranges yet".
     let (_, skip_rx) = std::sync::mpsc::channel();
+    let (write_tx, write_confirm_rx) = spawn_write_worker(db_path.clone());
     let state = Rc::new(RefCell::new(PlayerState {
         // Virgin identity: begin_load binds the first article
         // (and the empty stream marks "nothing loaded yet" for
@@ -1061,6 +1297,11 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
         last_save: std::time::Instant::now(),
         seeked: true,
         saved_position_ms: 0,
+        seek_verify: None,
+        stopped_needs_resume: false,
+        last_queued_pos: -1,
+        write_tx: Some(write_tx),
+        write_confirm_rx,
         skips: Vec::new(),
         skip_rx,
         skipped: HashSet::new(),
@@ -1127,6 +1368,9 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
             st_pp.borrow_mut().autoplay_active = false;
             crate::announce("general", "Paused");
         } else {
+            // Play after Stop first re-runs the resume
+            // restore against the saved row (M08).
+            resume_after_stop(&st_pp);
             m.play();
             crate::announce("general", "Playing");
             // This press already said it: the tick's
@@ -1143,14 +1387,24 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
         // Save only when media actually loaded (see
         // begin_load): a stop during loading must not zero
         // the article's saved resume position.
-        {
+        let had_stream = {
             let s = st.borrow();
             if !s.stream.is_empty() {
                 save_position(&s, &m, false);
+                true
+            } else {
+                false
             }
-        }
+        };
         m.stop();
-        st.borrow_mut().autoplay_active = false;
+        let mut s = st.borrow_mut();
+        s.autoplay_active = false;
+        // Any pending seek verification ends with the stop;
+        // Play re-runs the restore from the saved row (M08).
+        s.seek_verify = None;
+        if had_stream {
+            s.stopped_needs_resume = true;
+        }
     });
     let stop_click = stop.clone();
     stop_btn.on_click(move |_| stop_click());
@@ -1167,7 +1421,8 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
         Rc::new(move || {
             let cfg =
                 blindrss_core::config::Config::load(&crate::config_path()).unwrap_or_default();
-            m.seek(-cfg.get_i64("seek_back_ms", 10_000), SeekMode::FromCurrent);
+            let target = m.seek(-cfg.get_i64("seek_back_ms", 10_000), SeekMode::FromCurrent);
+            begin_user_seek(&mut st.borrow_mut(), target);
             arm_seek_summary(&st);
         })
     };
@@ -1178,7 +1433,8 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
             let cfg =
                 blindrss_core::config::Config::load(&crate::config_path()).unwrap_or_default();
             let back = cfg.get_i64("seek_back_ms", 10_000);
-            m.seek(cfg.get_i64("seek_forward_ms", back), SeekMode::FromCurrent);
+            let target = m.seek(cfg.get_i64("seek_forward_ms", back), SeekMode::FromCurrent);
+            begin_user_seek(&mut st.borrow_mut(), target);
             arm_seek_summary(&st);
         })
     };
@@ -1247,6 +1503,7 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
         let m = media;
         let frame_ch = frame;
         let chapters_live_c = chapters_live.clone();
+        let st = state.clone();
         prev_ch_btn.on_click(move |_| {
             let (chapters_nav, starts_nav) = chapters_live_c.borrow().clone();
             let pos = m.tell();
@@ -1263,6 +1520,7 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
                 idx.saturating_sub(1)
             };
             m.seek(starts_nav[target], SeekMode::FromStart);
+            begin_user_seek(&mut st.borrow_mut(), starts_nav[target]);
             m.play();
             let label = chapter_label(&chapters_nav, target);
             frame_ch.set_status_text(&label, 0);
@@ -1273,6 +1531,7 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
         let m = media;
         let frame_ch = frame;
         let chapters_live_c = chapters_live.clone();
+        let st = state.clone();
         next_ch_btn.on_click(move |_| {
             let (chapters_nav, starts_nav) = chapters_live_c.borrow().clone();
             let pos = m.tell();
@@ -1282,6 +1541,7 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
                 return;
             }
             m.seek(starts_nav[next], SeekMode::FromStart);
+            begin_user_seek(&mut st.borrow_mut(), starts_nav[next]);
             m.play();
             let label = chapter_label(&chapters_nav, next);
             frame_ch.set_status_text(&label, 0);
@@ -1295,12 +1555,14 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
     let chapter_seek: Rc<dyn Fn()> = {
         let m = media;
         let chapters_live_dl = chapters_live.clone();
+        let st = state.clone();
         Rc::new(move || {
             let (chapters_dl, starts_dl) = chapters_live_dl.borrow().clone();
             if let Some(sel) = chapter_list.get_selection()
                 && let Some(ms) = starts_dl.get(sel as usize)
             {
                 m.seek(*ms, SeekMode::FromStart);
+                begin_user_seek(&mut st.borrow_mut(), *ms);
                 m.play();
                 crate::announce(
                     "media_navigation",
@@ -1394,11 +1656,13 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
                     code,
                 ) {
                     Some("seek_back") => {
-                        m.seek(-seek_back_ms, SeekMode::FromCurrent);
+                        let target = m.seek(-seek_back_ms, SeekMode::FromCurrent);
+                        begin_user_seek(&mut st_k.borrow_mut(), target);
                         true
                     }
                     Some("seek_forward") => {
-                        m.seek(seek_fwd_ms, SeekMode::FromCurrent);
+                        let target = m.seek(seek_fwd_ms, SeekMode::FromCurrent);
+                        begin_user_seek(&mut st_k.borrow_mut(), target);
                         true
                     }
                     Some("volume_up") => {
@@ -1446,7 +1710,9 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
                 314 if !on_slider && !on_list => {
                     let cfg = blindrss_core::config::Config::load(&crate::config_path())
                         .unwrap_or_default();
-                    m.seek(-cfg.get_i64("seek_back_ms", 10_000), SeekMode::FromCurrent);
+                    let target =
+                        m.seek(-cfg.get_i64("seek_back_ms", 10_000), SeekMode::FromCurrent);
+                    begin_user_seek(&mut st_k.borrow_mut(), target);
                     arm_seek_summary(&st_k);
                     ev.skip(false);
                 }
@@ -1454,7 +1720,9 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
                     let cfg = blindrss_core::config::Config::load(&crate::config_path())
                         .unwrap_or_default();
                     let back = cfg.get_i64("seek_back_ms", 10_000);
-                    m.seek(cfg.get_i64("seek_forward_ms", back), SeekMode::FromCurrent);
+                    let target =
+                        m.seek(cfg.get_i64("seek_forward_ms", back), SeekMode::FromCurrent);
+                    begin_user_seek(&mut st_k.borrow_mut(), target);
                     arm_seek_summary(&st_k);
                     ev.skip(false);
                 }
@@ -1496,6 +1764,7 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
             if len > 0 {
                 let target = len * ev.get_value() as i64 / 1000;
                 m.seek(target, SeekMode::FromStart);
+                begin_user_seek(&mut st.borrow_mut(), target);
                 arm_seek_summary(&st);
             }
         });
@@ -1524,6 +1793,18 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
         let mut queue_error: Option<String> = None;
         {
             let mut s = st.borrow_mut();
+            // Persistence confirmations (M07): save bookkeeping
+            // advances only for writes the worker reports
+            // landed — a queued-but-unwritten position never
+            // counts as saved.
+            while let Ok(written) = s.write_confirm_rx.try_recv() {
+                for (id, saved) in written {
+                    if id == blindrss_core::playback::playback_id(&s.article_id) {
+                        s.last_saved_pos = saved.position_ms;
+                        s.last_save = std::time::Instant::now();
+                    }
+                }
+            }
             // Queue advance: a resolved next entry switches the
             // loaded media (frame title + chapters follow). The
             // queue is taken out of the state while processed so
@@ -1574,6 +1855,10 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
                                 .map(|saved| s.resume.resume_target(&saved, &stream))
                                 .unwrap_or(0);
                             s.seeked = s.saved_position_ms <= 0;
+                            s.seek_verify = None;
+                            if s.saved_position_ms > 0 {
+                                s.seek_verify = Some(resume_verifier(s.saved_position_ms, &stream));
+                            }
                             let mut chapters = Db::open(&s.db_path)
                                 .ok()
                                 .and_then(|db| db.chapters(&entry.id).ok())
@@ -1601,9 +1886,43 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
             while let Ok(ranges) = s.skip_rx.try_recv() {
                 s.skips.extend(ranges);
             }
-            if !s.seeked && len > 0 && s.saved_position_ms > 0 {
-                m.seek(s.saved_position_ms, SeekMode::FromStart);
-                s.seeked = true;
+            // Verified seek drive (M05): the armed verifier —
+            // resume restore or user-seek guard — observes the
+            // backend's real position once a second. It waits
+            // through opening/buffering, issues and re-issues
+            // the seek within its bounded budget, learns seek
+            // support from the outcome (persisted through the
+            // write queue), and reports a failed user seek
+            // exactly once.
+            if let Some(mut verifier) = s.seek_verify.take() {
+                let step = verifier.observe(
+                    std::time::Instant::now(),
+                    m.stream_phase(),
+                    pos,
+                    m.is_seekable(),
+                );
+                if let Some(target) = step.seek_to {
+                    m.seek(target, SeekMode::FromStart);
+                }
+                if let Some(supported) = step.learn_seek_supported {
+                    queue_seek_supported(&s, supported);
+                }
+                if step.announce_failure {
+                    crate::announce(
+                        "general",
+                        &format!(
+                            "Could not seek there. Position {}",
+                            blindrss_core::playback::format_time_ms(pos)
+                        ),
+                    );
+                }
+                if step.active {
+                    s.seek_verify = Some(verifier);
+                } else if verifier.kind() == SeekKind::Resume {
+                    // The restore ended (landed or given up):
+                    // position saves may resume.
+                    s.seeked = true;
+                }
             }
             let hit = s
                 .skips
@@ -1762,9 +2081,12 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
                 && pos >= 1_000
                 && s.last_save.elapsed() >= s.resume.save_interval
                 && pos != s.last_saved_pos
+                && pos != s.last_queued_pos
             {
-                s.last_saved_pos = pos;
-                s.last_save = std::time::Instant::now();
+                // Queue the save on the worker (M07);
+                // last_saved_pos/last_save advance only when
+                // its confirmation comes back.
+                s.last_queued_pos = pos;
                 save_position(&s, &m, false);
             }
         }
