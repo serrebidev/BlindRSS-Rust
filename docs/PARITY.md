@@ -4015,3 +4015,8 @@ backend actually loaded (possibly a loopback proxy URL,
 hence local tolerance). (6) The plan's manual confirmation
 of resume and soundcard behavior with real libVLC remains
 Brandon's acceptance — unclaimed here.
+
+**Task 19 integration gate (2026-11-04):** cherry-picked onto
+main over 5d2e0e1 with no conflicts. Merged gate: fmt clean,
+clippy clean (workspace and core windows-gnu), 691 passed /
+0 failed, build OK.
