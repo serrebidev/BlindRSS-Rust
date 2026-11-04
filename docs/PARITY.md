@@ -3861,3 +3861,17 @@ of them the Task 17 slice), clippy `--workspace
 --all-targets --target x86_64-pc-windows-gnu -D warnings`
 clean (this task touches Windows-facing key handling),
 `cargo build -p blindrss` OK, `cargo fmt --all` run last.
+
+**Wave 3 batch 2 integration note (2026-11-04):** Tasks 17 and
+18 both branched from 76cbe5a and were cherry-picked onto main
+in that order. Three merge points needed judgment, resolved as
+follows. (1) player.rs: both tasks appended helpers after
+`dispatch_command` — kept both blocks (Task 18's session
+helpers, then Task 17's shortcut delegate). (2) main.rs:
+`MediaResolution` keeps Task 18's shape (URL + headers; yt-dlp
+info travels as `MediaInfoReady`) and gains Task 17's
+`ShortcutDispatch` type. (3) player.rs media-key volume arms:
+Task 17's sites used its local `volume_step` value while Task
+18 made it a module function re-reading config at use time —
+the two arms now call `volume_step()` like Task 18's other
+sites. Merged gate follows below.
