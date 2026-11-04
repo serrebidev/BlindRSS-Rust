@@ -120,14 +120,14 @@ fn config_path() -> PathBuf {
 
 /// Map a stored `last_selected_feed` value (shared Python format,
 /// Audit 8 G20) to the startup state: the Rust tree selection and
-/// the read filter. Python's Favorites and Deleted views have no
-/// node in the Rust tree (Deleted is a dialog), so they restore
-/// as the All view; the stored value itself is left untouched in
+/// the read filter. Favorites has a real tree node (Audit 8
+/// G06); Deleted has none (it is a dialog), so it restores as
+/// the All view; the stored value itself is left untouched in
 /// the config until the user selects a view.
 fn restored_view_state(raw: &str) -> (Option<String>, u8) {
     let view = blindrss_core::config::decode_remembered_view(raw);
     let selected = match view.view_id.as_deref() {
-        Some("favorites:all") | Some("deleted:all") => None,
+        Some("deleted:all") => None,
         other => other.map(|s| s.to_string()),
     };
     (selected, view.read_filter)
@@ -314,17 +314,51 @@ fn maybe_cache_youtube(article: &Article, stream_url: &str, via_ytdlp: bool) -> 
     }
 }
 
+/// The video id of a recommendation article id
+/// ("youtube-account:recommendations:<account>:<video_id>").
+fn recommendation_video_id(article_id: &str) -> Option<&str> {
+    article_id
+        .strip_prefix(blindrss_core::youtube_account::RECOMMENDATIONS_FEED_ID)?
+        .strip_prefix(':')?
+        .split_once(':')
+        .map(|(_, video)| video)
+}
+
 /// Read/favorite writes route to the recommendations table for
 /// virtual-feed articles (their ids are not in `articles`).
+/// Read state is SHARED with the local feed article for the
+/// same video (Audit 8 D17, Python's v2.5.8 twin rule): marking
+/// either copy marks the other. The twin rule is local-provider
+/// only — hosted account article state is never merged.
 pub(crate) fn mark_article_read(
     db: &blindrss_core::db::Db,
     article: &blindrss_core::db::Article,
     read: bool,
 ) {
-    if article.feed_id == blindrss_core::youtube_account::RECOMMENDATIONS_FEED_ID {
+    let is_rec = article.feed_id == blindrss_core::youtube_account::RECOMMENDATIONS_FEED_ID;
+    if is_rec {
         let _ = db.set_recommendation_state(&article.id, Some(read), None);
     } else {
         let _ = db.mark_read(&article.id, read);
+    }
+    let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+    if blindrss_core::provider::active_name(&cfg) != "local" {
+        return;
+    }
+    if is_rec {
+        if let Some(video_id) = recommendation_video_id(&article.id) {
+            let _ = db.mark_read(&format!("yt:video:{video_id}"), read);
+        }
+    } else if let Some(video_id) = article.id.strip_prefix("yt:video:") {
+        let token = cfg.get_str("youtube_account_refresh_token", "");
+        let account = blindrss_core::youtube_account::account_key(token);
+        if !account.is_empty() {
+            let rec_id = format!(
+                "{}:{account}:{video_id}",
+                blindrss_core::youtube_account::RECOMMENDATIONS_FEED_ID
+            );
+            let _ = db.set_recommendation_state(&rec_id, Some(read), None);
+        }
     }
 }
 
@@ -1953,6 +1987,10 @@ fn rebuild_tree(state: &mut State, tree: &TreeCtrl) {
     paths.sort();
     let mut cat_items: std::collections::HashMap<String, TreeItemId> =
         std::collections::HashMap::new();
+    // Built-in Favorites view (Audit 8 G06): Python adds the
+    // node whenever the provider supports favorites, which
+    // every backend does. Item data is the shared view id.
+    tree.append_item_with_data(&root, "Favorites", "favorites:all".to_string(), None, None);
     // Uncategorized is a real node (Python's local provider):
     // feeds with no category — or carrying the sentinel — group
     // under it, and selecting it lists only their articles.
@@ -2049,19 +2087,23 @@ fn rebuild_tree(state: &mut State, tree: &TreeCtrl) {
         }
     }
     // YouTube Recommendations virtual feed (the account
-    // provider wrapper injects it whenever signed in).
+    // provider wrapper injects it whenever signed in AND a
+    // recommendations snapshot exists — Python's _has_snapshot).
     let yt_token = blindrss_core::config::Config::load(&config_path())
         .unwrap_or_default()
         .get_str("youtube_account_refresh_token", "")
         .to_string();
     if !yt_token.is_empty() {
-        tree.append_item_with_data(
-            &root,
-            "Recommendations",
-            blindrss_core::youtube_account::RECOMMENDATIONS_FEED_ID.to_string(),
-            None,
-            None,
-        );
+        let account = blindrss_core::youtube_account::account_key(&yt_token);
+        if db.has_recommendation_snapshot(&account).unwrap_or(false) {
+            tree.append_item_with_data(
+                &root,
+                "Recommendations",
+                blindrss_core::youtube_account::RECOMMENDATIONS_FEED_ID.to_string(),
+                None,
+                None,
+            );
+        }
     }
     // Smart folders: item data is "smart:<id>".
     if let Ok(folders) = db.smart_folders()
@@ -2232,6 +2274,65 @@ fn load_more_articles(state: &mut State, list: &ListCtrl) {
     list.ensure_visible(offset as i64);
 }
 
+/// The signed-in YouTube account key from a loaded config
+/// ("" when signed out).
+fn youtube_account_key(cfg: &blindrss_core::config::Config) -> String {
+    blindrss_core::youtube_account::account_key(cfg.get_str("youtube_account_refresh_token", ""))
+}
+
+/// Whether a category view includes the YouTube account's
+/// recommendations (Python's wrapper `_view`): the account
+/// category itself, or any ancestor of it.
+fn category_includes_recommendations(cfg: &blindrss_core::config::Config, path: &str) -> bool {
+    let category = cfg.get_str("youtube_account_category", "YouTube");
+    let category = if category.is_empty() {
+        "YouTube"
+    } else {
+        category
+    };
+    category == path || category.starts_with(&format!("{path}{}", blindrss_core::CATEGORY_PATH_SEP))
+}
+
+/// Which recommendations a Mark All Read over a view covers,
+/// as (account, favorites_only) — Python's wrapper
+/// `mark_all_read` marks `_articles(view)` beside the provider
+/// mark (Audit 8 D20). None when the view includes no
+/// recommendations or no account is signed in.
+fn recommendations_mark_scope(
+    cfg: &blindrss_core::config::Config,
+    filter: Option<&str>,
+) -> Option<(String, bool)> {
+    let account = youtube_account_key(cfg);
+    if account.is_empty() {
+        return None;
+    }
+    match filter {
+        None => Some((account, false)),
+        Some("favorites:all") => Some((account, true)),
+        Some(id) if id == blindrss_core::youtube_account::RECOMMENDATIONS_FEED_ID => {
+            Some((account, false))
+        }
+        Some(view) => {
+            let path = view.strip_prefix("cat:")?;
+            category_includes_recommendations(cfg, path).then_some((account, false))
+        }
+    }
+}
+
+/// Merge recommendation rows into an article list and put the
+/// whole list in the standard display order (date DESC, id
+/// DESC — the order the SQL queries return). Python's wrapper
+/// concatenates its rows into the provider's list and the
+/// merged list sorts by the stored (first-recommended) dates.
+fn merge_recommendations(mut base: Vec<Article>, extra: Vec<Article>) -> Vec<Article> {
+    if extra.is_empty() {
+        return base;
+    }
+    base.extend(extra);
+    base.sort_by(|a, b| b.date.cmp(&a.date).then_with(|| b.id.cmp(&a.id)));
+    base
+}
+
 fn refill_articles(state: &mut State, list: &ListCtrl) {
     state.reader_generation = state.reader_generation.wrapping_add(1);
     state.pending_fulltext = None;
@@ -2287,6 +2388,18 @@ fn refill_inner(state: &mut State, list: &ListCtrl) {
         }
         return finish_refill(state, list, loaded);
     }
+    // Built-in Favorites view (Audit 8 G06): favorite articles
+    // plus the account's favorite recommendations — including
+    // favorites that fell out of the latest snapshot (D19).
+    if filter == Some("favorites:all") {
+        let mut loaded = db.favorites(1000).unwrap_or_default();
+        let account = youtube_account_key(&cfg);
+        if !account.is_empty() {
+            let favs = db.favorite_recommendations(&account).unwrap_or_default();
+            loaded = merge_recommendations(loaded, favs);
+        }
+        return finish_refill(state, list, loaded);
+    }
     // YouTube Recommendations virtual feed.
     if filter == Some(blindrss_core::youtube_account::RECOMMENDATIONS_FEED_ID) {
         let token = blindrss_core::config::Config::load(&config_path())
@@ -2301,6 +2414,20 @@ fn refill_inner(state: &mut State, list: &ListCtrl) {
     // feeds, minus articles moved elsewhere, plus articles moved
     // or labeled into the subtree.
     if let Some(path) = filter.and_then(|f| f.strip_prefix("cat:")) {
+        // Recommendations merge into the account category and
+        // its ancestors (Audit 8 D19); a merged view loads whole
+        // and date-sorts like Python's, so it does not page.
+        let account = youtube_account_key(&cfg);
+        if !account.is_empty()
+            && category_includes_recommendations(&cfg, path)
+            && db.has_recommendation_snapshot(&account).unwrap_or(false)
+        {
+            let loaded = db
+                .articles_for_category_light(path, 500)
+                .unwrap_or_default();
+            let recs = db.recommendations_merged(&account).unwrap_or_default();
+            return finish_refill(state, list, merge_recommendations(loaded, recs));
+        }
         if view_pages(state) {
             state.view_total = db.articles_for_category_count(path).unwrap_or(-1);
             let loaded = db
@@ -2313,14 +2440,25 @@ fn refill_inner(state: &mut State, list: &ListCtrl) {
             .unwrap_or_default();
         return finish_refill(state, list, loaded);
     }
-    if view_pages(state) {
+    // All view: recommendations merge in too (Audit 8 D19).
+    // A merged view loads whole and date-sorts, so it does not
+    // page; unmerged views keep the paged path.
+    let account = youtube_account_key(&cfg);
+    let merged_recs = if filter.is_none() && !account.is_empty() {
+        db.recommendations_merged(&account).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    if view_pages(state) && merged_recs.is_empty() {
         state.view_total = db.articles_count(filter).unwrap_or(-1);
         let loaded = db
             .articles_light_page(filter, ARTICLE_PAGE, 0)
             .unwrap_or_default();
         return finish_refill(state, list, loaded);
     }
-    let loaded = db.articles_light(filter, 300).unwrap_or_default();
+    let cap = if merged_recs.is_empty() { 300 } else { 500 };
+    let loaded = db.articles_light(filter, cap).unwrap_or_default();
+    let loaded = merge_recommendations(loaded, merged_recs);
     finish_refill(state, list, loaded);
 }
 
@@ -3727,6 +3865,7 @@ fn main() {
                 let is_feed_view = filter.as_deref().is_some_and(|f| {
                     !f.starts_with("cat:")
                         && !f.starts_with("smart:")
+                        && f != "favorites:all"
                         && f != blindrss_core::youtube_account::RECOMMENDATIONS_FEED_ID
                 });
                 let is_cat_view = filter.as_deref().is_some_and(|f| f.starts_with("cat:"));
@@ -3734,6 +3873,16 @@ fn main() {
                     let cfg =
                         blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
                     if blindrss_core::provider::active_name(&cfg) != "local" {
+                        // Recommendations are local-only even
+                        // under a hosted provider (Python's
+                        // wrapper marks them beside the remote
+                        // mark — Audit 8 D20).
+                        if let Some(db) = st.db.as_ref()
+                            && let Some((account, favorites_only)) =
+                                recommendations_mark_scope(&cfg, filter.as_deref())
+                        {
+                            let _ = db.mark_recommendations_read(&account, favorites_only);
+                        }
                         drop(st);
                         frame_ma.set_status_text("Marking all read...", 0);
                         let tx = tx_ma.clone();
@@ -3760,6 +3909,18 @@ fn main() {
             let mut count = 0;
             if let Some(db) = st.db.as_ref() {
                 count = db.mark_all_read(filter.as_deref()).unwrap_or(0);
+                // Recommendations in scope are marked in their
+                // own table, persisted (Audit 8 D20 — Python's
+                // wrapper mark_all_read); the pre-fix code only
+                // flipped the displayed flags below.
+                let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+                if let Some((account, favorites_only)) =
+                    recommendations_mark_scope(&cfg, filter.as_deref())
+                {
+                    count += db
+                        .mark_recommendations_read(&account, favorites_only)
+                        .unwrap_or(0);
+                }
                 for a in st.articles.iter_mut() {
                     a.is_read = true;
                 }
@@ -8006,6 +8167,7 @@ fn main() {
             let selected = state_ctx_tree.borrow().selected_feed.clone();
             let kind = match selected.as_deref() {
                 Some(s) if s.starts_with("cat:") => "category",
+                Some("favorites:all") => "all",
                 Some("smart:") => "smart_root",
                 Some(s) if s.starts_with("smart:") => "smart",
                 Some(_) => "feed",
@@ -9313,13 +9475,15 @@ mod ui_parity_tests {
         let (selected, filter) = restored_view_state("read:feed-42");
         assert_eq!(selected.as_deref(), Some("feed-42"));
         assert_eq!(filter, 2);
-        // Python's special views have no Rust tree node: All view,
-        // and the stored value is not rewritten by restoring.
+        // Deleted has no Rust tree node (it is a dialog): All
+        // view, and the stored value is not rewritten by
+        // restoring. Favorites DOES have a node (Audit 8 G06)
+        // and restores onto it.
         let (selected, filter) = restored_view_state("deleted:all");
         assert_eq!(selected, None);
         assert_eq!(filter, 0);
         let (selected, _) = restored_view_state("favorites:all");
-        assert_eq!(selected, None);
+        assert_eq!(selected.as_deref(), Some("favorites:all"));
         // Saving a Rust selection writes the Python format.
         assert_eq!(
             remembered_view_value(Some("cat:News / Tech"), 1),
@@ -9327,6 +9491,77 @@ mod ui_parity_tests {
         );
         assert_eq!(remembered_view_value(None, 0), "all");
         assert_eq!(remembered_view_value(Some("smart:7"), 1), "smart:7");
+    }
+
+    #[test]
+    fn youtube_recommendation_view_scopes() {
+        // Audit 8 Task 10 (D19/D20): which views include the
+        // account's recommendations, and which Mark All Read
+        // scopes persist to their table.
+        let mut cfg = blindrss_core::config::Config::default();
+        cfg.set_path(
+            "youtube_account_refresh_token",
+            serde_json::json!("refresh-token-task10"),
+        );
+        cfg.set_path(
+            "youtube_account_category",
+            serde_json::json!("Media / YouTube"),
+        );
+        // The account category and its ancestors include them;
+        // siblings and unrelated categories do not.
+        assert!(category_includes_recommendations(&cfg, "Media / YouTube"));
+        assert!(category_includes_recommendations(&cfg, "Media"));
+        assert!(!category_includes_recommendations(&cfg, "Media / You"));
+        assert!(!category_includes_recommendations(&cfg, "News"));
+        // Mark scopes: All and the dedicated feed take the
+        // current snapshot, Favorites takes favorites, a plain
+        // feed takes none.
+        let (account, fav) = recommendations_mark_scope(&cfg, None).unwrap();
+        assert!(!account.is_empty() && !fav);
+        let (_, fav) = recommendations_mark_scope(&cfg, Some("favorites:all")).unwrap();
+        assert!(fav);
+        let (_, fav) = recommendations_mark_scope(
+            &cfg,
+            Some(blindrss_core::youtube_account::RECOMMENDATIONS_FEED_ID),
+        )
+        .unwrap();
+        assert!(!fav);
+        let (_, fav) = recommendations_mark_scope(&cfg, Some("cat:Media")).unwrap();
+        assert!(!fav);
+        assert!(recommendations_mark_scope(&cfg, Some("cat:News")).is_none());
+        assert!(recommendations_mark_scope(&cfg, Some("some-feed-id")).is_none());
+        assert!(recommendations_mark_scope(&cfg, Some("smart:3")).is_none());
+        // Signed out: no scope anywhere.
+        let cfg = blindrss_core::config::Config::default();
+        assert!(recommendations_mark_scope(&cfg, None).is_none());
+    }
+
+    #[test]
+    fn youtube_recommendations_merge_in_date_order() {
+        // Audit 8 D19: merged views interleave recommendations
+        // with RSS articles by stored date, newest first.
+        let mk = |id: &str, date: &str| Article {
+            id: id.into(),
+            feed_id: "f".into(),
+            title: id.into(),
+            url: String::new(),
+            content: None,
+            description: None,
+            date: Some(date.into()),
+            author: None,
+            is_read: false,
+            is_favorite: false,
+            media_url: None,
+            media_type: None,
+        };
+        let base = vec![
+            mk("new", "2026-11-03T10:00:00+00:00"),
+            mk("old", "2026-11-01T10:00:00+00:00"),
+        ];
+        let extra = vec![mk("mid", "2026-11-02T10:00:00+00:00")];
+        let merged = merge_recommendations(base, extra);
+        let ids: Vec<&str> = merged.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(ids, ["new", "mid", "old"]);
     }
 
     #[test]

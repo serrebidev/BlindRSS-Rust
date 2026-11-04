@@ -272,6 +272,53 @@ fn iso_utc(stamp: std::time::Duration) -> String {
     )
 }
 
+/// Parse an ISO-8601 UTC stamp of the shape [`iso_utc`] writes
+/// (and Python's `datetime.isoformat` writes for aware UTC
+/// values) back into a duration since the Unix epoch. Returns
+/// None for anything else; callers treat that as "leave the
+/// stored value alone" rather than failing.
+fn parse_iso_utc(text: &str) -> Option<std::time::Duration> {
+    let bytes = text.as_bytes();
+    if bytes.len() < 19 {
+        return None;
+    }
+    let num = |from: usize, len: usize| -> Option<i64> { text.get(from..from + len)?.parse().ok() };
+    let (year, month, day) = (num(0, 4)?, num(5, 2)?, num(8, 2)?);
+    let (hour, min, sec) = (num(11, 2)?, num(14, 2)?, num(17, 2)?);
+    let micros: i64 = match text.get(19..20) {
+        Some(".") => {
+            let frac: String = text[20..]
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            if frac.is_empty() {
+                0
+            } else {
+                let padded = format!("{frac:0<6}");
+                padded[..6].parse().ok()?
+            }
+        }
+        _ => 0,
+    };
+    // Days-from-civil (Howard Hinnant's algorithm, inverse of
+    // the one in iso_utc).
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let mp = if month > 2 { month - 3 } else { month + 9 };
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    let secs = days * 86_400 + hour * 3600 + min * 60 + sec;
+    if secs < 0 {
+        return None;
+    }
+    Some(std::time::Duration::new(
+        secs as u64,
+        (micros * 1000) as u32,
+    ))
+}
+
 pub struct Db {
     conn: Connection,
 }
@@ -457,8 +504,12 @@ impl Db {
     /// Replace the visible recommendations snapshot atomically,
     /// retaining read/favorite/deleted state (Python's
     /// save_recommendations). `videos` is (video_id, title, author)
-    /// in YouTube's order; dates are stamped now minus position
-    /// microseconds, exactly as Python does.
+    /// in YouTube's order; a NEW video's date is stamped now minus
+    /// position microseconds, exactly as Python does, and a known
+    /// video KEEPS its first-recommended date (Python's upsert
+    /// updates title/author/position/current, never date — Audit 8
+    /// D18), so still-recommended videos do not churn to the top
+    /// of mixed views on every sync.
     pub fn save_recommendations(
         &self,
         account: &str,
@@ -479,7 +530,7 @@ impl Db {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
                  ON CONFLICT(account, video_id) DO UPDATE SET \
                  title = excluded.title, author = excluded.author, \
-                 date = excluded.date, position = excluded.position, current = 1",
+                 position = excluded.position, current = 1",
                 rusqlite::params![
                     account,
                     video_id,
@@ -493,37 +544,164 @@ impl Db {
         tx.commit()
     }
 
-    /// The account's current recommendations as articles in the
-    /// virtual feed (Python's YouTubeAccountProvider._articles).
-    pub fn recommendations(&self, account: &str) -> rusqlite::Result<Vec<Article>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT video_id, title, author, date, is_read, is_favorite \
+    /// One shape of the account's recommendations as articles in
+    /// the virtual feed (Python's YouTubeAccountProvider._articles).
+    ///
+    /// Read state is the SHARED state (Audit 8 D17): a
+    /// recommendation is read when its own row is read OR the
+    /// local feed article for the same video (`yt:video:<id>`,
+    /// the id YouTube's RSS gives channel/playlist entries) is
+    /// read — Python's `_read_sql` EXISTS clause. The clause is
+    /// a no-op over hosted-provider caches, whose article ids are
+    /// provider-scoped and never `yt:video:` ids, so hosted
+    /// account state is never merged.
+    ///
+    /// `favorites_only` drops the `current = 1` condition
+    /// (Python's favorites view: favorites that fell out of the
+    /// latest snapshot still show — Audit 8 D19/G06). Otherwise
+    /// only current rows appear. `rebase_dates` applies the
+    /// dedicated view's dating: rows keep their first-recommended
+    /// date in storage (mixed views sort by it), but the
+    /// standalone Recommendations list sorts by date, so Python's
+    /// wrapper re-dates rows down from the newest stored date by
+    /// position microseconds to reproduce YouTube's order.
+    fn recommendation_articles(
+        &self,
+        account: &str,
+        favorites_only: bool,
+        rebase_dates: bool,
+    ) -> rusqlite::Result<Vec<Article>> {
+        let scope = if favorites_only {
+            "is_favorite = 1"
+        } else {
+            "current = 1"
+        };
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT video_id, title, author, date, \
+             (is_read OR EXISTS (SELECT 1 FROM articles \
+              WHERE articles.id = 'yt:video:' || youtube_recommendations.video_id \
+              AND articles.is_read = 1)), \
+             is_favorite, position \
              FROM youtube_recommendations \
-             WHERE account = ?1 AND current = 1 AND is_deleted = 0 \
-             ORDER BY current DESC, position, date DESC",
-        )?;
+             WHERE account = ?1 AND is_deleted = 0 AND {scope} \
+             ORDER BY current DESC, position, date DESC"
+        ))?;
         let rows = stmt.query_map([account], |row| {
             let video_id: String = row.get(0)?;
             let url = format!("https://www.youtube.com/watch?v={video_id}");
-            Ok(Article {
-                id: format!(
-                    "{}:{account}:{video_id}",
-                    crate::youtube_account::RECOMMENDATIONS_FEED_ID
-                ),
-                feed_id: crate::youtube_account::RECOMMENDATIONS_FEED_ID.to_string(),
-                title: row.get(1)?,
-                url: url.clone(),
-                content: None,
-                description: None,
-                date: row.get(3)?,
-                author: row.get(2)?,
-                is_read: row.get::<_, i64>(4)? != 0,
-                is_favorite: row.get::<_, i64>(5)? != 0,
-                media_url: Some(url),
-                media_type: Some("video/youtube".to_string()),
-            })
+            Ok((
+                Article {
+                    id: format!(
+                        "{}:{account}:{video_id}",
+                        crate::youtube_account::RECOMMENDATIONS_FEED_ID
+                    ),
+                    feed_id: crate::youtube_account::RECOMMENDATIONS_FEED_ID.to_string(),
+                    title: row.get(1)?,
+                    url: url.clone(),
+                    content: None,
+                    description: None,
+                    date: row.get(3)?,
+                    author: row.get(2)?,
+                    is_read: row.get::<_, i64>(4)? != 0,
+                    is_favorite: row.get::<_, i64>(5)? != 0,
+                    media_url: Some(url),
+                    media_type: Some("video/youtube".to_string()),
+                },
+                row.get::<_, i64>(6)?,
+            ))
         })?;
-        rows.collect()
+        let mut rows: Vec<(Article, i64)> = rows.collect::<Result<_, _>>()?;
+        if rebase_dates && !rows.is_empty() {
+            let newest: Option<String> = self.conn.query_row(
+                "SELECT MAX(date) FROM youtube_recommendations \
+                 WHERE account = ?1 AND current = 1",
+                [account],
+                |r| r.get(0),
+            )?;
+            if let Some(newest) = newest.and_then(|d| parse_iso_utc(&d)) {
+                for (article, position) in &mut rows {
+                    let stamp =
+                        newest - std::time::Duration::from_micros((*position).max(0) as u64);
+                    article.date = Some(iso_utc(stamp));
+                }
+            }
+        }
+        Ok(rows.into_iter().map(|(a, _)| a).collect())
+    }
+
+    /// The account's current recommendations as articles in the
+    /// virtual feed, dedicated-view dating (Python's
+    /// YouTubeAccountProvider._articles for the standalone feed).
+    pub fn recommendations(&self, account: &str) -> rusqlite::Result<Vec<Article>> {
+        self.recommendation_articles(account, false, true)
+    }
+
+    /// Current recommendations with their STORED (first
+    /// recommended) dates, for views that mix them with RSS
+    /// articles (All, the account category and its ancestors —
+    /// Audit 8 D19). The caller merges and date-sorts.
+    pub fn recommendations_merged(&self, account: &str) -> rusqlite::Result<Vec<Article>> {
+        self.recommendation_articles(account, false, false)
+    }
+
+    /// The account's favorite recommendations, including ones
+    /// that fell out of the latest snapshot (Python's favorites
+    /// view through the wrapper — Audit 8 D19/G06).
+    pub fn favorite_recommendations(&self, account: &str) -> rusqlite::Result<Vec<Article>> {
+        self.recommendation_articles(account, true, false)
+    }
+
+    /// Whether the account has any current recommendations
+    /// (Python's `_has_snapshot`: the Recommendations feed only
+    /// exists in the tree while a snapshot does).
+    pub fn has_recommendation_snapshot(&self, account: &str) -> rusqlite::Result<bool> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM youtube_recommendations \
+             WHERE account = ?1 AND current = 1",
+            [account],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Mark the account's recommendations read, PERSISTED
+    /// (Audit 8 D20: Python's wrapper mark_all_read updates
+    /// their table; the pre-fix app only flipped displayed
+    /// flags, so the state was back on reopen). Scope mirrors
+    /// the wrapper's `_articles(view)`: the current snapshot, or
+    /// favorites (including ones no longer current) for the
+    /// Favorites view. Each marked video's local feed twin is
+    /// marked too (Python's mark_read_batch routes through the
+    /// twin rule). Returns how many recommendation rows were
+    /// newly marked.
+    pub fn mark_recommendations_read(
+        &self,
+        account: &str,
+        favorites_only: bool,
+    ) -> rusqlite::Result<usize> {
+        let scope = if favorites_only {
+            "is_favorite = 1"
+        } else {
+            "current = 1"
+        };
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            &format!(
+                "UPDATE articles SET is_read = 1 WHERE is_read = 0 AND id IN \
+                 (SELECT 'yt:video:' || video_id FROM youtube_recommendations \
+                  WHERE account = ?1 AND is_deleted = 0 AND {scope})"
+            ),
+            [account],
+        )?;
+        let n = tx.execute(
+            &format!(
+                "UPDATE youtube_recommendations SET is_read = 1 \
+                 WHERE account = ?1 AND is_deleted = 0 AND is_read = 0 AND {scope}"
+            ),
+            [account],
+        )?;
+        tx.commit()?;
+        Ok(n)
     }
 
     /// Soft-delete a recommendations article (Python's provider
@@ -698,6 +876,49 @@ impl Db {
     }
 
     pub fn article_by_id(&self, article_id: &str) -> rusqlite::Result<Option<Article>> {
+        // Recommendation articles live in their own table, not
+        // `articles` (Python's wrapper get_article_by_id routes
+        // them there, with no current-snapshot filter, and with
+        // the shared twin read state).
+        if let Some(rest) = article_id.strip_prefix(crate::youtube_account::RECOMMENDATIONS_FEED_ID)
+            && let Some((account, video_id)) =
+                rest.strip_prefix(':').and_then(|r| r.split_once(':'))
+        {
+            let mut stmt = self.conn.prepare(
+                "SELECT video_id, title, author, date, \
+                 (is_read OR EXISTS (SELECT 1 FROM articles \
+                  WHERE articles.id = 'yt:video:' || youtube_recommendations.video_id \
+                  AND articles.is_read = 1)), \
+                 is_favorite, position \
+                 FROM youtube_recommendations \
+                 WHERE account = ?1 AND video_id = ?2 AND is_deleted = 0",
+            )?;
+            let mut rows = stmt.query_map(params![account, video_id], |row| {
+                let video_id: String = row.get(0)?;
+                let url = format!("https://www.youtube.com/watch?v={video_id}");
+                Ok(Article {
+                    id: format!(
+                        "{}:{account}:{video_id}",
+                        crate::youtube_account::RECOMMENDATIONS_FEED_ID
+                    ),
+                    feed_id: crate::youtube_account::RECOMMENDATIONS_FEED_ID.to_string(),
+                    title: row.get(1)?,
+                    url: url.clone(),
+                    content: None,
+                    description: None,
+                    date: row.get(3)?,
+                    author: row.get(2)?,
+                    is_read: row.get::<_, i64>(4)? != 0,
+                    is_favorite: row.get::<_, i64>(5)? != 0,
+                    media_url: Some(url),
+                    media_type: Some("video/youtube".to_string()),
+                })
+            })?;
+            return match rows.next() {
+                Some(r) => Ok(Some(r?)),
+                None => Ok(None),
+            };
+        }
         let mut stmt = self.conn.prepare(
             "SELECT id, feed_id, title, url, content, description, date, author, \
              is_read, is_favorite, media_url, media_type \

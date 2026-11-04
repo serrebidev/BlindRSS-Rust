@@ -2851,3 +2851,88 @@ Owner acceptance with real hosted accounts (refresh of a genuinely
 expired token, remote unsubscribe/category changes appearing after
 sync, category mark-all against a live account) remains pending as
 platform acceptance, as with all hosted work.
+## Audit 8 Task 10 resolution — YouTube merged state and built-in favorites (D17, D18, D19, D20, G06) (2026-11-03)
+
+Reproduction first: the new core suite
+`crates/core/tests/audit8_task10_slice.rs` failed to compile against
+the pre-fix tree (the merged/favorites/mark APIs did not exist), and
+source inspection confirmed the underlying defects — the snapshot
+upsert in `Db::save_recommendations` overwrote `date` on conflict,
+`Db::recommendations` selected the raw `is_read` flag with a
+`current = 1` filter only, and the app's Mark All Read flipped only
+the displayed rows' flags. All seven tests pass after the fix; the
+app gained two unit tests (`youtube_recommendation_view_scopes`,
+`youtube_recommendations_merge_in_date_order`) plus an updated G20
+restore assertion.
+
+- **D17 (shared read state) — resolved.** Python's wrapper
+  (`providers/youtube_account.py`) computes a recommendation's read
+  state as `is_read OR EXISTS (articles.id = 'yt:video:' ||
+  video_id AND is_read)`, and its `_set_read` writes both copies.
+  Core now uses that exact EXISTS expression in every
+  recommendation read shape (`recommendation_articles`,
+  `article_by_id`), and the app's `mark_article_read` writes the
+  twin through in both directions (recommendation → `yt:video:`
+  article and back). The twin rule is gated on the active provider
+  being Local in the app, and the SQL clause is naturally inert
+  over hosted caches (their article ids are provider-scoped, never
+  `yt:video:`), so hosted-account article state is never merged.
+- **D18 (snapshot date churn) — resolved.** `save_recommendations`'
+  upsert no longer sets `date`: a known video keeps the date it was
+  first recommended (Python `core/youtube_account.py`
+  `save_recommendations`), while title/author/position/current
+  still update. The dedicated view applies Python's wrapper
+  re-dating: rows are dated down from `MAX(date)` of the current
+  snapshot by position microseconds, so the standalone list's date
+  sort reproduces YouTube's current order (regression test pins
+  the one-microsecond step). Merged views use the stored dates.
+- **D19 (merged views + old favorites) — resolved.** Core gained
+  `recommendations_merged` (current rows, stored dates, shared
+  read state) and `favorite_recommendations` (favorites WITHOUT
+  the current condition — Python's favorites query in the
+  wrapper). The app merges current recommendations into the All
+  view and into the account category and its ancestors
+  (`category_includes_recommendations`, Python's `_view` rule),
+  date-sorted into the list via `merge_recommendations`; merged
+  views load whole instead of paging, like Python's merged lists.
+  The dedicated feed node now also requires a snapshot
+  (`has_recommendation_snapshot`, Python's `_has_snapshot`).
+  `Db::article_by_id` resolves recommendation ids with no
+  current filter, as Python's `get_article_by_id` does.
+- **D20 (Mark All Read persistence) — resolved.** Core gained
+  `mark_recommendations_read(account, favorites_only)`, which
+  persists `is_read = 1` over the wrapper's `_articles(view)`
+  scope (current snapshot, or favorites for the Favorites view)
+  and marks each video's local feed twin in the same transaction.
+  The app's Mark All Read routes through
+  `recommendations_mark_scope` in BOTH the local path and the
+  hosted path (recommendations are local-only under hosted
+  providers, as in Python). Regression test reopens the database
+  and verifies the persisted rows and the twin.
+- **G06 (built-in Favorites view) — resolved.** The tree gains a
+  "Favorites" node with the shared view id `favorites:all`
+  (Python adds it whenever the provider supports favorites; every
+  backend does). Selecting it lists `Db::favorites` merged with
+  `favorite_recommendations`, so favorited recommendations —
+  including ones absent from the latest snapshot — appear, and
+  unfavoriting removes a row on the refill the toggle already
+  triggers. `favorites:all` also restores from the shared
+  `last_selected_feed` format again (it previously restored as
+  All because there was no node), is excluded from the tree
+  context menu's feed variant and from the hosted mark-all
+  feed-view routing, and Mark All Read over it marks only the
+  favorite recommendations (Python's local provider refuses to
+  mass-mark the favorites view itself).
+
+Recorded deviations: none against the plan. The Recommendations
+tree node stays at the root (its pre-existing placement); Python
+groups the feed under the account category — the view inclusion
+semantics above follow Python exactly, and the node placement is
+unchanged from earlier batches. Owner NVDA acceptance of the
+merged views, the Favorites node and recommendation state flows
+remains pending as platform acceptance, as with all GUI work.
+
+Gate in this tree: `cargo test --workspace` 509 passed / 0 failed
+(500 at Wave 1 integration + 7 new core tests + 2 new app tests),
+clippy `--workspace --all-targets -D warnings` clean,
+`cargo fmt --all` run last.
