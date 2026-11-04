@@ -2956,7 +2956,11 @@ const MEDIA_EXTS: [&str; 20] = [
 ];
 
 fn url_path_lower(url: &str) -> String {
-    let after = url.split("://").nth(1).unwrap_or(url);
+    // Windows file paths reach here as article "URLs" for local
+    // enclosures; their backslash separators must split like '/'
+    // or the path reads as empty and media detection fails.
+    let url = url.replace('\\', "/");
+    let after = url.split("://").nth(1).unwrap_or(&url);
     let path = after
         .split(['?', '#'])
         .next()
@@ -4514,6 +4518,23 @@ pub fn meta_content(html: &str, name: &str) -> Option<String> {
 #[cfg(test)]
 mod parity_recovery_tests {
     use super::*;
+
+    #[test]
+    fn media_url_detection_accepts_windows_file_paths() {
+        // Regression (Wave 3 batch 1 Windows CI failure): a local
+        // enclosure path with backslash separators produced an
+        // empty path here, so looks_like_id3_media_url was false
+        // and render_rich_article never read the ID3 notes.
+        let win = r"C:\Users\brandon\AppData\Local\Temp\episode.MP3";
+        assert!(looks_like_id3_media_url(win));
+        assert!(looks_like_media_url(win));
+        assert!(looks_like_id3_media_url("/tmp/episode.mp3"));
+        assert!(looks_like_id3_media_url(
+            "https://example.test/a/episode.mp3"
+        ));
+        assert!(!looks_like_id3_media_url(r"C:\podcasts\episode.m4a"));
+        assert!(!looks_like_media_url("https://example.test/story"));
+    }
 
     #[test]
     fn empty_extractions_expire_and_include_encoding_in_the_key() {

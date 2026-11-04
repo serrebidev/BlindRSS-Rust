@@ -3573,3 +3573,15 @@ clean, clippy `--workspace --all-targets -D warnings` clean,
 clippy for `blindrss-core` on `x86_64-pc-windows-gnu` clean,
 `cargo test --workspace` 646 passed / 0 failed, `cargo build
 -p blindrss` OK. Ships with the Wave 3 release.
+
+**Batch 1 Windows CI fix (2026-11-04):** The batch's first CI
+run failed only on Windows, in Task 13's
+`rich_header_id3_metadata_overrides_stale_fallback`: a local
+MP3 path with backslash separators produced an empty path in
+`extract::url_path_lower` (it split on '/' only), so
+`looks_like_id3_media_url` was false and the ID3 branch of
+`render_rich_article` never ran — a real Windows defect for
+local enclosures, not just a test artifact. `url_path_lower`
+now normalizes '\\' to '/' before splitting; regression test
+`media_url_detection_accepts_windows_file_paths` pins Windows
+and POSIX path shapes on every platform.
