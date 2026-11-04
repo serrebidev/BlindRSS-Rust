@@ -4223,3 +4223,8 @@ SAVEPOINT) — pre-existing Rust behavior, unchanged here.
 Owner screen-reader acceptance (chapter flows, speed/volume
 controls, live status feel, row annotation wording under
 NVDA) remains Brandon's — unclaimed here.
+
+**Task 20 integration gate (2026-11-04):** cherry-picked onto
+main over fa81968 with no conflicts. Merged gate: fmt clean,
+clippy clean (workspace and core windows-gnu), 722 passed /
+0 failed, build OK.
