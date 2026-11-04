@@ -2614,3 +2614,112 @@ the hand-rolled update functions. Task 6's follow-up (owner decision
 2026-11-03) switched release packaging to the fixed ship-shape asset
 names, so this is the first release whose assets the ship-shape
 updater can find.
+
+### Audit 8 Task 8 resolution — unified worker-side refresh and source dispatch (D16, D22, F01)
+
+Reproduction first (recorded before the fix): the regression suite
+`crates/core/tests/audit8_task8_slice.rs` was written against APIs
+that did not exist (`feeds::feed_body_digest`,
+`feeds::fetch_feed_document`, `refresh::refresh_feed_with_options`,
+`refresh::subscribe_url`, `discovery::source_listing_url`) and
+failed to compile with 7 unresolved-import errors. Behind those
+missing APIs, the wired behaviour was: the app's refresh workers
+fetched raw documents with `feeds::fetch_with_cache`, and the GUI
+drain then ran `store_parsed_with_retention` on the 150 ms timer
+thread with the UI connection — including the NPR/Sky media
+attachment inside the store, which performs network fetches
+(D22). Every refresh reparsed and re-stored the whole feed:
+`fetch_with_cache` reparsed the cached body on a 304 and stored
+identical 200 bodies again (D16). Subscription callers bypassed
+the listing sources entirely: `resolve_subscribe_url` assumed a
+native feed document, and even the social transforms that return
+a listing page itself (YouTube search, Rumble/Odysee channels)
+were fed to `fetch_and_parse`, which fails on those pages (F01).
+
+D16 — unchanged-body fast path, ported from Python
+`providers/local.py` (v2.5.5+): `feeds::feed_body_digest` is the
+SHA-1 hex of the body with each `<media:statistics…>` /
+`<media:starRating…>` opening tag stripped, byte-for-byte
+Python's `_feed_body_digest` rule. `feeds::fetch_feed_document`
+returns `FeedFetch::NotModified` for a 304 whose cached-body
+digest matches the digest recorded for the feed, and for a 200
+whose body digest matches; the recorded digest
+(`_stored_feed_body_digests` equivalent, keyed by feed id,
+in-memory like Python's provider-instance map) is written by
+`refresh_feed_with_options` only AFTER `store_parsed_with_retention`
+commits, so a failed store is retried by the next refresh even
+when the publisher then answers 304. Forced refreshes never take
+the fast path. Validators from an unchanged 200 are still
+persisted (Python persists the new ETag/Last-Modified so the
+next refresh earns a real 304), and the fetch path now parses
+before caching, so a body that fails to parse no longer advances
+the validators. Where Python's `_store_youtube_items` pops the
+digest (listing dates are day-only; the next RSS body must store
+again to restore exact times), the port pops it too: the YouTube
+search listing branch, the channel RSS-failure fallback, and the
+history backfill. The history backfill now also stores through
+the caller's retention boundary, as Python computes one cutoff
+per `_refresh_single_feed` for all its insert paths.
+
+D22 — one worker-side refresh: `refresh::refresh_feed_with_options`
+runs source dispatch, the document fetch, the store and the
+NPR/Sky attachment on the caller's thread through the caller's
+own `Db` connection, and returns a `WorkerRefresh` carrying only
+the committed `StoreOutcome` plus the not-modified flag. The
+app's `spawn_refresh` workers call it directly (with the run's
+delete behavior and retention cutoff, the existing pool/host-gate/
+retry shape unchanged), record or clear the feed error on the
+worker connection, and a cancelled refresh records and reports
+nothing (the AllDone path announces the stop, as before).
+`RefreshMsg::FeedDone` now carries the `StoreOutcome`; the drain
+keeps only counting and notification bookkeeping — the
+GUI-thread store call is gone. Cancellation is checked before
+the fetch and again before the store (`REFRESH_CANCELLED`);
+Python checks inside its per-entry loop, the port's store is a
+single call, so a cancel landing mid-store takes effect at the
+next feed — the same granularity the app already had between
+feeds. All subscribe entry points share
+`refresh::subscribe_url` on their worker threads (Add Feed,
+Feed Search, Video Search subscribe, the archive manager's Find
+flow, and `LocalProvider::add_feed`).
+
+F01 — shared source dispatch: `discovery::source_listing_url`
+returns the normalized subscription URL for the Rumble, Odysee,
+YouTube search, SoundCloud and Mixcloud listing sources (Python
+`_resolve_feed_url` normalization), and `resolve_subscribe_url`
+routes those URLs — including the social transforms that return
+a listing page — through `sources::fetch_listing` instead of
+assuming feed XML. A YouTube search subscription resolves with
+Python's `YouTube: {query}` title and no fetch at all; its
+articles are enumerated by the unified refresh, whose listing
+ids are shaped with the real feed id (which is why
+`subscribe_url` creates the row first and then refreshes, with
+Python's add-flow tolerance: a failed first enumeration leaves
+the subscription standing). `discover_feed_urls` returns the
+normalized listing URL as the candidate for a source page.
+Google Groups / Groups.io dispatch is untouched: those kinds are
+explicitly excluded from the new listing path because
+`forum_sources` owns them and that dispatch already works.
+
+Evidence: `crates/core/tests/audit8_task8_slice.rs` (11 tests) —
+digest counter-invariance; unchanged-200 skip with validator
+persistence proven by a third request carrying the new ETag into
+a 304; forced refresh bypassing the fast path; a store forced to
+fail by an aborting trigger, then retried successfully when the
+publisher answers 304; cancellation before the fetch (no request
+made) and during the fetch (nothing stored); committed rows
+visible to a second connection before the refresh returns; a
+loopback NPR story page delayed 1.2 s whose audio is attached by
+the time the worker refresh returns (Sky's attach shares the
+same store-time call site; its host rules keep it off loopback);
+listing-URL normalization; YouTube search resolution without a
+feed document; worker-side subscribe for a plain feed and for a
+YouTube search row. The pre-existing `refresh_slice.rs`,
+`feed_cache_parity.rs`, `source_feeds_parity.rs` and
+`source_depth_parity.rs` suites pass unchanged. Gate results are
+recorded in the batch commit message. Remaining owner
+acceptance: NVDA responsiveness during a Refresh All that
+includes slow media feeds (the plan's manual check) — the
+loopback test proves the work executes inside the worker call;
+the screen-reader verdict stays Brandon's, as with all refresh
+work.

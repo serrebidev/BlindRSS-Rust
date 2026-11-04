@@ -18,7 +18,7 @@ mod settings;
 mod startup;
 mod update;
 
-use blindrss_core::{Article, Db, Feed, ParsedFeed, store_parsed_with_retention};
+use blindrss_core::{Article, Db, Feed};
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -138,6 +138,21 @@ fn restored_view_state(raw: &str) -> (Option<String>, u8) {
 /// core's Python-compatible encoder.
 fn remembered_view_value(selected: Option<&str>, read_filter: u8) -> String {
     blindrss_core::config::encode_remembered_view(selected, read_filter)
+}
+
+/// Subscribe worker body (Audit 8 F01/D22): resolve, insert and
+/// store a new feed on the calling (worker) thread, through its
+/// own DB connection. Returns the created feed row.
+fn subscribe_on_worker(url: &str, category: Option<&str>) -> Result<Feed, String> {
+    let db = Db::open(&db_path()).map_err(|e| format!("Database: {e}"))?;
+    let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+    blindrss_core::refresh::subscribe_url(
+        &db,
+        url,
+        category,
+        cfg.get_str("delete_behavior", "deleted"),
+        article_retention_cutoff().as_deref(),
+    )
 }
 
 /// The retention boundary ingestion must not insert past (Python
@@ -1349,10 +1364,13 @@ type MediaResolution = (
 );
 
 enum RefreshMsg {
-    FeedDone(PathBuf, Feed, Result<ParsedFeed, String>),
+    /// One feed's worker refresh finished: the committed store
+    /// outcome (Audit 8 D22 — the drain never stores).
+    FeedDone(PathBuf, Feed, Result<blindrss_core::StoreOutcome, String>),
     AllDone(PathBuf),
-    /// Result of adding a feed by URL: (url, fetch result).
-    Added(String, Result<(String, ParsedFeed), String>, Option<String>),
+    /// Result of adding a feed by URL: the created feed row (the
+    /// worker resolved, inserted and stored — Audit 8 F01/D22).
+    Added(String, Result<Feed, String>, Option<String>),
     /// Result of a hosted-provider sync: (provider name, (feeds, new)).
     ProviderDone(String, Result<(usize, usize), String>),
     /// Fetched article page HTML for full-text extraction.
@@ -3186,6 +3204,15 @@ fn main() {
             let workers = cfg.get_i64("max_concurrent_refreshes", 16).clamp(1, 64) as usize;
             let per_host = cfg.get_i64("per_host_max_connections", 4).clamp(1, 64) as usize;
             let attempts = cfg.get_i64("feed_retry_attempts", 1).clamp(1, 10) as u32;
+            // Store knobs for the worker refresh: the global delete
+            // behavior and the shared retention boundary (Python
+            // computes both once per refresh run).
+            let global_behavior = cfg.get_str("delete_behavior", "deleted").to_string();
+            let retention_cutoff = blindrss_core::retention::retention_cutoff_date(
+                blindrss_core::retention::retention_days(
+                    cfg.get_str("article_retention", "unlimited"),
+                ),
+            );
             let total = feeds.len();
             let path = db_path();
             if total == 0 {
@@ -3209,6 +3236,8 @@ fn main() {
                 let stopped = stopped.clone();
                 let workers_left = workers_left.clone();
                 let path = path.clone();
+                let global_behavior = global_behavior.clone();
+                let retention_cutoff = retention_cutoff.clone();
                 std::thread::spawn(move || {
                     let database = Db::open(&path);
                     loop {
@@ -3232,20 +3261,48 @@ fn main() {
                             })
                             .clone();
                         gate.acquire();
-                        let fetch = || match &database {
-                            Ok(db) => {
-                                blindrss_core::feeds::fetch_with_cache(db, &feed.url, force_full)
-                            }
+                        // Unified worker refresh (Audit 8 D16/D22/F01):
+                        // source dispatch, fetch, store and media
+                        // attachment all run here, on this worker's
+                        // own DB connection; only the committed
+                        // outcome is sent to the drain.
+                        let work = || match &database {
+                            Ok(db) => blindrss_core::refresh::refresh_feed_with_options(
+                                db,
+                                &feed,
+                                &global_behavior,
+                                retention_cutoff.as_deref(),
+                                force_full,
+                                &cancel,
+                            )
+                            .map(|w| w.outcome),
                             Err(error) => Err(format!("Database: {error}")),
                         };
-                        let mut result = fetch();
+                        let mut result = work();
                         for _ in 1..attempts {
-                            if result.is_ok() {
+                            if result.is_ok() || cancel.load(std::sync::atomic::Ordering::Relaxed) {
                                 break;
                             }
-                            result = fetch();
+                            result = work();
                         }
                         gate.release();
+                        if cancel.load(std::sync::atomic::Ordering::Relaxed) && result.is_err() {
+                            // A stop, not a failure: record nothing
+                            // and report nothing (AllDone announces
+                            // the stop, as before).
+                            stopped.store(true, std::sync::atomic::Ordering::Relaxed);
+                            break;
+                        }
+                        if let Ok(db) = &database {
+                            match &result {
+                                Ok(_) => {
+                                    let _ = db.clear_feed_error(&feed.id);
+                                }
+                                Err(e) => {
+                                    let _ = db.record_feed_error(&feed.id, e);
+                                }
+                            }
+                        }
                         let _ = tx.send(RefreshMsg::FeedDone(path.clone(), feed, result));
                     }
                     if workers_left.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 1 {
@@ -5226,8 +5283,8 @@ fn main() {
                         frame_vs.set_status_text(&format!("Adding {url}..."), 0);
                         let tx = tx_vs.clone();
                         std::thread::spawn(move || {
-                            let resolved = blindrss_core::discovery::resolve_subscribe_url(&url);
-                            let _ = tx.send(RefreshMsg::Added(url, resolved, None));
+                            let result = subscribe_on_worker(&url, None);
+                            let _ = tx.send(RefreshMsg::Added(url, result, None));
                         });
                     }
                     _ => {}
@@ -5465,7 +5522,7 @@ fn main() {
             frame_fs.set_status_text(&format!("Adding {url}..."), 0);
             let tx = tx_fs.clone();
             std::thread::spawn(move || {
-                let result = blindrss_core::discovery::resolve_subscribe_url(&url);
+                let result = subscribe_on_worker(&url, None);
                 let _ = tx.send(RefreshMsg::Added(url, result, None));
             });
         });
@@ -6157,9 +6214,12 @@ fn main() {
                 return;
             };
             std::thread::spawn(move || {
-                // Discovery chain: social transforms, direct feed,
-                // then HTML alternate links.
-                let result = blindrss_core::discovery::resolve_subscribe_url(&url);
+                // One worker subscribe path: discovery chain
+                // (social transforms, listing sources, direct
+                // feed, HTML alternates), row insert and the
+                // first store all happen on this thread.
+                let category = Some(picked_category.as_str()).filter(|c| !c.trim().is_empty());
+                let result = subscribe_on_worker(&url, category);
                 let _ = tx.send(RefreshMsg::Added(url, result, Some(picked_category)));
             });
         });
@@ -8484,45 +8544,24 @@ fn main() {
             loop {
                 let msg = rx_tick.borrow().try_recv();
                 match msg {
-                    Ok(RefreshMsg::FeedDone(path, feed, Ok(parsed))) => {
+                    Ok(RefreshMsg::FeedDone(path, feed, Ok(outcome))) => {
                         let mut st = state_tick.borrow_mut();
                         if path != st.store_path {
                             continue;
                         }
-                        let mut stored_new = 0usize;
-                        if let Some(db) = st.db.as_ref() {
-                            // The count that reaches the status
-                            // line and notifications is Python's
-                            // new_items: rule-removed and
-                            // notification-suppressed articles do
-                            // not count (Audit 8 D13). The store
-                            // also enforces the retention boundary
-                            // (Audit 8 D04).
-                            let global_behavior =
-                                blindrss_core::config::Config::load(&config_path())
-                                    .map(|c| c.get_str("delete_behavior", "deleted").to_string())
-                                    .unwrap_or_else(|_| "deleted".to_string());
-                            match store_parsed_with_retention(
-                                db,
-                                &feed,
-                                &parsed,
-                                &global_behavior,
-                                article_retention_cutoff().as_deref(),
-                            ) {
-                                Ok(outcome) => {
-                                    new_total += outcome.notify_count;
-                                    stored_new = outcome.notify_count;
-                                    let _ = db.clear_feed_error(&feed.id);
-                                }
-                                Err(e) => frame_tick.set_status_text(
-                                    &format!("{}: store failed: {e}", feed.title),
-                                    0,
-                                ),
-                            }
-                        }
-                        if stored_new > 0 {
-                            st.refresh_new
-                                .push((feed.id.clone(), feed.title.clone(), stored_new));
+                        // The worker already stored through its
+                        // own connection (Audit 8 D22); the count
+                        // that reaches the status line and
+                        // notifications is Python's new_items:
+                        // rule-removed and notification-suppressed
+                        // articles do not count (Audit 8 D13).
+                        new_total += outcome.notify_count;
+                        if outcome.notify_count > 0 {
+                            st.refresh_new.push((
+                                feed.id.clone(),
+                                feed.title.clone(),
+                                outcome.notify_count,
+                            ));
                         }
                     }
                     Ok(RefreshMsg::FeedDone(path, feed, Err(e))) => {
@@ -8531,48 +8570,18 @@ fn main() {
                             continue;
                         }
                         st.refresh_failed = true;
-                        if let Some(db) = st.db.as_ref() {
-                            let _ = db.record_feed_error(&feed.id, &e);
-                        }
                         frame_tick.set_status_text(&format!("{}: {e}", feed.title), 0);
                     }
-                    Ok(RefreshMsg::Added(_url, Ok((feed_url, parsed)), add_category)) => {
+                    Ok(RefreshMsg::Added(_url, Ok(feed), _add_category)) => {
+                        // The subscribe worker resolved, inserted
+                        // and stored the feed (Audit 8 F01/D22);
+                        // the drain only takes the new row in.
                         let mut st = state_tick.borrow_mut();
-                        if let Some(db) = st.db.as_ref() {
-                            let title = if parsed.title.trim().is_empty() {
-                                feed_url.clone()
-                            } else {
-                                parsed.title.clone()
-                            };
-                            match db.add_feed(
-                                &feed_url,
-                                &title,
-                                add_category.as_deref().filter(|c| !c.trim().is_empty()),
-                            ) {
-                                Ok(feed) => {
-                                    let global_behavior =
-                                        blindrss_core::config::Config::load(&config_path())
-                                            .map(|c| {
-                                                c.get_str("delete_behavior", "deleted").to_string()
-                                            })
-                                            .unwrap_or_else(|_| "deleted".to_string());
-                                    let _ = store_parsed_with_retention(
-                                        db,
-                                        &feed,
-                                        &parsed,
-                                        &global_behavior,
-                                        article_retention_cutoff().as_deref(),
-                                    );
-                                    st.feeds.push(feed);
-                                    rebuild_tree(&mut st, &tree);
-                                    refill_articles(&mut st, &list);
-                                    frame_tick.set_status_text(&format!("Added {title}"), 0);
-                                }
-                                Err(e) => {
-                                    frame_tick.set_status_text(&format!("Add failed: {e}"), 0)
-                                }
-                            }
-                        }
+                        let title = feed.title.clone();
+                        st.feeds.push(feed);
+                        rebuild_tree(&mut st, &tree);
+                        refill_articles(&mut st, &list);
+                        frame_tick.set_status_text(&format!("Added {title}"), 0);
                     }
                     Ok(RefreshMsg::Added(url, Err(e), _)) => {
                         frame_tick.set_status_text(&format!("Could not add {url}: {e}"), 0);

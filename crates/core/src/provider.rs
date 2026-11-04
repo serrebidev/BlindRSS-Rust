@@ -122,15 +122,11 @@ impl Provider for LocalProvider {
             .map_err(|e| format!("{e}"))
     }
     fn add_feed(&self, url: &str) -> Result<String, String> {
-        // Local subscribe resolves + stores like Add Feed does;
-        // the app keeps its richer async flow for "local" and
-        // uses this for hosted backends. Still functional:
-        let (feed_url, parsed) = crate::discovery::resolve_subscribe_url(url)?;
+        // Local subscribe goes through the one shared worker
+        // subscribe path (resolve + row + first store, with
+        // listing-source dispatch) — the same path Add Feed uses.
         let db = self.db()?;
-        let feed = db
-            .add_feed(&feed_url, &parsed.title, None)
-            .map_err(|e| format!("{e}"))?;
-        crate::refresh::store_parsed(&db, &feed, &parsed, &self.delete_behavior)?;
+        let feed = crate::refresh::subscribe_url(&db, url, None, &self.delete_behavior, None)?;
         Ok(format!("Added {}", feed.title))
     }
     fn remove_feed(&self, feed: &Feed) -> Result<(), String> {

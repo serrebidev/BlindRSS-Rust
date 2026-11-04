@@ -2175,20 +2175,22 @@ pub fn show_podcast_archive(frame: &Frame, db: &Db) -> Option<blindrss_core::Fee
                     provider.add_feed(&url).map(|_| None)
                 } else {
                     (|| -> Result<Option<String>, String> {
-                        let (feed_url, parsed) =
+                        let (feed_url, _parsed) =
                             blindrss_core::discovery::resolve_subscribe_url(&url)?;
                         let db = Db::open(&db_path).map_err(|e| e.to_string())?;
                         if db.feed_url_exists(&feed_url).unwrap_or(false) {
                             return Ok(None);
                         }
-                        let feed = db
-                            .add_feed(&feed_url, &parsed.title, None)
-                            .map_err(|e| e.to_string())?;
-                        blindrss_core::refresh::store_parsed(
+                        // The shared worker subscribe path (Audit 8
+                        // F01/D22): row + first store through this
+                        // thread's own connection, listing sources
+                        // through the unified refresh.
+                        let feed = blindrss_core::refresh::subscribe_url(
                             &db,
-                            &feed,
-                            &parsed,
+                            &url,
+                            None,
                             cfg.get_str("delete_behavior", "deleted"),
+                            crate::article_retention_cutoff().as_deref(),
                         )?;
                         Ok(Some(feed.id))
                     })()

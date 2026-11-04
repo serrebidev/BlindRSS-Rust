@@ -30,15 +30,16 @@ fn request(agent: ureq::Agent, url: &str) -> ureq::RequestBuilder<ureq::typestat
     request
 }
 
-/// Conditional refresh keeps the validated response body, so a failed later
-/// store can retry safely even if the publisher next returns 304.
-pub fn fetch_with_cache(db: &crate::Db, url: &str, force_full: bool) -> Result<ParsedFeed, String> {
-    if let Some(result) = crate::forum_sources::fetch_feed(url) {
-        return result;
-    }
-    let cached = db
-        .cached_feed(url)
-        .map_err(|e| format!("feed cache: {e}"))?;
+type CachedFeed = (Option<String>, Option<String>, Vec<u8>);
+
+/// One conditional request for a feed document: validators from
+/// the cached copy unless `force_full`, with the Python issue #42
+/// SSL fallback on certificate errors.
+fn fetch_response(
+    url: &str,
+    force_full: bool,
+    cached: &Option<CachedFeed>,
+) -> Result<ureq::http::Response<ureq::Body>, String> {
     let fetch = |agent| {
         let mut request = request(agent, url);
         if !force_full && let Some((etag, modified, _)) = &cached {
@@ -51,37 +52,176 @@ pub fn fetch_with_cache(db: &crate::Db, url: &str, force_full: bool) -> Result<P
         }
         request.call().map_err(|e| format!("fetch failed: {e}"))
     };
-    let mut response = match fetch(crate::http::agent()) {
+    match fetch(crate::http::agent()) {
         Err(error)
             if crate::http::ssl_fallback_allowed()
                 && crate::http::looks_like_ssl_cert_error(&error) =>
         {
-            fetch(crate::http::insecure_agent())?
+            fetch(crate::http::insecure_agent())
         }
-        result => result?,
+        result => result,
+    }
+}
+
+fn response_validators(
+    response: &ureq::http::Response<ureq::Body>,
+) -> (Option<String>, Option<String>) {
+    let header = |name: &str| {
+        response
+            .headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
     };
+    (header("etag"), header("last-modified"))
+}
+
+fn read_body(response: &mut ureq::http::Response<ureq::Body>) -> Result<Vec<u8>, String> {
+    response
+        .body_mut()
+        .with_config()
+        .limit(10 * 1024 * 1024)
+        .read_to_vec()
+        .map_err(|e| format!("read failed: {e}"))
+}
+
+/// Digest of a feed body that ignores view/rating counters
+/// (Python `_feed_body_digest`): YouTube's feeds/videos.xml sends
+/// no ETag/Last-Modified and its only moving parts between fetches
+/// are the `<media:statistics>` / `<media:starRating>` tags, which
+/// BlindRSS never stores. SHA-1 hex, byte-identical rule: strip
+/// each volatile opening tag through its closing `>`.
+pub fn feed_body_digest(bytes: &[u8]) -> String {
+    use sha1::Digest;
+    let mut stripped = Vec::with_capacity(bytes.len());
+    let mut rest = bytes;
+    loop {
+        let tag_at = ["<media:statistics", "<media:starRating"]
+            .iter()
+            .filter_map(|tag| {
+                let at = find_subslice(rest, tag.as_bytes())?;
+                // Python's `\b`: the tag name must not continue.
+                match rest.get(at + tag.len()) {
+                    Some(b) if b.is_ascii_alphanumeric() || *b == b'_' || *b == b'-' => None,
+                    _ => Some(at),
+                }
+            })
+            .min();
+        let Some(at) = tag_at else {
+            stripped.extend_from_slice(rest);
+            break;
+        };
+        stripped.extend_from_slice(&rest[..at]);
+        let after = &rest[at..];
+        match after.iter().position(|b| *b == b'>') {
+            Some(end) => rest = &after[end + 1..],
+            None => break,
+        }
+    }
+    let mut hasher = sha1::Sha1::new();
+    hasher.update(&stripped);
+    format!("{:x}", hasher.finalize())
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+/// The outcome of one worker-side feed-document fetch (Audit 8
+/// D16, Python's v2.5.5+ unchanged-body fast path).
+#[derive(Debug, Clone, PartialEq)]
+pub enum FeedFetch {
+    /// The publisher's body is unchanged since a store of it
+    /// already committed (a 304, or a 200 whose digest matches the
+    /// recorded stored digest): nothing to parse or store.
+    NotModified,
+    /// A body that must be stored. `body_digest` identifies it:
+    /// the caller records the digest only after the store commits,
+    /// so a failed store is retried by the next refresh even when
+    /// the publisher then answers 304.
+    Fetched {
+        parsed: ParsedFeed,
+        body_digest: String,
+    },
+}
+
+/// Fetch one feed document for the worker refresh path.
+/// `stored_digest` is the digest of the last body whose store
+/// committed for this feed (see `FeedFetch::Fetched`). Forced
+/// fetches never take the fast path. Validators from an unchanged
+/// 200 are still persisted, so the next refresh can earn a real
+/// 304 (Python does the same).
+pub fn fetch_feed_document(
+    db: &crate::Db,
+    url: &str,
+    force_full: bool,
+    stored_digest: Option<&str>,
+) -> Result<FeedFetch, String> {
+    if let Some(result) = crate::forum_sources::fetch_feed(url) {
+        // Forum documents have no HTTP body to digest; they never
+        // take the fast path (empty digest = never recorded).
+        return Ok(FeedFetch::Fetched {
+            parsed: result?,
+            body_digest: String::new(),
+        });
+    }
+    let cached = db
+        .cached_feed(url)
+        .map_err(|e| format!("feed cache: {e}"))?;
+    let mut response = fetch_response(url, force_full, &cached)?;
+    if response.status().as_u16() == 304 {
+        let (_, _, body) =
+            cached.ok_or_else(|| "Feed returned 304 without cached content".to_string())?;
+        let digest = feed_body_digest(&body);
+        if !force_full && stored_digest == Some(digest.as_str()) {
+            return Ok(FeedFetch::NotModified);
+        }
+        return Ok(FeedFetch::Fetched {
+            parsed: parse_feed(&body)?,
+            body_digest: digest,
+        });
+    }
+    let (etag, modified) = response_validators(&response);
+    let body = read_body(&mut response)?;
+    let digest = feed_body_digest(&body);
+    if !force_full && stored_digest == Some(digest.as_str()) {
+        db.cache_feed(url, etag.as_deref(), modified.as_deref(), &body)
+            .map_err(|e| format!("feed cache: {e}"))?;
+        return Ok(FeedFetch::NotModified);
+    }
+    // Parse before caching: a body that fails to parse must not
+    // advance the validators, or the next conditional request
+    // would 304 against content that was never stored (Python
+    // persists validators only inside its store/unchanged paths).
+    let parsed = parse_feed(&body)?;
+    db.cache_feed(url, etag.as_deref(), modified.as_deref(), &body)
+        .map_err(|e| format!("feed cache: {e}"))?;
+    Ok(FeedFetch::Fetched {
+        parsed,
+        body_digest: digest,
+    })
+}
+
+/// Conditional refresh keeps the validated response body, so a failed later
+/// store can retry safely even if the publisher next returns 304.
+pub fn fetch_with_cache(db: &crate::Db, url: &str, force_full: bool) -> Result<ParsedFeed, String> {
+    if let Some(result) = crate::forum_sources::fetch_feed(url) {
+        return result;
+    }
+    let cached = db
+        .cached_feed(url)
+        .map_err(|e| format!("feed cache: {e}"))?;
+    let mut response = fetch_response(url, force_full, &cached)?;
     if response.status().as_u16() == 304 {
         return cached
             .map(|(_, _, body)| body)
             .ok_or_else(|| "Feed returned 304 without cached content".into())
             .and_then(|body| parse_feed(&body));
     }
-    let etag = response
-        .headers()
-        .get("etag")
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string);
-    let modified = response
-        .headers()
-        .get("last-modified")
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string);
-    let body = response
-        .body_mut()
-        .with_config()
-        .limit(10 * 1024 * 1024)
-        .read_to_vec()
-        .map_err(|e| format!("read failed: {e}"))?;
+    let (etag, modified) = response_validators(&response);
+    let body = read_body(&mut response)?;
     let feed = parse_feed(&body)?;
     db.cache_feed(url, etag.as_deref(), modified.as_deref(), &body)
         .map_err(|e| format!("feed cache: {e}"))?;

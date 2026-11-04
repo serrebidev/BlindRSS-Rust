@@ -347,12 +347,64 @@ fn probe_common_feeds(page_url: &str) -> Vec<(String, crate::feeds::ParsedFeed)>
         .collect()
 }
 
+/// The subscription URL for a listing-source page (Rumble/Odysee
+/// channel, YouTube search, SoundCloud/Mixcloud user or playlist):
+/// the URL the subscription stores, normalized the way Python's
+/// `_resolve_feed_url` normalizes it. `None` for ordinary feed
+/// URLs and for the forum sources — Google Groups and Groups.io
+/// search keep their independent, working forum dispatch
+/// (Audit 8 F01).
+pub fn source_listing_url(url: &str) -> Option<String> {
+    let kind = crate::sources::classify(url)?;
+    match kind {
+        crate::sources::SourceKind::GoogleGroup | crate::sources::SourceKind::GroupsIoSearch => {
+            None
+        }
+        crate::sources::SourceKind::Odysee => Some(crate::sources::normalize_odysee_url(url)),
+        crate::sources::SourceKind::Rumble => Some(crate::sources::normalize_rumble_feed_url(url)),
+        _ => Some(url.trim().to_string()),
+    }
+}
+
+/// Resolve a listing-source page to its subscription document.
+/// Python's `add_feed` derives a YouTube search subscription's
+/// title from the query (`YouTube: {query}`) and fetches nothing —
+/// refresh enumerates the items later, under ids shaped with the
+/// real feed id — so that branch returns an empty entry list.
+/// The other listing sources return their current items.
+fn resolve_source_listing(listing_url: &str) -> Result<(String, crate::feeds::ParsedFeed), String> {
+    let kind =
+        crate::sources::classify(listing_url).ok_or_else(|| "not a listing source".to_string())?;
+    if kind == crate::sources::SourceKind::YoutubeSearch {
+        let query = crate::sources::youtube_search_query(listing_url)
+            .ok_or_else(|| "not a YouTube search URL".to_string())?;
+        return Ok((
+            listing_url.to_string(),
+            crate::feeds::ParsedFeed {
+                title: format!("YouTube: {query}"),
+                entries: Vec::new(),
+            },
+        ));
+    }
+    let (title, items) = crate::sources::fetch_listing(listing_url, kind, "", 0)?;
+    Ok((
+        listing_url.to_string(),
+        crate::feeds::ParsedFeed {
+            title,
+            entries: crate::sources::items_to_entries(items),
+        },
+    ))
+}
+
 /// Find all advertised feeds, falling back to common paths when necessary.
 pub fn discover_feed_urls(url: &str) -> Result<Vec<String>, String> {
     if let Some(feed_url) =
         crate::forum_sources::subscription_url(url).or_else(|| social_feed_url(url))
     {
         return Ok(vec![feed_url]);
+    }
+    if let Some(listing_url) = source_listing_url(url) {
+        return Ok(vec![listing_url]);
     }
     if crate::feeds::fetch_and_parse(url).is_ok() {
         return Ok(vec![url.trim().to_string()]);
@@ -378,8 +430,20 @@ pub fn resolve_subscribe_url(url: &str) -> Result<(String, crate::feeds::ParsedF
         return Ok((feed_url, parsed));
     }
     if let Some(feed_url) = social_feed_url(url) {
+        // Some social transforms return a listing-source page
+        // itself (YouTube search, Rumble/Odysee channels): it has
+        // no native feed document, so resolve it as a listing.
+        if let Some(listing_url) = source_listing_url(&feed_url) {
+            return resolve_source_listing(&listing_url);
+        }
         let parsed = crate::feeds::fetch_and_parse(&feed_url)?;
         return Ok((feed_url, parsed));
+    }
+    // Listing sources have no native feed document at the page
+    // URL; resolve them through their source fetcher instead of
+    // assuming feed XML (Audit 8 F01).
+    if let Some(listing_url) = source_listing_url(url) {
+        return resolve_source_listing(&listing_url);
     }
     if let Ok(parsed) = crate::feeds::fetch_and_parse(url) {
         return Ok((url.trim().to_string(), parsed));

@@ -49,9 +49,12 @@ pub struct StoreOutcome {
     pub new_articles: Vec<Article>,
 }
 
-/// Store an already-parsed feed. Split from fetching so a UI can
-/// fetch on a worker thread and store on its main thread, where
-/// the database connection lives. `global_delete_behavior` is
+/// Store an already-parsed feed. Split from fetching so worker
+/// paths that already hold a document (subscription resolution,
+/// dialogs) can store through their own connection; the refresh
+/// path itself fetches and stores in one worker call
+/// (`refresh_feed_with_options`) — storage never runs on a UI
+/// thread (Audit 8 D22). `global_delete_behavior` is
 /// the global `delete_behavior` config value; a feed's own
 /// `feeds.delete_behavior` override wins over it when a filter
 /// rule deletes (Audit 8 D12).
@@ -224,10 +227,82 @@ fn apply_filter_pipeline(db: &Db, eff: &crate::rules::ResolvedActions, article: 
     false
 }
 
-/// Refresh one feed; returns how many new articles are
-/// notification-eligible (Python's per-feed `new_items`: stored
-/// and neither rule-removed nor notification-suppressed).
-pub fn refresh_feed(db: &Db, feed: &Feed, global_delete_behavior: &str) -> Result<usize, String> {
+/// Error returned when a refresh is cancelled before its store
+/// (Python `_refresh_single_feed` returns silently on cancel; the
+/// app treats this exact message as a user stop, not a failure).
+pub const REFRESH_CANCELLED: &str = "refresh cancelled";
+
+/// What one worker-side refresh did. The store — including the
+/// NPR/Sky media attachment, which is network work — has fully
+/// committed through the worker's own DB connection before this is
+/// returned; only committed deltas travel back to the caller
+/// (Audit 8 D22).
+#[derive(Debug, Clone, Default)]
+pub struct WorkerRefresh {
+    pub outcome: StoreOutcome,
+    /// The publisher's body was unchanged since the last
+    /// committed store: nothing was parsed or stored (D16).
+    pub not_modified: bool,
+}
+
+// Digests of the last feed bodies whose stores committed, keyed
+// by feed id (Python's `_stored_feed_body_digests` on the local
+// provider). In-memory on purpose: Python's map lives on the
+// provider instance, so a restart re-stores each feed once.
+static STORED_BODY_DIGESTS: std::sync::Mutex<Option<std::collections::HashMap<String, String>>> =
+    std::sync::Mutex::new(None);
+
+fn stored_body_digest(feed_id: &str) -> Option<String> {
+    let guard = STORED_BODY_DIGESTS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    guard.as_ref().and_then(|map| map.get(feed_id).cloned())
+}
+
+fn record_body_digest(feed_id: &str, digest: &str) {
+    let mut guard = STORED_BODY_DIGESTS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    guard
+        .get_or_insert_with(std::collections::HashMap::new)
+        .insert(feed_id.to_string(), digest.to_string());
+}
+
+/// Forget a feed's stored-body digest (Python pops it whenever
+/// YouTube listing items are stored: their day-only dates must
+/// not make the next full RSS body look unchanged).
+pub fn forget_body_digest(feed_id: &str) {
+    let mut guard = STORED_BODY_DIGESTS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    if let Some(map) = guard.as_mut() {
+        map.remove(feed_id);
+    }
+}
+
+fn cancelled(cancel: &std::sync::atomic::AtomicBool) -> bool {
+    cancel.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Refresh one feed end to end on the caller's (worker) thread:
+/// dispatch, fetch, store and media attachment all happen here,
+/// through `db` — which must be the worker's own connection.
+/// `force` bypasses the conditional request and the unchanged-
+/// body fast path (Python's single-feed refresh is forced);
+/// `retention_cutoff` is the shared retention boundary (`None` =
+/// unlimited). Cancellation is checked before the fetch and again
+/// before the store, and reported as `REFRESH_CANCELLED`.
+pub fn refresh_feed_with_options(
+    db: &Db,
+    feed: &Feed,
+    global_delete_behavior: &str,
+    retention_cutoff: Option<&str>,
+    force: bool,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<WorkerRefresh, String> {
+    if cancelled(cancel) {
+        return Err(REFRESH_CANCELLED.to_string());
+    }
     // Listing sources (Batch 35): subscriptions with no native RSS
     // are enumerated by their source fetcher, mirroring the branch
     // order of Python `providers/local.py::_refresh_single_feed`.
@@ -256,11 +331,30 @@ pub fn refresh_feed(db: &Db, feed: &Feed, global_delete_behavior: &str) -> Resul
         let feed = feed_owned.as_ref().unwrap_or(feed);
         let existing = db.article_count_for_feed(&feed.id).unwrap_or(0);
         let (title, items) = crate::sources::fetch_listing(&feed.url, kind, &feed.id, existing)?;
+        if cancelled(cancel) {
+            return Err(REFRESH_CANCELLED.to_string());
+        }
         let parsed = crate::feeds::ParsedFeed {
             title,
             entries: crate::sources::items_to_entries(items),
         };
-        return store_parsed(db, feed, &parsed, global_delete_behavior).map(|o| o.notify_count);
+        let outcome = store_parsed_with_retention(
+            db,
+            feed,
+            &parsed,
+            global_delete_behavior,
+            retention_cutoff,
+        )?;
+        if kind == crate::sources::SourceKind::YoutubeSearch {
+            // `_store_youtube_items` pops the stored-body digest:
+            // listing dates are day-only, so the next RSS body of
+            // the channel must be stored again to restore times.
+            forget_body_digest(&feed.id);
+        }
+        return Ok(WorkerRefresh {
+            outcome,
+            not_modified: false,
+        });
     }
     // One-time channel history backfill (issue #109) runs before
     // the fetch, as in Python: the RSS feed carries only the newest
@@ -268,32 +362,137 @@ pub fn refresh_feed(db: &Db, feed: &Feed, global_delete_behavior: &str) -> Resul
     // it under the same stable ids, whatever the RSS fetch then does.
     let channel_id = crate::sources::youtube_channel_id(&feed.url);
     if let Some(cid) = &channel_id {
-        youtube_history_backfill(db, feed, cid, global_delete_behavior);
+        youtube_history_backfill(db, feed, cid, global_delete_behavior, retention_cutoff);
     }
-    let parsed = match crate::feeds::fetch_with_cache(db, &feed.url, false) {
-        Ok(p) => p,
-        Err(e) => {
-            // YouTube channel feeds answer 404/500 at random for
-            // some channels (issue #107): fall back to listing the
-            // uploads playlist through yt-dlp. An empty listing is
-            // not a recovery — Python re-raises the RSS error.
-            if let Some(cid) = &channel_id {
-                let (title, items) =
-                    crate::sources::fetch_youtube_channel_items(cid, 30).map_err(|_| e.clone())?;
-                if items.is_empty() {
-                    return Err(e);
-                }
-                let parsed = crate::feeds::ParsedFeed {
-                    title,
-                    entries: crate::sources::items_to_entries(shape_stable_ids(db, feed, items)),
-                };
-                return store_parsed(db, feed, &parsed, global_delete_behavior)
-                    .map(|o| o.notify_count);
+    let stored = stored_body_digest(&feed.id);
+    let (parsed, body_digest) =
+        match crate::feeds::fetch_feed_document(db, &feed.url, force, stored.as_deref()) {
+            Ok(crate::feeds::FeedFetch::NotModified) => {
+                return Ok(WorkerRefresh {
+                    outcome: StoreOutcome::default(),
+                    not_modified: true,
+                });
             }
-            return Err(e);
-        }
+            Ok(crate::feeds::FeedFetch::Fetched {
+                parsed,
+                body_digest,
+            }) => (parsed, body_digest),
+            Err(e) => {
+                // YouTube channel feeds answer 404/500 at random for
+                // some channels (issue #107): fall back to listing the
+                // uploads playlist through yt-dlp. An empty listing is
+                // not a recovery — Python re-raises the RSS error.
+                if let Some(cid) = &channel_id {
+                    let (title, items) = crate::sources::fetch_youtube_channel_items(cid, 30)
+                        .map_err(|_| e.clone())?;
+                    if items.is_empty() {
+                        return Err(e);
+                    }
+                    if cancelled(cancel) {
+                        return Err(REFRESH_CANCELLED.to_string());
+                    }
+                    let parsed = crate::feeds::ParsedFeed {
+                        title,
+                        entries: crate::sources::items_to_entries(shape_stable_ids(
+                            db, feed, items,
+                        )),
+                    };
+                    let outcome = store_parsed_with_retention(
+                        db,
+                        feed,
+                        &parsed,
+                        global_delete_behavior,
+                        retention_cutoff,
+                    )?;
+                    forget_body_digest(&feed.id);
+                    return Ok(WorkerRefresh {
+                        outcome,
+                        not_modified: false,
+                    });
+                }
+                return Err(e);
+            }
+        };
+    if cancelled(cancel) {
+        return Err(REFRESH_CANCELLED.to_string());
+    }
+    let outcome =
+        store_parsed_with_retention(db, feed, &parsed, global_delete_behavior, retention_cutoff)?;
+    // Record the digest only now: a failed store above must be
+    // retried by the next refresh (D16 failed-store semantics).
+    if !body_digest.is_empty() {
+        record_body_digest(&feed.id, &body_digest);
+    }
+    Ok(WorkerRefresh {
+        outcome,
+        not_modified: false,
+    })
+}
+
+/// Refresh one feed; returns how many new articles are
+/// notification-eligible (Python's per-feed `new_items`: stored
+/// and neither rule-removed nor notification-suppressed).
+pub fn refresh_feed(db: &Db, feed: &Feed, global_delete_behavior: &str) -> Result<usize, String> {
+    refresh_feed_with_options(
+        db,
+        feed,
+        global_delete_behavior,
+        None,
+        false,
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+    .map(|w| w.outcome.notify_count)
+}
+
+/// Subscribe to a feed URL end to end, on the caller's (worker)
+/// thread (Audit 8 F01 + D22): resolution, the feeds-row insert
+/// and the first store all happen here, through the worker's own
+/// connection. Listing sources store their articles through the
+/// unified refresh — listing ids are shaped with the real feed
+/// id, which only exists once the row does — with Python's
+/// add-flow tolerance: a failed first enumeration does not
+/// unsubscribe the feed (the row stands; refresh owns retries).
+pub fn subscribe_url(
+    db: &Db,
+    url: &str,
+    category: Option<&str>,
+    global_delete_behavior: &str,
+    retention_cutoff: Option<&str>,
+) -> Result<Feed, String> {
+    let (feed_url, parsed) = crate::discovery::resolve_subscribe_url(url)?;
+    let title = if parsed.title.trim().is_empty() {
+        feed_url.clone()
+    } else {
+        parsed.title.clone()
     };
-    store_parsed(db, feed, &parsed, global_delete_behavior).map(|o| o.notify_count)
+    let feed = db
+        .add_feed(&feed_url, &title, category)
+        .map_err(|e| format!("{e}"))?;
+    if crate::discovery::source_listing_url(&feed_url).is_some() {
+        if let Err(e) = refresh_feed_with_options(
+            db,
+            &feed,
+            global_delete_behavior,
+            retention_cutoff,
+            true,
+            &std::sync::atomic::AtomicBool::new(false),
+        ) {
+            eprintln!(
+                "blindrss: first refresh of new feed {} failed: {e}",
+                feed.title
+            );
+        }
+    } else {
+        store_parsed_with_retention(db, &feed, &parsed, global_delete_behavior, retention_cutoff)?;
+    }
+    // Re-read the row: the first refresh may have persisted a
+    // normalized listing URL back into it.
+    Ok(db
+        .feeds()
+        .map_err(|e| format!("{e}"))?
+        .into_iter()
+        .find(|f| f.id == feed.id)
+        .unwrap_or(feed))
 }
 
 /// Shape channel-listing items for storage: an id already owned by
@@ -322,7 +521,13 @@ fn shape_stable_ids(
 const YOUTUBE_HISTORY_MAX_ITEMS: usize = 5000;
 const YOUTUBE_HISTORY_TIMEOUT_S: u64 = 300;
 
-fn youtube_history_backfill(db: &Db, feed: &Feed, channel_id: &str, global_delete_behavior: &str) {
+fn youtube_history_backfill(
+    db: &Db,
+    feed: &Feed,
+    channel_id: &str,
+    global_delete_behavior: &str,
+    retention_cutoff: Option<&str>,
+) {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs_f64())
@@ -347,7 +552,11 @@ fn youtube_history_backfill(db: &Db, feed: &Feed, channel_id: &str, global_delet
         // news: the outcome is deliberately discarded. Python marks
         // the history done only when the listing produced items
         // and they were stored.
-        if store_parsed(db, feed, &parsed, global_delete_behavior).is_ok() {
+        if store_parsed_with_retention(db, feed, &parsed, global_delete_behavior, retention_cutoff)
+            .is_ok()
+        {
+            // `_store_youtube_items` pops the stored-body digest.
+            forget_body_digest(&feed.id);
             let _ = db.set_youtube_history_state(&feed.id, 2, now);
         }
     }

@@ -79,5 +79,6 @@ pub use db::{
 pub use extract::{ExtractOutcome, extract_article};
 pub use feeds::{ParsedEntry, ParsedFeed, parse_feed};
 pub use refresh::{
-    StoreOutcome, refresh_all, refresh_feed, store_parsed, store_parsed_with_retention,
+    REFRESH_CANCELLED, StoreOutcome, WorkerRefresh, forget_body_digest, refresh_all, refresh_feed,
+    refresh_feed_with_options, store_parsed, store_parsed_with_retention, subscribe_url,
 };
