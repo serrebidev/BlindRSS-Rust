@@ -34,19 +34,27 @@ fn video_id_forms() {
 
 #[test]
 fn segments_parse_and_filter() {
+    // The hash-prefix response shape: a list of videos that
+    // share the prefix, each with its own segments. Only the
+    // requested video's real skip segments survive (the full
+    // semantics live in sponsorblock_parity.rs).
     let json = r#"[
-      {"segment": [12.5, 30.0], "category": "sponsor", "actionType": "skip"},
-      {"segment": [60.0, 75.25], "category": "intro", "actionType": "skip"},
-      {"segment": [90.0, 90.0], "category": "sponsor", "actionType": "skip"}
+      {"videoID": "dQw4w9WgXcQ", "segments": [
+        {"segment": [12.5, 30.0], "category": "sponsor", "actionType": "skip", "UUID": "u1"},
+        {"segment": [60.0, 75.25], "category": "intro", "actionType": "skip", "UUID": "u2"},
+        {"segment": [90.0, 90.0], "category": "sponsor", "actionType": "skip", "UUID": "u3"}
+      ]},
+      {"videoID": "collision99", "segments": [
+        {"segment": [1.0, 9.0], "category": "sponsor", "actionType": "skip", "UUID": "zz"}
+      ]}
     ]"#;
-    let cats = vec!["sponsor".to_string()];
-    let segs = parse_segments(json, &cats);
-    assert_eq!(segs.len(), 1);
+    let segs = parse_segments(json, "dQw4w9WgXcQ");
+    assert_eq!(segs.len(), 2);
     assert_eq!(segs[0].start, 12.5);
     assert_eq!(segs[0].end, 30.0);
-    let all = parse_segments(json, &[]);
-    assert_eq!(all.len(), 2);
-    assert!(parse_segments("not json", &cats).is_empty());
+    assert_eq!(segs[0].uuid, "u1");
+    assert!(parse_segments(json, "nothere").is_empty());
+    assert!(parse_segments("not json", "dQw4w9WgXcQ").is_empty());
 }
 
 #[test]

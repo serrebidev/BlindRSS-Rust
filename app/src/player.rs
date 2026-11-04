@@ -33,11 +33,25 @@ pub fn dispatch_command(id: &str) -> bool {
 }
 
 /// A range the player skips over, with its announcement label.
+/// `uuid` is the SponsorBlock segment UUID (empty for silence
+/// ranges): skipped SponsorBlock segments are remembered by
+/// UUID, as Python does, never by start time.
 #[derive(Clone)]
 struct SkipRange {
     start_ms: i64,
     end_ms: i64,
     label: String,
+    uuid: String,
+}
+
+/// The already-skipped key for a range: the SponsorBlock
+/// UUID when it has one, else its start time.
+fn skip_key(range: &SkipRange) -> String {
+    if range.uuid.is_empty() {
+        format!("start:{}", range.start_ms)
+    } else {
+        range.uuid.clone()
+    }
 }
 
 struct PlayerState {
@@ -53,9 +67,11 @@ struct PlayerState {
     /// workers on `skip_rx`, drained by the tick.
     skips: Vec<SkipRange>,
     skip_rx: std::sync::mpsc::Receiver<Vec<SkipRange>>,
-    /// Range starts already skipped (Python's already-skipped
+    /// Ranges already skipped (Python's already-skipped
     /// guard: never skip the same range twice in a session).
-    skipped: HashSet<i64>,
+    /// SponsorBlock ranges key by segment UUID, silence
+    /// ranges by start time (see `skip_key`).
+    skipped: HashSet<String>,
     /// Chapter index at the last tick, for crossing announcements.
     last_chapter: Option<usize>,
     /// True while the tick sets the seek slider programmatically,
@@ -230,22 +246,11 @@ fn spawn_skip_workers(
     stream_url: &str,
 ) -> std::sync::mpsc::Receiver<Vec<SkipRange>> {
     let (skip_tx, skip_rx) = std::sync::mpsc::channel::<Vec<SkipRange>>();
-    if cfg.get_bool("sponsorblock_enabled", true) {
-        let cats: Vec<String> = cfg
-            .raw()
-            .get("sponsorblock_categories")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_else(|| {
-                ["sponsor", "selfpromo", "interaction"]
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect()
-            });
+    // Python skip_categories: empty when SponsorBlock is
+    // off or no categories are chosen — and then no lookup
+    // is issued at all.
+    let cats = blindrss_core::sponsorblock::skip_categories(cfg);
+    if !cats.is_empty() {
         let vid = blindrss_core::sponsorblock::youtube_video_id(&article.url).or_else(|| {
             article
                 .media_url
@@ -255,17 +260,28 @@ fn spawn_skip_workers(
         if let Some(vid) = vid {
             let tx = skip_tx.clone();
             std::thread::spawn(move || {
-                if let Ok(segs) = blindrss_core::sponsorblock::fetch_segments(&vid, &cats) {
-                    let ranges = segs
-                        .iter()
-                        .map(|s| SkipRange {
+                // fetch_segments never errors: any lookup
+                // failure yields no segments and playback
+                // carries on.
+                let segs = blindrss_core::sponsorblock::fetch_segments(&vid, &cats);
+                let ranges = segs
+                    .iter()
+                    .map(|s| {
+                        let secs = (s.end - s.start).round() as i64;
+                        SkipRange {
                             start_ms: (s.start * 1000.0) as i64,
                             end_ms: (s.end * 1000.0) as i64,
-                            label: format!("Skipped {}", s.category),
-                        })
-                        .collect();
-                    let _ = tx.send(ranges);
-                }
+                            label: format!(
+                                "Skipped {}, {} second{}",
+                                blindrss_core::sponsorblock::category_label(&s.category),
+                                secs,
+                                if secs == 1 { "" } else { "s" }
+                            ),
+                            uuid: s.uuid.clone(),
+                        }
+                    })
+                    .collect();
+                let _ = tx.send(ranges);
             });
         }
     }
@@ -292,6 +308,7 @@ fn spawn_skip_workers(
                         start_ms: (s * 1000.0) as i64,
                         end_ms: (e * 1000.0) as i64,
                         label: "Skipped silence".to_string(),
+                        uuid: String::new(),
                     })
                     .collect();
                 let _ = tx.send(ranges);
@@ -1064,11 +1081,18 @@ fn open_player_impl(
                 .skips
                 .iter()
                 .find(|r| {
-                    pos >= r.start_ms && pos < r.end_ms - 250 && !s.skipped.contains(&r.start_ms)
+                    // SponsorBlock ranges follow Python's
+                    // segment_at: the last half second does
+                    // not count, and a segment is done by
+                    // UUID. Silence ranges keep their tail.
+                    let tail_ms = if r.uuid.is_empty() { 250 } else { 500 };
+                    pos >= r.start_ms
+                        && pos < r.end_ms - tail_ms
+                        && !s.skipped.contains(&skip_key(r))
                 })
-                .map(|r| (r.start_ms, r.end_ms, r.label.clone()));
-            if let Some((start, end, label)) = hit {
-                s.skipped.insert(start);
+                .map(|r| (skip_key(r), r.end_ms, r.label.clone()));
+            if let Some((key, end, label)) = hit {
+                s.skipped.insert(key);
                 seek_to = Some((end, label));
             }
             // Chapter crossing announcements while playing.

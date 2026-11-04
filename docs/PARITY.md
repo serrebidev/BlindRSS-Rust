@@ -2426,3 +2426,48 @@ Open / not covered here:
   after this batch lands.
 - Manual packaged-build upgrades on all three OSes and an NVDA pass over
   ship-shape's own dialogs remain owner acceptance, as the plan requires.
+## Audit 8 Task 7 resolution — M02 SponsorBlock privacy and action semantics (2026-11-03)
+
+M02 is closed. The pre-fix Rust client sent the bare video ID to the
+wrong host (`sponsor.ajayyy.com/api/skipSegments?videoID=...`), accepted
+non-"skip" and sub-0.5 s segments, carried no segment UUIDs, hard-coded
+a `BlindRSS-Rust/0.1` User-Agent, and the player remembered skipped
+segments by start time. A failing probe against the old parser was
+recorded first (a 0.2 s "skip" segment survived parsing; Python keeps
+only the one real segment).
+
+`crates/core/src/sponsorblock.rs` is now a faithful port of Python
+`core/sponsorblock.py`: lookups go to
+`https://sponsor.ajay.app/api/skipSegments/{prefix}` where the prefix
+is the first four hex digits of SHA-256(video id), with `categories`
+and `actionTypes=["skip"]` as JSON query params; an empty video id or
+empty category list issues NO request. `parse_segments` performs
+collision matching (only the response entry whose `videoID` equals
+the requested id is read), defaults a missing `actionType` to "skip"
+and drops any other action, drops segments shorter than 0.5 s, and
+preserves each segment's `UUID`. `skip_categories` ports Python's
+switch/order/fallback semantics over the CATEGORIES table (stored
+non-list falls back to DEFAULT_SKIP; result in CATEGORIES order), and
+`segment_at` ports the done-by-UUID lookup with the last-half-second
+tail exclusion. Every lookup failure (404, 5xx, connection refused,
+unreadable body) returns no segments, so playback carries on. The
+User-Agent now comes from core's central resolution
+(`crate::http::user_agent()`), never a call-site string.
+
+In `app/src/player.rs`, `spawn_skip_workers` resolves categories
+through core `skip_categories` (no worker and no request when empty),
+`fetch_segments` no longer returns a Result the caller could drop,
+skip announcements use Python's category label and duration text, and
+the tick remembers skipped SponsorBlock segments by UUID with
+Python's 500 ms tail (silence ranges keep their existing start-time
+keying and 250 ms tail; silence semantics are Task 21's scope).
+
+Evidence: `crates/core/tests/sponsorblock_parity.rs` (7 tests) ports
+Python's `tests/test_sponsorblock.py` cases and adds a loopback
+fixture server proving the recorded request line contains only the
+hash prefix (never the full video ID), carries the central
+User-Agent, that empty categories produce zero fixture hits, and that
+500/404/refused lookups all return empty. `batch3_slice.rs` was
+updated to the prefix-response shape. Owner NVDA acceptance of skip
+announcements remains pending as platform acceptance, as with all
+player work.
