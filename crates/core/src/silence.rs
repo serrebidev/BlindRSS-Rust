@@ -10,23 +10,12 @@
 
 use std::path::PathBuf;
 
-/// Locate ffmpeg: user-configured path, explicit override env,
-/// then PATH.
+/// Locate ffmpeg through the shared resolution policy (Audit 8
+/// Task 23, O14): user-configured path, explicit override env,
+/// the managed install, PATH, bundled and known package
+/// locations — see `dependency::find_tool`.
 pub fn find_ffmpeg() -> Option<PathBuf> {
-    let names: &[&str] = if cfg!(windows) {
-        &["ffmpeg.exe", "ffmpeg"]
-    } else {
-        &["ffmpeg"]
-    };
-    if let Some(p) = crate::dependency::user_tool_path("ffmpeg", names) {
-        return Some(p);
-    }
-    if let Ok(p) = std::env::var("BLINDRSS_FFMPEG")
-        && !p.is_empty()
-    {
-        return Some(PathBuf::from(p));
-    }
-    crate::dependency::find_on_path(names)
+    crate::dependency::find_tool("ffmpeg")
 }
 
 /// Parse ffmpeg silencedetect stderr into raw (start, end)

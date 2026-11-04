@@ -2523,6 +2523,22 @@ fn run_watcher_once(tx: &std::sync::mpsc::Sender<RefreshMsg>) {
 }
 
 fn main() {
+    // Packaged runtime smoke test (Python main.py's
+    // --blindrss-runtime-self-test, core/runtime_self_test.py;
+    // Audit 8 O15): verify the bundled tools resolve and run and
+    // the extraction cascade is healthy, print failures, and exit
+    // without opening the GUI.
+    if std::env::args().any(|a| a == "--blindrss-runtime-self-test") {
+        let errors = blindrss_core::dependency::runtime_smoke_test();
+        if errors.is_empty() {
+            println!("Runtime self-test passed.");
+            return;
+        }
+        for e in &errors {
+            eprintln!("Runtime self-test failed: {e}");
+        }
+        std::process::exit(1);
+    }
     // Panics land in blindrss.log in the data dir instead of dying
     // silently (a screen reader user gets no console to read).
     std::panic::set_hook(Box::new(|info| {
@@ -3277,6 +3293,22 @@ fn main() {
                     .collect();
                 if !missing.is_empty() {
                     let _ = tx_dep.send(RefreshMsg::DepsMissing(missing));
+                }
+            });
+            // Nightly yt-dlp maintenance (Audit 8 O06; Python
+            // _ensure_yt_dlp_cli): an EXISTING yt-dlp is kept on
+            // the nightly channel — throttled to one successful
+            // check per 24 h inside core, failure-safe (a failed
+            // update keeps the working copy and does not burn the
+            // throttle). Off the UI thread; result only logged.
+            std::thread::spawn(move || {
+                if let Some(report) = blindrss_core::dependency::maintain_ytdlp(&data_dir()) {
+                    log_line(&format!(
+                        "yt-dlp maintenance: {:?} at {} (version {})",
+                        report.action,
+                        report.path.display(),
+                        report.version.as_deref().unwrap_or("unknown")
+                    ));
                 }
             });
         }

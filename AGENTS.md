@@ -203,12 +203,23 @@ Python `core/casting.py`, in that order.
   `_maybe_range_cache_url`): the player's primary load goes through
   it, the /stream and /play fallbacks stay behind it.
 - `dependency.rs`: external tool resolution and installation
-  (yt-dlp, ffmpeg, ffprobe). Detection order: user-chosen path from
-  Settings, then the managed runtime copy, then PATH, then known
-  package locations. ffmpeg/ffprobe install automatically in the
-  background when missing (winget/Homebrew/static-build routes per
-  platform) and are validated by running them; the UI reports progress
-  in the status bar instead of showing a dead-end dialog (v0.1.27).
+  (yt-dlp, ffmpeg, ffprobe). One shared policy for every caller:
+  `find_tool` resolves in the order user-chosen path from Settings,
+  `BLINDRSS_*` env pointer, the managed runtime copy, PATH, bundled
+  location, then known package locations; `find_js_runtime` does
+  the same for Deno. All tool subprocesses run through `run_tool`
+  (finite timeout, capped output, killed and reaped on timeout),
+  and validation uses the tool-correct version flag
+  (`ffmpeg -version`, `yt-dlp --version`); a tool that exists but
+  does not run counts as missing so it gets repaired. ffmpeg/ffprobe
+  install automatically in the background when missing
+  (winget/Homebrew/static-build routes per platform) and are validated
+  by running them; the UI reports progress in the status bar instead
+  of showing a dead-end dialog (v0.1.27). The managed yt-dlp is
+  kept on the nightly channel by `maintain_ytdlp` (24 h
+  success-only throttle, verified swap, failure keeps the working
+  copy), and `--blindrss-runtime-self-test` runs the packaged
+  smoke checks (tools + extraction) without opening the GUI.
   - yt-dlp stays a wrapped executable, never a library port, and must
     always be current — a stale yt-dlp stops working outright.
   - The extraction crates follow the same bleeding-edge intent as

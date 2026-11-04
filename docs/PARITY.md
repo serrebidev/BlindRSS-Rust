@@ -2472,6 +2472,132 @@ updated to the prefix-response shape. Owner NVDA acceptance of skip
 announcements remains pending as platform acceptance, as with all
 player work.
 
+### Audit 8 Task 23 resolution — current, validated dependencies and owned subprocesses (O06, O13, O14, O15, F20)
+
+Reproduction first: the new `crates/core/tests/dependency_parity.rs`
+suite (16 tests) was written against Python
+`core/dependency_check.py`, `core/discovery.py` and
+`core/runtime_self_test.py` before the fix; it failed to compile
+against the old core (none of the policy APIs existed), and its
+behavioral premises were verified against the old code by reading:
+`dependency.rs` probed every tool with `--version` and no timeout
+(Python: `ffmpeg -version`, 6 s), `update_ytdlp` fetched the STABLE
+channel and the app only ever installed missing tools, resolution
+stopped at configured/env/managed/PATH, and the `videosearch.rs` /
+`sources.rs` yt-dlp runners abandoned timed-out children on
+detached threads.
+
+O13 — one validation policy in `dependency.rs`: `run_tool` is the
+owned-subprocess runner (stdin closed, stdout/stderr drained on
+reader threads and capped at `MAX_TOOL_OUTPUT_BYTES` = 1 MiB per
+stream, child killed AND reaped on timeout). `version_arg_for_tool`
+ports Python `_version_arg_for_tool` (ffmpeg/ffprobe `-version`,
+everything else `--version`); `validate_executable` (6 s) and
+`probe_version` (10 s, one retry when the runner itself fails —
+never when the tool ran and failed) port `_validate_executable` /
+`ytdlp_version`. `check_tools` now counts a present-but-invalid
+tool as missing, so the app's existing missing-tool flow repairs a
+broken install instead of trusting it (Python
+`detect_media_tool_paths(validate=True)` semantics). The internal
+`version_of` used by the ffmpeg install check rides the same probe.
+
+O14 — one resolution policy: `dependency::find_tool` (user
+override, `BLINDRSS_*` env pointer, managed copy, PATH, the
+directory beside the executable and its `bin/`, then
+`known_package_dirs`). The package-location set ports Python
+`_collect_tool_candidates`' bounded lists: POSIX system/Homebrew/
+MacPorts/snap/per-user dirs, and on Windows the Scoop (incl.
+ffmpeg-essentials/-shared/-gyan-nightly), WinGet Links,
+Chocolatey, Gyan/FFmpeg, Program Files and MSYS2 locations.
+`media::find_ytdlp`, `silence::find_ffmpeg` and
+`dependency::find_ffprobe` are now thin wrappers over it; the old
+pure `resolve_ytdlp` helper and its unit test were replaced by
+precedence coverage in the new suite (user override beats the
+managed copy). Recorded deviation: Python also expands a handful
+of versioned WinGet/Chocolatey glob patterns; the port covers the
+stable shim directories (WinGet Links, Scoop `current`, Choco
+`bin`) those installs always create, and does not glob.
+
+O06 — nightly yt-dlp maintenance, ported from Python
+`_ensure_yt_dlp_cli`/`_update_managed_ytdlp`:
+`update_managed_ytdlp` compares the managed copy's version with
+the newest yt-dlp-nightly-builds tag, tries `--update-to nightly`
+first without trusting its exit code (version re-read), then falls
+back to a full download that is verified to run BEFORE it replaces
+the working copy — a failed update reports
+`KeptExistingAfterFailure` with the old binary byte-identical;
+with no working copy a failed download is an error. `update_ytdlp`
+(the app's install path) now installs the nightly asset through
+the same verified swap; the old 100 KB size heuristic is gone
+because verification replaces it. `maintain_ytdlp` adds Python's
+24 h throttle (marker `last_ytdlp_update_check.txt` in the data
+dir — Python keeps its marker in the temp dir; the data dir is
+the durable equivalent), written ONLY after a successful check,
+and the app runs it on a background thread at startup: the managed
+copy gets full maintenance, a system copy is only offered
+`--update-to nightly` and never overwritten. Deviation: Python's
+separate embedded-module wheel update has no Rust analogue (there
+is no embedded yt-dlp module; the CLI is the only consumer).
+
+O15 — JavaScript runtime + packaged smoke support:
+`find_js_runtime` resolves Deno through the same `find_tool`
+policy (Python ships Deno in the bundle for yt-dlp's YouTube
+signature challenges and finds it via `_find_executable_path`).
+`dependency::runtime_smoke_test` is the Rust-appropriate port of
+`core/runtime_self_test.py`: yt-dlp, Deno, ffmpeg and ffprobe
+must resolve and run, and `smoke_extraction_error` runs Python's
+sample-article extraction check (>= 500 chars, identical across
+repeated passes). The app exposes it as
+`--blindrss-runtime-self-test` (Python's exact flag in main.py),
+printing failures and exiting 1 without opening the GUI. Python's
+libVLC/updater-helper smoke checks stay with the app/player
+layer's own paths and are not duplicated here. Workflow
+integration prepared but NOT landed (owner approval required, no
+workflow files were edited): release packaging must place a Deno
+binary beside the app executable (or in its `bin/`) on all three
+platforms — the Windows asset is
+`https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip`
+(Python `build.bat` uses the same URL), `deno-x86_64-unknown-linux-gnu.zip`
+and `deno-aarch64-apple-darwin.zip`/`deno-x86_64-apple-darwin.zip`
+for the other legs — and add a packaged smoke step running
+`blindrss --blindrss-runtime-self-test` with a minimal PATH before
+signing.
+
+F20 — timed-out subprocesses are killed and reaped:
+`videosearch.rs`'s search runner and both `sources.rs` yt-dlp
+runners (flat listing and info document) now go through
+`dependency::run_tool`, as does `media.rs`'s runner (600 s finite
+budget, previously unbounded); the detached-thread/recv_timeout
+pattern is gone from all three. The new suite proves kill+reap
+with a sleeping fake executable that writes its pid (the pid is
+fully gone after the timeout returns). Remaining unbounded or
+detach-pattern yt-dlp callers in `download.rs`, `play_cache.rs`,
+`feedsearch.rs`, `source_feeds.rs` and `ytfull.rs` belong to
+Tasks 22, 26 and 16 respectively and are recorded here as their
+scope, not silently fixed or claimed by this task.
+
+Evidence: `crates/core/tests/dependency_parity.rs` (16 tests:
+version-flag matrix, single-dash ffmpeg fake, broken/hanging
+probes, broken-tool-as-missing check_tools + precedence, package
+dirs, find_in_dirs, kill/reap pid proof, output cap, throttle
+window, four loopback nightly scenarios — current-not-redownloaded
+with an asset-hit counter, stale self-update-distrust fallback,
+failed-download-keeps-working-copy byte comparison, fresh
+install/failure — Deno resolution and the extraction smoke).
+Gates on this branch: `cargo fmt --all` clean (check mode),
+clippy `--workspace --all-targets -D warnings` zero,
+`cargo test --workspace` 515 passed / 0 failed,
+`cargo check -p blindrss-core --target x86_64-pc-windows-gnu`
+clean (the cfg(windows) package-location table compiles),
+`cargo build -p blindrss` OK. One flake note: under heavy
+parallel load a version probe of a healthy fake intermittently
+returned no result once in several full-suite runs; root-caused
+to the runner failing (not the tool) and hardened with the
+single runner-error retry in `probe_version` — 4/4 clean
+full-suite runs of the new binary followed. Owner platform
+acceptance (packaged Deno beside the app, smoke step in the
+release workflow) remains pending per the workflow item above.
+
 ## Audit 8 Wave 1 integration (2026-11-03)
 
 Wave 1 (Tasks 1-7) integrated onto main in dependency order and

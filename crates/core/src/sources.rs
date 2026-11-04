@@ -474,19 +474,23 @@ fn ytdlp_flat_listing(
         args.push("youtubetab:approximate_date".into());
     }
     args.push(url.to_string());
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let out = std::process::Command::new(&exe).args(&args).output();
-        let _ = tx.send(out);
-    });
-    let out = match rx.recv_timeout(std::time::Duration::from_secs(timeout_s.max(5))) {
-        Ok(Ok(out)) => out,
-        Ok(Err(e)) => return Err(format!("yt-dlp: {e}")),
-        Err(_) => return Err("yt-dlp listing timed out".to_string()),
-    };
-    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    // F20: owned subprocess — a timed-out listing is killed and
+    // reaped via the shared runner, never abandoned on a thread.
+    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let out = crate::dependency::run_tool(
+        &exe,
+        &arg_refs,
+        std::time::Duration::from_secs(timeout_s.max(5)),
+    )
+    .map_err(|e| {
+        if e.contains("timed out") {
+            "yt-dlp listing timed out".to_string()
+        } else {
+            format!("yt-dlp: {e}")
+        }
+    })?;
     let mut entries = Vec::new();
-    for line in stdout.lines() {
+    for line in out.stdout.lines() {
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -495,9 +499,8 @@ fn ytdlp_flat_listing(
             entries.push(v);
         }
     }
-    if entries.is_empty() && !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
-        let last = err.lines().last().unwrap_or("failed").trim();
+    if entries.is_empty() && !out.success {
+        let last = out.stderr.lines().last().unwrap_or("failed").trim();
         return Err(format!("yt-dlp: {last}"));
     }
     Ok(entries)
@@ -602,20 +605,23 @@ fn ytdlp_info_document(url: &str, max_items: usize, timeout_s: u64) -> Result<Va
         max_items.to_string(),
         url.to_string(),
     ];
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let out = std::process::Command::new(&exe).args(&args).output();
-        let _ = tx.send(out);
-    });
-    let out = match rx.recv_timeout(std::time::Duration::from_secs(timeout_s.max(5))) {
-        Ok(Ok(out)) => out,
-        Ok(Err(e)) => return Err(format!("yt-dlp: {e}")),
-        Err(_) => return Err("yt-dlp listing timed out".to_string()),
-    };
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    serde_json::from_str::<Value>(&stdout).map_err(|e| {
-        let err = String::from_utf8_lossy(&out.stderr);
-        let last = err.lines().last().unwrap_or("failed").trim();
+    // F20: owned subprocess via the shared runner (kill + reap
+    // on timeout), same as `ytdlp_flat_listing`.
+    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let out = crate::dependency::run_tool(
+        &exe,
+        &arg_refs,
+        std::time::Duration::from_secs(timeout_s.max(5)),
+    )
+    .map_err(|e| {
+        if e.contains("timed out") {
+            "yt-dlp listing timed out".to_string()
+        } else {
+            format!("yt-dlp: {e}")
+        }
+    })?;
+    serde_json::from_str::<Value>(&out.stdout).map_err(|e| {
+        let last = out.stderr.lines().last().unwrap_or("failed").trim();
         format!("yt-dlp: {last} ({e})")
     })
 }

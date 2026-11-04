@@ -8,7 +8,6 @@
 use crate::db::Chapter;
 use serde::Deserialize;
 use std::path::PathBuf;
-use std::process::Command;
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct MediaInfo {
@@ -65,33 +64,12 @@ pub fn parse_info(json: &str) -> Result<MediaInfo, String> {
     })
 }
 
-/// Locate the yt-dlp executable: user-configured path, explicit
-/// override env, managed runtime, then PATH.
+/// Locate the yt-dlp executable through the shared resolution
+/// policy (Audit 8 Task 23, O14): user-configured path, explicit
+/// override env, managed runtime, PATH, bundled and known
+/// package locations — see `dependency::find_tool`.
 pub fn find_ytdlp() -> Option<PathBuf> {
-    let names: &[&str] = if cfg!(windows) {
-        &["yt-dlp.exe", "yt-dlp"]
-    } else {
-        &["yt-dlp"]
-    };
-    resolve_ytdlp(
-        crate::dependency::user_tool_path("yt-dlp", names),
-        std::env::var_os("BLINDRSS_YTDLP")
-            .filter(|p| !p.is_empty())
-            .map(PathBuf::from),
-        crate::dependency::managed_ytdlp_path(),
-        || crate::dependency::find_on_path(names),
-    )
-}
-
-fn resolve_ytdlp(
-    user: Option<PathBuf>,
-    explicit: Option<PathBuf>,
-    managed: Option<PathBuf>,
-    on_path: impl FnOnce() -> Option<PathBuf>,
-) -> Option<PathBuf> {
-    user.or(explicit)
-        .or_else(|| managed.filter(|p| p.is_file()))
-        .or_else(on_path)
+    crate::dependency::find_tool("yt-dlp")
 }
 
 /// Extra yt-dlp arguments from the app's environment, set at
@@ -120,16 +98,15 @@ fn run_ytdlp(args: &[&str]) -> Result<String, String> {
     let env_args = ytdlp_env_args();
     let mut full: Vec<&str> = env_args.iter().map(|a| a.as_str()).collect();
     full.extend(args.iter().copied());
-    let out = Command::new(&exe)
-        .args(&full)
-        .output()
+    // Owned subprocess (Audit 8 F20 policy): finite timeout,
+    // capped output, killed and reaped on timeout.
+    let run = crate::dependency::run_tool(&exe, &full, std::time::Duration::from_secs(600))
         .map_err(|e| format!("yt-dlp failed to start: {e}"))?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
-        let first = err.lines().last().unwrap_or("unknown error");
+    if !run.success {
+        let first = run.stderr.lines().last().unwrap_or("unknown error");
         return Err(format!("yt-dlp: {first}"));
     }
-    String::from_utf8(out.stdout).map_err(|e| format!("yt-dlp output: {e}"))
+    Ok(run.stdout)
 }
 
 /// Fetch info (title/duration/chapters) for a page URL.
@@ -557,42 +534,10 @@ pub fn resolve_for_play(
 mod tests {
     use super::*;
 
-    #[test]
-    fn ytdlp_managed_copy_beats_path_and_detects_install_after_startup() {
-        let dir = std::env::temp_dir().join(format!("blindrss-ytdlp-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let managed = crate::dependency::managed_ytdlp(&dir);
-        let path = dir.join("path-ytdlp");
-        let find = || resolve_ytdlp(None, None, Some(managed.clone()), || Some(path.clone()));
-        assert_eq!(find(), Some(path.clone()));
-        std::fs::create_dir_all(managed.parent().unwrap()).unwrap();
-        std::fs::write(&managed, b"managed").unwrap();
-        assert_eq!(find(), Some(managed.clone()));
-        let user = dir.join("user-ytdlp");
-        let explicit = dir.join("explicit-ytdlp");
-        assert_eq!(
-            resolve_ytdlp(
-                Some(user.clone()),
-                Some(explicit.clone()),
-                Some(managed.clone()),
-                || Some(path.clone())
-            ),
-            Some(user),
-        );
-        assert_eq!(
-            resolve_ytdlp(
-                None,
-                Some(explicit.clone()),
-                Some(managed.clone()),
-                || Some(path.clone())
-            ),
-            Some(explicit),
-        );
-        std::fs::remove_file(&managed).unwrap();
-        std::fs::create_dir(&managed).unwrap();
-        assert_eq!(find(), Some(path));
-        std::fs::remove_dir_all(dir).unwrap();
-    }
+    // The yt-dlp resolution-precedence unit test that used to
+    // live here covered the removed pure `resolve_ytdlp` helper.
+    // Precedence is now `dependency::find_tool`'s and is covered
+    // in crates/core/tests/dependency_parity.rs (Audit 8 Task 23).
 
     #[test]
     fn hls_and_dash_enclosures_are_playable() {

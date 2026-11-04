@@ -4,6 +4,16 @@
 //! self-update yt-dlp from its GitHub releases into
 //! <data_dir>/bin, registered at startup and checked by find_ytdlp
 //! before PATH on every lookup.
+//!
+//! Audit 8 Task 23 (O06, O13, O14, O15, F20): one shared
+//! resolution/validation policy lives here — `find_tool` (user
+//! override, env override, managed copy, PATH, bundled and known
+//! package locations), `validate_executable`/`probe_version`
+//! (tool-correct version flag, finite timeout, capped output via
+//! the owned-subprocess runner `run_tool`, which kills and reaps
+//! on timeout), the nightly yt-dlp maintenance cycle
+//! (`maintain_ytdlp`), Deno resolution (`find_js_runtime`) and
+//! the packaged runtime smoke test (`runtime_smoke_test`).
 
 /// One tool's detection result.
 #[derive(Debug, Clone, PartialEq)]
@@ -26,9 +36,18 @@ static USER_TOOL_PATHS: std::sync::Mutex<Option<std::collections::HashMap<String
 
 static MANAGED_YTDLP: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
 
+static DATA_DIR: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
+
 /// Register the runtime location; lookup checks it again after background installs.
 pub fn set_managed_ytdlp_dir(data_dir: &std::path::Path) {
     *MANAGED_YTDLP.lock().unwrap_or_else(|p| p.into_inner()) = Some(managed_ytdlp(data_dir));
+    *DATA_DIR.lock().unwrap_or_else(|p| p.into_inner()) = Some(data_dir.to_path_buf());
+}
+
+/// The data dir registered at startup, when any (used to locate
+/// the managed ffmpeg/ffprobe install during tool resolution).
+pub fn registered_data_dir() -> Option<std::path::PathBuf> {
+    DATA_DIR.lock().unwrap_or_else(|p| p.into_inner()).clone()
 }
 
 pub(crate) fn managed_ytdlp_path() -> Option<std::path::PathBuf> {
@@ -123,61 +142,421 @@ pub fn find_on_path(names: &[&str]) -> Option<std::path::PathBuf> {
     None
 }
 
-/// Locate ffprobe: user-configured path, then the managed
-/// install's env pointer, then PATH.
+/// Locate ffprobe through the shared resolution policy
+/// (`find_tool`): user-configured path, env pointer, the managed
+/// install, PATH, then known package locations.
 pub fn find_ffprobe() -> Option<std::path::PathBuf> {
-    let names: &[&str] = if cfg!(windows) {
-        &["ffprobe.exe", "ffprobe"]
-    } else {
-        &["ffprobe"]
-    };
-    if let Some(p) = user_tool_path("ffprobe", names) {
-        return Some(p);
-    }
-    if let Ok(p) = std::env::var("BLINDRSS_FFPROBE")
-        && !p.is_empty()
-    {
-        return Some(std::path::PathBuf::from(p));
-    }
-    find_on_path(names)
+    find_tool("ffprobe")
 }
 
-fn version_of(path: &std::path::Path) -> Option<String> {
-    let out = std::process::Command::new(path)
-        .arg("--version")
-        .output()
-        .ok()?;
-    if !out.status.success() {
+// ---------------------------------------------------------------------------
+// Owned subprocesses (F20) and tool validation (O13).
+//
+// Every helper the app shells out to is run through `run_tool`:
+// stdin is closed, stdout/stderr are drained on reader threads
+// and capped, and on timeout the child is KILLED AND REAPED
+// (Python `core/discovery.py` terminates timed-out subprocesses
+// the same way) — never detached to finish on its own.
+// ---------------------------------------------------------------------------
+
+/// Maximum bytes of stdout/stderr `run_tool` retains per stream.
+/// A tool flooding its pipes cannot grow memory without bound;
+/// the pipes are still drained past the cap so the child never
+/// blocks on a full pipe.
+pub const MAX_TOOL_OUTPUT_BYTES: usize = 1 << 20;
+
+/// One finished tool run: exit success plus capped output.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolRun {
+    pub success: bool,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+fn read_capped<R: std::io::Read + Send + 'static>(
+    mut reader: R,
+) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut kept: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 8192];
+        loop {
+            match reader.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if kept.len() < MAX_TOOL_OUTPUT_BYTES {
+                        let take = (MAX_TOOL_OUTPUT_BYTES - kept.len()).min(n);
+                        kept.extend_from_slice(&chunk[..take]);
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        kept
+    })
+}
+
+/// Run `exe` with `args`, returning its capped output, or an
+/// error when it cannot start or exceeds `timeout` (in which
+/// case it is killed and reaped before this returns).
+pub fn run_tool(
+    exe: &std::path::Path,
+    args: &[&str],
+    timeout: std::time::Duration,
+) -> Result<ToolRun, String> {
+    let mut child = std::process::Command::new(exe)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("{} failed to start: {e}", exe.display()))?;
+    let out_reader = child.stdout.take().map(read_capped);
+    let err_reader = child.stderr.take().map(read_capped);
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    if let Some(h) = out_reader {
+                        let _ = h.join();
+                    }
+                    if let Some(h) = err_reader {
+                        let _ = h.join();
+                    }
+                    return Err(format!(
+                        "{} timed out after {:.1}s",
+                        exe.display(),
+                        timeout.as_secs_f64()
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("{} wait failed: {e}", exe.display()));
+            }
+        }
+    };
+    let stdout = out_reader.and_then(|h| h.join().ok()).unwrap_or_default();
+    let stderr = err_reader.and_then(|h| h.join().ok()).unwrap_or_default();
+    Ok(ToolRun {
+        success: status.success(),
+        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+    })
+}
+
+/// The harmless version flag for a tool (Python
+/// `_version_arg_for_tool`): ffmpeg/ffprobe use single-dash
+/// `-version`; yt-dlp, Deno and everything else use `--version`.
+pub fn version_arg_for_tool(tool: &str) -> &'static str {
+    match canon_tool_name(tool).as_str() {
+        "ffmpeg" | "ffprobe" => "-version",
+        _ => "--version",
+    }
+}
+
+/// True when `path` is a file that runs its version command to
+/// exit code 0 within `timeout` (Python `_validate_executable`).
+pub fn validate_executable_with_timeout(
+    path: &std::path::Path,
+    tool: &str,
+    timeout: std::time::Duration,
+) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    run_tool(path, &[version_arg_for_tool(tool)], timeout)
+        .map(|r| r.success)
+        .unwrap_or(false)
+}
+
+/// `validate_executable_with_timeout` with Python's 6 s probe budget.
+pub fn validate_executable(path: &std::path::Path, tool: &str) -> bool {
+    validate_executable_with_timeout(path, tool, std::time::Duration::from_secs(6))
+}
+
+/// The first stdout line of the tool's version command when it
+/// runs successfully, bounded at 10 s (Python `ytdlp_version`).
+pub fn probe_version(path: &std::path::Path, tool: &str) -> Option<String> {
+    // One retry when the RUNNER fails (spawn error or timeout
+    // under load): a probe that never ran says nothing about the
+    // tool, and treating it as "broken" would replace or report
+    // missing a healthy executable. A tool that runs and fails is
+    // NOT retried — that verdict is real.
+    let run = run_tool(
+        path,
+        &[version_arg_for_tool(tool)],
+        std::time::Duration::from_secs(10),
+    )
+    .or_else(|_| {
+        run_tool(
+            path,
+            &[version_arg_for_tool(tool)],
+            std::time::Duration::from_secs(10),
+        )
+    })
+    .ok()?;
+    if !run.success {
         return None;
     }
-    String::from_utf8_lossy(&out.stdout)
+    run.stdout
         .lines()
         .next()
         .map(|l| l.trim().to_string())
         .filter(|l| !l.is_empty())
 }
 
-/// Detect the tools BlindRSS shells out to.
+fn version_of(path: &std::path::Path) -> Option<String> {
+    let tool = path.file_stem()?.to_str()?;
+    probe_version(path, tool)
+}
+
+// ---------------------------------------------------------------------------
+// Shared resolution policy (O14): user override, env override,
+// managed copy, PATH, bundled location, known package locations
+// (Python `_find_executable_path` + `_collect_tool_candidates`).
+// ---------------------------------------------------------------------------
+
+fn tool_file_names(tool: &str) -> Vec<String> {
+    let base = canon_tool_name(tool);
+    if cfg!(windows) {
+        vec![format!("{base}.exe"), base]
+    } else {
+        vec![base]
+    }
+}
+
+fn env_override_path(tool: &str) -> Option<std::path::PathBuf> {
+    let key = match canon_tool_name(tool).as_str() {
+        "ffmpeg" => "BLINDRSS_FFMPEG",
+        "ffprobe" => "BLINDRSS_FFPROBE",
+        "yt-dlp" => "BLINDRSS_YTDLP",
+        "deno" => "BLINDRSS_DENO",
+        _ => return None,
+    };
+    std::env::var_os(key)
+        .filter(|p| !p.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
+/// The first of `names` that is a file inside any of `dirs`.
+pub fn find_in_dirs(names: &[&str], dirs: &[std::path::PathBuf]) -> Option<std::path::PathBuf> {
+    for dir in dirs {
+        for name in names {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+/// Directories where package managers and portable layouts put
+/// command-line tools, consulted when PATH is minimal or stripped
+/// by a launcher (Python `_collect_tool_candidates`'s bounded
+/// list — never a drive scan). The Windows set covers Scoop,
+/// WinGet Links, Chocolatey, Gyan/FFmpeg and MSYS2 locations; the
+/// POSIX set covers system, Homebrew, MacPorts, snap and per-user
+/// locations.
+pub fn known_package_dirs(tool: &str) -> Vec<std::path::PathBuf> {
+    let tool = canon_tool_name(tool);
+    let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+    #[cfg(not(windows))]
+    {
+        let _ = &tool;
+        dirs.extend(
+            [
+                "/usr/local/bin",
+                "/usr/bin",
+                "/bin",
+                "/snap/bin",
+                "/opt/homebrew/bin",
+                "/opt/local/bin",
+            ]
+            .iter()
+            .map(std::path::PathBuf::from),
+        );
+        if let Some(home) = std::env::home_dir() {
+            dirs.push(home.join(".local").join("bin"));
+            dirs.push(home.join("bin"));
+        }
+    }
+    #[cfg(windows)]
+    {
+        let env_dir = |key: &str| {
+            std::env::var_os(key)
+                .filter(|v| !v.is_empty())
+                .map(std::path::PathBuf::from)
+        };
+        let media = matches!(tool.as_str(), "ffmpeg" | "ffprobe");
+        if let Some(user) = env_dir("USERPROFILE") {
+            dirs.push(user.join("scoop").join("shims"));
+            if media {
+                for app in [
+                    "ffmpeg",
+                    "ffmpeg-essentials",
+                    "ffmpeg-shared",
+                    "ffmpeg-gyan-nightly",
+                ] {
+                    dirs.push(
+                        user.join("scoop")
+                            .join("apps")
+                            .join(app)
+                            .join("current")
+                            .join("bin"),
+                    );
+                }
+                dirs.push(user.join("bin"));
+                dirs.push(user.join("ffmpeg").join("bin"));
+            }
+            if tool == "yt-dlp" {
+                dirs.push(
+                    user.join("scoop")
+                        .join("apps")
+                        .join("yt-dlp")
+                        .join("current"),
+                );
+                dirs.push(user.join(".local").join("bin"));
+                dirs.push(user.join("bin"));
+            }
+            if tool == "deno" {
+                dirs.push(user.join("scoop").join("apps").join("deno").join("current"));
+                dirs.push(user.join(".local").join("bin"));
+            }
+        }
+        if let Some(local) = env_dir("LOCALAPPDATA") {
+            dirs.push(local.join("Microsoft").join("WinGet").join("Links"));
+            if media {
+                dirs.push(local.join("Programs").join("ffmpeg").join("bin"));
+                dirs.push(local.join("Programs").join("FFmpeg").join("bin"));
+                dirs.push(
+                    local
+                        .join("Programs")
+                        .join("Gyan")
+                        .join("FFmpeg")
+                        .join("bin"),
+                );
+            }
+            if tool == "yt-dlp" {
+                dirs.push(local.join("Programs").join("yt-dlp"));
+                dirs.push(local.join("Programs").join("yt-dlp").join("bin"));
+                dirs.push(local.join("Microsoft").join("WindowsApps"));
+            }
+        }
+        if media {
+            for key in ["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"] {
+                if let Some(base) = env_dir(key) {
+                    dirs.push(base.join("Gyan").join("FFmpeg").join("bin"));
+                    dirs.push(base.join("FFmpeg").join("bin"));
+                    dirs.push(base.join("ffmpeg").join("bin"));
+                }
+            }
+            dirs.extend(
+                [
+                    r"C:\ffmpeg\bin",
+                    r"C:\tools\ffmpeg\bin",
+                    r"C:\msys64\ucrt64\bin",
+                    r"C:\msys64\mingw64\bin",
+                ]
+                .iter()
+                .map(std::path::PathBuf::from),
+            );
+        }
+        if tool == "yt-dlp" {
+            dirs.push(std::path::PathBuf::from(r"C:\msys64\usr\bin"));
+        }
+        let choco = env_dir("ChocolateyInstall")
+            .unwrap_or_else(|| std::path::PathBuf::from(r"C:\ProgramData\chocolatey"));
+        dirs.push(choco.join("bin"));
+    }
+    dirs
+}
+
+/// Resolve a media tool through the one shared policy: the
+/// user's configured path, the BLINDRSS_* env pointer, the
+/// managed copy (yt-dlp's runtime download; the managed ffmpeg
+/// install), PATH, the directory beside the executable (packaged
+/// bundles ship their tools there or in its `bin/`), and finally
+/// the known package locations. Mirrors Python's order except
+/// that the managed yt-dlp deliberately beats PATH: PATH copies
+/// are the stale ones (Python keeps the same preference for its
+/// verified managed copy).
+pub fn find_tool(tool: &str) -> Option<std::path::PathBuf> {
+    let canon = canon_tool_name(tool);
+    let names = tool_file_names(&canon);
+    let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+    if let Some(p) = user_tool_path(&canon, &name_refs) {
+        return Some(p);
+    }
+    if let Some(p) = env_override_path(&canon) {
+        return Some(p);
+    }
+    if canon == "yt-dlp"
+        && let Some(p) = managed_ytdlp_path().filter(|p| p.is_file())
+    {
+        return Some(p);
+    }
+    if (canon == "ffmpeg" || canon == "ffprobe")
+        && let Some(data_dir) = registered_data_dir()
+        && let Some(bin) = managed_ffmpeg_bin_dir(&data_dir)
+    {
+        let candidate = bin.join(&names[0]);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    if let Some(p) = find_on_path(&name_refs) {
+        return Some(p);
+    }
+    let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(parent) = exe.parent()
+    {
+        dirs.push(parent.to_path_buf());
+        dirs.push(parent.join("bin"));
+    }
+    dirs.extend(known_package_dirs(&canon));
+    find_in_dirs(&name_refs, &dirs)
+}
+
+/// The JavaScript runtime yt-dlp uses for YouTube's signature
+/// challenges (O15): Deno, resolved through the shared policy
+/// exactly like the media tools (Python ships it in the app
+/// bundle and finds it via `_find_executable_path("deno")`).
+pub fn find_js_runtime() -> Option<std::path::PathBuf> {
+    find_tool("deno")
+}
+
+/// Detect the tools BlindRSS shells out to. A candidate that
+/// exists but fails validation counts as MISSING (O13): the
+/// caller repairs whatever this reports path-less, which is how
+/// a broken install gets fixed instead of silently trusted
+/// (Python `detect_media_tool_paths(validate=True)` semantics).
 pub fn check_tools() -> Vec<ToolStatus> {
-    let ytdlp = crate::media::find_ytdlp();
-    let ffmpeg = crate::silence::find_ffmpeg();
-    let ffprobe = find_ffprobe();
+    let status = |name: &str, found: Option<std::path::PathBuf>| {
+        let (path, version) = match found {
+            Some(p) if validate_executable(&p, name) => (
+                Some(p.to_string_lossy().to_string()),
+                probe_version(&p, name),
+            ),
+            _ => (None, None),
+        };
+        ToolStatus {
+            name: name.to_string(),
+            path,
+            version,
+        }
+    };
     vec![
-        ToolStatus {
-            name: "yt-dlp".to_string(),
-            version: ytdlp.as_deref().and_then(version_of),
-            path: ytdlp.map(|p| p.to_string_lossy().to_string()),
-        },
-        ToolStatus {
-            name: "ffmpeg".to_string(),
-            version: ffmpeg.as_deref().and_then(version_of),
-            path: ffmpeg.map(|p| p.to_string_lossy().to_string()),
-        },
-        ToolStatus {
-            name: "ffprobe".to_string(),
-            version: ffprobe.as_deref().and_then(version_of),
-            path: ffprobe.map(|p| p.to_string_lossy().to_string()),
-        },
+        status("yt-dlp", crate::media::find_ytdlp()),
+        status("ffmpeg", crate::silence::find_ffmpeg()),
+        status("ffprobe", find_ffprobe()),
     ]
 }
 
@@ -195,6 +574,32 @@ pub fn managed_ytdlp(data_dir: &std::path::Path) -> std::path::PathBuf {
 /// platform into <data_dir>/bin and make it executable.
 /// Returns the installed path.
 pub fn update_ytdlp(data_dir: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    Ok(update_managed_ytdlp(data_dir, &ytdlp_nightly_asset_url(), YTDLP_NIGHTLY_API_URL)?.path)
+}
+
+// ---------------------------------------------------------------------------
+// Nightly yt-dlp maintenance (O06; Python `_ensure_yt_dlp_cli` /
+// `_update_managed_ytdlp`). yt-dlp runs on the NIGHTLY channel:
+// stable releases trail YouTube's changes by weeks. The managed
+// copy is checked against the newest nightly tag, updated first
+// via `yt-dlp --update-to nightly` (whose exit code is NOT
+// trusted — the version is re-read) and then via a full download
+// that is verified to run BEFORE it replaces the working copy,
+// so a failed update never leaves the app without a working
+// yt-dlp. Checks are throttled to once per 24 h and the throttle
+// marker is written only after a check actually succeeds, so a
+// copy that fails to update retries on the next launch.
+// ---------------------------------------------------------------------------
+
+/// Newest-nightly lookup (GitHub API for yt-dlp-nightly-builds).
+pub const YTDLP_NIGHTLY_API_URL: &str =
+    "https://api.github.com/repos/yt-dlp/yt-dlp-nightly-builds/releases/latest";
+
+/// Nightly download base (per-platform asset appended).
+pub const YTDLP_NIGHTLY_ASSET_BASE: &str =
+    "https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/latest/download";
+
+fn ytdlp_nightly_asset_url() -> String {
     let asset = if cfg!(target_os = "windows") {
         "yt-dlp.exe"
     } else if cfg!(target_os = "macos") {
@@ -202,32 +607,316 @@ pub fn update_ytdlp(data_dir: &std::path::Path) -> Result<std::path::PathBuf, St
     } else {
         "yt-dlp_linux"
     };
-    let url = format!("https://github.com/yt-dlp/yt-dlp/releases/latest/download/{asset}");
+    format!("{YTDLP_NIGHTLY_ASSET_BASE}/{asset}")
+}
+
+/// The newest published nightly tag from `api_url`, or None when
+/// it cannot be reached — "don't know", never "up to date"
+/// (Python `latest_ytdlp_version`).
+pub fn latest_ytdlp_version_from(api_url: &str) -> Option<String> {
+    let mut resp = crate::http::agent().get(api_url).call().ok()?;
+    let body = resp.body_mut().read_to_string().ok()?;
+    let value: serde_json::Value = serde_json::from_str(&body).ok()?;
+    value
+        .get("tag_name")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn download_to_file(url: &str, dest: &std::path::Path) -> Result<(), String> {
     let mut resp = crate::http::agent()
-        .get(&url)
+        .get(url)
         .call()
         .map_err(|e| format!("yt-dlp download: {e}"))?;
     let bytes = resp
         .body_mut()
         .read_to_vec()
         .map_err(|e| format!("yt-dlp download: {e}"))?;
-    if bytes.len() < 100_000 {
-        return Err("yt-dlp download looks truncated".to_string());
+    std::fs::write(dest, &bytes).map_err(|e| format!("write: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(dest, std::fs::Permissions::from_mode(0o755));
     }
+    Ok(())
+}
+
+/// What one managed-yt-dlp maintenance pass did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum YtdlpUpdateAction {
+    /// The managed copy already reports the newest nightly tag.
+    AlreadyCurrent,
+    /// `yt-dlp --update-to nightly` brought the copy current
+    /// (verified by re-reading its version).
+    SelfUpdated,
+    /// The self-update did not get there; the full nightly binary
+    /// was downloaded, verified and swapped in.
+    Downloaded,
+    /// No working copy existed; the nightly binary was
+    /// downloaded, verified and installed.
+    InstalledNew,
+    /// Updating failed, but the previous working copy is intact.
+    KeptExistingAfterFailure,
+    /// The resolved copy belongs to the system (PATH/package
+    /// install): `--update-to nightly` was offered, and the
+    /// binary was never overwritten (Python's rule for copies it
+    /// does not manage).
+    SystemUpdateOffered,
+}
+
+/// Outcome of a managed-yt-dlp maintenance pass.
+#[derive(Debug, Clone, PartialEq)]
+pub struct YtdlpUpdateReport {
+    pub path: std::path::PathBuf,
+    pub action: YtdlpUpdateAction,
+    pub version: Option<String>,
+}
+
+/// Bring the managed yt-dlp in `data_dir` to the newest nightly
+/// served by `asset_url`/`api_url` (the injectable URLs are the
+/// production nightly endpoints in `update_ytdlp`/
+/// `maintain_ytdlp`; tests serve loopback fixtures). Failure-safe:
+/// with a working copy present, any failure reports
+/// `KeptExistingAfterFailure` with the copy untouched; with no
+/// working copy, a failed download is an error.
+pub fn update_managed_ytdlp(
+    data_dir: &std::path::Path,
+    asset_url: &str,
+    api_url: &str,
+) -> Result<YtdlpUpdateReport, String> {
     let dest = managed_ytdlp(data_dir);
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("bin dir: {e}"))?;
     }
-    let tmp = dest.with_extension("new");
-    std::fs::write(&tmp, &bytes).map_err(|e| format!("write: {e}"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755));
+    let existing_version = if dest.is_file() {
+        probe_version(&dest, "yt-dlp")
+    } else {
+        None
+    };
+    let works = existing_version.is_some();
+    let latest = latest_ytdlp_version_from(api_url);
+    if works && latest.is_some() && existing_version == latest {
+        set_managed_ytdlp_dir(data_dir);
+        return Ok(YtdlpUpdateReport {
+            path: dest,
+            action: YtdlpUpdateAction::AlreadyCurrent,
+            version: existing_version,
+        });
     }
-    std::fs::rename(&tmp, &dest).map_err(|e| format!("install: {e}"))?;
-    set_managed_ytdlp_dir(data_dir);
-    Ok(dest)
+    if works {
+        // Python: `--update-to nightly` first (small patch), but
+        // its exit code is not trusted — re-read the version.
+        let _ = run_tool(
+            &dest,
+            &["--update-to", "nightly"],
+            std::time::Duration::from_secs(300),
+        );
+        let after = probe_version(&dest, "yt-dlp");
+        if let (Some(l), Some(a)) = (&latest, &after)
+            && l == a
+        {
+            set_managed_ytdlp_dir(data_dir);
+            return Ok(YtdlpUpdateReport {
+                path: dest,
+                action: YtdlpUpdateAction::SelfUpdated,
+                version: after,
+            });
+        }
+        // Still behind (or the newest tag is unknown): fall
+        // through to the full verified download, as Python does.
+    }
+    let staging = dest.with_extension("new");
+    let staged = download_to_file(asset_url, &staging).and_then(|()| {
+        if probe_version(&staging, "yt-dlp").is_some() {
+            Ok(())
+        } else {
+            Err("downloaded yt-dlp did not run".to_string())
+        }
+    });
+    match staged {
+        Ok(()) => {
+            let version = probe_version(&staging, "yt-dlp");
+            std::fs::rename(&staging, &dest).map_err(|e| format!("install: {e}"))?;
+            set_managed_ytdlp_dir(data_dir);
+            Ok(YtdlpUpdateReport {
+                path: dest,
+                action: if works {
+                    YtdlpUpdateAction::Downloaded
+                } else {
+                    YtdlpUpdateAction::InstalledNew
+                },
+                version,
+            })
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&staging);
+            if works {
+                Ok(YtdlpUpdateReport {
+                    path: dest,
+                    action: YtdlpUpdateAction::KeptExistingAfterFailure,
+                    version: existing_version,
+                })
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
+
+/// The 24 h update-check throttle marker inside the data dir
+/// (Python keeps the same marker under the temp dir; the data
+/// dir is the durable equivalent for the port).
+pub fn ytdlp_marker_path(data_dir: &std::path::Path) -> std::path::PathBuf {
+    data_dir.join("last_ytdlp_update_check.txt")
+}
+
+/// True when a yt-dlp update check is due at `now`: no marker,
+/// an unreadable marker, or the last successful check at least
+/// 24 h ago (Python `_should_check_updates`).
+pub fn ytdlp_check_due_at(marker: &std::path::Path, now: std::time::SystemTime) -> bool {
+    let Ok(text) = std::fs::read_to_string(marker) else {
+        return true;
+    };
+    let Ok(secs) = text.trim().parse::<u64>() else {
+        return true;
+    };
+    let last = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs);
+    now.duration_since(last)
+        .map(|d| d >= std::time::Duration::from_secs(86_400))
+        .unwrap_or(false)
+}
+
+/// Record a successful update check at `now` (Python
+/// `_mark_update_checked` — called only once an update has
+/// actually landed or the copy proved current).
+pub fn mark_ytdlp_checked_at(marker: &std::path::Path, now: std::time::SystemTime) {
+    if let Ok(elapsed) = now.duration_since(std::time::SystemTime::UNIX_EPOCH) {
+        let _ = std::fs::write(marker, elapsed.as_secs().to_string());
+    }
+}
+
+/// True when a yt-dlp update check is due for `data_dir` now.
+pub fn ytdlp_check_due(data_dir: &std::path::Path) -> bool {
+    ytdlp_check_due_at(&ytdlp_marker_path(data_dir), std::time::SystemTime::now())
+}
+
+/// One throttled maintenance pass over the resolved yt-dlp
+/// (Python `_ensure_yt_dlp_cli`'s update block): the managed copy
+/// gets the full verified nightly maintenance; a system copy is
+/// only offered `--update-to nightly`. Returns None when the
+/// throttle window is still running or nothing working resolves
+/// (the missing-tool install flow handles that case). The marker
+/// is written only when the pass succeeded.
+pub fn maintain_ytdlp(data_dir: &std::path::Path) -> Option<YtdlpUpdateReport> {
+    if !ytdlp_check_due(data_dir) {
+        return None;
+    }
+    let marker = ytdlp_marker_path(data_dir);
+    if managed_ytdlp(data_dir).is_file() {
+        let report =
+            update_managed_ytdlp(data_dir, &ytdlp_nightly_asset_url(), YTDLP_NIGHTLY_API_URL)
+                .ok()?;
+        if report.action != YtdlpUpdateAction::KeptExistingAfterFailure {
+            mark_ytdlp_checked_at(&marker, std::time::SystemTime::now());
+        }
+        return Some(report);
+    }
+    if let Some(exe) = crate::media::find_ytdlp()
+        && validate_executable(&exe, "yt-dlp")
+    {
+        let ok = run_tool(
+            &exe,
+            &["--update-to", "nightly"],
+            std::time::Duration::from_secs(300),
+        )
+        .map(|r| r.success)
+        .unwrap_or(false);
+        if ok {
+            mark_ytdlp_checked_at(&marker, std::time::SystemTime::now());
+        }
+        let version = probe_version(&exe, "yt-dlp");
+        return Some(YtdlpUpdateReport {
+            path: exe,
+            action: YtdlpUpdateAction::SystemUpdateOffered,
+            version,
+        });
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// Packaged runtime smoke test (O15; Python
+// `core/runtime_self_test.py`, invoked there as
+// `--blindrss-runtime-self-test`). The Rust-appropriate subset:
+// the bundled tools resolve through the shared policy and
+// actually run (yt-dlp, Deno, ffmpeg, ffprobe — Python's
+// _REQUIRED_TOOLS plus ffprobe), and the extraction cascade
+// produces complete, stable text for a known article. VLC and
+// updater-helper checks are the app/player layer's own smoke
+// paths and stay there.
+// ---------------------------------------------------------------------------
+
+/// The extraction half of the smoke test: a fixed sample article
+/// must extract completely (>= 500 chars, Python's threshold)
+/// and identically across repeated passes. Returns the failure
+/// message, or None when extraction is healthy.
+pub fn smoke_extraction_error() -> Option<String> {
+    let paragraphs: String = (0..10)
+        .map(|i| {
+            format!(
+                "<p>Paragraph {i} contains enough distinct article prose to verify \
+                 that the packaged full-text extractor keeps the complete story when \
+                 repeated prefetch and on-demand extraction passes run.</p>"
+            )
+        })
+        .collect();
+    let html = format!(
+        "<html><head><title>Runtime extraction check</title></head><body>\
+         <main><article><h1>Runtime extraction check</h1>{paragraphs}</article></main></body></html>"
+    );
+    let extract = |html: &str| match crate::extract::extract_article(
+        html,
+        "https://example.com/runtime-extraction-check",
+        None,
+    ) {
+        crate::extract::ExtractOutcome::Article { text, .. } => Some(text),
+        _ => None,
+    };
+    match extract(&html) {
+        None => Some("full-text extraction returned no article".to_string()),
+        Some(text) if text.chars().count() < 500 => {
+            Some("full-text extraction returned incomplete article text".to_string())
+        }
+        Some(text) => {
+            if extract(&html).as_deref() != Some(text.as_str()) {
+                Some("full-text extraction changed across repeated passes".to_string())
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// Run the packaged-runtime smoke checks and return the list of
+/// failures (empty = healthy). The app exposes this as
+/// `--blindrss-runtime-self-test` for packaging verification.
+pub fn runtime_smoke_test() -> Vec<String> {
+    let mut errors = Vec::new();
+    for tool in ["yt-dlp", "deno", "ffmpeg", "ffprobe"] {
+        match find_tool(tool) {
+            None => errors.push(format!("bundled tool not found: {tool}")),
+            Some(p) => {
+                if !validate_executable(&p, tool) {
+                    errors.push(format!("bundled tool does not run: {tool}"));
+                }
+            }
+        }
+    }
+    if let Some(e) = smoke_extraction_error() {
+        errors.push(e);
+    }
+    errors
 }
 
 // ---------------------------------------------------------------------------

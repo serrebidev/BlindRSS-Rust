@@ -125,30 +125,30 @@ fn percent_encode(s: &str) -> String {
     out
 }
 
-/// Run yt-dlp and return its stdout, killing the wait after
-/// `timeout_s` (the child is detached on timeout; yt-dlp exits
-/// on its own once its stdout pipe closes).
+/// Run yt-dlp and return its stdout. F20: the run goes through
+/// the shared owned-subprocess runner, so a timed-out search is
+/// KILLED AND REAPED (Python `core/discovery.py` terminates
+/// timed-out subprocesses) instead of being abandoned to finish
+/// on its own.
 fn run_ytdlp(args: Vec<String>, timeout_s: u64) -> Result<String, String> {
     let exe = crate::media::find_ytdlp().ok_or("yt-dlp not found")?;
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let out = std::process::Command::new(&exe).args(&args).output();
-        let _ = tx.send(out);
-    });
-    match rx.recv_timeout(std::time::Duration::from_secs(timeout_s)) {
-        Ok(Ok(out)) => {
-            if out.status.success() {
-                Ok(String::from_utf8_lossy(&out.stdout).to_string())
-            } else {
-                let err = String::from_utf8_lossy(&out.stderr);
-                Err(format!(
-                    "yt-dlp: {}",
-                    err.lines().last().unwrap_or("failed").trim()
-                ))
-            }
-        }
-        Ok(Err(e)) => Err(format!("yt-dlp: {e}")),
-        Err(_) => Err("yt-dlp search timed out".to_string()),
+    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let run =
+        crate::dependency::run_tool(&exe, &arg_refs, std::time::Duration::from_secs(timeout_s))
+            .map_err(|e| {
+                if e.contains("timed out") {
+                    "yt-dlp search timed out".to_string()
+                } else {
+                    format!("yt-dlp: {e}")
+                }
+            })?;
+    if run.success {
+        Ok(run.stdout)
+    } else {
+        Err(format!(
+            "yt-dlp: {}",
+            run.stderr.lines().last().unwrap_or("failed").trim()
+        ))
     }
 }
 
