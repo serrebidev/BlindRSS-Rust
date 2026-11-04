@@ -3291,3 +3291,97 @@ net new tests), clippy `--workspace --all-targets
 -D warnings` clean on the Linux target and for
 `blindrss-core` on `x86_64-pc-windows-gnu`, `cargo build -p
 blindrss` OK, `cargo fmt --all` run last.
+### Audit 8 Task 15 resolution — complete Reddit/Lemmy documents in both readers (R02, R03, R04) (2026-11-04)
+
+Python builds ONE complete thread document per Reddit/Lemmy thread and
+feeds that same document to both readers. The old Rust code visited
+only the initially inlined `t1` replies, so any comment behind a
+`morechildren` expansion or a `_` continuation route never reached
+either reader (R02); Lemmy fetched a single v3 page of 200 comments
+at depth 8, sorted comment paths lexically (so comment 10 printed
+before comment 9), and parsed the query/fragment suffix as part of
+the post id, rejecting valid URLs such as `…/post/123?x=1` outright
+(R03); and `reconstructed_article_html` excluded Reddit and Lemmy,
+so the rich reader cleaned the original shell page instead of the
+rebuilt document (R04).
+
+Implementation (`crates/core/src/threads.rs`, `extract.rs`): both
+builders now mirror `core/article_extractor.py` in the Python tree.
+The Reddit collector queues `more` nodes exactly as Python does —
+`morechildren` batches of 100 children, at most 100 expansion
+requests, `_` continuations fetched only once the id queue drains,
+dedupe by fullname across the initial payload and every expansion,
+a 10,000-comment cap — then rebuilds display order by grouping
+children under their parent and emitting depth-first in arrival
+order, with orphans appended at their stored depth. When the JSON
+route yields nothing, the RSS fallback document is built instead
+(entries deduped by id/link, content preferred over summary, empty
+entries skipped, flat depth-0 blocks). The Lemmy fetcher pages v3
+(`page`) and then v4 (`page_cursor`) at limit 50 with
+`max_depth=999` and `sort=Old`, at most 250 requests and 10,000
+comments, deduping by comment id else `ap_id`, stopping on an empty
+page, a short v3 page, or an empty/repeated v4 cursor; a first-page
+failure fails that API version (so v3 falls through to v4) while a
+later-page failure keeps the document built so far. Comments stay
+in API order — paths now only set depth (segments excluding `""`
+and `"0"`, count minus one) — and the post id is parsed from the
+URL path only, so query/fragment suffixes no longer break valid
+Lemmy URLs. Both builders emit the same semantic document shape
+Python emits (`blindrss-reddit-post` / `blindrss-lemmy-post`
+sections; `#N Posted|Comment by author — YYYY-MM-DD HH:MM UTC —
+Reply level D` headings; `body_html`/`selftext_html` fragments with
+entity-escaped fragments unescaped first, plain bodies split into
+paragraphs, the Linked content line under Python's exact permalink
+rules, `[removed]`/`[deleted]`/`[no text available]` markers,
+Markdown bodies). `reconstructed_article_html` now chains
+`reddit_html`/`lemmy_html` after the forum reconstructions, so the
+one document feeds the plain reader through `html_to_text` and the
+rich reader through `clean_article_html`, as in Python.
+
+Evidence, regression-first: 13 new tests in
+`threads::reddit_lemmy_tests` pin the Python behaviour per finding —
+morechildren + continuation expansion in parent order with dedupe
+and exact request counts, repeated-more termination, the
+10,000-comment / 100-request bounds, body-HTML variants, the
+linked-content permalink rules, malformed-payload rejection, the
+RSS fallback, Lemmy query/fragment URLs, v3 paging at full depth
+in API order (comment 9 before comment 10), v4 repeated-cursor
+termination, and first-page vs later-page failure handling — plus
+two integration tests in `forum_sources_parity.rs`
+(`reddit_document_is_identical_in_both_readers`,
+`lemmy_document_is_identical_in_both_readers`) asserting the plain
+(`html_to_text`) and rich (`clean_article_html`) surfaces yield the
+identical complete list of reply identities for the same built
+document. Gate on this tree: `cargo fmt --all` clean, `cargo
+clippy --workspace --all-targets -- -D warnings` clean,
+`cargo test --workspace` 604 passed / 0 failed (589 on main
+`6da89d0` before this task; core 570 passed / 0 failed),
+`cargo build -p blindrss` OK. No `cfg(windows)` code was touched,
+so the Windows-gnu clippy leg did not apply.
+
+Deviations, named honestly:
+
+- The Lemmy origin is rebuilt from the parsed URL's host and port
+  rather than Python's raw netloc string; a URL carrying userinfo
+  would lose it. No real instance URL carries userinfo, and the
+  API requests are unaffected.
+- Heading, title and attribute escaping reuses the shipped GitHub
+  document escaper, which emits `&#39;` for an apostrophe where
+  Python's `html.escape` emits `&#x27;`; both decode identically
+  in the plain and rich readers.
+- Markdown is rendered by pulldown-cmark 0.13 (tables, footnotes,
+  strikethrough and task lists enabled, approximating
+  Python-Markdown's `extra` + `sane_lists`) rather than
+  Python-Markdown itself. Python's escape-first rule is preserved,
+  so raw HTML inside a post stays literal text; pathological
+  Markdown edge cases can differ in markup shape, not in the text
+  either reader speaks.
+- The pre-existing fetch gate is unchanged: in
+  `fetch_full_text_opts` a longer feed-supplied text still wins
+  over the reconstructed document for Reddit/Lemmy, exactly as for
+  forum reconstructions (GitHub alone was already exempted). When
+  the document is the selected content, both readers receive the
+  same complete document, which is what the identity tests pin.
+- Owner screen-reader acceptance is NOT claimed: NVDA/JAWS/
+  VoiceOver passes over the rebuilt Reddit/Lemmy documents in both
+  readers remain Brandon's manual gate, per the house rules.

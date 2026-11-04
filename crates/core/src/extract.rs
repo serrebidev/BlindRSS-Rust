@@ -200,7 +200,7 @@ fn table_lines(html: &str) -> Vec<String> {
 
 /// Minimal HTML entity unescape for JSON-LD / Next-data bodies (Python
 /// relies on the stdlib unescape in the same spots).
-fn unescape_entities(s: &str) -> String {
+pub(crate) fn unescape_entities(s: &str) -> String {
     s.replace("&amp;", "&")
         .replace("&lt;", "<")
         .replace("&gt;", ">")
@@ -2892,6 +2892,8 @@ pub(crate) fn reconstructed_article_html(url: &str) -> Option<(String, String)> 
     crate::threads::github_html(url)
         .or_else(|| crate::forum_sources::topic_html(url))
         .or_else(|| crate::forum_sources::web_thread_html(url))
+        .or_else(|| crate::threads::reddit_html(url))
+        .or_else(|| crate::threads::lemmy_html(url))
 }
 
 /// Fetch a page and extract its full text, running Python's
