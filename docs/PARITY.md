@@ -3874,4 +3874,7 @@ info travels as `MediaInfoReady`) and gains Task 17's
 Task 17's sites used its local `volume_step` value while Task
 18 made it a module function re-reading config at use time —
 the two arms now call `volume_step()` like Task 18's other
-sites. Merged gate follows below.
+sites. Merged gate: fmt clean, clippy clean (workspace and
+core windows-gnu), 673 passed / 0 failed, build OK. The count
+reconciles: 646 (batch 1) + 1 (Windows-path regression test)
++ 15 (Task 18) + 11 (Task 17).
