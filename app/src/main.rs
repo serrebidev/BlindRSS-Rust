@@ -17,7 +17,7 @@ mod player;
 mod settings;
 mod startup;
 
-use blindrss_core::{Article, Db, Feed, ParsedFeed, store_parsed};
+use blindrss_core::{Article, Db, Feed, ParsedFeed, store_parsed_with_retention};
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -137,6 +137,14 @@ fn restored_view_state(raw: &str) -> (Option<String>, u8) {
 /// core's Python-compatible encoder.
 fn remembered_view_value(selected: Option<&str>, read_filter: u8) -> String {
     blindrss_core::config::encode_remembered_view(selected, read_filter)
+/// The retention boundary ingestion must not insert past (Python
+/// issue #106): the `YYYY-MM-DD` cutoff for the configured
+/// `article_retention`, or None when retention is unlimited.
+fn article_retention_cutoff() -> Option<String> {
+    let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+    blindrss_core::retention::retention_cutoff_date(blindrss_core::retention::retention_days(
+        cfg.get_str("article_retention", "unlimited"),
+    ))
 }
 
 /// Append one line to blindrss.log in the data dir (startup and
@@ -8302,7 +8310,12 @@ fn main() {
                         }
                         let mut stored_new = 0usize;
                         if let Some(db) = st.db.as_ref() {
-                            match store_parsed(db, &feed, &parsed) {
+                            match store_parsed_with_retention(
+                                db,
+                                &feed,
+                                &parsed,
+                                article_retention_cutoff().as_deref(),
+                            ) {
                                 Ok(n) => {
                                     new_total += n;
                                     stored_new = n;
@@ -8344,7 +8357,12 @@ fn main() {
                                 add_category.as_deref().filter(|c| !c.trim().is_empty()),
                             ) {
                                 Ok(feed) => {
-                                    let _ = store_parsed(db, &feed, &parsed);
+                                    let _ = store_parsed_with_retention(
+                                        db,
+                                        &feed,
+                                        &parsed,
+                                        article_retention_cutoff().as_deref(),
+                                    );
                                     st.feeds.push(feed);
                                     rebuild_tree(&mut st, &tree);
                                     refill_articles(&mut st, &list);

@@ -2117,3 +2117,65 @@ and Python delete semantics: batch1, batch25, batch27, batch32,
 audit7, manage, ops, hosted_gui (plus a capability test there).
 Owner screen-reader acceptance of the category dialogs remains
 pending as manual acceptance, per the plan.
+## Audit 8 Task 3 resolution — ingestion identity, metadata and retention (D03, D04, D05, D06, D15)
+
+Reproduction first: the new offline suite `crates/core/tests/audit8_task3_slice.rs`
+failed behaviorally on the pre-fix code in five of its six tests — the second
+feed's copy of GUID `1` stored 0 rows, a changed GUID revived a deleted URL,
+a publisher URL correction was ignored, old unread non-favorites survived
+prune, and a zero-day prune deleted the tombstone itself. The sixth test
+(retention insert boundary) is written against the new
+`store_parsed_with_retention` API and passes with the fix.
+
+- D03 (feed-scoped identity): `refresh::store_parsed_with_retention` resolves
+  identity the way Python's generic store does — an entry whose raw id is
+  owned by a different feed is stored under `{feed_id}:{base_id}` with
+  independent read/favorite state, media, deletion and change history.
+  `Db::insert_article_if_new` no longer records a version against another
+  feed's row. The pre-existing YouTube `shape_stable_ids` prefixing is
+  unchanged and composes with this (it shapes listing items before store).
+- D15 (tombstone identity): new `Db::deleted_tombstones_for_feed` ports
+  Python's per-feed (ids, urls) pair; refresh skips an entry when its raw id,
+  its scoped id, or its URL matches that feed's tombstones. Other feeds are
+  unaffected. Hosted-provider sync paths still consult the global
+  `deleted_article_ids` set — they are provider-shaped stores, outside this
+  task's cited sites, and are not changed here.
+- D06 (metadata sync): existing rows for the refreshing feed (raw or scoped
+  id) now go through `Db::sync_existing_article_metadata`, porting Python's
+  update: date, description, media URL/type and article URL (with Python's
+  stale-enclosure URL healing) are updated when changed; read/favorite state,
+  the stored body, tags and labels are never touched, and a changed feed body
+  is appended to change history only. One recorded sub-deviation: chapter URL
+  is synced by the Db function when a caller supplies one, but the Rust
+  ingestion pipeline has no chapter source today (`ParsedEntry` carries no
+  chapter URL and no Rust code writes `articles.chapter_url` at ingest), so
+  refresh passes None and the stored value is preserved rather than cleared.
+- D04 (one retention boundary): `retention::retention_cutoff_date` and
+  `retention::article_is_outside_retention` port Python's shared boundary
+  (including the undated floor `"0002"`). `store_parsed_with_retention`
+  refuses NEW entries outside the window, and the app's refresh drain and
+  Add Feed paths pass the cutoff derived from the `article_retention`
+  config (`app::article_retention_cutoff`). `store_parsed` keeps the old
+  no-boundary behavior for its remaining callers (archive recovery, dialogs,
+  provider add-feed). Prune no longer ages out tombstones (see D05), so the
+  resurrection guard cannot expire. Core `refresh_feed`/`refresh_all` do not
+  receive config in this port's wiring and keep no-boundary storage; the
+  production refresh path is the app drain, which is wired.
+- D05 (cleanup policy): `Db::prune_old_articles` now mirrors Python
+  `cleanup_old_articles`: old read AND unread non-favorites are deleted,
+  favorites and undated rows (empty date or the `0001-01-01` sentinel, via
+  the `date >= '0002'` guard) are protected, and chapters plus
+  `article:<id>` playback_state rows are deleted with their articles.
+  Tombstones are not deleted at all. The pre-existing
+  `maintenance_slice::prune_keeps_unread_and_favorites` test encoded the old
+  divergent policy and was updated to the Python policy (renamed
+  `prune_removes_old_unread_keeps_favorites_and_tombstones`).
+
+Verification: `audit8_task3_slice` 6/6, `refresh_slice` 2/2,
+`maintenance_slice` 3/3, `articles_slice` 2/2, `parity_core_audit` 6/6 and
+the retention unit tests pass; the full gate in this batch's worktree ran
+`cargo fmt --all` (check clean), `cargo clippy` at zero warnings for core,
+app and xtask, `cargo test --workspace` 450 passed / 0 failed, and
+`cargo build -p blindrss` successfully. Category path handling is untouched: this batch builds on
+current main's path code and assumes Task 2's canonical `" / "` separator
+work lands independently (no category code is modified here).

@@ -116,6 +116,18 @@ pub struct ArticleVersion {
     pub content: String,
 }
 
+/// Publisher-owned fields of a stored article (see
+/// `Db::existing_article_meta`).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ExistingArticleMeta {
+    pub date: Option<String>,
+    pub description: Option<String>,
+    pub media_url: Option<String>,
+    pub media_type: Option<String>,
+    pub chapter_url: Option<String>,
+    pub url: String,
+}
+
 /// One feed's recorded refresh failure (Python issue #32 shape).
 #[derive(Debug, Clone, PartialEq)]
 pub struct FeedError {
@@ -1932,48 +1944,44 @@ impl Db {
         Ok(true)
     }
 
-    /// Retention: delete read, non-favorite articles older than
-    /// `keep_days` (by article date when parseable, else by row
-    /// position — dates are ISO text in this schema), plus
-    /// tombstones older than the same window. Returns rows removed.
+    /// Retention cleanup (Python `cleanup_old_articles`): delete
+    /// articles older than `keep_days` — read AND unread — except
+    /// favorites, and except undated rows (empty date or the
+    /// "0001-01-01" sentinel, which compare below the undated
+    /// floor). Dependent chapters and playback state go with the
+    /// articles. Tombstones are NEVER aged out here: Python removes
+    /// them only on restore or confirmed purge, so a deleted
+    /// article's resurrection guard does not expire. Returns
+    /// article rows removed.
     pub fn prune_old_articles(&self, keep_days: i64) -> rusqlite::Result<usize> {
-        let cutoff = {
-            // ISO date string keep_days in the past, matching the
-            // schema's ISO `date` text format.
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-            let then = now - keep_days * 86_400;
-            let days = then.div_euclid(86_400);
-            // Days since epoch -> (y, m, d) via civil algorithm.
-            let z = days + 719_468;
-            let era = z.div_euclid(146_097);
-            let doe = z.rem_euclid(146_097);
-            let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-            let y = yoe + era * 400;
-            let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-            let mp = (5 * doy + 2) / 153;
-            let d = doy - (153 * mp + 2) / 5 + 1;
-            let m = if mp < 10 { mp + 3 } else { mp - 9 };
-            let y = if m <= 2 { y + 1 } else { y };
-            format!("{y:04}-{m:02}-{d:02}")
+        let Some(cutoff) = crate::retention::retention_cutoff_date(Some(keep_days)) else {
+            return Ok(0);
         };
-        let removed = self.conn.execute(
-            "DELETE FROM articles WHERE is_read = 1 AND is_favorite = 0 \
-             AND date != '' AND date < ?1",
+        // One WHERE clause shared by the article delete and its
+        // dependent cleanups, exactly as in Python.
+        let cond = format!(
+            "date < ?1 AND date >= '{}' AND is_favorite = 0",
+            crate::retention::UNDATED_ARTICLE_FLOOR
+        );
+        self.conn.execute(
+            &format!(
+                "DELETE FROM chapters WHERE article_id IN \
+                 (SELECT id FROM articles WHERE {cond})"
+            ),
             params![cutoff],
         )?;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs_f64())
-            .unwrap_or(0.0);
-        let tomb_cutoff = now - (keep_days as f64) * 86_400.0;
-        let removed_tomb = self.conn.execute(
-            "DELETE FROM deleted_articles WHERE deleted_at < ?1",
-            params![tomb_cutoff],
+        self.conn.execute(
+            &format!(
+                "DELETE FROM playback_state WHERE id IN \
+                 (SELECT 'article:' || id FROM articles WHERE {cond})"
+            ),
+            params![cutoff],
         )?;
-        Ok(removed + removed_tomb)
+        let removed = self.conn.execute(
+            &format!("DELETE FROM articles WHERE {cond}"),
+            params![cutoff],
+        )?;
+        Ok(removed)
     }
 
     /// Permanently delete an article (Python delete_behavior
@@ -2299,6 +2307,49 @@ impl Db {
         rows.collect()
     }
 
+    /// Tombstones for ONE feed (Python
+    /// `deleted_article_tombstones_for_feed`): the deleted article
+    /// ids and their URLs, both trimmed and non-empty. Refresh
+    /// matches an incoming entry against the ids (raw or
+    /// feed-scoped) OR its URL, so a publisher GUID change cannot
+    /// revive a deleted URL, and one feed's deletions never
+    /// suppress another feed's articles.
+    pub fn deleted_tombstones_for_feed(
+        &self,
+        feed_id: &str,
+    ) -> rusqlite::Result<(
+        std::collections::HashSet<String>,
+        std::collections::HashSet<String>,
+    )> {
+        let mut ids = std::collections::HashSet::new();
+        let mut urls = std::collections::HashSet::new();
+        if feed_id.trim().is_empty() {
+            return Ok((ids, urls));
+        }
+        let mut stmt = self
+            .conn
+            .prepare("SELECT article_id, url FROM deleted_articles WHERE feed_id = ?1")?;
+        let rows = stmt.query_map(params![feed_id], |r| {
+            Ok((
+                r.get::<_, Option<String>>(0)?,
+                r.get::<_, Option<String>>(1)?,
+            ))
+        })?;
+        for row in rows {
+            let (article_id, url) = row?;
+            if let Some(aid) = article_id
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+            {
+                ids.insert(aid);
+            }
+            if let Some(u) = url.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+                urls.insert(u);
+            }
+        }
+        Ok((ids, urls))
+    }
+
     pub fn deleted_articles(&self) -> rusqlite::Result<Vec<Article>> {
         let mut stmt = self.conn.prepare(
             "SELECT article_id, feed_id, title, url, content, description, date, \
@@ -2394,6 +2445,9 @@ impl Db {
     /// Both outcomes record a change-history version (Python
     /// providers/local.py): a first fetch seeds the original, a
     /// later fetch appends only when (title, content) changed.
+    /// A row already owned by a DIFFERENT feed is not this article:
+    /// no version is recorded against the other feed's history
+    /// (feed-scoped identity is resolved by the caller in refresh).
     pub fn insert_article_if_new(&self, a: &Article) -> rusqlite::Result<bool> {
         let n = self.conn.execute(
             "INSERT OR IGNORE INTO articles \
@@ -2415,8 +2469,110 @@ impl Db {
                 a.media_type
             ],
         )?;
-        let _ = self.record_article_version(&a.id, &a.title, a.content.as_deref());
-        Ok(n > 0)
+        if n > 0 {
+            let _ = self.record_article_version(&a.id, &a.title, a.content.as_deref());
+            return Ok(true);
+        }
+        let owner = self
+            .conn
+            .query_row(
+                "SELECT feed_id FROM articles WHERE id = ?1",
+                params![a.id],
+                |r| r.get::<_, String>(0),
+            )
+            .ok();
+        if owner.as_deref() == Some(a.feed_id.as_str()) {
+            let _ = self.record_article_version(&a.id, &a.title, a.content.as_deref());
+        }
+        Ok(false)
+    }
+
+    /// Publisher-owned fields of a stored article, for the refresh
+    /// metadata sync (Python providers/local.py existing-article
+    /// path). Local state (read/favorite, stored body, labels) is
+    /// deliberately not part of this shape.
+    pub fn existing_article_meta(
+        &self,
+        article_id: &str,
+    ) -> rusqlite::Result<Option<ExistingArticleMeta>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT date, description, media_url, media_type, chapter_url, url \
+             FROM articles WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query(params![article_id])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(ExistingArticleMeta {
+                date: row.get(0)?,
+                description: row.get(1)?,
+                media_url: row.get(2)?,
+                media_type: row.get(3)?,
+                chapter_url: row.get(4)?,
+                url: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
+            })),
+            None => Ok(None),
+        }
+    }
+
+    /// Sync publisher-owned metadata onto an existing article
+    /// (Python updates date, description, URL, enclosure/type and
+    /// chapter URL when any of them changed). Read/favorite state,
+    /// the stored body, tags and labels are local and are never
+    /// touched; a changed feed body is appended to change history
+    /// only. `chapter_url` is None when the caller has no chapter
+    /// source (the Rust ingestion pipeline carries none today), in
+    /// which case the stored value is preserved rather than
+    /// cleared. Returns true when a column changed.
+    pub fn sync_existing_article_metadata(
+        &self,
+        article_id: &str,
+        a: &Article,
+        chapter_url: Option<&str>,
+    ) -> rusqlite::Result<bool> {
+        let Some(meta) = self.existing_article_meta(article_id)? else {
+            return Ok(false);
+        };
+        // Self-heal stored webpage URLs (Python): adopt the feed's
+        // current link; clear a stale stored URL that was really
+        // the media enclosure; never wipe a good URL just because
+        // the feed temporarily omits its link.
+        let url_to_store = if !a.url.is_empty() && a.url != meta.url {
+            a.url.clone()
+        } else if a.url.is_empty()
+            && !meta.url.is_empty()
+            && (a.media_url.as_deref() == Some(meta.url.as_str())
+                || crate::media::media_type_for_url(&meta.url).is_some())
+        {
+            String::new()
+        } else {
+            meta.url.clone()
+        };
+        let chapter_to_store = chapter_url
+            .map(|s| Some(s.to_string()))
+            .unwrap_or_else(|| meta.chapter_url.clone());
+        let norm = |v: &Option<String>| v.clone().filter(|s| !s.is_empty());
+        let changed = norm(&a.date) != norm(&meta.date)
+            || norm(&a.description) != norm(&meta.description)
+            || norm(&a.media_url) != norm(&meta.media_url)
+            || norm(&a.media_type) != norm(&meta.media_type)
+            || chapter_to_store != meta.chapter_url
+            || url_to_store != meta.url;
+        if changed {
+            self.conn.execute(
+                "UPDATE articles SET date = ?2, description = ?3, media_url = ?4, \
+                 media_type = ?5, chapter_url = ?6, url = ?7 WHERE id = ?1",
+                params![
+                    article_id,
+                    a.date,
+                    a.description,
+                    a.media_url,
+                    a.media_type,
+                    chapter_to_store,
+                    url_to_store
+                ],
+            )?;
+        }
+        let _ = self.record_article_version(article_id, &a.title, a.content.as_deref());
+        Ok(changed)
     }
 
     /// Sync server-owned article fields without replacing local history, tags, or labels.

@@ -42,7 +42,7 @@ fn backup_restore_roundtrip() {
 }
 
 #[test]
-fn prune_keeps_unread_and_favorites() {
+fn prune_removes_old_unread_keeps_favorites_and_tombstones() {
     let path = scratch("prune.db");
     let conn = rusqlite::Connection::open(&path).unwrap();
     conn.execute_batch(
@@ -63,10 +63,16 @@ fn prune_keeps_unread_and_favorites() {
     .unwrap();
     drop(conn);
     let db = blindrss_core::Db::open(&path).unwrap();
+    // Python cleanup_old_articles (Audit 8 D04/D05): old read AND
+    // unread non-favorites are removed; favorites survive; and
+    // tombstones are never aged out by prune (only restore or a
+    // confirmed purge removes them), so 'ancient' stays as the
+    // resurrection guard for its article.
     let removed = db.prune_old_articles(30).unwrap();
-    assert_eq!(removed, 2); // old-read + ancient tombstone
+    assert_eq!(removed, 2); // old-read + old-unread articles
     let left = db.articles(None, 10).unwrap();
-    assert_eq!(left.len(), 3);
+    assert_eq!(left.len(), 2); // old-fav + new-read
+    assert!(db.deleted_article_ids().unwrap().contains("ancient"));
 }
 
 #[test]

@@ -44,18 +44,72 @@ pub fn store_parsed(
     feed: &Feed,
     parsed: &crate::feeds::ParsedFeed,
 ) -> Result<usize, String> {
-    // Deleted articles must not resurrect on refresh (Python checks
-    // tombstones the same way).
-    let tombstones = db.deleted_article_ids().unwrap_or_default();
+    store_parsed_with_retention(db, feed, parsed, None)
+}
+
+/// Store a parsed feed, refusing NEW entries outside the retention
+/// boundary (`retention_cutoff` is a `YYYY-MM-DD` string from
+/// `retention::retention_cutoff_date`; None = no boundary).
+pub fn store_parsed_with_retention(
+    db: &Db,
+    feed: &Feed,
+    parsed: &crate::feeds::ParsedFeed,
+    retention_cutoff: Option<&str>,
+) -> Result<usize, String> {
+    // Deleted articles must not resurrect on refresh. Tombstones
+    // are feed-scoped (Python `deleted_article_tombstones_for_feed`):
+    // an entry matches on its raw id, its feed-scoped id, or its
+    // URL — so a changed GUID cannot revive a deleted URL, and one
+    // feed's deletions never suppress another feed's articles.
+    let (tomb_ids, tomb_urls) = db.deleted_tombstones_for_feed(&feed.id).unwrap_or_default();
     // Filter-rule pipeline (Python applies enabled rules to articles
     // as they arrive). Missing table (older fixtures) = no rules.
     let rules = db.filter_rules().unwrap_or_default();
     let mut inserted = 0;
     for entry in &parsed.entries {
-        if tombstones.contains(&entry.id) {
+        let base_id = entry.id.trim().to_string();
+        if base_id.is_empty() {
             continue;
         }
-        let article = entry_to_article(&feed.id, entry);
+        // Feed-scoped identity (Python): when another feed already
+        // owns the raw id, this feed's copy lives under
+        // `{feed_id}:{base_id}` with fully independent state.
+        let scoped_id = format!("{}:{}", feed.id, base_id);
+        let entry_url = entry.url.trim();
+        if tomb_ids.contains(&base_id)
+            || tomb_ids.contains(&scoped_id)
+            || (!entry_url.is_empty() && tomb_urls.contains(entry_url))
+        {
+            continue;
+        }
+        let mut article = entry_to_article(&feed.id, entry);
+        // Existing row for THIS feed, under the raw or scoped id:
+        // sync publisher-owned metadata and keep local state.
+        let existing_id = match db.article_by_id(&base_id) {
+            Ok(Some(row)) if row.feed_id == feed.id => Some(base_id.clone()),
+            _ => match db.article_by_id(&scoped_id) {
+                Ok(Some(row)) if row.feed_id == feed.id => Some(scoped_id.clone()),
+                _ => None,
+            },
+        };
+        if let Some(eid) = existing_id {
+            db.sync_existing_article_metadata(&eid, &article, None)
+                .map_err(|e| format!("store failed: {e}"))?;
+            continue;
+        }
+        // New row. A raw id owned by a different feed means this
+        // entry is stored under the scoped id instead.
+        if matches!(db.article_by_id(&base_id), Ok(Some(_))) {
+            article.id = scoped_id;
+        } else {
+            article.id = base_id;
+        }
+        // One retention boundary (Python issue #106): a feed keeps
+        // listing entries retention has already purged; inserting
+        // one would resurrect it as unread.
+        if crate::retention::article_is_outside_retention(entry.date.as_deref(), retention_cutoff) {
+            continue;
+        }
         if db
             .insert_article_if_new(&article)
             .map_err(|e| format!("store failed: {e}"))?
