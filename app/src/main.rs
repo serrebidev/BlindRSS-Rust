@@ -3728,6 +3728,7 @@ fn main() {
             };
             if let Some(a) = marked {
                 propagate_read_state(&a, true);
+            }
         });
         if let Some(wv) = rich_view.as_ref() {
             let state_wf = state.clone();
