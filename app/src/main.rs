@@ -196,6 +196,26 @@ fn log_line(msg: &str) {
 /// the server's fetch-content result competes with the local
 /// cascade outcome; the more complete text wins. Runs on the
 /// full-text worker thread.
+/// Automatic translation inside the full-text worker
+/// (Python's worker-side `_translate_rendered_text_if_enabled`,
+/// Audit 8 O07): when a translation runtime config exists,
+/// the extracted text is translated before it is cached or
+/// shown; any failure keeps the original text, so a blank or
+/// failing translation never replaces the article.
+fn auto_translate_text(text: String) -> String {
+    if text.trim().is_empty() {
+        return text;
+    }
+    let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+    let Some(settings) = blindrss_core::translate::settings_from_config(&cfg) else {
+        return text;
+    };
+    match blindrss_core::translate::translate_text(&cfg, &text, &settings.target_language) {
+        Ok(translated) if !translated.trim().is_empty() => translated,
+        _ => text,
+    }
+}
+
 fn arbitrate_full_text(
     outcome: blindrss_core::extract::ExtractOutcome,
     article_id: &str,
@@ -1228,6 +1248,89 @@ fn show_image_alt_for(cfg: &blindrss_core::config::Config, db: Option<&Db>, feed
     cfg.get_bool("show_image_alt", false)
 }
 
+/// Re-render the selected article in place after a display
+/// setting changed (Audit 8 G16; Python's
+/// `on_set_feed_images` re-runs `_update_content_view`): the
+/// article's cached renderings are invalidated, the reader
+/// generation moves on so in-flight results retire, and the
+/// feed body is shown again under the new setting — plain and
+/// rich outputs alike — without moving the selection.
+#[allow(clippy::too_many_arguments)]
+fn rerender_current_article(
+    state: &Rc<RefCell<State>>,
+    frame: &Frame,
+    reader: &TextCtrl,
+    rich_view: &Rc<Option<WebView>>,
+    rich_loading: &Rc<std::cell::Cell<bool>>,
+    tx: &Sender<RefreshMsg>,
+) {
+    let mut st = state.borrow_mut();
+    let Some(idx) = st.selected_article else {
+        return;
+    };
+    let Some(mut a) = st.articles.get(idx).cloned() else {
+        return;
+    };
+    ensure_content(st.db.as_ref(), &mut a);
+    if let Some(row) = st.articles.get_mut(idx) {
+        row.content = a.content.clone();
+    }
+    st.reader_generation = st.reader_generation.wrapping_add(1);
+    st.pending_fulltext = None;
+    st.auto_load = None;
+    st.reader_cache.remove_prefix(&format!("{}:", a.id));
+    let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+    let keep_alt = show_image_alt_for(&cfg, st.db.as_ref(), &a.feed_id);
+    let raw_body = a
+        .content
+        .clone()
+        .filter(|c| !c.trim().is_empty())
+        .or_else(|| a.description.clone())
+        .unwrap_or_else(|| "(no stored text)".to_string());
+    let body = blindrss_core::extract::html_to_text_opts(&raw_body, keep_alt);
+    reader.set_value(&format!("{}\n\n{}", a.title, body));
+    if cfg.get_bool("full_text_rich_view", false)
+        && let Some(wv) = rich_view.as_ref()
+    {
+        {
+            let frag = blindrss_core::article_html::rich_article_from_feed(
+                &a.url,
+                &raw_body,
+                &a.title,
+                a.author.as_deref().unwrap_or(""),
+                a.date
+                    .as_deref()
+                    .unwrap_or("")
+                    .split('T')
+                    .next()
+                    .unwrap_or(""),
+                "",
+                "",
+                &ui_language(),
+            );
+            match frag {
+                Some(frag) => {
+                    rich_loading.set(true);
+                    wv.set_page(&rich_document(&frag), &a.url);
+                    wv.show(true);
+                    reader.show(false);
+                    frame.layout();
+                    spawn_rich_fetch(tx, &a);
+                }
+                None => {
+                    wv.show(false);
+                    reader.show(true);
+                }
+            }
+            return;
+        }
+    }
+    if let Some(wv) = rich_view.as_ref() {
+        wv.show(false);
+    }
+    reader.show(true);
+}
+
 /// The config's notification-excluded feed ids (Python
 /// `_get_notification_excluded_feed_ids`).
 fn notification_excluded_ids(cfg: &blindrss_core::config::Config) -> Vec<String> {
@@ -1332,7 +1435,18 @@ fn base_db_path() -> PathBuf {
     target
 }
 
-fn reader_cache_key(article: &Article, keep_alt: bool) -> String {
+/// The translation variant identity of a config (Python's
+/// `_translation_fulltext_cache_suffix`): empty when no
+/// translation runtime config exists, so untranslated and
+/// translated renderings never share a cache entry (Audit 8
+/// O07/O08).
+fn translation_variant(cfg: &blindrss_core::config::Config) -> String {
+    blindrss_core::translate::settings_from_config(cfg)
+        .map(|s| s.cache_suffix())
+        .unwrap_or_default()
+}
+
+fn reader_cache_key(article: &Article, keep_alt: bool, tr_variant: &str) -> String {
     use std::hash::{Hash, Hasher};
     let mut hash = std::collections::hash_map::DefaultHasher::new();
     (
@@ -1342,9 +1456,43 @@ fn reader_cache_key(article: &Article, keep_alt: bool) -> String {
         &article.description,
         keep_alt,
         ui_language(),
+        tr_variant,
     )
         .hash(&mut hash);
-    format!("{:016x}", hash.finish())
+    // The article id prefixes the key so per-article
+    // invalidation (image-alt changes, G16) can find every
+    // variant of one article's entries.
+    format!("{}:{:016x}", article.id, hash.finish())
+}
+
+/// Whether selecting an article starts the automatic
+/// full-text load (Python `on_article_selected`): translation
+/// is on (the pane must end up translated without a focus
+/// action), or the platform is macOS (VoiceOver never fires
+/// the reader focus event), or the article is a forum thread
+/// or YouTube video whose feed body is only a stub (Audit 8
+/// G02).
+fn auto_fulltext_on_select(
+    translation_ready: bool,
+    platform_macos: bool,
+    forum_thread: bool,
+    youtube_video: bool,
+) -> bool {
+    translation_ready || platform_macos || forum_thread || youtube_video
+}
+
+/// Queue the automatic full-text load for the drain timer:
+/// immediate when forced (reader focus), debounced 350 ms
+/// otherwise (Python `_fulltext_debounce_ms`), and tied to
+/// the current reader generation so a selection change
+/// cancels it.
+fn schedule_auto_fulltext(st: &mut State, force: bool) {
+    let delay = if force {
+        std::time::Duration::ZERO
+    } else {
+        std::time::Duration::from_millis(350)
+    };
+    st.auto_load = Some((st.reader_generation, std::time::Instant::now() + delay));
 }
 
 struct State {
@@ -1431,6 +1579,11 @@ struct State {
     reader_cache: blindrss_core::reader_cache::ReaderCache,
     reader_generation: u64,
     pending_fulltext: Option<(u64, String)>,
+    /// A scheduled automatic full-text load (Audit 8 G02):
+    /// (reader generation, when it comes due). The drain
+    /// timer fires it through the Read Full Text action once
+    /// due; a generation change cancels it.
+    auto_load: Option<(u64, std::time::Instant)>,
 }
 
 /// A resolved playback stream: URL, optional yt-dlp info and request headers.
@@ -1480,13 +1633,16 @@ enum RefreshMsg {
     /// Cast discovery finished: the devices found plus the
     /// article and its resolved stream URL, for the picker.
     CastDevices(Vec<blindrss_core::cast::CastDevice>, Article, String),
-    /// Open-article-by-URL result: (page title, plain text).
-    OpenedArticle(Result<(String, String, String), String>),
     /// A finished active-provider action (hosted refresh,
     /// subscribe, unsubscribe): a human summary or an error.
     ProviderAction(Result<String, String>),
-    /// A finished article translation: (article id, result).
-    Translated(String, Result<String, String>),
+    /// A finished article translation: the request identity
+    /// it was started under (article, generation, variant —
+    /// Audit 8 O08) plus the result.
+    Translated(
+        blindrss_core::reader_cache::TranslationRequest,
+        Result<String, String>,
+    ),
     /// A second copy asked this one to come to the front.
     ActivateWindow,
     /// The Windows global show/hide hotkey fired.
@@ -3306,6 +3462,7 @@ fn main() {
             reader_cache: blindrss_core::reader_cache::ReaderCache::default(),
             reader_generation: 0,
             pending_fulltext: None,
+            auto_load: None,
         }));
 
         // A staged restore (Python backup.py semantics) applies
@@ -3535,6 +3692,27 @@ fn main() {
                 }
                 reader.show(true);
             }
+            // Automatic full-text load (Audit 8 G02/O07,
+            // Python on_article_selected): with translation
+            // on, the pane must end up translated without a
+            // focus action; on macOS VoiceOver never fires
+            // the reader focus event; forum threads and
+            // YouTube videos syndicate only a stub. Debounced
+            // and generation-guarded, so fast arrowing is
+            // safe; every other article waits for reader
+            // focus (the SET_FOCUS binding below).
+            // Selection still marks nothing (Audit 8 G01,
+            // Task 11): Task 12's mark-on-select block was
+            // dropped at integration — marking belongs to
+            // reader focus and activation.
+            if auto_fulltext_on_select(
+                blindrss_core::translate::settings_from_config(&cfg).is_some(),
+                cfg!(target_os = "macos"),
+                blindrss_core::forum_sources::is_forum_thread_host(&a.url),
+                blindrss_core::ytfull::is_youtube_video_url(&a.url),
+            ) {
+                schedule_auto_fulltext(&mut st, false);
+            }
         });
 
         // Reader focus marks the selected article read +
@@ -3550,7 +3728,6 @@ fn main() {
             };
             if let Some(a) = marked {
                 propagate_read_state(&a, true);
-            }
         });
         if let Some(wv) = rich_view.as_ref() {
             let state_wf = state.clone();
@@ -4682,7 +4859,7 @@ fn main() {
             ensure_content(st.db.as_ref(), &mut article);
             let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
             let keep_alt = show_image_alt_for(&cfg, st.db.as_ref(), &article.feed_id);
-            let cache_key = reader_cache_key(&article, keep_alt);
+            let cache_key = reader_cache_key(&article, keep_alt, &translation_variant(&cfg));
             if let Some((text, source)) = st
                 .reader_cache
                 .get(&cache_key, cfg.get_bool("cache_full_text", false))
@@ -4726,7 +4903,8 @@ fn main() {
                     let result = blindrss_core::download::youtube_full_text_in_language(
                         &url,
                         &ui_language(),
-                    );
+                    )
+                    .map(auto_translate_text);
                     let _ = tx.send(RefreshMsg::YoutubeText(request, result));
                 } else {
                     let jar = blindrss_core::cookies::load_jar_beside(&config_path());
@@ -4754,6 +4932,22 @@ fn main() {
                     // the local cascade; the more complete
                     // result wins.
                     let outcome = arbitrate_full_text(outcome, &article_id);
+                    // Automatic translation happens here, on
+                    // the worker, before caching — Python's
+                    // pipeline translates the rendered text
+                    // inside its full-text worker (Audit 8 O07).
+                    let outcome = match outcome {
+                        blindrss_core::extract::ExtractOutcome::Article {
+                            title,
+                            text,
+                            source,
+                        } => blindrss_core::extract::ExtractOutcome::Article {
+                            title,
+                            text: auto_translate_text(text),
+                            source,
+                        },
+                        other => other,
+                    };
                     let _ = tx.send(RefreshMsg::FullText(request, outcome, first_html));
                 }
             });
@@ -4825,12 +5019,28 @@ fn main() {
                 return;
             }
             frame_tl.set_status_text("Translating...", 0);
+            // The result is applied only under this exact
+            // identity (Audit 8 O08): same article, same
+            // reader generation, same provider/language/model
+            // variant. Bumping the generation also retires
+            // any in-flight full-text application, like
+            // Python's mode/token change.
+            let request = {
+                let mut st = state_tl.borrow_mut();
+                st.reader_generation = st.reader_generation.wrapping_add(1);
+                st.pending_fulltext = None;
+                st.auto_load = None;
+                blindrss_core::reader_cache::TranslationRequest {
+                    article_id: article.id.clone(),
+                    generation: st.reader_generation,
+                    variant: translation_variant(&cfg),
+                }
+            };
             let tx = tx_tl.clone();
-            let id = article.id.clone();
             std::thread::spawn(move || {
                 let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
                 let result = blindrss_core::translate::translate_text(&cfg, &text, &target);
-                let _ = tx.send(RefreshMsg::Translated(id, result));
+                let _ = tx.send(RefreshMsg::Translated(request, result));
             });
         });
 
@@ -5504,48 +5714,48 @@ fn main() {
             restore_focus(&state_about.borrow(), &tree_about, &list_about);
         });
 
-        // Open Article from URL (Tools): fetch + extract on a
-        // worker, then show the ArticleWindow from the drain.
+        // Open Article from URL (Tools): dialog, then the
+        // article window loads the page itself (Audit 8 G13).
         let frame_oa = frame;
-        let state_oa = state.clone();
-        let tree_oa = tree;
-        let list_oa = list;
-        let tx_oa = tx.clone();
         let act_open_article: Rc<dyn Fn()> = Rc::new(move || {
-            let Some(url) = prompt_focus(
+            // Python on_open_article_url (Audit 8 G13): the
+            // dialog is prefilled with the clipboard contents
+            // when they are a usable URL, offers the starting
+            // reader, and the article window opens immediately
+            // — the page loads inside it, asynchronously,
+            // instead of this command blocking on a plain-text
+            // prefetch before any window appears.
+            let clipboard_url = wxdragon::prelude::Clipboard::get()
+                .get_text()
+                .map(|t| blindrss_core::media_url::normalize_media_url(t.trim()))
+                .unwrap_or_default();
+            let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+            let Some((typed, rich)) = dialogs::show_open_article_dialog(
                 &frame_oa,
-                "Article URL:",
-                "Open Article from URL",
-                "",
-                &state_oa.borrow(),
-                &tree_oa,
-                &list_oa,
+                &clipboard_url,
+                cfg.get_bool("full_text_rich_view", false),
             ) else {
                 return;
             };
-            let url = url.trim().to_string();
+            let url = blindrss_core::media_url::normalize_media_url(typed.trim());
             if url.is_empty() {
+                let message = if typed.trim().is_empty() {
+                    "Paste the address of an article first."
+                } else {
+                    "That does not look like an article address. Paste the full address, starting with http:// or https://."
+                };
+                let dialog =
+                    wxdragon::prelude::MessageDialog::builder(&frame_oa, message, "Open Article")
+                        .with_style(
+                            wxdragon::prelude::MessageDialogStyle::OK
+                                | wxdragon::prelude::MessageDialogStyle::IconInformation,
+                        )
+                        .build();
+                dialog.show_modal();
+                dialog.destroy();
                 return;
             }
-            frame_oa.set_status_text("Fetching article...", 0);
-            let tx = tx_oa.clone();
-            std::thread::spawn(move || {
-                let jar = blindrss_core::cookies::load_jar_beside(&config_path());
-                let header = blindrss_core::cookies::cookie_header_for(&jar, &url);
-                let (outcome, _) = blindrss_core::extract::fetch_full_text(&url, &header, None, "");
-                let result = match outcome {
-                    blindrss_core::extract::ExtractOutcome::Article { title, text, .. } => {
-                        Ok((url, title, text))
-                    }
-                    blindrss_core::extract::ExtractOutcome::Gate { reason } => {
-                        Err(format!("page blocked: {reason}"))
-                    }
-                    blindrss_core::extract::ExtractOutcome::Empty => {
-                        Err("nothing extractable on that page".to_string())
-                    }
-                };
-                let _ = tx.send(RefreshMsg::OpenedArticle(result));
-            });
+            article_window::open_url(&url, rich);
         });
 
         // Open Media URL (Tools): play an arbitrary media URL in
@@ -6381,6 +6591,9 @@ fn main() {
             ("columns", act_columns.clone()),
             ("equalizer", act_equalizer.clone()),
         ];
+        let rich_view_set = rich_view.clone();
+        let rich_loading_set = rich_loading.clone();
+        let tx_set = tx.clone();
         let act_settings: Rc<dyn Fn()> = Rc::new(move || {
             #[cfg(target_os = "windows")]
             let prior_accel = blindrss_core::config::Config::load(&config_path())
@@ -6389,8 +6602,27 @@ fn main() {
                         .to_string()
                 })
                 .unwrap_or_else(|_| "Ctrl+Alt+B".to_string());
+            let prior_alt = blindrss_core::config::Config::load(&config_path())
+                .map(|c| c.get_bool("show_image_alt", false))
+                .unwrap_or(false);
             let intent = settings::show_settings(&frame_set, &config_path());
             apply_http_config();
+            // Audit 8 G16: a global image-alt change
+            // re-renders the current article immediately,
+            // like the per-feed commands do.
+            let now_alt = blindrss_core::config::Config::load(&config_path())
+                .map(|c| c.get_bool("show_image_alt", false))
+                .unwrap_or(false);
+            if now_alt != prior_alt {
+                rerender_current_article(
+                    &state_set,
+                    &frame_set,
+                    &reader,
+                    &rich_view_set,
+                    &rich_loading_set,
+                    &tx_set,
+                );
+            }
             let path = db_path();
             if state_set.borrow().store_path != path {
                 let mut st = state_set.borrow_mut();
@@ -6410,6 +6642,7 @@ fn main() {
                 st.pending_play = None;
                 st.pending_queue = None;
                 st.pending_fulltext = None;
+                st.auto_load = None;
                 st.reader_generation = st.reader_generation.wrapping_add(1);
                 st.reader_cache = blindrss_core::reader_cache::ReaderCache::default();
                 st.refresh_new.clear();
@@ -7065,6 +7298,9 @@ fn main() {
         let make_imgalt = |mode: Option<bool>| -> Rc<dyn Fn()> {
             let state_ia = state.clone();
             let frame_ia = frame;
+            let rich_view_ia = rich_view.clone();
+            let rich_loading_ia = rich_loading.clone();
+            let tx_ia = tx.clone();
             Rc::new(move || {
                 let (feed_id, done) = {
                     let st = state_ia.borrow();
@@ -7086,6 +7322,26 @@ fn main() {
                         },
                         0,
                     );
+                    // Audit 8 G16: the change re-renders the
+                    // current article at once (Python
+                    // `_update_content_view`) when it belongs
+                    // to this feed — no reselection needed.
+                    let selected_feed = {
+                        let st = state_ia.borrow();
+                        st.selected_article
+                            .and_then(|i| st.articles.get(i))
+                            .map(|a| a.feed_id.clone())
+                    };
+                    if selected_feed.as_deref() == feed_id.as_deref() {
+                        rerender_current_article(
+                            &state_ia,
+                            &frame_ia,
+                            &reader,
+                            &rich_view_ia,
+                            &rich_loading_ia,
+                            &tx_ia,
+                        );
+                    }
                 }
             })
         };
@@ -8678,6 +8934,22 @@ fn main() {
             reader.popup_menu(&mut menu, None);
         });
 
+        // Reader focus starts the full-text load at once
+        // (Audit 8 G02; Python on_content_focus with
+        // force=True). The load itself runs through the Read
+        // Full Text action via the drain timer, so cache,
+        // request guards and translation apply unchanged.
+        {
+            let state_focus = state.clone();
+            reader.bind_internal(EventType::SET_FOCUS, move |ev| {
+                ev.skip(true);
+                let mut st = state_focus.borrow_mut();
+                if st.selected_article.is_some() {
+                    schedule_auto_fulltext(&mut st, true);
+                }
+            });
+        }
+
         // Enter (item activation): play when the article has
         // media, otherwise open its link in the browser
         // (Brandon's rule, 2026-10-30).
@@ -8898,6 +9170,7 @@ fn main() {
         let rich_loading_tick = rich_loading.clone();
         let rx_tick = rx.clone();
         let tx_tick = tx.clone();
+        let auto_ft_tick = act_fulltext.clone();
         timer.on_tick(move |_| {
             if frame_tick.is_shown() && frame_tick.is_iconized() {
                 let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
@@ -8912,6 +9185,34 @@ fn main() {
                 if st.refill_pending {
                     st.refill_pending = false;
                     refill_articles(&mut st, &list);
+                }
+            }
+            // Automatic full-text load (Audit 8 G02): a
+            // schedule set by selection or reader focus fires
+            // once when due, through the Read Full Text
+            // action so every guard in it applies. A schedule
+            // whose generation moved on is cancelled silently.
+            {
+                let fire = {
+                    let mut st = state_tick.borrow_mut();
+                    match st.auto_load {
+                        Some((generation, due)) if generation == st.reader_generation => {
+                            if std::time::Instant::now() >= due {
+                                st.auto_load = None;
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                        Some(_) => {
+                            st.auto_load = None;
+                            false
+                        }
+                        None => false,
+                    }
+                };
+                if fire {
+                    auto_ft_tick();
                 }
             }
             // Tray "Unread: {count}" label (Batch 41a): refresh
@@ -9078,20 +9379,45 @@ fn main() {
                         }
                         Err(e) => frame_tick.set_status_text(&format!("yt-dlp download: {e}"), 0),
                     },
-                    Ok(RefreshMsg::Translated(id, result)) => {
+                    Ok(RefreshMsg::Translated(request, result)) => {
+                        // Audit 8 O08: a late translation applies
+                        // only to the article, generation and
+                        // variant it was requested under. A
+                        // delayed A result after selecting B —
+                        // or after an account, provider,
+                        // language or model change — is dropped,
+                        // never written over the current article.
+                        let cfg =
+                            blindrss_core::config::Config::load(&config_path())
+                                .unwrap_or_default();
+                        let current_variant = translation_variant(&cfg);
                         let st = state_tick.borrow();
-                        let title = st
-                            .articles
-                            .iter()
-                            .find(|a| a.id == id)
-                            .map(|a| a.title.clone())
-                            .unwrap_or_default();
-                        match result {
-                            Ok(text) => {
-                                reader.set_value(&format!("{title}\n\n{text}"));
-                                frame_tick.set_status_text("Article translated", 0);
+                        let selected = st
+                            .selected_article
+                            .and_then(|i| st.articles.get(i))
+                            .cloned();
+                        let current = selected.as_ref().is_some_and(|a| {
+                            request.is_current(st.reader_generation, &a.id, &current_variant)
+                        });
+                        if current && let Some(article) = selected {
+                            match result {
+                                Ok(text) => {
+                                    reader.set_value(&format!("{}\n\n{}", article.title, text));
+                                    frame_tick.set_status_text("Article translated", 0);
+                                    // The rich document is an
+                                    // output too: refresh it so
+                                    // toggling modes stays
+                                    // truthful.
+                                    if cfg.get_bool("full_text_rich_view", false)
+                                        && rich_view_tick.as_ref().is_some()
+                                    {
+                                        spawn_rich_fetch(&tx_tick, &article);
+                                    }
+                                }
+                                Err(e) => {
+                                    frame_tick.set_status_text(&format!("Translate: {e}"), 0)
+                                }
                             }
-                            Err(e) => frame_tick.set_status_text(&format!("Translate: {e}"), 0),
                         }
                     }
                     Ok(RefreshMsg::ProviderAction(result)) => {
@@ -9449,13 +9775,6 @@ fn main() {
                         Ok(msg) => frame_tick.set_status_text(&msg, 0),
                         Err(e) => frame_tick.set_status_text(&format!("Cast: {e}"), 0),
                     },
-                    Ok(RefreshMsg::OpenedArticle(result)) => match result {
-                        Ok((url, title, text)) => {
-                            article_window::open(&title, &text, Some(&url));
-                            frame_tick.set_status_text("Article opened in its own window", 0);
-                        }
-                        Err(e) => frame_tick.set_status_text(&format!("Open article: {e}"), 0),
-                    },
                     Ok(RefreshMsg::AllDone(path)) => {
                         if path != state_tick.borrow().store_path {
                             continue;
@@ -9658,6 +9977,46 @@ mod ui_parity_tests {
             is_read: false,
             is_favorite: false,
         }
+    }
+
+    #[test]
+    fn auto_fulltext_triggers_match_python_selection_rules() {
+        // Audit 8 G02/O07: translation on, macOS, a forum
+        // thread or a YouTube video each start the automatic
+        // load on selection; a plain article on another
+        // platform waits for reader focus.
+        assert!(auto_fulltext_on_select(true, false, false, false));
+        assert!(auto_fulltext_on_select(false, true, false, false));
+        assert!(auto_fulltext_on_select(false, false, true, false));
+        assert!(auto_fulltext_on_select(false, false, false, true));
+        assert!(!auto_fulltext_on_select(false, false, false, false));
+    }
+
+    #[test]
+    fn reader_cache_keys_separate_variants_and_carry_the_article_prefix() {
+        // Audit 8 O07/G16: the translation variant is part of
+        // the key (translated and original renderings never
+        // collide), and every key for one article shares its
+        // `id:` prefix so an image-alt change can invalidate
+        // exactly that article's entries.
+        let a = article("https://example.com/post", None);
+        let plain = reader_cache_key(&a, false, "");
+        let translated = reader_cache_key(&a, false, "::tr[grok:en]");
+        let alt = reader_cache_key(&a, true, "");
+        assert_ne!(plain, translated);
+        assert_ne!(plain, alt);
+        for key in [&plain, &translated, &alt] {
+            assert!(
+                key.starts_with("episode:"),
+                "key {key} lacks the article prefix"
+            );
+        }
+        let other = {
+            let mut b = article("https://example.com/post", None);
+            b.id = "other".into();
+            reader_cache_key(&b, false, "")
+        };
+        assert!(!other.starts_with("episode:"));
     }
 
     #[test]

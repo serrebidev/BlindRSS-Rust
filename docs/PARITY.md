@@ -3051,3 +3051,128 @@ Gate in this tree: `cargo test --workspace` 568 passed /
 0 failed (6 new core tests + 2 new app tests in this task),
 clippy `--workspace --all-targets -D warnings` clean,
 `cargo build -p blindrss` green, `cargo fmt --all` run last.
+## Audit 8 Task 12 resolution — automatic reader/translation lifecycle (G02, G12, G13, G16, O07, O08, S20, S21) (2026-11-03)
+
+Reproductions first: `crates/core/tests/reader_translation_parity.rs`
+(15 tests) failed to compile against the pre-fix tree — the S20
+fallback vectors, the S21 response parsers, the runtime-config /
+cache-variant identity, the translation request guard and the
+reader-cache prefix invalidation did not exist. App policy tests pin
+the automatic-load trigger table and the cache-key shape;
+article-window unit tests pin Copy Text's source, the failure
+stand-ins and the rich caption.
+
+- **S20 (translation compatibility fallbacks) — resolved.**
+  `crates/core/src/translate.rs` is now a faithful port of Python
+  `core/translation.py`'s provider layer: Qwen walks its three
+  regional endpoints (international, China mainland, United States)
+  in order per chunk; the default model candidates match Python
+  exactly (Grok gains grok-4-0709, grok-3-fast, grok-3, grok-4 and
+  grok-beta; Qwen gains qwen-mt-flash, qwen-mt-lite,
+  qwen-plus-latest and qwen3.5-plus and drops the nonexistent
+  qwen-mt-turbo); a `gsk_` key configured for Grok routes to Groq's
+  endpoint and default models, while a user-configured model still
+  wins as the single candidate and stored models are never
+  rewritten. Fallback advances only on Python's retryable model
+  errors (HTTP 400/403/404 whose message names an unavailable
+  model); anything else aborts the chunk with Python's
+  `HTTP {code}: {message}` detail. Loopback tests drive the
+  vectors, the routing and the fallback rule against scripted
+  local servers.
+- **S21 (translation responses lost or falsely accepted) —
+  resolved.** Chat content arrays join their text parts; Gemini
+  joins every part of the first candidate; a blank or whitespace
+  success is an error ("returned an empty translation response",
+  with Gemini's prompt-feedback / finish reason when given),
+  never a replacement for the original. Requests now honour
+  Python's per-request timeout (`translation_timeout_seconds`,
+  clamped 5..=180) and chunk size (`translation_chunk_chars`,
+  500..=8000); the chunker is Python's `_iter_text_chunks`
+  (contiguous, boundary-preferring, lossless under concatenation;
+  results joined with no separator). Gemini sends Python's single
+  user prompt with the key as both header and `key` query
+  parameter.
+- **O07 (automatic translation unreachable) — resolved.**
+  `translate::settings_from_config` ports
+  `_translation_runtime_config` (enabled AND the selected
+  provider's key present; an unknown provider clamps to grok) and
+  `TranslationSettings::cache_suffix` ports
+  `_translation_fulltext_cache_suffix`. The full-text workers
+  (web cascade and YouTube) translate the extracted text on the
+  worker before caching — a failure or blank result keeps the
+  original — and the reader cache key carries the variant suffix,
+  so each provider/language/model variant caches separately.
+  Selecting an article while translation is on schedules the
+  automatic load (G02), so the pane ends up translated with no
+  explicit command; the standalone article window's plain loads
+  translate the same way.
+- **O08 (late translation replaces another selection) —
+  resolved.** Manual translations carry a core
+  `TranslationRequest` (article id, reader generation, variant
+  suffix). Starting one bumps the reader generation, retiring
+  in-flight full-text application like Python's token change; the
+  drain applies a result only when the request still matches the
+  live generation, the selected article and the *current*
+  variant — a delayed A result after selecting B, or after an
+  account, provider, language or model change, is dropped, and a
+  stale request's error never reaches the status line. On apply,
+  the rich document is refetched too, so both reader outputs
+  agree after a translation. The guard is unit-tested in core.
+- **G02 (plain full text needs an explicit action) — resolved.**
+  Selection schedules the automatic full-text load exactly when
+  Python does (`auto_fulltext_on_select`: translation ready,
+  macOS, forum-thread host, YouTube video), debounced 350 ms and
+  tied to the reader generation; reader focus (SET_FOCUS)
+  schedules it immediately. Both fire through the existing Read
+  Full Text action from the drain timer, so the cache, request
+  dedupe and generation guards are shared with the manual
+  command, and stale worker results still cannot land (the
+  FullText / YoutubeText / RichHtml drain arms were already
+  generation- and key-guarded).
+- **G13 (Open URL lacks mode-aware translated loading) —
+  resolved.** Tools > Open Article opens Python's dialog
+  (clipboard URL prefill through `normalize_media_url`, "Open in
+  HTML view" defaulting to the rich-view setting, Python's two
+  invalid-address messages) and the article window opens
+  *immediately* in the chosen starting mode and loads
+  asynchronously under its generation token; plain results pass
+  through automatic translation, the caption follows the
+  extracted page title (plain) or the rendered `<h1>` (rich),
+  and a failed load shows Python's `failure_text` /
+  `failure_html` stand-ins in the reader. The old
+  prefetch-then-open path (`RefreshMsg::OpenedArticle`) is
+  deleted.
+- **G12 (Copy Text can copy stale hidden text) — resolved.** The
+  article window tracks the whole current plain result; Copy
+  Text copies the active mode's whole output — in HTML view,
+  `collapse_blank_lines(html_to_text(cached document))`, falling
+  back to the plain result before the document loads — instead
+  of the hidden plain control's stale contents. Ctrl+C in the
+  reader keeps its selection semantics.
+- **G16 (image-alt changes do not update current output) —
+  resolved.** Reader cache keys now begin with the article id,
+  and `ReaderCache::remove_prefix` invalidates exactly one
+  article's variants. The per-feed image-alt commands and a
+  global `show_image_alt` change in Settings both re-render the
+  selected article in place (`rerender_current_article`:
+  generation bump, per-article cache invalidation, plain body
+  rebuilt under the new alt setting, rich document refetched
+  when the rich view is on) without moving the selection.
+
+Recorded deviations: Python's automatic full-text path also
+raises a "Translation failed" status when its worker-side
+translation fails; the Rust worker keeps the original text
+silently (no status channel exists inside the extraction
+worker; the manual Translate command still reports errors).
+Python's Gemini empty-response reason also consults
+safetyRatings; the port surfaces promptFeedback and
+finishReason. Owner NVDA acceptance of the automatic load feel,
+the translation flows, the Open Article window and the alt
+rerender remains pending as platform acceptance, as with all
+GUI work.
+
+Gate in this tree: `cargo test --workspace` 580 passed / 0 failed
+(15 new core tests in `reader_translation_parity.rs`, 2 new app
+policy tests, 3 new article-window unit tests), clippy
+`--workspace --all-targets -D warnings` clean, `cargo build -p
+blindrss` OK, `cargo fmt --all` run last.

@@ -901,6 +901,52 @@ pub fn show_about(frame: &Frame) {
 
 /// A standalone article window (Python's ArticleWindow): the
 /// article text in its own frame, non-modal.
+/// Open Article dialog (Python's OpenArticleDialog, Audit 8
+/// G13): the address (prefilled from the clipboard when it
+/// holds a usable URL — the caller computes that) and the
+/// starting reader. The checkbox only picks the *starting*
+/// mode; the article window's own switch changes it without
+/// fetching again. Returns (url as typed, rich) on OK; the
+/// caller normalizes the URL.
+pub fn show_open_article_dialog(
+    frame: &Frame,
+    initial_url: &str,
+    rich_default: bool,
+) -> Option<(String, bool)> {
+    let dialog = Dialog::builder(frame, "Open Article").build();
+    bind_f1(frame, &dialog, "OpenArticleDialog");
+    let sizer = BoxSizer::builder(Orientation::Vertical).build();
+    let intro = StaticText::builder(&dialog)
+        .with_label(&crate::tr(
+            "Paste the address of an article or web page.\nBlindRSS reads it the way it reads a feed article, without the\npage's own layout, menus, or pop-ups.",
+        ))
+        .build();
+    sizer.add(&intro, 0, SizerFlag::All, 4);
+    let url_ctrl = name_row(&dialog, &sizer, "Article address:", initial_url);
+    url_ctrl.set_name("Article address");
+    let rich_cb = CheckBox::builder(&dialog)
+        .with_label(&crate::tr("Open in &HTML view"))
+        .build();
+    rich_cb.set_value(rich_default);
+    sizer.add(&rich_cb, 0, SizerFlag::All, 4);
+    let note = StaticText::builder(&dialog)
+        .with_label(&crate::tr(
+            "Cleared, the article opens as plain full text. Checked, it keeps headings, links, and embedded video.",
+        ))
+        .build();
+    sizer.add(&note, 0, SizerFlag::All, 4);
+    ok_cancel(&dialog, &sizer);
+    dialog.set_sizer(sizer, true);
+    dialog.set_size(Size::new(560, 300));
+    let result = if dialog.show_modal() == 5100 {
+        Some((url_ctrl.get_value(), rich_cb.is_checked()))
+    } else {
+        None
+    };
+    dialog.destroy();
+    result
+}
+
 pub fn show_article_window(title: &str, body: &str) {
     crate::article_window::open(title, body, None);
 }

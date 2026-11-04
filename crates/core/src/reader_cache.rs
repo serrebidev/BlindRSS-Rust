@@ -16,6 +16,31 @@ impl ReaderRequest {
     }
 }
 
+/// Identity of an in-flight article translation (Audit 8
+/// O08): the article it was requested for, the reader
+/// generation at request time, and the translation variant
+/// (`translate::TranslationSettings::cache_suffix` — provider,
+/// target language and configured model). A result applies
+/// only while all three still match the live state: a delayed
+/// result for article A must never replace article B's text,
+/// and a provider/language/model (or account) change
+/// invalidates results requested under the old variant.
+/// Python guards the same triple in
+/// `MainFrame._fulltext_apply_result` (token + current cache
+/// key, whose suffix carries the variant).
+#[derive(Clone)]
+pub struct TranslationRequest {
+    pub article_id: String,
+    pub generation: u64,
+    pub variant: String,
+}
+
+impl TranslationRequest {
+    pub fn is_current(&self, generation: u64, article_id: &str, variant: &str) -> bool {
+        self.generation == generation && self.article_id == article_id && self.variant == variant
+    }
+}
+
 pub struct ReaderCache {
     entries: VecDeque<(String, String, &'static str, usize, u64)>,
     max_entries: usize,
@@ -47,6 +72,23 @@ impl ReaderCache {
         let result = (entry.1.clone(), entry.2);
         self.entries.push_back(entry);
         Some(result)
+    }
+
+    /// Drop every entry whose key starts with `prefix`
+    /// (Audit 8 G16: reader cache keys begin with the article
+    /// id, so an image-alt change invalidates exactly that
+    /// article's cached renderings before the rerender).
+    pub fn remove_prefix(&mut self, prefix: &str) {
+        let mut removed_chars = 0usize;
+        self.entries.retain(|entry| {
+            if entry.0.starts_with(prefix) {
+                removed_chars += entry.3;
+                false
+            } else {
+                true
+            }
+        });
+        self.chars = self.chars.saturating_sub(removed_chars);
     }
 
     pub fn insert(&mut self, key: String, text: String, source: &'static str, generation: u64) {
