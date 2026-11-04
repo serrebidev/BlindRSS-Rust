@@ -10180,6 +10180,7 @@ mod ui_parity_tests {
                 pending_queue: None,
                 reader_cache: blindrss_core::reader_cache::ReaderCache::default(),
                 reader_generation: 0,
+                auto_load: None,
                 pending_fulltext: None,
             }
         }
