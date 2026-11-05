@@ -5487,3 +5487,47 @@ the standing acceptance list.
 clean onto main. Merged gate: fmt clean, clippy clean
 (workspace and core windows-gnu), 825 passed / 0 failed,
 build OK.
+**Task 24 macOS fix addendum (2026-11-05):** CI run
+41978897138 on the Task 24 tree passed Ubuntu and Windows
+but failed five `browser_parity` tests on macOS (warm
+session reuse, click-clears-challenge, failure cooldown,
+proxy relaunch, extract clearance refresh). Root cause:
+`attempt()` in `browser.rs` bounded browser LAUNCH by the
+caller's fetch timeout (`timeout_s.min(60)`), so on a slow
+or loaded machine the browser start alone consumed the
+whole budget and the fetch died with "Browser retrieval
+timed out or cancelled" before ever navigating, while the
+post-start page work takes under a second. Python never
+charges startup against `timeout_s`: SeleniumBase starts
+the driver on its own terms, and `timeout_s` budgets the
+settle poll and the escalation. The 90 s production paths
+survived a slow start; the 15/30 s callers did not. A
+second, test-only defect: the extract test hard-coded the
+Linux Firefox profile path (`.mozilla/firefox/...`),
+which never exists on macOS
+(`~/Library/Application Support/Firefox`), so clearance
+refresh found no profile and the article stayed gated.
+Fix: launch now runs against its own startup budget
+(`LAUNCH_STARTUP_MAX_SECONDS = 60`, a wedge guard only,
+not drawn from the caller's timeout); the launch-deadline
+failure reports "Browser startup timed out", distinct
+from fetch-lock starvation and cancellation; the DevTools
+discovery poll bypasses any environment proxy
+(`.proxy(None)` — the endpoint is the loopback port of
+the browser just spawned); `settle_page` tolerates
+page-state read errors and keeps polling to the settle
+deadline, matching Python `_settle_page`'s swallowed
+`get_page_source` exceptions. The fixture gained a
+`start_delay_seconds` behaviour knob, and a new
+regression test (`fixture_slow_browser_start_still_fetches`:
+20 s start delay against a 15 s fetch timeout) failed
+with the exact CI error before the fix and passes after;
+the extract test's Firefox path is platform-correct.
+Proof: `browser_parity` 15 passed / 0 failed / 1 ignored
+across repeated runs, including single-CPU saturation
+runs and forced-35 s-start-delay runs of the four
+formerly failing fixture tests; full gate fmt clean,
+clippy clean (workspace `--all-targets` and core
+`x86_64-pc-windows-gnu`, `-D warnings`), 804 passed /
+0 failed (803 baseline + 1 new regression test),
+`cargo build -p blindrss` OK.

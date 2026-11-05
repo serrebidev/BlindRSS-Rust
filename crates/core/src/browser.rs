@@ -63,6 +63,15 @@ const NEGATIVE_RESULT_COOLDOWN_SECONDS: f64 = 6.0 * 3600.0;
 const NEGATIVE_RESULT_CACHE_LIMIT: usize = 512;
 const SETTLE_POLL_SECONDS: f64 = 0.35;
 const SETTLE_MAX_SECONDS: f64 = 25.0;
+/// Browser startup is NOT charged against the caller's
+/// fetch timeout: Python's `timeout_s` budgets the settle
+/// poll (and the escalation), while SeleniumBase starts
+/// the driver on its own terms — a cold Chromium on a
+/// loaded machine may need many seconds before its
+/// DevTools port answers, and that wait must not eat the
+/// budget the page work needs. The cap exists only so a
+/// wedged browser process cannot hang a fetch forever.
+const LAUNCH_STARTUP_MAX_SECONDS: f64 = 60.0;
 const MIN_USABLE_PAGE_CHARS: usize = 2048;
 const SOLVE_FIRST_DELAY_SECONDS: f64 = 2.0;
 const SOLVE_RETRY_SECONDS: f64 = 3.0;
@@ -716,18 +725,27 @@ fn launch_session(
         .map_err(|_| LaunchError::Failed("Could not start Chromium".into()))?;
     // Poll the discovery endpoint until the page target
     // answers; bail on cancel, deadline or early exit.
+    // The endpoint is the loopback DevTools port of the
+    // process just spawned: an environment proxy must
+    // never sit between us and it (ureq's default config
+    // reads one from the environment), so it is disabled
+    // explicitly.
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(5)))
         .http_status_as_error(false)
+        .proxy(None)
         .build()
         .into();
     let websocket = loop {
-        if cancelled(cancel) || Instant::now() >= deadline {
+        if cancelled(cancel) {
             let _ = child.kill();
             let _ = child.wait();
-            return Err(LaunchError::Failed(
-                "Browser retrieval timed out or cancelled".into(),
-            ));
+            return Err(LaunchError::Failed("Browser retrieval cancelled".into()));
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(LaunchError::Failed("Browser startup timed out".into()));
         }
         if child
             .try_wait()
@@ -846,8 +864,9 @@ fn try_solve_click(cdp: &mut Cdp, deadline: Instant) {
 /// Poll the loading page until it is usable (Python
 /// `_settle_page`): 0.35 s polls, Turnstile clicks on the
 /// 2 s / 3 s cadence while a challenge is on screen.
-/// Err is a transport failure (the retry-from-scratch
-/// path); Ok(None) means the page never became usable.
+/// Page-source read failures are tolerated as an empty
+/// page (Python swallows them the same way); Ok(None)
+/// means the page never became usable in the window.
 fn settle_page(
     cdp: &mut Cdp,
     feed_only: bool,
@@ -860,7 +879,15 @@ fn settle_page(
         if cancelled(cancel) {
             return Ok(None);
         }
-        let (html, url) = cdp.page_state(deadline)?;
+        // Python's `_settle_page` treats a failed
+        // page-source read as an empty page and keeps
+        // polling: between navigation and first paint the
+        // document read can fail transiently, and one slow
+        // read on a loaded machine must not abort the
+        // whole fetch as a transport failure.
+        let (html, url) = cdp
+            .page_state(deadline)
+            .unwrap_or_else(|_| (String::new(), String::new()));
         if let Some(text) = usable_document(&html, feed_only) {
             return Ok(Some(Settled {
                 text,
@@ -1138,7 +1165,7 @@ fn attempt(
         old.close();
     }
     if session.is_none() {
-        let deadline = Instant::now() + Duration::from_secs_f64(timeout_s.min(60.0));
+        let deadline = Instant::now() + Duration::from_secs_f64(LAUNCH_STARTUP_MAX_SECONDS);
         match launch_session(root, &options, deadline, cancel) {
             Ok(launched) => session = Some(launched),
             Err(LaunchError::Unavailable(message)) => {

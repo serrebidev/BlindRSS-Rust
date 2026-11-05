@@ -231,6 +231,19 @@ fn setup_fixture(
     cfg: &blindrss_core::config::Config,
     pages: serde_json::Value,
 ) -> FixtureEnv {
+    setup_fixture_with_delay(tag, cfg, pages, 0.0)
+}
+
+/// As `setup_fixture`, but the fake browser waits
+/// `start_delay_seconds` before its DevTools port starts
+/// answering — a loaded machine's cold browser start.
+#[cfg(unix)]
+fn setup_fixture_with_delay(
+    tag: &str,
+    cfg: &blindrss_core::config::Config,
+    pages: serde_json::Value,
+    start_delay_seconds: f64,
+) -> FixtureEnv {
     let dir = std::env::temp_dir().join(format!("blindrss-t24-{}-{}", tag, uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
     let log = dir.join("browser.log");
@@ -238,6 +251,7 @@ fn setup_fixture(
         "log": log.to_string_lossy(),
         "user_agent": "FakeBrowserUA/1.0",
         "pages": pages,
+        "start_delay_seconds": start_delay_seconds,
     });
     let behavior_path = dir.join("behavior.json");
     std::fs::write(&behavior_path, behavior.to_string()).unwrap();
@@ -318,6 +332,36 @@ fn fixture_warm_session_is_reused_and_shutdown_kills_it() {
         std::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)).is_err(),
         "browser port still answering after shutdown"
     );
+    teardown_fixture(&env);
+}
+
+/// Regression (macOS CI, run 41978897138): browser
+/// startup is not charged against the caller's fetch
+/// timeout — Python's `timeout_s` budgets the settle,
+/// not the driver start. On the loaded macOS runner the
+/// fixture needed ~30 s to answer discovery; every
+/// 15/30 s fetch died in the launch phase ("Browser
+/// retrieval timed out or cancelled") before navigating,
+/// while the 90 s production paths passed slowly. Here
+/// the browser needs 20 s to become ready and the fetch
+/// timeout is 15 s: the fetch must still succeed.
+#[test]
+#[cfg(unix)]
+fn fixture_slow_browser_start_still_fetches() {
+    use std::time::Instant;
+    let _serial = FIXTURE_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let url = "http://127.0.0.1:9/slowstart/story";
+    let pages = serde_json::json!({ url: { "html": article_html("Slow start story") } });
+    let cfg = blindrss_core::config::Config::default();
+    let env = setup_fixture_with_delay("slowstart", &cfg, pages, 20.0);
+    let began = Instant::now();
+    let response =
+        blindrss_core::browser::fetch_page_with_options(url, 15.0, false, "", None).unwrap();
+    assert!(response.html.contains("Slow start story"));
+    // The delay was real: the fetch waited the browser
+    // out instead of failing at the 15 s caller budget.
+    assert!(began.elapsed().as_secs() >= 19);
+    assert_eq!(env.count("NAVIGATE "), 1);
     teardown_fixture(&env);
 }
 
@@ -603,9 +647,18 @@ fn extract_clearance_refresh_recovers_a_gated_article() {
     blindrss_core::browser::configure(&cfg, &config_path);
     blindrss_core::extract::configure_cookies(&config_path);
     // A Firefox profile under a fixture HOME holding the
-    // fresh clearance cookie for the origin host.
+    // fresh clearance cookie for the origin host. The
+    // root is the platform's (Python `_firefox_roots`):
+    // ~/.mozilla/firefox on Linux, ~/Library/Application
+    // Support/Firefox on macOS — the macOS CI failure was
+    // this test planting the profile where macOS roots
+    // never look.
     let home = dir.join("home");
-    let profile_dir = home.join(".mozilla/firefox/test.default");
+    let profile_dir = if cfg!(target_os = "macos") {
+        home.join("Library/Application Support/Firefox/test.default")
+    } else {
+        home.join(".mozilla/firefox/test.default")
+    };
     std::fs::create_dir_all(&profile_dir).unwrap();
     {
         let conn = rusqlite::Connection::open(profile_dir.join("cookies.sqlite")).unwrap();

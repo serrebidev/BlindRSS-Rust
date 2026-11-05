@@ -9,7 +9,10 @@ the tier-4 turnstile.render hook surface
 (window.__blindrssTurnstile / __blindrssTurnstileCallback).
 
 Behaviour is driven by a JSON file named by the
-BLINDRSS_FAKE_BROWSER_BEHAVIOR environment variable:
+BLINDRSS_FAKE_BROWSER_BEHAVIOR environment variable.
+The optional "start_delay_seconds" key makes the
+process wait that long before binding its DevTools
+port (a slow cold start on a loaded machine).
 
 {
   "log": "<path appended with LAUNCH/NAVIGATE/CLICK/TOKEN lines>",
@@ -41,6 +44,7 @@ import os
 import struct
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
@@ -58,6 +62,12 @@ def main():
 
     with open(os.environ["BLINDRSS_FAKE_BROWSER_BEHAVIOR"]) as handle:
         behavior = json.load(handle)
+    # A test may ask the browser to be slow to become
+    # ready (a loaded machine's cold browser start): the
+    # delay runs before the DevTools port is bound, so
+    # discovery polls see the same silence a slow real
+    # Chromium would produce.
+    time.sleep(float(behavior.get("start_delay_seconds", 0)))
     log_path = behavior["log"]
     pages = behavior.get("pages", {})
     log_lock = threading.Lock()
