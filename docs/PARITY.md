@@ -5531,3 +5531,11 @@ clippy clean (workspace `--all-targets` and core
 `x86_64-pc-windows-gnu`, `-D warnings`), 804 passed /
 0 failed (803 baseline + 1 new regression test),
 `cargo build -p blindrss` OK.
+
+**Task 24 macOS fix integration gate (2026-11-05):**
+cherry-picked onto main (PARITY union, 1 region). Merged
+gate: fmt clean, clippy clean (workspace and core
+windows-gnu), 826 passed / 0 failed, build OK. One
+transient single-test failure in the first gate attempt
+under peak three-way build contention did not reproduce
+in two subsequent full runs; CI is the arbiter.
