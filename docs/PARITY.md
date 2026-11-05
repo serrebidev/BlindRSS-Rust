@@ -6519,3 +6519,20 @@ windows-gnu check is blocked by the known build.rs
 issue). Fix: items gated `cfg(any(macos, all(test,
 unix)))`, test module gated `cfg(all(test, unix))`.
 Behavior unchanged everywhere the code runs.
+
+**CI fixes on the combined Wave 4 tree (2026-11-05):**
+run 42104773420: macOS success; Windows failed the new
+single_instance_contract test; Ubuntu was cancelled after
+~90 minutes stuck in the "Install wxWidgets build
+dependencies" apt step (runner infrastructure — the same
+apt trap recorded for BlindFB the same day; no code
+involved; the job never reached compile). Windows root
+cause: the contract test assumed the state path follows
+XDG_RUNTIME_DIR on every platform, but Python
+`_state_path` (and the port's state_path, faithfully)
+uses %TEMP% unconditionally on Windows — serve() wrote
+the real temp path while the test read its scratch dir
+and found its own stale plant. Production code matches
+Python exactly; the test now computes the expected path
+by Python's platform rule. The earlier B13 cfg fix is
+confirmed by this run's clean Windows clippy.

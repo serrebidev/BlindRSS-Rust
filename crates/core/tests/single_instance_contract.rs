@@ -31,7 +31,18 @@ fn serve_signal_round_trip_token_gate_and_stale_replacement() {
     unsafe {
         std::env::set_var("XDG_RUNTIME_DIR", &dir);
     }
-    let path = dir.join(".blindrss-instance.json");
+    // The expected path follows Python `_state_path`'s own
+    // platform rule, which state_path() mirrors: Windows
+    // uses %TEMP% unconditionally (per-user by construction);
+    // POSIX uses XDG_RUNTIME_DIR. Assuming the XDG path on
+    // Windows made serve() write %TEMP% while the test read
+    // its scratch dir — the stale plant staring back is what
+    // CI caught.
+    let path = if cfg!(target_os = "windows") {
+        std::env::temp_dir().join(".blindrss-instance.json")
+    } else {
+        dir.join(".blindrss-instance.json")
+    };
 
     // No state file: no instance to signal.
     assert!(!single_instance::signal_existing());
