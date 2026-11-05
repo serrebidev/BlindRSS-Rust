@@ -135,31 +135,248 @@ pub fn sanitize_filename(name: &str) -> String {
     }
 }
 
-fn extension_from_url(url: &str) -> Option<String> {
-    let path = url.split(['?', '#']).next().unwrap_or("");
-    let last = path.rsplit('/').next().unwrap_or("");
-    let (_, ext) = last.rsplit_once('.')?;
-    if ext.len() <= 5 && ext.chars().all(|c| c.is_ascii_alphanumeric()) {
-        Some(ext.to_lowercase())
+/// Python `_safe_name` (gui/mainframe.py): runs of
+/// `[\\/:*?"<>|]+` collapse to one underscore, whitespace is
+/// stripped, trailing dots are stripped, the result is capped
+/// at 120 chars, and empty becomes "untitled". Used for
+/// download folder names and download file base names —
+/// deliberately NOT the same rules as `sanitize_filename`.
+pub fn safe_download_name(text: &str) -> String {
+    if text.is_empty() {
+        return "untitled".to_string();
+    }
+    let mut cleaned = String::with_capacity(text.len());
+    let mut in_run = false;
+    for c in text.chars() {
+        if matches!(c, '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|') {
+            if !in_run {
+                cleaned.push('_');
+                in_run = true;
+            }
+        } else {
+            in_run = false;
+            cleaned.push(c);
+        }
+    }
+    let cleaned = cleaned.trim().trim_end_matches('.');
+    let out: String = cleaned.chars().take(120).collect();
+    if out.is_empty() {
+        "untitled".to_string()
     } else {
-        None
+        out
     }
 }
 
-/// Download a direct URL to `dir`, naming the file after `title`
-/// (keeping the URL's extension). Returns the written path.
+/// Python `_download_dir_for_article`: the download folder
+/// for an article — the root plus the safe-named destination
+/// override (pasted-link items) when present, else the root
+/// plus the safe-named feed title ("Feed" when unknown).
+pub fn download_dir_for(
+    root: &std::path::Path,
+    feed_title: Option<&str>,
+    folder_override: Option<&str>,
+) -> PathBuf {
+    if let Some(over) = folder_override.map(str::trim).filter(|s| !s.is_empty()) {
+        return root.join(safe_download_name(over));
+    }
+    root.join(safe_download_name(feed_title.unwrap_or("Feed")))
+}
+
+/// Python `_guess_extension`: the URL path's extension when
+/// it is short (<= 5 chars including the dot), else the
+/// response media type mapped through Python's table (exact
+/// canonical match, then prefix), else ".mp3" — never ".bin".
+pub fn extension_for_download(url: &str, content_type: Option<&str>) -> String {
+    let path = url.split(['?', '#']).next().unwrap_or("");
+    let last = path.rsplit('/').next().unwrap_or("");
+    if let Some(idx) = last.rfind('.')
+        && idx > 0
+    {
+        let ext = &last[idx..];
+        if ext.len() <= 5 {
+            return ext.to_string();
+        }
+    }
+    const MIME_EXTENSIONS: [(&str, &str); 12] = [
+        ("audio/mpeg", ".mp3"),
+        ("audio/mp3", ".mp3"),
+        ("audio/mp4", ".m4a"),
+        ("audio/aac", ".aac"),
+        ("audio/ogg", ".ogg"),
+        ("audio/opus", ".opus"),
+        ("audio/x-wav", ".wav"),
+        ("audio/wav", ".wav"),
+        ("audio/flac", ".flac"),
+        ("audio/x-flac", ".flac"),
+        ("application/flac", ".flac"),
+        ("application/x-flac", ".flac"),
+    ];
+    if let Some(ct) = content_type {
+        // utils.canonical_media_type: parameters stripped,
+        // lowercased, FLAC aliases fold to audio/flac (which is
+        // itself in the table, so the fold changes nothing here
+        // beyond the prefix scan below).
+        let canonical = ct
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase()
+            .trim_end_matches('/')
+            .to_string();
+        for (mime, ext) in MIME_EXTENSIONS {
+            if canonical == mime {
+                return ext.to_string();
+            }
+        }
+        for (mime, ext) in MIME_EXTENSIONS {
+            if canonical.starts_with(mime) {
+                return ext.to_string();
+            }
+        }
+    }
+    ".mp3".to_string()
+}
+
+/// Python `_find_downloaded_file`: files in `dir` whose name
+/// starts with `base_name`, excluding temp/partial sidecars,
+/// newest by mtime.
+pub fn find_downloaded_file(dir: &std::path::Path, base_name: &str) -> Option<PathBuf> {
+    let mut best: Option<(PathBuf, std::time::SystemTime)> = None;
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.starts_with(base_name)
+            || name.to_ascii_lowercase().contains(".temp.")
+            || [".part", ".ytdl", ".tmp"].iter().any(|s| name.ends_with(s))
+        {
+            continue;
+        }
+        let mtime = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        if best.as_ref().is_none_or(|(_, t)| mtime > *t) {
+            best = Some((path, mtime));
+        }
+    }
+    best.map(|(p, _)| p)
+}
+
+/// Python `_find_legacy_downloaded_media_path`: locate a
+/// download written before the `downloaded_media` index
+/// tracked it. Python looks in the article's own download
+/// folder; core does not know the feed title, so the scan
+/// covers the root and every first-level subfolder (the feed
+/// folders and "Media Links") — a superset that finds the
+/// file in whichever folder it landed.
+pub fn legacy_downloaded_media_path(
+    root: &std::path::Path,
+    article: &crate::Article,
+) -> Option<PathBuf> {
+    let title = article.title.trim();
+    let base = safe_download_name(if title.is_empty() { "episode" } else { title });
+    if let Some(path) = find_downloaded_file(root, &base) {
+        return Some(path);
+    }
+    for entry in std::fs::read_dir(root).ok()?.flatten() {
+        let dir = entry.path();
+        if dir.is_dir()
+            && let Some(path) = find_downloaded_file(&dir, &base)
+        {
+            return Some(path);
+        }
+    }
+    None
+}
+
+/// `downloaded_media_path` plus the legacy folder scan
+/// (Audit 8 Task 22, M19): the index wins; the scan runs only
+/// when the index has nothing.
+pub fn downloaded_media_path_or_legacy(
+    cfg: &crate::config::Config,
+    article: &crate::Article,
+    root: &std::path::Path,
+) -> Option<PathBuf> {
+    downloaded_media_path(cfg, article).or_else(|| legacy_downloaded_media_path(root, article))
+}
+
+fn sweep_dir_retention(dir: &std::path::Path, cutoff: std::time::SystemTime) {
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for entry in rd.flatten() {
+            let path = entry.path();
+            if path.is_file()
+                && entry
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .is_ok_and(|t| t < cutoff)
+            {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+}
+
+/// Python `_apply_download_retention`: delete files in THIS
+/// folder older than the retention window (None = unlimited).
+/// Runs after each successful download, scoped to the folder
+/// the download landed in.
+pub fn apply_download_retention(dir: &std::path::Path, retention_seconds: Option<i64>) {
+    let Some(seconds) = retention_seconds else {
+        return;
+    };
+    let cutoff =
+        std::time::SystemTime::now() - std::time::Duration::from_secs(seconds.max(0) as u64);
+    sweep_dir_retention(dir, cutoff);
+}
+
+/// The refresh-time retention cleanup: Python applies
+/// retention per download folder; since downloads now land in
+/// feed subfolders (M19), the sweep covers the root and its
+/// first-level subfolders.
+pub fn sweep_download_retention(root: &std::path::Path, retention_seconds: Option<i64>) {
+    let Some(seconds) = retention_seconds else {
+        return;
+    };
+    let cutoff =
+        std::time::SystemTime::now() - std::time::Duration::from_secs(seconds.max(0) as u64);
+    sweep_dir_retention(root, cutoff);
+    if let Ok(rd) = std::fs::read_dir(root) {
+        for entry in rd.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                sweep_dir_retention(&path, cutoff);
+            }
+        }
+    }
+}
+
+/// Download a direct URL to `dir`, naming the file after
+/// `title`. Python names the file from the response, not the
+/// request (Audit 8 Task 22, M19): the request goes out first,
+/// then the extension comes from the URL or the response's
+/// media type (`extension_for_download`), the base name is
+/// the Python-safe article title (or "episode"), and an
+/// existing file advances to `name-1`, `name-2`, ... —
+/// never a UUID suffix, never ".bin". The partial-file +
+/// no-overwrite publish is unchanged.
 pub fn download_direct(url: &str, dir: &std::path::Path, title: &str) -> Result<PathBuf, String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("download dir: {e}"))?;
-    let ext = extension_from_url(url).unwrap_or_else(|| "bin".to_string());
-    let name = sanitize_filename(title);
-    let mut path = dir.join(format!("{name}.{ext}"));
-    if path.exists() {
-        path = dir.join(format!("{name}-{}.{ext}", uuid::Uuid::new_v4()));
-    }
     let mut resp = crate::http::agent()
         .get(url)
         .call()
         .map_err(|e| format!("download failed: {e}"))?;
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let ext = extension_for_download(url, content_type.as_deref());
+    let title = title.trim();
+    let name = safe_download_name(if title.is_empty() { "episode" } else { title });
     let partial = dir.join(format!(".blindrss-{}.part", uuid::Uuid::new_v4()));
     let result = (|| {
         let mut file = std::fs::OpenOptions::new()
@@ -171,33 +388,53 @@ pub fn download_direct(url: &str, dir: &std::path::Path, title: &str) -> Result<
         std::io::copy(&mut reader, &mut file).map_err(|e| format!("write failed: {e}"))?;
         file.sync_all().map_err(|e| format!("save download: {e}"))?;
         drop(file);
-        // Publish without replacing an existing download, including a concurrent writer's file.
-        if let Err(error) = std::fs::hard_link(&partial, &path) {
-            if error.kind() == std::io::ErrorKind::AlreadyExists {
-                return Err("A download with this name already exists".into());
-            }
-            // FAT/exFAT destinations have no hard links; reserve the output before copying.
-            let mut output = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-                .map_err(|e| format!("finish download: {e}"))?;
-            let copied = (|| {
-                let mut source = std::fs::File::open(&partial)?;
-                std::io::copy(&mut source, &mut output)?;
-                output.sync_all()
-            })();
-            drop(output);
-            if let Err(error) = copied {
-                let _ = std::fs::remove_file(&path);
-                return Err(format!("finish download: {error}"));
+        // Publish without replacing an existing download
+        // (Python _unique_path): name, name-1, name-2, ...
+        let mut counter = 0u32;
+        loop {
+            let stem = if counter == 0 {
+                name.clone()
+            } else {
+                format!("{name}-{counter}")
+            };
+            let path = dir.join(format!("{stem}{ext}"));
+            match std::fs::hard_link(&partial, &path) {
+                Ok(()) => return Ok(path),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    counter += 1;
+                    continue;
+                }
+                Err(_) => {
+                    // FAT/exFAT destinations have no hard links; reserve the output before copying.
+                    let mut output = match std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&path)
+                    {
+                        Ok(f) => f,
+                        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                            counter += 1;
+                            continue;
+                        }
+                        Err(e) => return Err(format!("finish download: {e}")),
+                    };
+                    let copied = (|| {
+                        let mut source = std::fs::File::open(&partial)?;
+                        std::io::copy(&mut source, &mut output)?;
+                        output.sync_all()
+                    })();
+                    drop(output);
+                    if let Err(error) = copied {
+                        let _ = std::fs::remove_file(&path);
+                        return Err(format!("finish download: {error}"));
+                    }
+                    return Ok(path);
+                }
             }
         }
-        Ok::<(), String>(())
     })();
     let _ = std::fs::remove_file(&partial);
-    result?;
-    Ok(path)
+    result
 }
 
 /// Named download formats (Python `core/download_formats.py`).
@@ -277,8 +514,11 @@ fn is_audio_only(id: &str) -> bool {
 }
 
 /// The yt-dlp argument list for a format identifier (Python
-/// `ytdlp_args`): format selection + output kind.
-pub fn ytdlp_format_args(id: &str) -> Vec<String> {
+/// `ytdlp_args`): format selection + output kind. The merge
+/// format applies to video presets only (Python ignores it
+/// for audio presets); it exists so a failed MP4 mux can be
+/// retried as MKV (M18).
+pub fn ytdlp_format_args_with_merge(id: &str, merge_output_format: &str) -> Vec<String> {
     let ident = normalize_download_format(id);
     let (selector, bitrate) = format_spec(ident);
     let mut args = vec!["-f".to_string(), selector];
@@ -298,48 +538,138 @@ pub fn ytdlp_format_args(id: &str) -> Vec<String> {
             }
         }
     } else {
-        args.extend(["--merge-output-format".to_string(), "mp4".to_string()]);
+        args.extend([
+            "--merge-output-format".to_string(),
+            if merge_output_format.is_empty() {
+                "mp4".to_string()
+            } else {
+                merge_output_format.to_string()
+            },
+        ]);
     }
     args
 }
 
+/// `ytdlp_format_args_with_merge` with Python's default
+/// merge format (mp4).
+pub fn ytdlp_format_args(id: &str) -> Vec<String> {
+    ytdlp_format_args_with_merge(id, "mp4")
+}
+
 /// Download a page URL with yt-dlp into `dir`, using the named
-/// format from config `download_format`. Returns the completed output file.
+/// format. Runs Python's shared recovery policy (Audit 8
+/// Task 22, M16+M18; mainframe `_download_article_via_ytdlp`):
+/// the client-pool/cookie/recovery-URL phases, the MP4 mux
+/// failure retried once as MKV inside the same attempt, audio
+/// presets never merge-retried, a timeout stopping all
+/// phases, and the anonymous attempt's error reported. The
+/// output template is Python's: the safe-named article title,
+/// so `_find_downloaded_file` (and `find_downloaded_file`)
+/// can locate the result by prefix.
 pub fn download_with_ytdlp(
     url: &str,
     dir: &std::path::Path,
     format_id: &str,
+    title: &str,
+) -> Result<PathBuf, String> {
+    let exe = crate::media::find_ytdlp().ok_or("yt-dlp not found")?;
+    let cookies = ytdlp_cookies_file();
+    download_with_ytdlp_using(&exe, url, dir, format_id, title, cookies.as_deref())
+}
+
+/// `download_with_ytdlp` against an explicit executable and
+/// cookie file (the seam the regression tests drive).
+pub fn download_with_ytdlp_using(
+    exe: &std::path::Path,
+    url: &str,
+    dir: &std::path::Path,
+    format_id: &str,
+    title: &str,
+    cookie_file: Option<&str>,
 ) -> Result<PathBuf, String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("download dir: {e}"))?;
-    let exe = crate::media::find_ytdlp().ok_or("yt-dlp not found")?;
-    let template = dir.join("%(title)s.%(ext)s");
-    let template = template.to_string_lossy().to_string();
-    let format_args = ytdlp_format_args(format_id);
-    let cookies = ytdlp_cookies_file();
-    let mut args: Vec<&str> = vec![
-        "--no-warnings",
-        "--no-playlist",
-        "--no-progress",
-        "--print",
-        "after_move:filepath",
-        "-o",
-        &template,
-    ];
-    args.extend(format_args.iter().map(|a| a.as_str()));
-    if let Some(cookies) = &cookies {
-        args.extend(["--cookies", cookies.as_str()]);
-    }
-    args.push(url);
-    let out = std::process::Command::new(&exe)
-        .args(&args)
-        .output()
-        .map_err(|e| format!("yt-dlp failed to start: {e}"))?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
-        let first = err.lines().last().unwrap_or("unknown error");
-        return Err(format!("yt-dlp download: {first}"));
-    }
-    downloaded_output_path(&String::from_utf8_lossy(&out.stdout))
+    let base_name = safe_download_name(title);
+    let template = dir
+        .join(format!("{base_name}.%(ext)s"))
+        .to_string_lossy()
+        .to_string();
+    let audio_only = is_audio_only(format_id);
+    let ffmpeg = crate::dependency::find_tool("ffmpeg");
+    let user_agent = std::env::var("BLINDRSS_USER_AGENT")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    crate::ytdlp_recovery::run_recovery(url, cookie_file, |phase, attempt| {
+        // Python's per-attempt merge loop: video presets try
+        // mp4, then mkv ONLY when the mp4 attempt's error says
+        // the conversion failed.
+        let merges: [&str; 2] = if audio_only { ["", ""] } else { ["mp4", "mkv"] };
+        let merge_count = if audio_only { 1 } else { 2 };
+        let mut attempt_err = String::new();
+        for (i, merge) in merges.iter().take(merge_count).enumerate() {
+            if i > 0
+                && !attempt_err
+                    .to_ascii_lowercase()
+                    .contains("conversion failed")
+            {
+                break;
+            }
+            let mut args: Vec<String> = vec![
+                "--no-playlist".into(),
+                "--no-warnings".into(),
+                "--no-progress".into(),
+                "--no-color".into(),
+                "--geo-bypass".into(),
+                "--extractor-args".into(),
+                crate::ytdlp_recovery::youtube_player_client_arg(phase.clients, None),
+            ];
+            args.extend(ytdlp_format_args_with_merge(format_id, merge));
+            args.push("--print".into());
+            args.push("after_move:filepath".into());
+            args.push("-o".into());
+            args.push(template.clone());
+            if let Some(ffmpeg) = &ffmpeg {
+                args.push("--ffmpeg-location".into());
+                args.push(ffmpeg.to_string_lossy().to_string());
+            }
+            if let Some(ua) = &user_agent {
+                args.push("--user-agent".into());
+                args.push(ua.clone());
+            }
+            if phase.impersonate {
+                args.push("--impersonate".into());
+                args.push("chrome".into());
+            }
+            if !matches!(attempt, crate::ytdlp_recovery::CookieAttempt::Base) {
+                args.extend(attempt.args());
+            }
+            args.push(phase.target_url.clone());
+            let arg_refs: Vec<&str> = args.iter().map(|a| a.as_str()).collect();
+            match crate::dependency::run_tool(exe, &arg_refs, std::time::Duration::from_secs(1800))
+            {
+                Ok(run) if run.success => {
+                    return match downloaded_output_path(&run.stdout) {
+                        Ok(p) => crate::ytdlp_recovery::AttemptOutcome::Success(p),
+                        Err(e) => crate::ytdlp_recovery::AttemptOutcome::Failed {
+                            error: e,
+                            fatal: false,
+                        },
+                    };
+                }
+                Ok(run) => {
+                    attempt_err = run.stderr.trim().to_string();
+                }
+                Err(e) => {
+                    let fatal = e.contains("timed out");
+                    return crate::ytdlp_recovery::AttemptOutcome::Failed { error: e, fatal };
+                }
+            }
+        }
+        crate::ytdlp_recovery::AttemptOutcome::Failed {
+            error: attempt_err,
+            fatal: false,
+        }
+    })
 }
 
 fn downloaded_output_path(stdout: &str) -> Result<PathBuf, String> {

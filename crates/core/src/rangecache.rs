@@ -43,7 +43,25 @@ use sha2::Digest;
 
 const PROBE_WAIT: Duration = Duration::from_secs(3);
 const PROBE_RESOLVE_WAIT: Duration = Duration::from_secs(20);
+/// Python `_PROBE_FORBIDDEN_RETRY_S`: pause before the one
+/// probe retry after a 401/403.
+const PROBE_FORBIDDEN_RETRY: Duration = Duration::from_secs(1);
 const INLINE_PREFETCH_CAP: u64 = 16 * 1024 * 1024;
+/// Python `_BG_MAX_REQUEST_BYTES`: no single background range
+/// request may exceed 10 MiB — past that, googlevideo answers
+/// larger ranges at ~31 KB/s after a delay, while many small
+/// ranges are served fast (Audit 8 Task 22, M04).
+pub const BG_MAX_REQUEST_BYTES: u64 = 10 * 1024 * 1024;
+
+/// The background worker's per-request target (Python:
+/// `min(bootstrap or chunk, _BG_MAX_REQUEST_BYTES)`): the
+/// first pass aims at the bootstrap depth, later passes at
+/// the steady-state chunk, both clamped to the 10 MiB cap so
+/// the configured depth is filled incrementally.
+pub fn background_request_target(first: bool, bootstrap_bytes: u64, chunk_bytes: u64) -> u64 {
+    let target = if first { bootstrap_bytes } else { chunk_bytes };
+    target.min(BG_MAX_REQUEST_BYTES)
+}
 const TRACKING_HOSTS: [&str; 11] = [
     "op3.dev",
     "pdst.fm",
@@ -363,21 +381,45 @@ impl Entry {
 
     // -- Probe ----------------------------------------------------
 
+    /// Whether the probe state is settled (Python's probe
+    /// early-exit): support known AND (total known OR support
+    /// is false). A probe round that was refused (401/403)
+    /// leaves support UNKNOWN — not settled — so the next
+    /// probe runs again (Audit 8 Task 22, M03).
+    fn probe_settled(&self) -> bool {
+        let st = self.state.lock().unwrap();
+        st.range_supported.is_some()
+            && (st.total_length.is_some() || st.range_supported == Some(false))
+    }
+
     /// Single-flight probe (Python's per-entry probe). Learns
     /// the total length, the content type, whether ranges are
     /// supported, and the final URL after redirects.
     fn probe(self: &Arc<Self>) {
         {
             let mut status = self.probe_status.lock().unwrap();
-            match *status {
-                2 => return,
-                1 => {
-                    while *status == 1 {
-                        status = self.probe_cv.wait(status).unwrap();
+            loop {
+                match *status {
+                    2 => {
+                        if self.probe_settled() {
+                            return;
+                        }
+                        // The last round was refused: support
+                        // is still unknown, so probe again
+                        // (Python clears _probe_done here).
+                        *status = 0;
                     }
-                    return;
+                    1 => {
+                        while *status == 1 {
+                            status = self.probe_cv.wait(status).unwrap();
+                        }
+                        return;
+                    }
+                    _ => {
+                        *status = 1;
+                        break;
+                    }
                 }
-                _ => *status = 1,
             }
         }
         let finish = |entry: &Arc<Self>| {
@@ -396,8 +438,25 @@ impl Entry {
             }
         }
         let target = self.target_url();
-        let resp =
+        // Python retries a refused (401/403) probe once after
+        // a short pause: googlevideo can refuse a freshly
+        // minted URL's first probe, then serve ranges a moment
+        // later. A round that still ends refused leaves range
+        // support UNKNOWN below, so a later request probes
+        // again instead of the session being poisoned (M03).
+        let mut resp =
             crate::http_headers::media_get(&self.url, &target, &self.origin_headers(Some((0, 0))));
+        if let Ok(r) = &resp {
+            let status = r.status().as_u16();
+            if status == 401 || status == 403 {
+                std::thread::sleep(PROBE_FORBIDDEN_RETRY);
+                resp = crate::http_headers::media_get(
+                    &self.url,
+                    &target,
+                    &self.origin_headers(Some((0, 0))),
+                );
+            }
+        }
         match resp {
             Err(_) => {
                 let mut st = self.state.lock().unwrap();
@@ -471,6 +530,17 @@ impl Entry {
                     {
                         st.total_length = Some(cl);
                     }
+                } else if status == 401 || status == 403 {
+                    // Refused even after the retry: Python
+                    // leaves range support UNKNOWN (it does not
+                    // guess "unsupported") and the next request
+                    // probes again (M03).
+                    if self.cfg.debug {
+                        eprintln!(
+                            "[range-cache] probe refused (status {status}) for {}; range support left unknown, next request probes again",
+                            redact_url_for_log(&self.url)
+                        );
+                    }
                 } else {
                     st.range_supported = Some(false);
                 }
@@ -504,7 +574,10 @@ impl Entry {
                 .wait_timeout(status, PROBE_RESOLVE_WAIT)
                 .unwrap();
         }
-        if !done(self) {
+        if !known(self) {
+            // Not done yet, OR done but the last probe was
+            // refused (support unknown): probe (again) inline,
+            // exactly Python's await_probe (M03).
             self.probe();
         }
     }
@@ -627,6 +700,11 @@ impl Entry {
         if expected == 0 {
             return false;
         }
+        // The entry dir is created at construction, but the
+        // cache is shared with the Python app (dual-run): an
+        // external cleanup can remove it under a live entry,
+        // and a bare File::create would fail ENOENT.
+        let _ = std::fs::create_dir_all(&self.dir);
         let tmp = self.dir.join(format!(
             "tmp_fetch_{}_{}.part",
             std::process::id(),
@@ -792,6 +870,10 @@ impl Entry {
         if expected == 0 {
             return fail;
         }
+        // As in fetch_chunk: the shared cache dir can be
+        // removed externally under a live entry (dual-run
+        // cleanup); re-ensure it before creating the temp file.
+        let _ = std::fs::create_dir_all(&self.dir);
         let tmp = self
             .dir
             .join(format!("tmp_{}_{}.part", std::process::id(), served_start));
@@ -935,11 +1017,11 @@ impl Entry {
                     std::thread::sleep(Duration::from_secs(1));
                     continue;
                 }
-                let chunk_target = if first {
-                    bootstrap_bytes
-                } else {
-                    self.cfg.background_chunk_bytes
-                };
+                let chunk_target = background_request_target(
+                    first,
+                    bootstrap_bytes,
+                    self.cfg.background_chunk_bytes,
+                );
                 let mut end = start.saturating_add(chunk_target).saturating_sub(1);
                 if let Some(total) = st.total_length {
                     end = end.min(total.saturating_sub(1));
@@ -1677,4 +1759,119 @@ pub fn maybe_range_cache_url(
         return url.to_string();
     }
     proxify(register_url, &req_headers, skip_resolve)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    /// M04 end to end, without the process-wide proxy: an Entry
+    /// whose configured bootstrap (64 MiB) and chunk (32 MiB)
+    /// both exceed Python's 10 MiB cap fills a 25 MiB file in
+    /// the background; every range the origin sees must stay
+    /// within the cap, and the cap must actually engage (the
+    /// largest request is exactly 10 MiB).
+    #[test]
+    fn background_download_never_exceeds_ten_mib_requests() {
+        let total: u64 = 25 * 1024 * 1024;
+        let body: Vec<u8> = (0..total).map(|i| (i % 251) as u8).collect();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let spans = Arc::new(Mutex::new(Vec::<(u64, u64)>::new()));
+        let spans_thread = spans.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let spans = spans_thread.clone();
+                let body = body.clone();
+                std::thread::spawn(move || {
+                    let mut buf = [0u8; 8192];
+                    let Ok(n) = stream.read(&mut buf) else { return };
+                    let text = String::from_utf8_lossy(&buf[..n]).into_owned();
+                    let range = text
+                        .lines()
+                        .find_map(|l| {
+                            let (k, v) = l.split_once(':')?;
+                            if k.trim().eq_ignore_ascii_case("range") {
+                                Some(v.trim().to_string())
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or_default();
+                    let total = body.len() as u64;
+                    let (status, start, end) = match parse_range_header(&range, Some(total)) {
+                        Some((s, Some(e))) => ("206 Partial Content", s, e),
+                        Some((s, None)) => ("206 Partial Content", s, total - 1),
+                        None => ("200 OK", 0, total - 1),
+                    };
+                    spans.lock().unwrap().push((start, end));
+                    let slice = &body[start as usize..=end as usize];
+                    let head = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: audio/mpeg\r\nContent-Length: {}\r\nContent-Range: bytes {start}-{end}/{total}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
+                        slice.len()
+                    );
+                    let _ = stream.write_all(head.as_bytes());
+                    let _ = stream.write_all(slice);
+                    let _ = stream.flush();
+                });
+            }
+        });
+
+        let cache_dir = std::env::temp_dir().join(format!(
+            "blindrss-rc-m04-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let cfg = RangeCacheConfig {
+            cache_dir: cache_dir.clone(),
+            prefetch_bytes: 16 * 1024 * 1024,
+            inline_window_bytes: 1024 * 1024,
+            initial_burst_bytes: 64 * 1024 * 1024,
+            initial_inline_prefetch_bytes: 1024 * 1024,
+            background_download: true,
+            background_chunk_bytes: 32 * 1024 * 1024,
+            debug: false,
+        };
+        let url = format!("http://127.0.0.1:{port}/big.mp3");
+        let entry = Arc::new(Entry::new(&url, Vec::new(), cfg));
+        let bg = {
+            let entry = entry.clone();
+            std::thread::spawn(move || entry.background_run())
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        let covered = loop {
+            {
+                let st = entry.state.lock().unwrap();
+                if st.total_length == Some(total)
+                    && missing_segments(&st.segments, 0, total - 1).is_empty()
+                {
+                    break true;
+                }
+            }
+            if std::time::Instant::now() > deadline {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        entry.stop_background();
+        let _ = bg.join();
+        assert!(covered, "background fill completed the file");
+        let spans = spans.lock().unwrap();
+        assert!(!spans.is_empty());
+        for (s, e) in spans.iter() {
+            // Request length is e - s + 1; the cap binds it.
+            assert!(
+                e - s < BG_MAX_REQUEST_BYTES,
+                "origin range {s}-{e} exceeds the 10 MiB cap"
+            );
+        }
+        let largest = spans.iter().map(|(s, e)| e - s + 1).max().unwrap();
+        assert_eq!(largest, BG_MAX_REQUEST_BYTES, "the cap engaged exactly");
+        let _ = std::fs::remove_dir_all(&cache_dir);
+    }
 }

@@ -307,6 +307,44 @@ pub(crate) fn playback_headers_for(
     )
 }
 
+/// Python `_default_download_dir` (core/config.py): an
+/// installed Windows build downloads into
+/// `<Downloads>/BlindRSS`; every other layout uses the app
+/// folder's `podcasts` directory.
+fn default_download_dir() -> PathBuf {
+    if windows_installed_build() {
+        home_dir().join("Downloads").join("BlindRSS")
+    } else {
+        app_dir().join("podcasts")
+    }
+}
+
+/// The download root (Python `_download_dir_for_article`'s
+/// root): the configured `download_path`, else the default.
+fn download_root(cfg: &blindrss_core::config::Config) -> PathBuf {
+    let configured = cfg.get_str("download_path", "");
+    if configured.trim().is_empty() {
+        default_download_dir()
+    } else {
+        PathBuf::from(configured)
+    }
+}
+
+/// The configured download retention in seconds (None =
+/// unlimited), via core's stable-identifier policy.
+fn download_retention_seconds(cfg: &blindrss_core::config::Config) -> Option<i64> {
+    blindrss_core::retention::retention_days(cfg.get_str("download_retention", "unlimited"))
+        .map(|days| days * 86_400)
+}
+
+/// The on-disk file for an article, if any: the
+/// `downloaded_media` index first, then the legacy scan of
+/// the download folders (Audit 8 Task 22, M19 — files Python
+/// or an older build wrote before the index tracked them).
+fn downloaded_path_for(cfg: &blindrss_core::config::Config, article: &Article) -> Option<PathBuf> {
+    blindrss_core::download::downloaded_media_path_or_legacy(cfg, article, &download_root(cfg))
+}
+
 /// The play-cache step (youtube_play_via_download): when a
 /// YouTube stream was resolved through yt-dlp and the cache
 /// is enabled, download the audio once and play the file.
@@ -323,8 +361,13 @@ fn maybe_cache_youtube(article: &Article, stream_url: &str, via_ytdlp: bool) -> 
     if !cfg.get_bool("youtube_play_via_download", false) {
         return stream_url.to_string();
     }
+    let configured_dir = cfg.get_str("youtube_play_cache_dir", "");
     let dir = blindrss_core::play_cache::cache_dir(
-        cfg.get_str("youtube_play_cache_dir", ""),
+        if configured_dir.trim().is_empty() {
+            None
+        } else {
+            Some(std::path::Path::new(configured_dir))
+        },
         &data_dir(),
     );
     let max_mb = cfg.get_i64("youtube_play_cache_max_mb", 500);
@@ -930,33 +973,13 @@ fn startup_maintenance() {
                 }
             }
         }
-        // Download retention: delete files older than the policy.
-        if let Some(days) =
-            blindrss_core::retention::retention_days(cfg.get_str("download_retention", "unlimited"))
-        {
-            let dir = cfg
-                .raw()
-                .get("download_path")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-                .map(PathBuf::from);
-            if let Some(dir) = dir {
-                let cutoff = std::time::SystemTime::now()
-                    - std::time::Duration::from_secs((days.max(0) as u64) * 86_400);
-                if let Ok(rd) = std::fs::read_dir(&dir) {
-                    for entry in rd.flatten() {
-                        let path = entry.path();
-                        let old = entry
-                            .metadata()
-                            .and_then(|m| m.modified())
-                            .map(|t| t < cutoff)
-                            .unwrap_or(false);
-                        if old && path.is_file() {
-                            let _ = std::fs::remove_file(path);
-                        }
-                    }
-                }
-            }
+        // Download retention: delete files older than the
+        // policy, in the download root AND its feed
+        // subfolders (Audit 8 Task 22, M19 — downloads land
+        // in per-feed folders now, as Python's do).
+        if let Some(seconds) = download_retention_seconds(&cfg) {
+            let dir = download_root(&cfg);
+            blindrss_core::download::sweep_download_retention(&dir, Some(seconds));
         }
     });
 }
@@ -5712,7 +5735,7 @@ fn main() {
                 let _ = db.mark_opened(&article.id);
             }
             let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
-            let playable = blindrss_core::download::downloaded_media_path(&cfg, &article).is_some()
+            let playable = downloaded_path_for(&cfg, &article).is_some()
                 || article.media_url.as_deref().is_some_and(|u| {
                     !u.is_empty()
                         && blindrss_core::media::is_playable_media(u, article.media_type.as_deref())
@@ -6455,16 +6478,36 @@ fn main() {
                 } else {
                     cfg.get_str("download_format", "video_best").to_string()
                 };
-                let dir = PathBuf::from(cfg.get_str("download_path", ""));
-                let dir = if dir.as_os_str().is_empty() {
-                    home_dir().join("Downloads").join("BlindRSS")
-                } else {
-                    dir
+                // Download layout (Audit 8 Task 22, M19,
+                // Python _download_dir_for_article): each
+                // article lands in its feed's folder under the
+                // download root; pasted-link items (no feed)
+                // go to the "Media Links" folder, Python's
+                // MEDIA_URL_DOWNLOAD_FOLDER.
+                let root = download_root(&cfg);
+                let retention_secs = download_retention_seconds(&cfg);
+                let feed_titles: std::collections::HashMap<String, String> = {
+                    let st = state.borrow();
+                    st.feeds
+                        .iter()
+                        .map(|f| (f.id.clone(), f.title.clone()))
+                        .collect()
                 };
                 frame.set_status_text("Downloading...", 0);
                 let tx = tx.clone();
                 std::thread::spawn(move || {
                     for article in articles {
+                        let feed_title = feed_titles.get(&article.feed_id).map(|t| t.as_str());
+                        let folder_override = if article.feed_id.trim().is_empty() {
+                            Some("Media Links")
+                        } else {
+                            None
+                        };
+                        let dir = blindrss_core::download::download_dir_for(
+                            &root,
+                            feed_title,
+                            folder_override,
+                        );
                         let result = if let Some(media) = article.media_url.as_deref().filter(|u| {
                             !u.is_empty()
                                 && blindrss_core::media::is_playable_media(
@@ -6489,6 +6532,7 @@ fn main() {
                                         &article.url,
                                         &dir,
                                         &format,
+                                        &article.title,
                                     )
                                 }
                                 Ok(r) => blindrss_core::download::download_direct(
@@ -6501,6 +6545,11 @@ fn main() {
                         } else {
                             Err("Article has nothing to download".to_string())
                         };
+                        if result.is_ok() {
+                            // Python applies retention to the
+                            // folder after each download.
+                            blindrss_core::download::apply_download_retention(&dir, retention_secs);
+                        }
                         let _ = tx.send(RefreshMsg::DownloadDone(article, result));
                     }
                 });
@@ -8239,8 +8288,7 @@ fn main() {
                 let mut changed = 0usize;
                 for i in indices {
                     let article = &st.articles[i];
-                    let playable = blindrss_core::download::downloaded_media_path(&cfg, article)
-                        .is_some()
+                    let playable = downloaded_path_for(&cfg, article).is_some()
                         || article.media_url.as_deref().is_some_and(|u| {
                             !u.is_empty()
                                 && blindrss_core::media::is_playable_media(
@@ -9951,6 +9999,25 @@ fn main() {
                         // begin_queue_play); this just clears the
                         // bookkeeping.
                         let _ = st.pending_queue.take();
+                        // A completed download on disk wins over
+                        // the resolved stream (Audit 8 Task 22,
+                        // M19 legacy lookup — Python checks
+                        // _downloaded_media_path_for_article
+                        // before resolving): a file Python or an
+                        // older build left in the article's
+                        // download folder plays locally even when
+                        // resolution itself failed.
+                        let legacy_file = {
+                            let cfg = blindrss_core::config::Config::load(&config_path())
+                                .unwrap_or_default();
+                            downloaded_path_for(&cfg, &article).and_then(|path| {
+                                blindrss_core::media::local_media_url(&path).ok()
+                            })
+                        };
+                        let result = match legacy_file {
+                            Some(file_url) => Ok((file_url, Vec::new())),
+                            None => result,
+                        };
                         match result {
                             Ok((stream, headers)) => {
                                 let chapters = st

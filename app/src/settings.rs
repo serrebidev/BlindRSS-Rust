@@ -865,6 +865,42 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
         .with_label(&crate::tr("Connect YouTube Account..."))
         .build();
     youtube.sizer.add(&youtube_btn, 0, SizerFlag::All, 2);
+    // Audit 8 Task 22 (S12): Python's remaining YouTube
+    // controls — appended after the existing ones, never
+    // inserted mid-page (control order is screen-reader muscle
+    // memory). Labels are Python's. The max-size value is a
+    // text field, matching this dialog's other numeric fields,
+    // where Python uses a spin control.
+    let auto_import_cookies_cb = add_check(
+        &youtube.win,
+        &youtube.sizer,
+        "Automatically import browser cookies.txt exports from Downloads",
+        cfg.get_bool("auto_import_browser_cookies", true),
+    );
+    let play_via_download_cb = add_check(
+        &youtube.win,
+        &youtube.sizer,
+        "Play YouTube by downloading first (most reliable; slower to start)",
+        cfg.get_bool("youtube_play_via_download", false),
+    );
+    let play_cache_dir_field = add_field(
+        &youtube.win,
+        &youtube.sizer,
+        "YouTube playback cache folder (blank = default, next to your data):",
+        cfg.get_str("youtube_play_cache_dir", ""),
+        false,
+    );
+    let play_cache_max_mb_field = add_field(
+        &youtube.win,
+        &youtube.sizer,
+        "Max cache size (MB, 0 = unlimited):",
+        &cfg.get_i64("youtube_play_cache_max_mb", 500).to_string(),
+        false,
+    );
+    let clear_cache_btn = Button::builder(&youtube.win)
+        .with_label(&crate::tr("Clear cache now"))
+        .build();
+    youtube.sizer.add(&clear_cache_btn, 0, SizerFlag::All, 2);
 
     // ---- Media Player page (Python's order) ----
     let mut soundcards = vec![("System Default".to_string(), String::new())];
@@ -1954,6 +1990,29 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
                 serde_json::json!(browser_cookie_import_cb.is_checked()),
             );
             cfg.set_path(
+                "auto_import_browser_cookies",
+                serde_json::json!(auto_import_cookies_cb.is_checked()),
+            );
+            cfg.set_path(
+                "youtube_play_via_download",
+                serde_json::json!(play_via_download_cb.is_checked()),
+            );
+            cfg.set_path(
+                "youtube_play_cache_dir",
+                serde_json::json!(play_cache_dir_field.get_value().trim()),
+            );
+            cfg.set_path(
+                "youtube_play_cache_max_mb",
+                serde_json::json!(
+                    play_cache_max_mb_field
+                        .get_value()
+                        .trim()
+                        .parse::<i64>()
+                        .unwrap_or(500)
+                        .clamp(0, 1_000_000)
+                ),
+            );
+            cfg.set_path(
                 "cache_full_text",
                 serde_json::json!(cache_full_text_cb.is_checked()),
             );
@@ -2032,6 +2091,64 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
         let path_yt = config_path.to_path_buf();
         youtube_btn.on_click(move |_| {
             crate::dialogs::show_youtube_signin(&frame_yt, &path_yt);
+        });
+    }
+    {
+        // Clear the playback cache (S12; Python
+        // _on_clear_play_cache): scoped to the folder in the
+        // (possibly unsaved) field, or the resolved default —
+        // counted first, confirmed, then cleared and reported.
+        let frame_cc = dialog;
+        let field_cc = play_cache_dir_field;
+        clear_cache_btn.on_click(move |_| {
+            let loc = field_cc.get_value();
+            let loc = loc.trim();
+            let dir = if loc.is_empty() {
+                blindrss_core::play_cache::cache_dir(None, &crate::data_dir())
+            } else {
+                std::path::PathBuf::from(loc)
+            };
+            let count = blindrss_core::play_cache::file_count(&dir);
+            if count == 0 {
+                let md = MessageDialog::builder(
+                    &frame_cc,
+                    &format!("The playback cache is already empty.\n\n{}", dir.display()),
+                    "Playback cache",
+                )
+                .with_style(MessageDialogStyle::OK | MessageDialogStyle::IconInformation)
+                .build();
+                md.show_modal();
+                return;
+            }
+            let size = blindrss_core::play_cache::size_bytes(&dir);
+            let confirm = MessageDialog::builder(
+                &frame_cc,
+                &format!(
+                    "Delete {count} cached file{} ({})?\n\n{}",
+                    if count == 1 { "" } else { "s" },
+                    blindrss_core::play_cache::human_size(size),
+                    dir.display()
+                ),
+                "Clear playback cache",
+            )
+            .with_style(MessageDialogStyle::YesNo | MessageDialogStyle::IconQuestion)
+            .build();
+            if confirm.show_modal() != ID_YES {
+                return;
+            }
+            let (removed, freed) = blindrss_core::play_cache::clear_cache(&dir);
+            let md = MessageDialog::builder(
+                &frame_cc,
+                &format!(
+                    "Removed {removed} file{}, freed {}.",
+                    if removed == 1 { "" } else { "s" },
+                    blindrss_core::play_cache::human_size(freed)
+                ),
+                "Playback cache cleared",
+            )
+            .with_style(MessageDialogStyle::OK | MessageDialogStyle::IconInformation)
+            .build();
+            md.show_modal();
         });
     }
     {

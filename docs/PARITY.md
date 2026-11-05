@@ -4466,3 +4466,215 @@ progress set is a prefix of the final set (progress
 converges, never contradicts). Production code unchanged;
 the player consumes the scan's return value, not progress,
 for the final ranges.
+## Audit 8 Task 22 resolution — range recovery, playback cache and download parity (M03, M04, M16, M17, M18, M19, M20, S12) (2026-11-04)
+
+**M03 (refused probes poisoned the session) — fixed.**
+`rangecache`'s probe now ports Python
+`core/range_cache_proxy.py`: a 401/403 probe response is
+retried once after 1 s; a refused probe leaves range support
+UNKNOWN (never latched `Some(false)`), only 206/200/other
+statuses or a transport error settle it; `await_probe`
+treats "probe done but support unresolved" as not settled
+and probes again inline, so a 403-then-206 origin recovers
+and repeated refusals degrade to passthrough for that read,
+never for the session. Regression tests (batch36_slice):
+`probe_403_then_206_recovers`,
+`probe_refusal_never_permanently_disables_cache`.
+
+**M04 (background ranges unbounded) — fixed.** Background
+range requests are capped at Python's
+`_BG_MAX_REQUEST_BYTES` = 10 MiB per request
+(`background_request_target` clamps the bootstrap target
+and the steady-state chunk alike); filling continues
+incrementally to the configured depth. Tests: the pure
+helper test plus the in-module loopback test
+`background_download_never_exceeds_ten_mib_requests`
+(25 MiB origin, 64 MiB bootstrap / 32 MiB chunk configured;
+every observed origin range ≤ 10 MiB, largest exactly
+10 MiB).
+
+**M16 (shared bounded yt-dlp recovery) — fixed.** New core
+module `ytdlp_recovery.rs` ports Python's policy from
+`gui/player.py` + `core/discovery.py` and is shared by
+stream resolution (`media::stream_url`), downloads
+(`download::download_with_ytdlp`) and the playback cache
+(`play_cache` fetch): Python's format selectors
+(`bestaudio[ext=m4a]/…` VLC audio, the SoundCloud
+progressive-MP3 selector), the primary client pool
+(`default,android_vr`) and the wider fallback pool, radio-mix
+URL normalization, the music/nocookie recovery URLs tried
+with `--impersonate chrome`, cookie attempt order (anonymous
+base, existing cookie file, browser sources; cookie file
+FIRST for Bloomberg hosts), the uncookieable-error rule
+(YouTube page URLs and cookie/login wording excluded;
+"please report this issue" / "unsupported url" skip all
+browser attempts), and DPAPI handling (a DPAPI failure skips
+later Chromium sources, Firefox continues; the final error
+carries Python's App-Bound Encryption explanation verbatim).
+Timeouts are fatal and stop all phases (900 s download /
+1800 s merged-download / 30 s CLI stream shape); the
+reported error is the anonymous base attempt's when there
+is one. All invocations go through Task 23's
+`dependency::run_tool` — the detach-pattern `Command`
+callers in download.rs and play_cache.rs are converted, as
+assigned by Task 23. The pre-resolution watchdog timing bug
+the finding warns about is not present in Rust and was not
+reintroduced: recovery here is attempt-sequenced, the
+player's stall watchdog (Tasks 18/19) is untouched.
+Deviations: (1) Python's pytubefix phase and hidden-browser
+visitor-data bootstrap phase are NOT ported — no Rust
+analogues exist; phases end at the impersonated
+recovery-URL phase. (2) Recovery-URL phases also try the
+cookie file (Python's play-cache tries base only there; its
+download worker tries both — the shared runner follows the
+download shape). (3) Stream resolution keeps the Rust CLI
+`-g` shape rather than Python's `--dump-single-json` parse;
+both ask yt-dlp for the chosen format's URL with the same
+selector, client pool, referer and UA. Tests: media_play
+policy unit test plus fake-yt-dlp end-to-end tests (fallback
+pool reached, cookie-file attempt, uncookieable skip,
+DPAPI Chromium skip, impersonated recovery URLs).
+
+**M17 (playback-download cache) — fixed.** `play_cache`
+now matches Python `core/play_cache.py`: the default
+directory is `ytplay_cache` beside the data dir (was
+`cache/play`), identity is the YouTube media ID (file
+`%(id)s.%(ext)s`) instead of a whole-URL FNV hash, so every
+URL form of a video (watch / youtu.be / music / shorts)
+hits one file and a cache copied from the Python app is
+reused offline unchanged. `.part`/`.ytdl`/`.tmp` sidecars
+are excluded from playback hits, size/count accounting and
+pruning; `clear_cache` removes everything and returns
+(removed, freed) like Python. Downloads carry the cookie
+file, the configured user agent and `--ffmpeg-location`.
+Tests: download_parity play-cache layout/accounting tests
+(default layout, sidecar accounting, offline reuse across
+URL forms, prune evicts oldest completed only, clear
+returns (3, 1050)) and a fake-yt-dlp fetch test (media-ID
+file created through run_tool; second fetch is a hit with
+exactly one invocation). Deviation: fetching a non-YouTube
+URL returns an error (no video ID); the only caller path is
+YouTube-gated in the app.
+
+**M18 (download retry/format recovery) — fixed.**
+`download_with_ytdlp` runs the M16 phase machine; per
+attempt, video formats try MP4 merge first and retry ONCE
+as MKV only when the error contains "conversion failed";
+audio presets never pass a merge format and never retry it
+(Python `core/download_formats.py` + the mainframe loop).
+The output template is Python's `<safe article
+title>.%(ext)s`. Tests: fake-yt-dlp MP4-failure→MKV retry
+(exactly 2 invocations), audio preset never merges, cookie
+file honored as the second attempt.
+
+**M19 (download layout, legacy lookup, MIME, retention) —
+fixed.** Core gains exact Python ports: `safe_download_name`
+(invalid-run collapse, trailing-dot strip, 120-char cap,
+"untitled"), `download_dir_for` (feed-title folder,
+`download_folder` override wins, "Feed" fallback),
+`extension_for_download` (URL extension ≤ 5 chars wins,
+else the response MIME table — never `.bin`; unknown types
+default `.mp3`), `find_downloaded_file` (prefix match,
+`.temp.`/sidecar exclusion, newest wins) and retention
+helpers (per-folder `apply_download_retention`; root +
+first-level-subfolder `sweep_download_retention`).
+`download_direct` requests first, then names from
+URL/MIME with Python's `_unique_path` numbering
+(`name-1.ext`, …) — no more early `.bin` or UUID suffixes.
+The app now downloads into per-feed folders (pasted-link
+items with no feed go to Python's "Media Links" folder),
+applies retention to the folder after each successful
+download, sweeps root + subfolders at refresh, and a
+completed download on disk (index OR legacy scan) wins over
+the resolved stream in the main window's delivery, in the
+player's queue advance, and at both activation checks.
+Deviations: (1) the core legacy scan covers the download
+root + every first-level subfolder — a superset of Python's
+single per-feed-folder lookup, because core does not know
+the article's feed title; the exact single-folder port
+exists as `find_downloaded_file` + `download_dir_for`.
+(2) The Rust `Article` has no `download_folder` field, so
+the override is approximated by the "Media Links" rule for
+feed-less articles. (3) `download_direct` keeps the
+partial-file + hard-link publish (Python writes the final
+name directly); on a hard-link race it advances the
+`_unique_path` counter instead of erroring. (4) The podcast
+archive dialog keeps its own chosen download directory
+while calling the new signature — Python's archive worker
+routes through the standard feed-folder path with a folder
+override; recorded as an adjacent find, not changed here
+(dialogs.rs is outside this task's file scope beyond the
+signature fix).
+
+**M20 (original/resolved URL context) — fixed.** The
+player now computes Python's context via the new core
+`media::range_cache_context` +
+`should_resolve_direct_media_url` (exact ports: the
+13-extension seekable list, the 11-host podcast-tracker
+list): a resolved direct-media URL registers its ORIGINAL
+URL with the range-cache gate, so expired signed redirects
+refresh through the original and reuse cached segments;
+yt-dlp resolutions and unresolved plays carry no context.
+The gate side already supported this (Task 21 era); the
+player previously passed `false, None`. The context is
+stored on the player state, so range-cache toggle reloads
+reuse it, and queue advance goes through the same delivery.
+Deviation: the player infers "via yt-dlp" from the input
+URL (`is_ytdlp_supported && !is_media_file_url`) because
+`MediaResolution` carries no via-yt-dlp flag to the player;
+a yt-dlp-supported page URL suppresses context, a direct or
+tracker URL carries it. Tests: media_play context/resolve
+gate test; batch36 gate test asserting the session id is
+the ORIGINAL URL's hash, never the signed URL's.
+
+**S12 (YouTube settings) — fixed.** The Settings YouTube
+page gains Python's missing controls, APPENDED after the
+existing controls (settings order is never rearranged):
+"Automatically import browser cookies.txt exports from
+Downloads" (`auto_import_browser_cookies`, default on),
+"Play YouTube by downloading first (most reliable; slower
+to start)" (`youtube_play_via_download`), the "YouTube
+playback cache folder" field, "Max cache size (MB,
+0 = unlimited):" (`youtube_play_cache_max_mb`, default 500)
+and a "Clear cache now" button. Clearing follows Python's
+`_on_clear_play_cache`: scoped to the field's current value
+(or the resolved default beside the data dir), counted
+first, an already-empty info box when there is nothing, a
+Yes/No confirm with count + human size + folder, then a
+"Removed N file(s), freed SIZE." report. All four keys save
+to config.json in Python's shapes, and their consumers
+(startup cookie import, download-first playback, cache
+pruning) already read them. Deviations: the max-size value
+is a text field, matching this dialog's other numeric
+fields, where Python uses a spin control; the cache-folder
+row has no Browse button (the field is directly editable);
+placement is appended rather than Python's interleaved
+order, per the append-only rule. There is no headless GUI
+test for the round-trip — the controls use the same
+get/set save pattern as the existing YouTube keys; the
+NVDA pass over the new controls joins Brandon's acceptance
+list.
+
+**Robustness fix found by the new tests (range cache):**
+the M03 loopback test flaked ~1 run in 3 with an empty 206
+body. Root cause (traced with origin request logs and
+temporary fetch-path instrumentation, both removed): the
+entry's segment directory is created at entry construction,
+but the cache directory is shared with the Python app
+(dual-run) — an external cleanup can remove an entry's
+directory under the live entry, and the fetch paths'
+`File::create(tmp)` then failed ENOENT, aborting the serve
+after headers were sent. Both fetch paths
+(`fetch_chunk` and `stream_origin_range_to_and_cache`) now
+re-ensure the entry directory before creating the temp
+file. The batch36 origin test servers also read through
+end-of-headers now (a single `read()` could return a split
+request and lose the Range line). After the fix the suite
+ran 8/8 clean (previously ~1-in-3 failures).
+
+**Task 22 gate (2026-11-04):** fmt clean (run last), clippy
+clean (workspace `--all-targets -D warnings` and core
+windows-gnu), **761 passed / 0 failed** (baseline 737 on
+this tree; +24: batch36 +4, media_play +7, download_parity
++11, play_cache in-module +1, rangecache in-module +1),
+`cargo build -p blindrss` OK.

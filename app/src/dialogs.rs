@@ -2459,7 +2459,7 @@ fn podcast_archive_download_one(
         article.content.as_deref(),
     ) {
         Ok(resolved) if resolved.via_ytdlp => {
-            blindrss_core::download::download_with_ytdlp(&article.url, dir, format)
+            blindrss_core::download::download_with_ytdlp(&article.url, dir, format, &article.title)
         }
         Ok(resolved) => {
             blindrss_core::download::download_direct(&resolved.url, dir, &article.title)

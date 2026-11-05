@@ -278,6 +278,15 @@ struct PlayerState {
     /// Raw stream URL of the current load (for escalation).
     stream: String,
     headers: Vec<(String, String)>,
+    /// Range-cache context of the current load (Audit 8
+    /// Task 22, M20): when resolution followed redirects from
+    /// the article's original URL to a different final URL,
+    /// the ORIGINAL is the cache identity the gate registers,
+    /// so an expired signed redirect refreshes through it and
+    /// reuses the cached segments. Set at deliver time;
+    /// toggle-reloads reuse it.
+    range_cache_resolved: bool,
+    range_cache_original: Option<String>,
     /// Last text written to the position readout.
     last_pos_text: String,
     /// Position at the last playback-state save (saves are
@@ -887,14 +896,25 @@ fn load_with_fallbacks(
     media: &MediaBackend,
     url: &str,
     headers: &[(String, String)],
+    url_is_resolved: bool,
+    original_url: Option<&str>,
 ) -> &'static str {
     // The primary load goes through the range cache when the
     // Python gate says so (Batch 36): it serves a truthful
     // Content-Length and real 206 ranges from a disk cache, so
     // the backend neither clamps seeks to a wrong duration nor
-    // re-streams bytes it already fetched.
+    // re-streams bytes it already fetched. A redirect-resolved
+    // load registers its ORIGINAL URL as the cache identity
+    // (M20): the resolved signed URL expires, the original
+    // does not.
     let cfg = blindrss_core::config::Config::load(&crate::config_path()).unwrap_or_default();
-    let primary = blindrss_core::rangecache::maybe_range_cache_url(url, headers, false, None, &cfg);
+    let primary = blindrss_core::rangecache::maybe_range_cache_url(
+        url,
+        headers,
+        url_is_resolved,
+        original_url,
+        &cfg,
+    );
     let primary_headers = if primary == url { headers } else { &[] };
     if media.load_uri_with_headers(&primary, primary_headers) {
         return "";
@@ -935,6 +955,10 @@ fn start_loaded_stream(
     // An EQ-wrapped URL is already a local ffmpeg stream (its
     // own network path is ffmpeg's), so it loads directly;
     // anything else goes through the fallback chain.
+    let (url_is_resolved, original_url) = {
+        let s = state.borrow();
+        (s.range_cache_resolved, s.range_cache_original.clone())
+    };
     let via = if wrapped != stream {
         if media.load_uri(&wrapped) {
             ""
@@ -942,7 +966,13 @@ fn start_loaded_stream(
             "failed"
         }
     } else {
-        load_with_fallbacks(media, stream, &headers)
+        load_with_fallbacks(
+            media,
+            stream,
+            &headers,
+            url_is_resolved,
+            original_url.as_deref(),
+        )
     };
     if via == "failed" {
         return false;
@@ -1384,6 +1414,23 @@ impl SessionControl {
         {
             let mut s = self.state.borrow_mut();
             s.skip_rx = skip_rx;
+            // Range-cache context (M20): the URL resolution
+            // started from is the article's enclosure (or its
+            // page URL). A yt-dlp-supported page URL means the
+            // stream came from yt-dlp and carries no context;
+            // anything else that resolved to a DIFFERENT final
+            // URL registers the original as the cache identity.
+            let input_url = article
+                .media_url
+                .as_deref()
+                .filter(|u| !u.trim().is_empty())
+                .unwrap_or(&article.url);
+            let via_ytdlp = blindrss_core::media::is_ytdlp_supported(input_url)
+                && !blindrss_core::media::is_media_file_url(input_url);
+            let (resolved, original) =
+                blindrss_core::media::range_cache_context(input_url, &stream_url, via_ytdlp, true);
+            s.range_cache_resolved = resolved;
+            s.range_cache_original = original;
             // Queue (do not start) this load's silence scan:
             // the tick starts it once playback is under way
             // (Python's queue-then-start scheduling, M09).
@@ -1739,6 +1786,8 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
         autoplay_level: 0,
         stream: String::new(),
         headers: Vec::new(),
+        range_cache_resolved: false,
+        range_cache_original: None,
         last_pos_text: String::new(),
         last_saved_pos: -1,
         hidden: HiddenAnnouncer::new(),
@@ -1778,14 +1827,21 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
             std::thread::spawn(move || {
                 let cfg =
                     blindrss_core::config::Config::load(&crate::config_path()).unwrap_or_default();
-                let result =
-                    blindrss_core::media::resolve_article_for_play(&cfg, &entry).map(|r| {
+                // A completed download on disk wins (M19
+                // legacy lookup, as in the main window's
+                // delivery path).
+                let legacy = crate::downloaded_path_for(&cfg, &entry)
+                    .and_then(|p| blindrss_core::media::local_media_url(&p).ok());
+                let result = match legacy {
+                    Some(file_url) => Ok((file_url, Vec::new())),
+                    None => blindrss_core::media::resolve_article_for_play(&cfg, &entry).map(|r| {
                         let headers = crate::playback_headers_for(&entry, &r.url, &path);
                         (
                             crate::maybe_cache_youtube(&entry, &r.url, r.via_ytdlp),
                             headers,
                         )
-                    });
+                    }),
+                };
                 let _ = tx.send((next, result));
             });
         });

@@ -71,6 +71,7 @@ pub mod user_agents;
 pub mod videosearch;
 pub mod windows_shortcuts;
 pub mod youtube_account;
+pub mod ytdlp_recovery;
 pub mod ytfull;
 
 pub use db::{

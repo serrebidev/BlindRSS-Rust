@@ -127,9 +127,25 @@ fn start_origin(body: Vec<u8>) -> Origin {
             let hits = hits2.clone();
             let body = body.clone();
             std::thread::spawn(move || {
-                let mut buf = [0u8; 8192];
-                let Ok(n) = stream.read(&mut buf) else { return };
-                let text = String::from_utf8_lossy(&buf[..n]).into_owned();
+                // Read through the end of the request headers:
+                // a single read() can return a split request
+                // under parallel-test load, losing the Range
+                // line and corrupting the response shape.
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    match stream.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            buf.extend_from_slice(&chunk[..n]);
+                            if buf.windows(4).any(|w| w == b"\r\n\r\n") || buf.len() > 65536 {
+                                break;
+                            }
+                        }
+                        Err(_) => return,
+                    }
+                }
+                let text = String::from_utf8_lossy(&buf).into_owned();
                 *hits.lock().unwrap() += 1;
                 let range = text
                     .lines()
@@ -243,4 +259,250 @@ fn end_to_end_range_cache_on_loopback() {
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------
+// Audit 8 Task 22 (M03, M04): refused probes recover; background
+// requests are capped at Python's 10 MiB.
+
+#[test]
+fn background_request_target_is_capped_at_ten_mib() {
+    // Python _BG_MAX_REQUEST_BYTES: the bootstrap target and the
+    // steady-state chunk both clamp to 10 MiB per origin request,
+    // however large the configured burst/chunk sizes are.
+    let cap = 10 * 1024 * 1024;
+    assert_eq!(
+        background_request_target(true, 64 * 1024 * 1024, 8 * 1024 * 1024),
+        cap
+    );
+    assert_eq!(
+        background_request_target(false, 64 * 1024 * 1024, 32 * 1024 * 1024),
+        cap
+    );
+    // Smaller configured sizes pass through untouched.
+    assert_eq!(
+        background_request_target(true, 4 * 1024 * 1024, 8 * 1024 * 1024),
+        4 * 1024 * 1024
+    );
+    assert_eq!(
+        background_request_target(false, 64 * 1024 * 1024, 1024 * 1024),
+        1024 * 1024
+    );
+}
+
+/// Origin with a controllable probe-refusal switch (M03):
+/// probe requests (Range bytes=0-0) can be refused with 403 a
+/// chosen number of times; data ranges always serve.
+struct GateOrigin {
+    url: String,
+    probe_hits: std::sync::Arc<std::sync::Mutex<usize>>,
+    data_hits: std::sync::Arc<std::sync::Mutex<usize>>,
+    refusals_left: std::sync::Arc<std::sync::Mutex<usize>>,
+}
+
+fn start_gate_origin(body: Vec<u8>, refusals: usize) -> GateOrigin {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let probe_hits = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+    let data_hits = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+    let refusals_left = std::sync::Arc::new(std::sync::Mutex::new(refusals));
+    let (ph, dh, rl) = (probe_hits.clone(), data_hits.clone(), refusals_left.clone());
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let (ph, dh, rl) = (ph.clone(), dh.clone(), rl.clone());
+            let body = body.clone();
+            std::thread::spawn(move || {
+                // Read through the end of the request headers:
+                // a single read() can return a split request
+                // under parallel-test load, losing the Range
+                // line and corrupting the response shape.
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    match stream.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            buf.extend_from_slice(&chunk[..n]);
+                            if buf.windows(4).any(|w| w == b"\r\n\r\n") || buf.len() > 65536 {
+                                break;
+                            }
+                        }
+                        Err(_) => return,
+                    }
+                }
+                let text = String::from_utf8_lossy(&buf).into_owned();
+                let range = text
+                    .lines()
+                    .find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        if k.trim().eq_ignore_ascii_case("range") {
+                            Some(v.trim().to_string())
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_default();
+                let total = body.len();
+                if range == "bytes=0-0" {
+                    *ph.lock().unwrap() += 1;
+                    let mut left = rl.lock().unwrap();
+                    if *left > 0 {
+                        *left -= 1;
+                        drop(left);
+                        let head = "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                        let _ = stream.write_all(head.as_bytes());
+                        let _ = stream.flush();
+                        return;
+                    }
+                } else {
+                    *dh.lock().unwrap() += 1;
+                }
+                let (status, start, end) = match parse_range_header(&range, Some(total as u64)) {
+                    Some((s, Some(e))) => ("206 Partial Content", s as usize, e as usize),
+                    Some((s, None)) => ("206 Partial Content", s as usize, total - 1),
+                    None => ("200 OK", 0, total - 1),
+                };
+                let slice = &body[start..=end];
+                let head = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: audio/mpeg\r\nContent-Length: {}\r\nContent-Range: bytes {start}-{end}/{total}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
+                    slice.len()
+                );
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(slice);
+                let _ = stream.flush();
+            });
+        }
+    });
+    GateOrigin {
+        url: format!("http://127.0.0.1:{port}/ep.mp3"),
+        probe_hits,
+        data_hits,
+        refusals_left,
+    }
+}
+
+fn rc_test_cfg(tag: &str) -> blindrss_core::config::Config {
+    let mut cfg = blindrss_core::config::Config::default();
+    let dir = std::env::temp_dir().join(format!(
+        "blindrss-rc-{tag}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    cfg.raw_mut()["range_cache_dir"] = serde_json::json!(dir.to_string_lossy());
+    cfg.raw_mut()["range_cache_background_download"] = serde_json::json!(false);
+    cfg
+}
+
+#[test]
+fn probe_403_then_206_recovers() {
+    // M03: googlevideo can refuse a freshly minted URL's first
+    // probe with 403 and serve ranges a second later. The probe
+    // retries once and the session must end up range-supported,
+    // with later reads served from the disk cache.
+    let body: Vec<u8> = (0..120_000u32).map(|i| (i % 251) as u8).collect();
+    let origin = start_gate_origin(body.clone(), 1);
+    let cfg = rc_test_cfg("m03a");
+    retune_from_config(&cfg);
+    let proxied = proxify(&origin.url, &[], false);
+    assert!(proxied.contains("/media?id="), "got {proxied}");
+
+    let (status, data, head) = http_get(&proxied, Some("bytes=1000-1999"));
+    assert_eq!(status, 206);
+    assert_eq!(data, body[1000..=1999]);
+    assert!(head.contains("bytes 1000-1999/120000"), "head: {head}");
+    assert_eq!(
+        *origin.probe_hits.lock().unwrap(),
+        2,
+        "one refused probe + one retry"
+    );
+    let data_after_first = *origin.data_hits.lock().unwrap();
+    assert_eq!(data_after_first, 1, "one origin fetch for the range");
+
+    // Second read of the same range: pure cache, no new origin
+    // traffic of either kind.
+    let (status2, data2, _) = http_get(&proxied, Some("bytes=1000-1999"));
+    assert_eq!(status2, 206);
+    assert_eq!(data2, body[1000..=1999]);
+    assert_eq!(*origin.probe_hits.lock().unwrap(), 2);
+    assert_eq!(*origin.data_hits.lock().unwrap(), data_after_first);
+}
+
+#[test]
+fn probe_refusal_never_permanently_disables_cache() {
+    // M03: a probe round that is refused twice (initial +
+    // retry) leaves range support UNKNOWN, not unsupported —
+    // the next request probes again and can recover.
+    let body: Vec<u8> = (0..120_000u32).map(|i| (i % 251) as u8).collect();
+    // Refuse far more probes than one request round makes.
+    let origin = start_gate_origin(body.clone(), usize::MAX);
+    let cfg = rc_test_cfg("m03b");
+    retune_from_config(&cfg);
+    let proxied = proxify(&origin.url, &[], false);
+
+    // While refused, the bytes still reach the client (the
+    // passthrough relays the origin's own 206).
+    let (status, data, _) = http_get(&proxied, Some("bytes=1000-1999"));
+    assert_eq!(status, 206);
+    assert_eq!(data, body[1000..=1999]);
+    let probes_while_refused = *origin.probe_hits.lock().unwrap();
+    assert!(
+        probes_while_refused >= 2,
+        "probe was retried, hits={probes_while_refused}"
+    );
+
+    // The origin starts answering probes: the very next read
+    // must probe again (support was left unknown, not latched
+    // off) and land on the cache path.
+    *origin.refusals_left.lock().unwrap() = 0;
+    let (status2, data2, head2) = http_get(&proxied, Some("bytes=2000-2999"));
+    assert_eq!(status2, 206);
+    assert_eq!(data2, body[2000..=2999]);
+    assert!(head2.contains("bytes 2000-2999/120000"), "head: {head2}");
+    assert!(
+        *origin.probe_hits.lock().unwrap() > probes_while_refused,
+        "a fresh probe ran after the refusal round"
+    );
+    let data_after_recovery = *origin.data_hits.lock().unwrap();
+
+    // And once recovered, repeat reads are cache-served.
+    let (status3, data3, _) = http_get(&proxied, Some("bytes=2000-2999"));
+    assert_eq!(status3, 206);
+    assert_eq!(data3, body[2000..=2999]);
+    assert_eq!(*origin.data_hits.lock().unwrap(), data_after_recovery);
+}
+
+#[test]
+fn gate_registers_original_url_as_cache_identity() {
+    // M20: when the player hands the gate a resolved URL plus
+    // its original, the persisted mapping is keyed by the
+    // ORIGINAL (stable) URL — an expired signed redirect later
+    // refreshes through the original and reuses the segments.
+    let cfg = rc_test_cfg("m20");
+    retune_from_config(&cfg);
+    let original = "https://pod.example.com/show/episode-7";
+    let resolved = "https://signed.example.com/ep.mp3?token=expires-soon";
+    let local = maybe_range_cache_url(resolved, &[], true, Some(original), &cfg);
+    assert!(local.contains("/media?id="), "got {local}");
+    // The session id is the hash of the REGISTERED url plus
+    // the request headers (proxify's identity rule): it must
+    // be the original URL's id, not the signed URL's — the
+    // signed URL is never the cache identity. (Asserted on
+    // the id rather than the mapping file because the proxy
+    // is a process-wide singleton shared with parallel tests.)
+    let ua = blindrss_core::http::user_agent();
+    let original_id = &sha256_hex(&format!("{original}\nuser-agent:{ua}"))[..24];
+    let signed_id = &sha256_hex(&format!("{resolved}\nuser-agent:{ua}"))[..24];
+    assert!(
+        local.contains(original_id),
+        "cache identity is the original URL: {local}"
+    );
+    assert!(
+        !local.contains(signed_id),
+        "signed URL must not be the identity: {local}"
+    );
 }

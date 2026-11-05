@@ -136,22 +136,146 @@ pub fn youtube_article_info(url: &str) -> Result<serde_json::Value, String> {
     serde_json::from_str(&json).map_err(|e| format!("YouTube metadata: {e}"))
 }
 
-/// Resolve a direct stream URL (best audio first — BlindRSS is an
-/// audio-first reader; video falls back to best combined).
+/// Resolve a direct stream URL through Python's shared,
+/// bounded yt-dlp recovery policy (Audit 8 Task 22, M16 —
+/// `ytdlp_recovery`): VLC-friendly audio selection, the
+/// primary and fallback YouTube client pools, cookie attempts
+/// with the futile-retry rules, and impersonated recovery-URL
+/// phases. The cookie file comes from the app's environment
+/// (BLINDRSS_YTDLP_COOKIES, set at startup from config).
 pub fn stream_url(url: &str) -> Result<String, String> {
-    let out = run_ytdlp(&[
-        "-g",
-        "--no-warnings",
-        "--no-playlist",
-        "-f",
-        "bestaudio/best",
-        url,
-    ])?;
-    out.lines()
-        .next()
+    let exe = find_ytdlp().ok_or("yt-dlp not found (install it or set BLINDRSS_YTDLP)")?;
+    let cookie_file = std::env::var("BLINDRSS_YTDLP_COOKIES")
+        .ok()
         .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| "yt-dlp returned no stream URL".to_string())
+        .filter(|s| !s.is_empty());
+    stream_url_with(&exe, url, cookie_file.as_deref())
+}
+
+/// `stream_url` against an explicit executable and cookie file
+/// (the seam the recovery regression tests drive).
+pub fn stream_url_with(
+    exe: &std::path::Path,
+    url: &str,
+    cookie_file: Option<&str>,
+) -> Result<String, String> {
+    use crate::ytdlp_recovery::{AttemptOutcome, CookieAttempt};
+    crate::ytdlp_recovery::run_recovery(url, cookie_file, |phase, attempt| {
+        let mut args: Vec<String> = vec![
+            "-g".into(),
+            "--no-playlist".into(),
+            "--format".into(),
+            crate::ytdlp_recovery::vlc_audio_format(&phase.target_url).to_string(),
+            "--extractor-args".into(),
+            crate::ytdlp_recovery::youtube_player_client_arg(phase.clients, None),
+            "--quiet".into(),
+            "--no-warnings".into(),
+            "--no-progress".into(),
+            "--geo-bypass".into(),
+            "--color".into(),
+            "never".into(),
+            "--user-agent".into(),
+            crate::http::user_agent(),
+            "--referer".into(),
+            phase.target_url.clone(),
+        ];
+        if phase.impersonate {
+            args.push("--impersonate".into());
+            args.push("chrome".into());
+        }
+        match attempt {
+            CookieAttempt::Base => {}
+            other => args.extend(other.args()),
+        }
+        args.push(phase.target_url.clone());
+        let arg_refs: Vec<&str> = args.iter().map(|a| a.as_str()).collect();
+        match crate::dependency::run_tool(exe, &arg_refs, std::time::Duration::from_secs(30)) {
+            Ok(run) if run.success => {
+                match run.stdout.lines().map(|s| s.trim()).find(|s| !s.is_empty()) {
+                    Some(u) => AttemptOutcome::Success(u.to_string()),
+                    None => AttemptOutcome::Failed {
+                        error: "yt-dlp returned no stream URL".to_string(),
+                        fatal: false,
+                    },
+                }
+            }
+            Ok(run) => AttemptOutcome::Failed {
+                error: run.stderr.trim().to_string(),
+                fatal: false,
+            },
+            Err(e) => {
+                let fatal = e.contains("timed out");
+                AttemptOutcome::Failed { error: e, fatal }
+            }
+        }
+    })
+}
+
+/// Python `_SEEKABLE_EXTENSIONS` (gui/player.py).
+const SEEKABLE_EXTENSIONS: [&str; 13] = [
+    ".mp3", ".m4a", ".m4b", ".aac", ".ogg", ".opus", ".wav", ".flac", ".mp4", ".m4v", ".webm",
+    ".mkv", ".mov",
+];
+
+/// Python `_PODCAST_TRACKING_HOSTS`: redirector/tracker hosts
+/// whose media-extension URLs still get redirect-resolved.
+const PODCAST_TRACKING_HOSTS: [&str; 11] = [
+    "op3.dev",
+    "pdst.fm",
+    "pscrb.fm",
+    "chrt.fm",
+    "chtbl.com",
+    "podtrac.com",
+    "mgln.ai",
+    "blubrry.com",
+    "podcasts.apple.com",
+    "anchor.fm",
+    "spotify.com",
+];
+
+fn is_podcast_tracking_url(url: &str) -> bool {
+    let host = crate::ytdlp_recovery::url_host(url);
+    !host.is_empty()
+        && PODCAST_TRACKING_HOSTS
+            .iter()
+            .any(|h| host == *h || host.ends_with(&format!(".{h}")))
+}
+
+/// Python `_should_resolve_direct_media_url`: resolve
+/// page-like URLs and podcast trackers, but skip ordinary
+/// files — a URL whose path ends in a seekable extension is
+/// resolved only when it sits on a tracking host; anything
+/// else is resolved.
+pub fn should_resolve_direct_media_url(url: &str, _media_type: &str) -> bool {
+    let path = crate::ytdlp_recovery::url_path(url).to_ascii_lowercase();
+    if SEEKABLE_EXTENSIONS.iter().any(|ext| path.ends_with(ext)) {
+        return is_podcast_tracking_url(url);
+    }
+    true
+}
+
+/// The range-cache context the player carries out of
+/// resolution (Audit 8 Task 22, M20; Python
+/// `_resolve_media_worker` + `_maybe_range_cache_url`): when a
+/// non-yt-dlp load was redirect-resolved to a DIFFERENT final
+/// URL, the gate must register the ORIGINAL URL as the cache
+/// identity — the proxy re-follows its redirects for a fresh
+/// signed link when the resolved one expires, and the cached
+/// segments are reused. Returns `(url_is_resolved,
+/// original_url)` for `rangecache::maybe_range_cache_url`.
+pub fn range_cache_context(
+    input_url: &str,
+    final_url: &str,
+    via_ytdlp: bool,
+    playback_enabled: bool,
+) -> (bool, Option<String>) {
+    if via_ytdlp || !playback_enabled {
+        return (false, None);
+    }
+    if !input_url.is_empty() && input_url != final_url {
+        return (true, Some(input_url.to_string()));
+    }
+    (false, None)
 }
 
 // ---------------------------------------------------------------------
