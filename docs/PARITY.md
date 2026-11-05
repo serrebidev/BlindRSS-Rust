@@ -4678,3 +4678,9 @@ windows-gnu), **761 passed / 0 failed** (baseline 737 on
 this tree; +24: batch36 +4, media_play +7, download_parity
 +11, play_cache in-module +1, rangecache in-module +1),
 `cargo build -p blindrss` OK.
+
+**Task 22 integration gate (2026-11-04):** cherry-picked onto
+main over 8192b29; the only conflict was the append-only
+PARITY region (union). Merged gate: fmt clean, clippy clean
+(workspace and core windows-gnu), 761 passed / 0 failed,
+build OK.
