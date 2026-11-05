@@ -4790,3 +4790,14 @@ reader paths as they already did in the main-window path.
 is gone with the rest of its private invocation: Python's CLI
 path does not pass it, and the incomplete-data signal R10 keys
 on travels as a warning.
+
+**Task 16 integration gate (2026-11-04):** cherry-picked
+clean onto main. Merged gate: fmt clean, clippy clean
+(workspace and core windows-gnu), 771 passed / 0 failed,
+build OK. Wave 3 is code-complete.
+
+**Wave 3 release v0.1.57 (2026-11-04):** version bumped
+0.1.56 -> 0.1.57; cargo update applied (cc 1.11.0,
+ureq 3.5.1, ureq-proto 0.7.1; 24 packages already latest).
+Release-tree gate re-run on the updated tree: fmt clean,
+clippy clean both legs, 771 passed / 0 failed, build OK.
