@@ -5732,3 +5732,8 @@ screen-reader acceptance items added by this task: the
 Takeout source-selection list's checked-state announcement
 and Space behavior under NVDA (F12), and archive Play
 focus behavior after activation from the dialog (F04).
+
+**Task 27 integration gate (2026-11-05):** cherry-picked
+onto main (PARITY union, 1 region). Merged gate: fmt
+clean, clippy clean (workspace and core windows-gnu),
+852 passed / 0 failed, build OK.
