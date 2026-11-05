@@ -4,14 +4,21 @@
 //! helpers under test are pure, and the ID3 cases read synthetic
 //! local files.
 
+#[cfg(unix)]
+use blindrss_core::article_html::render_rich_article_with_ytdlp;
 use blindrss_core::extract::{
     find_next_page, id3_metadata, looks_like_id3_media_url, looks_like_media_url,
     looks_like_metered_preview, merge_texts, metered_preview_notice,
 };
 use blindrss_core::threads::{GithubPage, github_page_parts};
-use blindrss_core::ytfull::{chapters_from_info, format_comments, video_id_from_url};
+#[cfg(unix)]
+use blindrss_core::ytfull::extract_article_with;
+use blindrss_core::ytfull::{
+    article_fields_from_info, article_fields_from_info_in_language, chapters_from_info,
+    format_comments, video_id_from_url,
+};
 use serde_json::json;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -524,4 +531,547 @@ fn github_page_classification() {
     assert!(github_page_parts("https://github.com/settings/profile").is_none());
     assert!(github_page_parts("https://example.com/serrebidev/BlindRSS/discussions/42").is_none());
     assert!(github_page_parts("https://github.com/serrebidev/BlindRSS").is_none());
+}
+
+// ---------------------------------------------------------------------
+// Audit 8 Task 16 (R10, R11, R12): one YouTube document/subtitle
+// pipeline. The extraction tests drive a fake yt-dlp executable
+// (the *_with seam, same pattern as media_play.rs); the subtitle
+// tests drive a loopback HTTP server. All offline.
+// ---------------------------------------------------------------------
+
+#[cfg(unix)]
+fn task16_scratch(tag: &str) -> std::path::PathBuf {
+    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!(
+        "blindrss-t16-{tag}-{}-{}-{n}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// Fake yt-dlp for info extraction: invocation N (counted in
+/// `n`) writes `errN` to stderr, exits with `exitN` when that
+/// file exists, and otherwise prints `payloadN.json` to stdout.
+/// Every invocation's argv is appended to `log`.
+#[cfg(unix)]
+fn fake_info_ytdlp(dir: &std::path::Path) -> std::path::PathBuf {
+    let script = r#"#!/bin/sh
+DIR='__DIR__'
+echo "$@" >> "$DIR/log"
+N=0
+[ -f "$DIR/n" ] && N=$(cat "$DIR/n")
+N=$((N+1))
+echo "$N" > "$DIR/n"
+[ -f "$DIR/err$N" ] && cat "$DIR/err$N" >&2
+[ -f "$DIR/exit$N" ] && exit $(cat "$DIR/exit$N")
+cat "$DIR/payload$N.json"
+exit 0
+"#;
+    let exe = dir.join("yt-dlp");
+    std::fs::write(&exe, script.replace("__DIR__", &dir.to_string_lossy())).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    exe
+}
+
+#[cfg(unix)]
+fn write_run(
+    dir: &std::path::Path,
+    n: usize,
+    payload: Option<&serde_json::Value>,
+    stderr: Option<&str>,
+    exit: Option<i32>,
+) {
+    if let Some(payload) = payload {
+        std::fs::write(
+            dir.join(format!("payload{n}.json")),
+            serde_json::to_string(payload).unwrap(),
+        )
+        .unwrap();
+    }
+    if let Some(stderr) = stderr {
+        std::fs::write(dir.join(format!("err{n}")), stderr).unwrap();
+    }
+    if let Some(exit) = exit {
+        std::fs::write(dir.join(format!("exit{n}")), exit.to_string()).unwrap();
+    }
+}
+
+#[cfg(unix)]
+fn invocation_log(dir: &std::path::Path) -> String {
+    std::fs::read_to_string(dir.join("log")).unwrap_or_default()
+}
+
+const WATCH: &str = "https://www.youtube.com/watch?v=abc123XYZ09";
+const INCOMPLETE_NOTICE: &str = "YouTube returned an incomplete comment page after retry; all comments received are shown below.";
+
+fn comment(id: &str, author: &str, text: &str) -> serde_json::Value {
+    json!({"id": id, "author": author, "text": text, "parent": "root"})
+}
+
+fn info_payload(comments: serde_json::Value) -> serde_json::Value {
+    json!({
+        "id": "abc123XYZ09",
+        "title": "Vid Title",
+        "channel": "Chan",
+        "description": "The description",
+        "comments": comments,
+    })
+}
+
+#[cfg(unix)]
+#[test]
+fn comments_retry_unions_by_id_and_clears_notice() {
+    // R10: run 1 succeeds but its stderr reports incomplete
+    // comment data; the pipeline retries once and unions the
+    // two comment sets by id.
+    let dir = task16_scratch("union");
+    let exe = fake_info_ytdlp(&dir);
+    write_run(
+        &dir,
+        1,
+        Some(&info_payload(json!([
+            comment("c1", "Ann", "First comment"),
+            comment("c2", "Bob", "Second comment"),
+        ]))),
+        Some("WARNING: Incomplete data received. Retrying...\n"),
+        None,
+    );
+    write_run(
+        &dir,
+        2,
+        Some(&info_payload(json!([
+            comment("c2", "Bob", "Second comment"),
+            comment("c3", "Cid", "Third comment"),
+        ]))),
+        None,
+        None,
+    );
+    let (_title, _author, text) = extract_article_with(&exe, WATCH).expect("article");
+    for needle in ["First comment", "Second comment", "Third comment"] {
+        assert!(text.contains(needle), "missing {needle}: {text}");
+    }
+    assert_eq!(
+        text.matches("Second comment").count(),
+        1,
+        "union dedupes: {text}"
+    );
+    assert!(!text.contains(INCOMPLETE_NOTICE), "retry completed: {text}");
+    let log = invocation_log(&dir);
+    assert_eq!(log.lines().count(), 2, "exactly one retry: {log}");
+    // The shared pipeline's invocation shape (Python
+    // _extract_info_via_cli with comments).
+    assert!(log.contains("--write-comments"), "{log}");
+    assert!(log.contains("max_comments=all,all,all,all,all"), "{log}");
+    assert!(log.contains("player_client=default,android_vr"), "{log}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn comments_incomplete_after_retry_shows_honest_notice() {
+    // R10: both runs report incomplete data — the comments
+    // received are preserved AND the document says they are
+    // incomplete, before the first comment.
+    let dir = task16_scratch("notice");
+    let exe = fake_info_ytdlp(&dir);
+    write_run(
+        &dir,
+        1,
+        Some(&info_payload(json!([comment(
+            "c1",
+            "Ann",
+            "First comment"
+        )]))),
+        Some("WARNING: Incomplete data received\n"),
+        None,
+    );
+    write_run(
+        &dir,
+        2,
+        Some(&info_payload(json!([comment(
+            "c2",
+            "Bob",
+            "Second comment"
+        )]))),
+        Some("WARNING: Incomplete data received\n"),
+        None,
+    );
+    let (_t, _a, text) = extract_article_with(&exe, WATCH).expect("article");
+    assert!(text.contains(INCOMPLETE_NOTICE), "{text}");
+    assert!(
+        text.contains("First comment") && text.contains("Second comment"),
+        "{text}"
+    );
+    assert!(
+        text.find(INCOMPLETE_NOTICE).unwrap() < text.find("First comment").unwrap(),
+        "notice precedes comments: {text}"
+    );
+    assert_eq!(invocation_log(&dir).lines().count(), 2);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn comments_retry_failure_keeps_first_extraction_with_notice() {
+    // R10: the retry itself fails — Python keeps the first
+    // extraction's comments and still flags incompleteness.
+    let dir = task16_scratch("retryfail");
+    let exe = fake_info_ytdlp(&dir);
+    write_run(
+        &dir,
+        1,
+        Some(&info_payload(json!([comment(
+            "c1",
+            "Ann",
+            "First comment"
+        )]))),
+        Some("WARNING: Incomplete data received\n"),
+        None,
+    );
+    write_run(&dir, 2, None, Some("ERROR: server blew up\n"), Some(1));
+    let (_t, _a, text) = extract_article_with(&exe, WATCH).expect("first extraction survives");
+    assert!(text.contains("First comment"), "{text}");
+    assert!(text.contains(INCOMPLETE_NOTICE), "{text}");
+    assert_eq!(invocation_log(&dir).lines().count(), 2);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn complete_comments_never_retry() {
+    let dir = task16_scratch("noretry");
+    let exe = fake_info_ytdlp(&dir);
+    write_run(
+        &dir,
+        1,
+        Some(&info_payload(json!([comment(
+            "c1",
+            "Ann",
+            "First comment"
+        )]))),
+        None,
+        None,
+    );
+    let (_t, _a, text) = extract_article_with(&exe, WATCH).expect("article");
+    assert!(text.contains("First comment"), "{text}");
+    assert!(!text.contains(INCOMPLETE_NOTICE), "{text}");
+    assert_eq!(
+        invocation_log(&dir).lines().count(),
+        1,
+        "no retry without the warning"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn incomplete_flag_renders_notice_before_comment_lines() {
+    // Pure shape (Python article_fields_from_info): the notice
+    // sits directly under the Comments heading, ahead of the
+    // comment lines — and ahead of the no-comments line.
+    let mut info = info_payload(json!([comment("c1", "Ann", "First comment")]));
+    info["_blindrss_comments_incomplete"] = json!(true);
+    let (_t, _a, text) = article_fields_from_info(&info, WATCH);
+    let comments_at = text.find("Comments").unwrap();
+    let notice_at = text.find(INCOMPLETE_NOTICE).unwrap();
+    let comment_at = text.find("First comment").unwrap();
+    assert!(comments_at < notice_at && notice_at < comment_at, "{text}");
+
+    let mut info = info_payload(json!([]));
+    info["_blindrss_comments_incomplete"] = json!(true);
+    let (_t, _a, text) = article_fields_from_info(&info, WATCH);
+    assert!(text.contains(INCOMPLETE_NOTICE), "{text}");
+    assert!(
+        text.find(INCOMPLETE_NOTICE).unwrap()
+            < text.find("No public comments were available.").unwrap(),
+        "{text}"
+    );
+
+    let info = info_payload(json!([comment("c1", "Ann", "First comment")]));
+    let (_t, _a, text) = article_fields_from_info(&info, WATCH);
+    assert!(!text.contains(INCOMPLETE_NOTICE), "{text}");
+}
+
+// ---------------------------------------------------------------------
+// R11: the shared subtitle downloader — headers forwarded, URL
+// dedupe, two-attempt cap, untranslated-429 stop.
+// ---------------------------------------------------------------------
+
+struct RecordedRequest {
+    path: String,
+    headers: String,
+}
+
+fn subtitle_server<F>(
+    handler: F,
+) -> (
+    String,
+    std::sync::Arc<std::sync::Mutex<Vec<RecordedRequest>>>,
+)
+where
+    F: Fn(&str, &str) -> (u16, String) + Send + Sync + 'static,
+{
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let recorded = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = recorded.clone();
+    let handler = std::sync::Arc::new(handler);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let seen = seen.clone();
+            let handler = handler.clone();
+            std::thread::spawn(move || {
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+                let mut raw: Vec<u8> = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !raw.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut buf) {
+                        Ok(0) => return,
+                        Ok(n) => raw.extend_from_slice(&buf[..n]),
+                        Err(_) => return,
+                    }
+                    if raw.len() > 65_536 {
+                        return;
+                    }
+                }
+                let text = String::from_utf8_lossy(&raw);
+                let path = text.split_whitespace().nth(1).unwrap_or("").to_string();
+                let headers = text.to_lowercase();
+                seen.lock().unwrap().push(RecordedRequest {
+                    path: path.clone(),
+                    headers: headers.clone(),
+                });
+                let (status, body) = handler(&path, &headers);
+                let reason = match status {
+                    200 => "OK",
+                    403 => "Forbidden",
+                    429 => "Too Many Requests",
+                    _ => "Internal Server Error",
+                };
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+            });
+        }
+    });
+    (base, recorded)
+}
+
+fn track(url: &str, ext: &str) -> serde_json::Value {
+    json!({"url": url, "ext": ext})
+}
+
+fn json3_body(text: &str) -> String {
+    format!(r#"{{"events":[{{"tStartMs":0,"segs":[{{"utf8":"{text}"}}]}}]}}"#)
+}
+
+fn subtitle_info(subtitles: serde_json::Value, automatic: serde_json::Value) -> serde_json::Value {
+    json!({
+        "id": "abc123XYZ09",
+        "title": "Vid Title",
+        "description": "The description",
+        "subtitles": subtitles,
+        "automatic_captions": automatic,
+    })
+}
+
+#[test]
+fn subtitle_track_fetched_with_extracted_headers() {
+    // R11: the track is header-protected (403 without the
+    // header from the info's http_headers); Python forwards
+    // them, so the transcript arrives.
+    let (base, recorded) = subtitle_server(|path, headers| {
+        if path == "/subs" && headers.contains("x-probe: task16") {
+            (200, json3_body("Protected transcript line"))
+        } else {
+            (403, String::new())
+        }
+    });
+    let mut info = subtitle_info(
+        json!({"en": [track(&format!("{base}/subs"), "json3")]}),
+        json!({}),
+    );
+    info["http_headers"] = json!({"X-Probe": "task16"});
+    let (_t, _a, text) = article_fields_from_info_in_language(&info, WATCH, "en");
+    assert!(text.contains("Protected transcript line"), "{text}");
+    assert!(text.contains("Subtitles (en)"), "{text}");
+    let seen = recorded.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    assert!(
+        seen[0].headers.contains("x-probe: task16"),
+        "headers: {}",
+        seen[0].headers
+    );
+}
+
+#[test]
+fn subtitle_duplicate_urls_requested_once() {
+    // R11: "en" and "en-orig" entries naming the same URL are
+    // one track (Python dedupes by URL before attempting).
+    let (base, recorded) = subtitle_server(|path, _headers| {
+        if path == "/good" {
+            (200, json3_body("Second track line"))
+        } else {
+            (500, String::new())
+        }
+    });
+    let dup = format!("{base}/dup");
+    let info = subtitle_info(
+        json!({"en": [track(&dup, "json3")]}),
+        json!({
+            "en-orig": [track(&dup, "json3")],
+            "en-GB": [track(&format!("{base}/good"), "json3")],
+        }),
+    );
+    let (_t, _a, text) = article_fields_from_info_in_language(&info, WATCH, "en");
+    assert!(text.contains("Second track line"), "{text}");
+    let seen = recorded.lock().unwrap();
+    let paths: Vec<&str> = seen.iter().map(|r| r.path.as_str()).collect();
+    assert_eq!(paths, ["/dup", "/good"], "dup URL attempted once");
+}
+
+#[test]
+fn subtitle_attempts_capped_at_two_tracks() {
+    // R11 / plan: at most two tracks are attempted, however
+    // many candidates exist.
+    let (base, recorded) = subtitle_server(|path, _headers| {
+        if path == "/c" {
+            (200, json3_body("Third track line"))
+        } else {
+            (500, String::new())
+        }
+    });
+    let info = subtitle_info(
+        json!({"en": [track(&format!("{base}/a"), "json3")]}),
+        json!({
+            "en": [track(&format!("{base}/b"), "json3")],
+            "en-GB": [track(&format!("{base}/c"), "json3")],
+        }),
+    );
+    let (_t, _a, text) = article_fields_from_info_in_language(&info, WATCH, "en");
+    assert!(text.contains("No subtitles were available."), "{text}");
+    assert!(!text.contains("Third track line"), "{text}");
+    let seen = recorded.lock().unwrap();
+    let paths: Vec<&str> = seen.iter().map(|r| r.path.as_str()).collect();
+    assert_eq!(paths, ["/a", "/b"], "two attempts, best-first");
+}
+
+#[test]
+fn subtitle_429_on_untranslated_track_stops_attempts() {
+    // R11: a 429 on a plain (untranslated) track ends the
+    // walk — another request would be rate-limited too.
+    let (base, recorded) = subtitle_server(|path, _headers| {
+        if path == "/b" {
+            (200, json3_body("Should not be fetched"))
+        } else {
+            (429, String::new())
+        }
+    });
+    let info = subtitle_info(
+        json!({
+            "en": [track(&format!("{base}/a"), "json3")],
+            "en-GB": [track(&format!("{base}/b"), "json3")],
+        }),
+        json!({}),
+    );
+    let (_t, _a, text) = article_fields_from_info_in_language(&info, WATCH, "en");
+    assert!(text.contains("No subtitles were available."), "{text}");
+    assert!(!text.contains("Should not be fetched"), "{text}");
+    assert_eq!(recorded.lock().unwrap().len(), 1, "stopped after the 429");
+}
+
+#[test]
+fn subtitle_429_on_translated_track_continues() {
+    // R11: the stop rule is only for untranslated tracks; a
+    // rate-limited machine translation falls through to the
+    // next candidate.
+    let (base, recorded) = subtitle_server(|path, _headers| {
+        if path.starts_with("/t2") {
+            (
+                200,
+                "WEBVTT\n\n00:00.000 --> 00:02.000\nTranslated fallback line\n".to_string(),
+            )
+        } else {
+            (429, String::new())
+        }
+    });
+    let info = subtitle_info(
+        json!({"de": [track(&format!("{base}/t1?tlang=en"), "json3")]}),
+        json!({"de-orig": [track(&format!("{base}/t2"), "vtt")]}),
+    );
+    let (_t, _a, text) = article_fields_from_info_in_language(&info, WATCH, "en");
+    assert!(text.contains("Translated fallback line"), "{text}");
+    let seen = recorded.lock().unwrap();
+    assert_eq!(seen.len(), 2);
+    assert!(
+        seen[0].path.starts_with("/t1"),
+        "translated track first: {}",
+        seen[0].path
+    );
+}
+
+// ---------------------------------------------------------------------
+// R12: rich reader keeps structured-YouTube identity — a longer
+// feed body never replaces the reconstruction, and a failed
+// reconstruction falls back to the feed body, never the watch
+// page.
+// ---------------------------------------------------------------------
+
+#[cfg(unix)]
+#[test]
+fn rich_youtube_reconstruction_survives_longer_feed() {
+    let dir = task16_scratch("richkeep");
+    let exe = fake_info_ytdlp(&dir);
+    write_run(&dir, 1, Some(&info_payload(json!([]))), None, None);
+    let feed = format!("<p>{}</p>", "FEEDONLY syndicated paragraph. ".repeat(400));
+    let out =
+        render_rich_article_with_ytdlp(WATCH, &feed, "Feed Title", "", "", "", "", "", "en", &exe)
+            .expect("rendered");
+    assert!(
+        out.contains("The description"),
+        "structured body kept: {out}"
+    );
+    assert!(
+        !out.contains("FEEDONLY"),
+        "feed must not replace reconstruction: {out}"
+    );
+    assert!(out.contains("Vid Title"), "extraction title wins: {out}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn rich_youtube_failed_reconstruction_falls_back_to_feed() {
+    let dir = task16_scratch("richfallback");
+    let exe = fake_info_ytdlp(&dir);
+    write_run(&dir, 1, None, Some("ERROR: unavailable\n"), Some(1));
+    let out = render_rich_article_with_ytdlp(
+        WATCH,
+        "<p>Feed fallback summary text</p>",
+        "Feed Title",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "en",
+        &exe,
+    )
+    .expect("feed fallback renders");
+    assert!(out.contains("Feed fallback summary text"), "{out}");
+    assert!(out.contains("Feed Title"), "{out}");
+    // With no feed body there is nothing honest to show.
+    let none =
+        render_rich_article_with_ytdlp(WATCH, "", "Feed Title", "", "", "", "", "", "en", &exe);
+    assert!(none.is_none(), "no watch-page scrape: {none:?}");
+    let _ = std::fs::remove_dir_all(&dir);
 }

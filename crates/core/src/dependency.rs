@@ -156,7 +156,9 @@ pub fn find_ffprobe() -> Option<std::path::PathBuf> {
 // stdin is closed, stdout/stderr are drained on reader threads
 // and capped, and on timeout the child is KILLED AND REAPED
 // (Python `core/discovery.py` terminates timed-out subprocesses
-// the same way) — never detached to finish on its own.
+// the same way) — never detached to finish on its own. The one
+// documented exception to the cap is `run_tool_full_output`
+// (the YouTube `-J` info extraction; see its doc).
 // ---------------------------------------------------------------------------
 
 /// Maximum bytes of stdout/stderr `run_tool` retains per stream.
@@ -173,8 +175,9 @@ pub struct ToolRun {
     pub stderr: String,
 }
 
-fn read_capped<R: std::io::Read + Send + 'static>(
+fn read_capped_at<R: std::io::Read + Send + 'static>(
     mut reader: R,
+    cap: usize,
 ) -> std::thread::JoinHandle<Vec<u8>> {
     std::thread::spawn(move || {
         let mut kept: Vec<u8> = Vec::new();
@@ -183,8 +186,8 @@ fn read_capped<R: std::io::Read + Send + 'static>(
             match reader.read(&mut chunk) {
                 Ok(0) => break,
                 Ok(n) => {
-                    if kept.len() < MAX_TOOL_OUTPUT_BYTES {
-                        let take = (MAX_TOOL_OUTPUT_BYTES - kept.len()).min(n);
+                    if kept.len() < cap {
+                        let take = (cap - kept.len()).min(n);
                         kept.extend_from_slice(&chunk[..take]);
                     }
                 }
@@ -248,9 +251,33 @@ pub fn run_tool(
     args: &[&str],
     timeout: std::time::Duration,
 ) -> Result<ToolRun, String> {
+    run_tool_impl(exe, args, timeout, MAX_TOOL_OUTPUT_BYTES)
+}
+
+/// `run_tool` without the output cap. Reserved for the
+/// YouTube `-J` extraction (`ytfull`): a comment-complete info
+/// dump legitimately runs to many megabytes, Python's
+/// subprocess pipeline caps nothing there, and truncating the
+/// JSON at the shared cap would fail the whole extraction.
+/// Ownership semantics are identical — finite timeout, killed
+/// and reaped on timeout, both pipes drained to EOF.
+pub fn run_tool_full_output(
+    exe: &std::path::Path,
+    args: &[&str],
+    timeout: std::time::Duration,
+) -> Result<ToolRun, String> {
+    run_tool_impl(exe, args, timeout, usize::MAX)
+}
+
+fn run_tool_impl(
+    exe: &std::path::Path,
+    args: &[&str],
+    timeout: std::time::Duration,
+    cap: usize,
+) -> Result<ToolRun, String> {
     let mut child = spawn_tool(exe, args, timeout)?;
-    let out_reader = child.stdout.take().map(read_capped);
-    let err_reader = child.stderr.take().map(read_capped);
+    let out_reader = child.stdout.take().map(|r| read_capped_at(r, cap));
+    let err_reader = child.stderr.take().map(|r| read_capped_at(r, cap));
     let deadline = std::time::Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {

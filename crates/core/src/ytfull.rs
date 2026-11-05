@@ -9,6 +9,7 @@
 use regex::Regex;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::OnceLock;
 
 const YOUTUBE_HOSTS: [&str; 6] = [
@@ -125,40 +126,59 @@ fn json_str(v: &Value, key: &str) -> String {
         .to_string()
 }
 
-/// Run yt-dlp -J with comment extraction (Python
-/// `_extract_info_via_cli` with include_comments=True).
-fn extract_info(url: &str, timeout_s: u64) -> Result<Value, String> {
-    let exe = crate::media::find_ytdlp().ok_or("yt-dlp not found")?;
-    let args: Vec<String> = vec![
-        "-J".into(),
-        "--ignore-config".into(),
-        "--no-playlist".into(),
-        "--skip-download".into(),
-        "--socket-timeout".into(),
-        "20".into(),
-        "--retries".into(),
-        "2".into(),
-        "--extractor-retries".into(),
-        "6".into(),
-        "--extractor-args".into(),
-        "youtube:player_client=default,android_vr;max_comments=all,all,all,all,all".into(),
-        "--write-comments".into(),
-        "--".into(),
-        url.to_string(),
-    ];
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let out = std::process::Command::new(&exe).args(&args).output();
-        let _ = tx.send(out);
-    });
-    let out = match rx.recv_timeout(std::time::Duration::from_secs(timeout_s.max(30))) {
-        Ok(Ok(out)) => out,
-        Ok(Err(e)) => return Err(format!("yt-dlp: {e}")),
-        Err(_) => return Err("yt-dlp did not finish in time".to_string()),
-    };
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
-        let last = err
+/// Seconds budget for one comment-complete CLI extraction
+/// (Python `_CLI_TIMEOUT_WITH_COMMENTS_S`: comment-heavy
+/// videos can take minutes; a hung CLI must still end).
+const CLI_TIMEOUT_WITH_COMMENTS_S: u64 = 900;
+
+/// Run one yt-dlp `-J` extraction with comments (Python
+/// `_extract_info_via_cli` with include_comments=True) through
+/// the owned-subprocess policy (`dependency::run_tool` — the
+/// full-output variant: a comment-complete dump legitimately
+/// exceeds the shared cap, and Python caps nothing here).
+/// Returns the info dict and whether a SUCCESSFUL run's
+/// stderr reported incomplete comment data — the signal
+/// Python's retry keys on.
+fn run_info_once(exe: &Path, extract_url: &str) -> Result<(Value, bool), String> {
+    let extractor_args = format!(
+        "{};max_comments=all,all,all,all,all",
+        crate::ytdlp_recovery::youtube_player_client_arg(
+            &crate::ytdlp_recovery::YOUTUBE_PLAYER_CLIENTS,
+            None,
+        )
+    );
+    let mut args: Vec<String> = crate::media::ytdlp_env_args();
+    args.extend(
+        [
+            "-J",
+            "--ignore-config",
+            "--no-playlist",
+            "--skip-download",
+            "--socket-timeout",
+            "20",
+            "--retries",
+            "2",
+            "--extractor-retries",
+            "6",
+            "--extractor-args",
+            &extractor_args,
+            "--write-comments",
+            "--",
+            extract_url,
+        ]
+        .iter()
+        .map(|s| s.to_string()),
+    );
+    let arg_refs: Vec<&str> = args.iter().map(|a| a.as_str()).collect();
+    let run = crate::dependency::run_tool_full_output(
+        exe,
+        &arg_refs,
+        std::time::Duration::from_secs(CLI_TIMEOUT_WITH_COMMENTS_S),
+    )
+    .map_err(|e| format!("yt-dlp failed to start: {e}"))?;
+    if !run.success {
+        let last = run
+            .stderr
             .lines()
             .rev()
             .find(|l| !l.trim().is_empty())
@@ -167,8 +187,113 @@ fn extract_info(url: &str, timeout_s: u64) -> Result<Value, String> {
             .to_string();
         return Err(last);
     }
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    serde_json::from_str(&stdout).map_err(|e| format!("yt-dlp output parse failed: {e}"))
+    let incomplete = run
+        .stderr
+        .to_lowercase()
+        .contains("incomplete data received");
+    let parsed: Value = serde_json::from_str(&run.stdout)
+        .map_err(|e| format!("yt-dlp output parse failed: {e}"))?;
+    let info = if parsed.is_object() {
+        parsed
+    } else {
+        Value::Object(serde_json::Map::new())
+    };
+    Ok((info, incomplete))
+}
+
+/// Canonical JSON with recursively sorted object keys — the
+/// dedupe key for a comment carrying no id (Python's
+/// `json.dumps(item, sort_keys=True)` fallback).
+fn canonical_json(value: &Value) -> String {
+    match value {
+        Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            let parts: Vec<String> = keys
+                .iter()
+                .map(|k| {
+                    format!(
+                        "{}:{}",
+                        serde_json::to_string(k).unwrap_or_default(),
+                        canonical_json(&map[*k])
+                    )
+                })
+                .collect();
+            format!("{{{}}}", parts.join(","))
+        }
+        Value::Array(items) => {
+            let parts: Vec<String> = items.iter().map(canonical_json).collect();
+            format!("[{}]", parts.join(","))
+        }
+        other => serde_json::to_string(other).unwrap_or_default(),
+    }
+}
+
+/// Merge two extractions' comment lists into the retry's
+/// info (Python `extract_video_info`): the first extraction's
+/// comments in order, then the retry's, deduped by comment
+/// id. The retry's info wins as the document source; only
+/// its comment list is replaced by the union.
+fn union_comments(first: &Value, retry: &mut Value) {
+    let mut merged: Vec<Value> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for source in [first, &*retry] {
+        if let Some(items) = source.get("comments").and_then(|v| v.as_array()) {
+            for item in items {
+                if !item.is_object() {
+                    continue;
+                }
+                let id = json_str(item, "id");
+                let key = if id.is_empty() {
+                    canonical_json(item)
+                } else {
+                    id
+                };
+                if seen.insert(key) {
+                    merged.push(item.clone());
+                }
+            }
+        }
+    }
+    retry["comments"] = Value::Array(merged);
+}
+
+/// The ONE YouTube info pipeline (Python `extract_video_info`
+/// with comments), shared by the plain reader, the rich
+/// reader and the main-window full-text path. A run whose
+/// stderr reports incomplete comment data is retried once
+/// and the two comment sets are unioned by id; when the
+/// retry still reports incomplete data (or fails outright),
+/// the info carries `_blindrss_comments_incomplete` so the
+/// document can say so honestly instead of silently
+/// presenting a partial discussion as complete.
+pub fn extract_video_info(url: &str) -> Result<Value, String> {
+    let exe = crate::media::find_ytdlp().ok_or("yt-dlp not found")?;
+    extract_video_info_with(&exe, url)
+}
+
+/// `extract_video_info` against an explicit executable (the
+/// seam the regression tests drive with a fake yt-dlp).
+pub fn extract_video_info_with(exe: &Path, url: &str) -> Result<Value, String> {
+    if !is_youtube_video_url(url) {
+        return Ok(Value::Object(serde_json::Map::new()));
+    }
+    let extract_url = crate::ytdlp_recovery::normalize_ytdlp_single_item_url(url);
+    let (info, incomplete) = run_info_once(exe, &extract_url)?;
+    if !incomplete {
+        return Ok(info);
+    }
+    let mut info = info;
+    let mut incomplete = true;
+    if let Ok((mut retry_info, retry_incomplete)) = run_info_once(exe, &extract_url) {
+        incomplete = retry_incomplete;
+        union_comments(&info, &mut retry_info);
+        info = retry_info;
+    }
+    if incomplete {
+        info["_blindrss_comments_incomplete"] = Value::Bool(true);
+    }
+    Ok(info)
 }
 
 fn timestamp(secs: f64) -> String {
@@ -369,12 +494,14 @@ fn transcript_from_vtt(body: &str) -> Vec<(f64, String)> {
 /// URL is a translated one (`tlang=` in the timedtext URL).
 fn track_translation(track: &Value) -> String {
     let url = json_str(track, "url");
-    for pair in url.split(['?', '&']) {
-        if let Some(v) = pair.strip_prefix("tlang=") {
-            return v.to_string();
-        }
-    }
-    String::new()
+    let Ok(parsed) = url::Url::parse(&url) else {
+        return String::new();
+    };
+    parsed
+        .query_pairs()
+        .find(|(key, _)| key == "tlang")
+        .map(|(_, value)| value.into_owned())
+        .unwrap_or_default()
 }
 
 struct SubCandidate {
@@ -384,12 +511,27 @@ struct SubCandidate {
     track: Value,
 }
 
+/// Whether a format entry names a real subtitle file: a
+/// format carrying a truthy "protocol" is not one (a
+/// livestream replay's "live_chat" entry points at the watch
+/// page — Python's `not item.get("protocol")` test).
+fn track_has_file(track: &Value) -> bool {
+    if json_str(track, "url").is_empty() {
+        return false;
+    }
+    match track.get("protocol") {
+        None | Some(Value::Null) => true,
+        Some(Value::String(s)) => s.is_empty(),
+        Some(Value::Bool(b)) => !*b,
+        Some(_) => false,
+    }
+}
+
 /// Subtitle tracks best-first (Python `_subtitle_candidates`): UI
 /// language, English, machine translation into the UI language, the
 /// video's original language, other authored tracks; authored
 /// before automatic within each step.
-fn subtitle_candidates(info: &Value) -> Vec<SubCandidate> {
-    let ui = ui_language();
+fn subtitle_candidates(info: &Value, ui: &str) -> Vec<SubCandidate> {
     let authored = info.get("subtitles");
     let automatic = info.get("automatic_captions");
     let mut original = String::new();
@@ -410,10 +552,7 @@ fn subtitle_candidates(info: &Value) -> Vec<SubCandidate> {
             let Some(formats) = formats.as_array() else {
                 continue;
             };
-            let mut usable: Vec<&Value> = formats
-                .iter()
-                .filter(|f| !json_str(f, "url").is_empty() && f.get("protocol").is_none())
-                .collect();
+            let mut usable: Vec<&Value> = formats.iter().filter(|f| track_has_file(f)).collect();
             usable.sort_by_key(|f| match json_str(f, "ext").as_str() {
                 "json3" => 0,
                 "vtt" => 1,
@@ -424,11 +563,11 @@ fn subtitle_candidates(info: &Value) -> Vec<SubCandidate> {
             };
             let translation = track_translation(track);
             let rank = if !translation.is_empty() {
-                match language_match(&translation, &ui) {
+                match language_match(&translation, ui) {
                     Some(m) => (2, m),
                     None => continue, // never offer other-language translations
                 }
-            } else if let Some(m) = language_match(language, &ui) {
+            } else if let Some(m) = language_match(language, ui) {
                 (0, m)
             } else if let Some(m) = language_match(language, "en") {
                 (1, m)
@@ -452,35 +591,81 @@ fn subtitle_candidates(info: &Value) -> Vec<SubCandidate> {
     out
 }
 
-fn fetch_text(url: &str) -> Result<String, String> {
-    let (bytes, _final) = crate::extract::fetch_page_bytes(url, "")?;
-    Ok(String::from_utf8_lossy(&bytes).to_string())
+/// The info's extracted HTTP headers (yt-dlp's
+/// `http_headers`), forwarded to subtitle requests exactly
+/// as Python forwards them — some tracks refuse requests
+/// that arrive without them.
+fn info_http_headers(info: &Value) -> Vec<(String, String)> {
+    let Some(map) = info.get("http_headers").and_then(|v| v.as_object()) else {
+        return Vec::new();
+    };
+    map.iter()
+        .filter_map(|(name, value)| value.as_str().map(|v| (name.clone(), v.to_string())))
+        .collect()
 }
 
-/// (language, cue texts) for the best subtitle track (Python
-/// `transcript_from_info`: at most 2 tracks tried).
-fn transcript_from_info(info: &Value) -> (String, Vec<String>) {
+/// GET one subtitle track: Ok(body) on success,
+/// Err(Some(status)) on an HTTP error status, Err(None) on a
+/// transport or read failure. Only the status is ever
+/// surfaced from a failure — the error text carries the
+/// signed track URL, which is never logged or returned.
+fn fetch_subtitle_track(url: &str, headers: &[(String, String)]) -> Result<String, Option<u16>> {
+    let mut req = crate::http::agent().get(url);
+    for (name, value) in headers {
+        req = req.header(name.as_str(), value.as_str());
+    }
+    let mut resp = req.call().map_err(|e| match e {
+        ureq::Error::StatusCode(code) => Some(code),
+        _ => None,
+    })?;
+    resp.body_mut()
+        .with_config()
+        .limit(8 * 1024 * 1024)
+        .read_to_string()
+        .map_err(|_| None)
+}
+
+/// (language, cue texts) for the best subtitle track — THE
+/// shared subtitle downloader (Python `transcript_from_info`),
+/// used by every reader path: candidates are deduplicated
+/// by URL, at most two tracks are attempted, the extracted
+/// headers ride every request, and a 429 on an untranslated
+/// track stops the walk (another request would be
+/// rate-limited too) while a translated track's 429 falls
+/// through to the next candidate.
+fn transcript_from_info(info: &Value, ui: &str) -> (String, Vec<String>) {
+    let headers = info_http_headers(info);
     let mut first_language = String::new();
-    let mut tried: HashMap<String, ()> = HashMap::new();
-    for cand in subtitle_candidates(info) {
+    let mut tried: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for cand in subtitle_candidates(info, ui) {
         let track_url = json_str(&cand.track, "url");
-        if track_url.is_empty() || tried.contains_key(&track_url) {
+        if track_url.is_empty() || tried.contains(&track_url) {
             continue;
         }
         if tried.len() >= 2 {
             break;
         }
-        tried.insert(track_url.clone(), ());
+        tried.insert(track_url.clone());
         if first_language.is_empty() {
             first_language = cand.language.clone();
         }
-        let Ok(body) = fetch_text(&track_url) else {
-            continue;
+        let translation = track_translation(&cand.track);
+        let body = match fetch_subtitle_track(&track_url, &headers) {
+            Ok(body) => body,
+            Err(status) => {
+                if status == Some(429) && translation.is_empty() {
+                    break;
+                }
+                continue;
+            }
         };
         let entries = if json_str(&cand.track, "ext") == "json3" {
             match serde_json::from_str::<Value>(&body) {
                 Ok(payload) => transcript_from_json3(&payload),
-                Err(_) => Vec::new(),
+                // Python's parse lives inside the same try as
+                // the download: a body that does not parse is
+                // a failed attempt, not an empty transcript.
+                Err(_) => continue,
             }
         } else {
             transcript_from_vtt(&body)
@@ -587,6 +772,18 @@ pub fn format_comments(comments: &Value) -> Vec<String> {
 /// Build the accessible document from a yt-dlp info dict (Python
 /// `article_fields_from_info`): (title, author, text).
 pub fn article_fields_from_info(info: &Value, url: &str) -> (String, String, String) {
+    article_fields_from_info_in_language(info, url, &ui_language())
+}
+
+/// `article_fields_from_info` with the subtitle-ranking
+/// language given explicitly (the main-window path passes
+/// the app's UI language, as Python's `app_ui_language`
+/// supplies it internally).
+pub fn article_fields_from_info_in_language(
+    info: &Value,
+    url: &str,
+    ui: &str,
+) -> (String, String, String) {
     let mut sections: Vec<String> = Vec::new();
     let description = json_str(info, "description");
     sections.push("Description".to_string());
@@ -604,7 +801,7 @@ pub fn article_fields_from_info(info: &Value, url: &str) -> (String, String, Str
             sections.push(format!("{} {}", timestamp(ch.start), ch.title));
         }
     }
-    let (language, transcript) = transcript_from_info(info);
+    let (language, transcript) = transcript_from_info(info, ui);
     sections.push(if language.is_empty() {
         "Subtitles".to_string()
     } else {
@@ -616,6 +813,19 @@ pub fn article_fields_from_info(info: &Value, url: &str) -> (String, String, Str
         sections.extend(transcript);
     }
     sections.push("Comments".to_string());
+    // Honest incompleteness (Python article_fields_from_info):
+    // the retry could not complete the discussion, so the
+    // document says so before showing what did arrive.
+    if info
+        .get("_blindrss_comments_incomplete")
+        .and_then(|v| v.as_bool())
+        == Some(true)
+    {
+        sections.push(
+            "YouTube returned an incomplete comment page after retry; all comments received are shown below."
+                .to_string(),
+        );
+    }
     let empty = Value::Null;
     let comments = info.get("comments").unwrap_or(&empty);
     let lines = format_comments(comments);
@@ -645,11 +855,22 @@ pub fn article_fields_from_info(info: &Value, url: &str) -> (String, String, Str
 /// Full structured extraction for a YouTube video URL.
 /// Returns (title, author, text); None when yt-dlp cannot serve it.
 pub fn extract_article(url: &str) -> Option<(String, String, String)> {
+    let exe = crate::media::find_ytdlp()?;
+    extract_article_with(&exe, url)
+}
+
+/// `extract_article` against an explicit executable (the
+/// seam the regression tests drive with a fake yt-dlp).
+pub fn extract_article_with(exe: &Path, url: &str) -> Option<(String, String, String)> {
     if !is_youtube_video_url(url) {
         return None;
     }
-    // With comments the CLI gets Python's generous budget.
-    let info = extract_info(url, 300).ok()?;
+    let info = extract_video_info_with(exe, url).ok()?;
+    // Python extract_article returns nothing for an empty
+    // info dict, however the fields builder would fill it.
+    if info.as_object().is_some_and(|o| o.is_empty()) {
+        return None;
+    }
     let (title, author, text) = article_fields_from_info(&info, url);
     if text.trim().is_empty() {
         None

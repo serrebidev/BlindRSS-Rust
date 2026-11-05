@@ -1,28 +1,20 @@
 //! Downloads / Takeout / archive tests.
 
-use blindrss_core::download::{compose_youtube_text, sanitize_filename, vtt_to_text};
+use blindrss_core::download::sanitize_filename;
 use std::io::Write;
 
-#[test]
-fn vtt_rolling_dedupe() {
-    let vtt = "WEBVTT\nKind: captions\nLanguage: en\n\n00:00:00.000 --> 00:00:02.000\nHello\n\n00:00:02.000 --> 00:00:04.000\nHello world\n\n00:00:04.000 --> 00:00:06.000\nHello world again\n\n00:00:06.000 --> 00:00:08.000\nNew line\n";
-    let text = vtt_to_text(vtt);
-    assert_eq!(text, "Hello world again New line");
-}
+// Audit 8 Task 16: the vtt_to_text / compose_youtube_text
+// tests that used to live here pinned download.rs's second,
+// divergent YouTube document builder (rolling-caption dedupe
+// and a differently shaped document). That implementation
+// was removed in favor of the one shared ytfull pipeline;
+// its transcript/comment behavior is covered by the Task 16
+// tests in batch35b_slice.rs and download_parity.rs.
 
 #[test]
-fn sanitize_and_compose() {
+fn sanitize_filename_shapes() {
     assert_eq!(sanitize_filename("a/b:c*d"), "a_b_c_d");
     assert_eq!(sanitize_filename("  "), "download");
-    let chapters = vec![blindrss_core::Chapter {
-        start: 65.0,
-        title: Some("Middle".into()),
-        href: None,
-    }];
-    let text = compose_youtube_text("Desc here", &chapters, "Transcript body");
-    assert!(text.contains("Desc here"));
-    assert!(text.contains("1:05 Middle"));
-    assert!(text.contains("Transcript:\nTranscript body"));
 }
 
 #[test]

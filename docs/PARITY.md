@@ -4684,3 +4684,109 @@ main over 8192b29; the only conflict was the append-only
 PARITY region (union). Merged gate: fmt clean, clippy clean
 (workspace and core windows-gnu), 761 passed / 0 failed,
 build OK.
+
+## Audit 8 Task 16 resolution — one YouTube document/subtitle pipeline (R10, R11, R12) (2026-11-04)
+
+**R10 (incomplete comments had no recovery or warning) — fixed.**
+There is now ONE info pipeline, `ytfull::extract_video_info`
+(Python `extract_video_info` with comments), and every consumer
+runs on it: the plain reader (`extract.rs`), the rich reader
+(`article_html.rs`), the main-window full-text path
+(`download::youtube_full_text_*`), and the chapter fetcher's
+info source (`media::youtube_article_info` now delegates to it;
+`chapters.rs` reads chapters from the same info as before). One
+run is Python's `_extract_info_via_cli` shape — `-J`,
+`--write-comments`, the primary client pool plus
+`max_comments=all,all,all,all,all`, the radio-mix-normalized
+URL, the app's cookie/UA env args — executed through the owned
+subprocess policy (`dependency::run_tool_full_output`, the new
+uncapped variant: a comment-complete dump legitimately exceeds
+the shared 1 MiB cap and Python caps nothing there; timeout,
+kill-and-reap and pipe draining are unchanged) with Python's
+900 s with-comments budget. A SUCCESSFUL run whose stderr
+contains "incomplete data received" is retried once; the retry's
+info wins as the document source with its comment list replaced
+by the union of both runs' comments (first run's order, deduped
+by comment id; an id-less comment keys on its canonical
+sorted-keys JSON, Python's `json.dumps(sort_keys=True)`
+fallback). If the retry still reports incomplete data — or
+fails outright, keeping the first extraction — the info carries
+`_blindrss_comments_incomplete`, and `article_fields_from_info`
+prints Python's notice verbatim ("YouTube returned an incomplete
+comment page after retry; all comments received are shown
+below.") directly under the Comments heading. Regression tests
+(batch35b_slice, fake yt-dlp via the `extract_article_with`
+seam): union across the retry with no notice, notice after two
+incomplete runs, retry failure keeps the first extraction with
+notice, a complete run never retries; plus a pure test pinning
+the notice's position. The main-window path
+(`download_parity.rs`): `youtube_full_text_with` produces the
+shared document with the retry applied, rejects non-video URLs
+without invoking yt-dlp, and surfaces a failed extraction as an
+error. The app's full-text worker now gates on
+`ytfull::is_youtube_video_url` instead of a substring match.
+
+**R11 (subtitle requests diverged between readers and from
+Python) — fixed.** One shared downloader,
+`ytfull::transcript_from_info` (Python `transcript_from_info`),
+serves every path: candidates from the one
+`subtitle_candidates` (whose protocol filter now matches
+Python's truthiness — a `"protocol": ""` format is a file, a
+`"live_chat"` entry is not), deduplicated by URL, at most two
+tracks attempted, the info's extracted `http_headers` forwarded
+on every request, and failure handling by HTTP status only (the
+error text carries the signed URL and is never surfaced): a 429
+on an untranslated track stops the walk, a translated track's
+429 falls through. A json3 body that does not parse counts as a
+failed attempt, as in Python where the parse lives inside the
+try. Tests (batch35b_slice, loopback server recording paths and
+headers): header-protected track fetched with the extracted
+headers; duplicate URLs requested once; two-attempt cap with
+best-first order; untranslated-429 stop after exactly one
+request; translated-429 continues to the next track.
+
+**R12 (rich YouTube fallback could show page chrome or replace
+rebuilt text) — fixed.** `render_rich_article` computes Python's
+`structured_youtube` identity once (non-media YouTube video URL)
+and retains it through failure: the generic page fetch is
+skipped for such URLs (a failed reconstruction now falls to the
+cleaned feed fallback, never the cleaned watch page), and the
+feed-length arbitration excludes structured YouTube exactly as
+Python's `not structured_youtube` guard does (GitHub's exclusion
+unchanged). Tests (batch35b_slice, via the
+`render_rich_article_with_ytdlp` seam): a reconstruction
+survives a far longer feed body (feed text absent, extraction
+title wins); a failed reconstruction renders the feed fallback
+and renders nothing at all without one.
+
+**Removed second implementation.** `download.rs`'s divergent
+YouTube document builder (12 subtitle attempts with no headers
+and no 429 stop, its own candidate ranking, rolling-caption
+VTT flattening, its own comment formatter) is deleted, along
+with `compose_youtube_text`; `youtube_full_text*` delegates to
+the shared pipeline. Its three in-module tests and the two
+`media2_slice` tests that pinned the deleted helpers
+(`vtt_rolling_dedupe`, `sanitize_and_compose` — the sanitize
+assertions survive as `sanitize_filename_shapes`) were removed
+with it; the behaviors that remain part of the product are
+covered by the Task 16 tests above. Test totals: 761 baseline →
+771 (batch35b +12, download_parity +2, removed divergent-helper
+tests −4 net).
+
+**Deviations, stated plainly.** (1) Python's extraction has an
+in-process yt_dlp fallback for checkouts with no CLI; Rust is
+CLI-only by the standing wrapped-executable rule, as before.
+(2) Python's `cancel_when` thread-local lets selection changes
+kill an in-flight CLI run; the Rust app relies on its existing
+generation guards at the call sites (unchanged by this task).
+(3) Python's chapter memo (`_remember_chapters`) is not ported;
+chapter lookups already cache through `chapters.rs`' own store.
+(4) The shared CLI run now carries the app's cookie/UA env
+args, which the old `ytfull` path lacked and the old
+`media::youtube_article_info` had — a superset of Python's CLI
+invocation, kept so cookie-required videos keep working in the
+reader paths as they already did in the main-window path.
+(5) `media::youtube_article_info`'s former `--no-warnings` flag
+is gone with the rest of its private invocation: Python's CLI
+path does not pass it, and the incomplete-data signal R10 keys
+on travels as a warning.

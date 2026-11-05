@@ -211,7 +211,11 @@ Python `core/casting.py`, in that order.
   (finite timeout, capped output, killed and reaped on timeout),
   and validation uses the tool-correct version flag
   (`ffmpeg -version`, `yt-dlp --version`); a tool that exists but
-  does not run counts as missing so it gets repaired. ffmpeg/ffprobe
+  does not run counts as missing so it gets repaired. The single
+  exception to the output cap is `run_tool_full_output`, used
+  only by the YouTube `-J` info extraction in `ytfull.rs`: a
+  comment-complete info dump legitimately exceeds the cap and
+  Python caps nothing there (Audit 8 Task 16). ffmpeg/ffprobe
   install automatically in the background when missing
   (winget/Homebrew/static-build routes per platform) and are validated
   by running them; the UI reports progress in the status bar instead

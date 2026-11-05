@@ -76,7 +76,7 @@ pub fn find_ytdlp() -> Option<PathBuf> {
 /// startup from config: BLINDRSS_YTDLP_COOKIES
 /// (`ytdlp_cookies_file`) and the shared fetch identity
 /// (BLINDRSS_USER_AGENT, from core::http::user_agent()).
-fn ytdlp_env_args() -> Vec<String> {
+pub(crate) fn ytdlp_env_args() -> Vec<String> {
     let mut out = Vec::new();
     if let Ok(c) = std::env::var("BLINDRSS_YTDLP_COOKIES")
         && !c.trim().is_empty()
@@ -115,25 +115,14 @@ pub fn info(url: &str) -> Result<MediaInfo, String> {
     parse_info(&json)
 }
 
-/// Full YouTube article metadata includes subtitle tracks and public discussion.
+/// Full YouTube article metadata includes subtitle tracks
+/// and public discussion. This IS the one shared pipeline
+/// (Audit 8 Task 16, R10): `ytfull::extract_video_info` —
+/// the same invocation, comment-completeness retry and
+/// union every reader path uses. Callers that only need
+/// chapters read them from the returned info as before.
 pub fn youtube_article_info(url: &str) -> Result<serde_json::Value, String> {
-    let json = run_ytdlp(&[
-        "-J",
-        "--ignore-config",
-        "--no-warnings",
-        "--no-playlist",
-        "--skip-download",
-        "--socket-timeout",
-        "20",
-        "--retries",
-        "2",
-        "--write-comments",
-        "--extractor-args",
-        "youtube:max_comments=all,all,all,all,all",
-        "--",
-        url,
-    ])?;
-    serde_json::from_str(&json).map_err(|e| format!("YouTube metadata: {e}"))
+    crate::ytfull::extract_video_info(url)
 }
 
 /// Resolve a direct stream URL through Python's shared,

@@ -1521,12 +1521,79 @@ pub fn render_rich_article(
     feed_item_lang: &str,
     ui_lang: &str,
 ) -> Option<String> {
+    render_rich_article_impl(
+        url,
+        fallback_html,
+        fallback_title,
+        fallback_author,
+        date,
+        cookie_header,
+        feed_lang,
+        feed_item_lang,
+        ui_lang,
+        None,
+    )
+}
+
+/// `render_rich_article` with the YouTube extraction running
+/// against an explicit yt-dlp executable (the seam the
+/// regression tests drive with a fake yt-dlp).
+#[allow(clippy::too_many_arguments)]
+pub fn render_rich_article_with_ytdlp(
+    url: &str,
+    fallback_html: &str,
+    fallback_title: &str,
+    fallback_author: &str,
+    date: &str,
+    cookie_header: &str,
+    feed_lang: &str,
+    feed_item_lang: &str,
+    ui_lang: &str,
+    ytdlp_exe: &std::path::Path,
+) -> Option<String> {
+    render_rich_article_impl(
+        url,
+        fallback_html,
+        fallback_title,
+        fallback_author,
+        date,
+        cookie_header,
+        feed_lang,
+        feed_item_lang,
+        ui_lang,
+        Some(ytdlp_exe),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_rich_article_impl(
+    url: &str,
+    fallback_html: &str,
+    fallback_title: &str,
+    fallback_author: &str,
+    date: &str,
+    cookie_header: &str,
+    feed_lang: &str,
+    feed_item_lang: &str,
+    ui_lang: &str,
+    ytdlp_exe: Option<&std::path::Path>,
+) -> Option<String> {
     let url = url.trim();
     let mut title = fallback_title.to_string();
     let mut author = fallback_author.to_string();
     let mut body = String::new();
     let mut page_lang: Option<String> = None;
     let mut metered_preview = false;
+    // Structured-YouTube identity (Python
+    // render_full_article_html): computed once and RETAINED
+    // through failure — a YouTube video URL never enters the
+    // generic watch-page fetch (its cleaned DOM is page
+    // chrome, not the article) and never takes part in the
+    // feed-length arbitration below (a longer feed body must
+    // not replace the reconstruction).
+    let structured_youtube = !url.is_empty()
+        && !crate::extract::looks_like_media_url(url)
+        && crate::ytfull::is_youtube_video_url(url);
 
     if let Some((source_title, source_html)) = crate::extract::reconstructed_article_html(url) {
         if title.is_empty() {
@@ -1557,12 +1624,15 @@ pub fn render_rich_article(
     // YouTube watch pages: the same structured reconstruction as
     // classic full text, wrapped as section HTML (Python
     // _structured_youtube_text_html).
-    if body.is_empty()
-        && !url.is_empty()
-        && !crate::extract::looks_like_media_url(url)
-        && crate::ytfull::is_youtube_video_url(url)
-        && let Some((t, a, text)) = crate::ytfull::extract_article(url)
-    {
+    let youtube_fields = if body.is_empty() && structured_youtube {
+        match ytdlp_exe {
+            Some(exe) => crate::ytfull::extract_article_with(exe, url),
+            None => crate::ytfull::extract_article(url),
+        }
+    } else {
+        None
+    };
+    if let Some((t, a, text)) = youtube_fields {
         // Same precedence as the ID3 path (Python
         // article_html): non-empty resolved metadata wins.
         if !t.is_empty() {
@@ -1575,6 +1645,7 @@ pub fn render_rich_article(
     }
 
     if body.is_empty()
+        && !structured_youtube
         && !url.is_empty()
         && let Ok((bytes, content_type)) = fetch_page_bytes(url, cookie_header)
     {
@@ -1649,8 +1720,10 @@ pub fn render_rich_article(
 
     // Some publishers serve a truncated page but syndicate the complete
     // story in the feed: prefer whichever body is fuller, never
-    // downgrading below the feed content. Never for a GitHub page.
-    if !fallback_html.is_empty() && !is_github_page_url(url) {
+    // downgrading below the feed content. Never for a GitHub page,
+    // and never for a structured YouTube reconstruction (Python
+    // render_full_article_html excludes both).
+    if !fallback_html.is_empty() && !structured_youtube && !is_github_page_url(url) {
         let feed_body = clean_article_html(fallback_html, url, false);
         if !feed_body.is_empty() {
             let body_len = char_len(&norm(&leaf_text(&body)));

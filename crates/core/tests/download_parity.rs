@@ -506,3 +506,113 @@ exit 0
     assert_eq!(log.lines().count(), 1, "one download only: {log}");
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+// ---------------------------------------------------------------------
+// Audit 8 Task 16 (R10): the main-window YouTube full-text path
+// (download::youtube_full_text_*) runs on the ONE shared
+// pipeline — same extraction, same comment retry/union, same
+// document as the reader paths.
+// ---------------------------------------------------------------------
+
+#[cfg(unix)]
+fn fake_info_ytdlp(dir: &std::path::Path) -> std::path::PathBuf {
+    let script = r#"#!/bin/sh
+DIR='__DIR__'
+echo "$@" >> "$DIR/log"
+N=0
+[ -f "$DIR/n" ] && N=$(cat "$DIR/n")
+N=$((N+1))
+echo "$N" > "$DIR/n"
+[ -f "$DIR/err$N" ] && cat "$DIR/err$N" >&2
+[ -f "$DIR/exit$N" ] && exit $(cat "$DIR/exit$N")
+cat "$DIR/payload$N.json"
+exit 0
+"#;
+    fake_download_ytdlp(dir, script)
+}
+
+#[cfg(unix)]
+fn write_info_run(
+    dir: &std::path::Path,
+    n: usize,
+    payload: Option<&serde_json::Value>,
+    stderr: Option<&str>,
+) {
+    if let Some(payload) = payload {
+        std::fs::write(
+            dir.join(format!("payload{n}.json")),
+            serde_json::to_string(payload).unwrap(),
+        )
+        .unwrap();
+    }
+    if let Some(stderr) = stderr {
+        std::fs::write(dir.join(format!("err{n}")), stderr).unwrap();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn youtube_full_text_uses_shared_pipeline_with_comment_retry() {
+    let dir = scratch();
+    let exe = fake_info_ytdlp(&dir);
+    let first = json!({
+        "id": "abc123XYZ09", "title": "Vid", "channel": "Chan",
+        "description": "The description",
+        "comments": [{"id": "c1", "author": "Ann", "text": "First comment", "parent": "root"}],
+    });
+    let second = json!({
+        "id": "abc123XYZ09", "title": "Vid", "channel": "Chan",
+        "description": "The description",
+        "comments": [{"id": "c2", "author": "Bob", "text": "Second comment", "parent": "root"}],
+    });
+    write_info_run(
+        &dir,
+        1,
+        Some(&first),
+        Some("WARNING: Incomplete data received\n"),
+    );
+    write_info_run(&dir, 2, Some(&second), None);
+    let text =
+        download::youtube_full_text_with(&exe, "https://www.youtube.com/watch?v=abc123XYZ09", "en")
+            .expect("full text");
+    // Same document shape as the reader pipeline: sections in
+    // Python's order, unioned comments, no truncation notice
+    // once the retry completed.
+    assert!(text.contains("Description"), "{text}");
+    assert!(
+        text.contains("First comment") && text.contains("Second comment"),
+        "{text}"
+    );
+    assert!(!text.contains("incomplete comment page"), "{text}");
+    let log = std::fs::read_to_string(dir.join("log")).unwrap();
+    assert_eq!(log.lines().count(), 2, "one retry: {log}");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn youtube_full_text_rejects_non_video_and_failed_extraction() {
+    let dir = scratch();
+    let exe = fake_info_ytdlp(&dir);
+    // A non-video URL never reaches yt-dlp (Python
+    // extract_video_info returns {}), and the caller sees the
+    // same failure the plain reader reports.
+    let err = download::youtube_full_text_with(&exe, "https://example.com/story", "en")
+        .expect_err("non-video rejected");
+    assert!(
+        err.contains("Could not retrieve YouTube video details"),
+        "{err}"
+    );
+    assert!(
+        !dir.join("log").exists(),
+        "yt-dlp must not run for non-videos"
+    );
+    // A failed extraction is an error, not an empty document.
+    write_info_run(&dir, 1, None, Some("ERROR: unavailable\n"));
+    std::fs::write(dir.join("exit1"), "1").unwrap();
+    let err =
+        download::youtube_full_text_with(&exe, "https://www.youtube.com/watch?v=abc123XYZ09", "en")
+            .expect_err("failed extraction");
+    assert!(!err.is_empty());
+    std::fs::remove_dir_all(dir).unwrap();
+}

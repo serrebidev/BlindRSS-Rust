@@ -3,7 +3,6 @@
 //! Direct media downloads stream to disk; page URLs go through
 //! yt-dlp with a small preset set mirroring Python's format choices.
 
-use crate::ytfull::language_match;
 use std::path::{Path, PathBuf};
 
 fn download_index_keys(cfg: &crate::config::Config, article: &crate::Article) -> Vec<String> {
@@ -692,363 +691,46 @@ fn ytdlp_cookies_file() -> Option<String> {
         .filter(|s| !s.trim().is_empty())
 }
 
-/// Convert a WebVTT subtitle file to plain transcript text with
-/// rolling-caption dedupe (the algorithm Python's YouTube full-text
-/// path relies on): cue text repeats cumulatively, so a line that
-/// extends the previous kept line replaces it.
-pub fn vtt_to_text(vtt: &str) -> String {
-    let mut kept: Vec<String> = Vec::new();
-    for raw in vtt.lines() {
-        let line = raw.trim();
-        if line.is_empty()
-            || line.starts_with("WEBVTT")
-            || line.contains("-->")
-            || line.starts_with("Kind:")
-            || line.starts_with("Language:")
-            || line.chars().all(|c| c.is_ascii_digit())
-        {
-            continue;
-        }
-        // Strip inline tags (<c>, <00:00:01.000>, ...).
-        let mut text = String::new();
-        let mut in_tag = false;
-        for c in line.chars() {
-            match c {
-                '<' => in_tag = true,
-                '>' => in_tag = false,
-                _ if !in_tag => text.push(c),
-                _ => {}
-            }
-        }
-        let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
-        if text.is_empty() {
-            continue;
-        }
-        match kept.last() {
-            Some(prev) if prev == &text => {}
-            Some(prev) if text.starts_with(prev.as_str()) => {
-                *kept.last_mut().unwrap() = text;
-            }
-            _ => kept.push(text),
-        }
-    }
-    kept.join(" ")
-}
-
-/// Compose a YouTube article's full text from its info (description)
-/// plus a transcript, mirroring `core/youtube_fulltext.py`'s shape.
-pub fn compose_youtube_text(
-    description: &str,
-    chapters: &[crate::db::Chapter],
-    transcript: &str,
-) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    if !description.trim().is_empty() {
-        parts.push(description.trim().to_string());
-    }
-    if !chapters.is_empty() {
-        let lines: Vec<String> = chapters
-            .iter()
-            .map(|c| {
-                let secs = c.start as i64;
-                format!(
-                    "{}:{:02} {}",
-                    secs / 60,
-                    secs % 60,
-                    c.title.as_deref().unwrap_or("")
-                )
-            })
-            .collect();
-        parts.push(format!("Chapters:\n{}", lines.join("\n")));
-    }
-    if !transcript.trim().is_empty() {
-        parts.push(format!("Transcript:\n{}", transcript.trim()));
-    }
-    parts.join("\n\n")
-}
-
-/// Fetch a YouTube page's full text: yt-dlp info for the
-/// description/chapters, and the subtitle file for the transcript.
+/// Fetch a YouTube page's full text (yt-dlp info for the
+/// description/chapters, and the subtitle file for the
+/// transcript) — through the ONE shared pipeline (Audit 8
+/// Task 16): `ytfull`'s extraction with the
+/// comment-completeness retry, the shared subtitle
+/// downloader, and the shared document builder, exactly
+/// what the plain and rich readers show. This module used
+/// to carry a second, divergent implementation (12 subtitle
+/// attempts, no extracted headers, no 429 stop, no comment
+/// retry); it is gone.
 pub fn youtube_full_text(url: &str) -> Result<String, String> {
     youtube_full_text_in_language(url, "en")
 }
 
-/// Full YouTube article in Python's reading order, with language-ranked subtitles.
+/// Full YouTube article in Python's reading order, with
+/// language-ranked subtitles.
 pub fn youtube_full_text_in_language(url: &str, ui_language: &str) -> Result<String, String> {
-    let raw = crate::media::youtube_article_info(url)?;
-    let info = crate::media::parse_info(&raw.to_string())?;
-    let mut transcript = None;
-    for (language, url, ext) in subtitle_candidates(&raw, ui_language).into_iter().take(12) {
-        let Ok(mut response) = crate::http::agent().get(&url).call() else {
-            continue;
-        };
-        let Ok(body) = response
-            .body_mut()
-            .with_config()
-            .limit(8 * 1024 * 1024)
-            .read_to_string()
-        else {
-            continue;
-        };
-        let text = if ext == "json3" {
-            serde_json::from_str(&body)
-                .map(|v| json3_to_text(&v))
-                .unwrap_or_default()
-        } else {
-            clean_subtitle_text(&vtt_to_text(&body))
-        };
-        if !text.is_empty() {
-            transcript = Some((language, text));
-            break;
-        }
-    }
-    if info.description.trim().is_empty()
-        && info.chapters.is_empty()
-        && transcript.is_none()
-        && raw
-            .get("comments")
-            .and_then(|v| v.as_array())
-            .is_none_or(|v| v.is_empty())
-    {
-        return Err("no description or transcript available".to_string());
-    }
-    let mut sections = vec![
-        "Description".to_string(),
-        if info.description.trim().is_empty() {
-            "No video description was provided.".to_string()
-        } else {
-            info.description.trim().to_string()
-        },
-    ];
-    let chapters = compose_youtube_text("", &info.chapters, "");
-    if chapters.is_empty() {
-        sections.extend(["Chapters".into(), "No chapters were provided.".into()]);
-    } else {
-        sections.push(chapters);
-    }
-    if let Some((language, text)) = transcript {
-        sections.extend([format!("Subtitles ({language})"), text]);
-    } else {
-        sections.extend(["Subtitles".into(), "No subtitles were available.".into()]);
-    }
-    sections.push("Comments".into());
-    let comments = youtube_comments_text(raw.get("comments").unwrap_or(&serde_json::Value::Null));
-    sections.push(if comments.is_empty() {
-        "No public comments were available.".into()
-    } else {
-        comments
-    });
-    Ok(sections.join("\n\n"))
+    let exe = crate::media::find_ytdlp().ok_or("yt-dlp not found")?;
+    youtube_full_text_with(&exe, url, ui_language)
 }
 
-fn subtitle_candidates(
-    info: &serde_json::Value,
-    ui_language: &str,
-) -> Vec<(String, String, String)> {
-    let original = info
-        .get("automatic_captions")
-        .and_then(|v| v.as_object())
-        .and_then(|v| v.keys().find_map(|k| k.strip_suffix("-orig")))
-        .unwrap_or("");
-    let mut candidates = Vec::new();
-    for (kind_rank, key) in ["subtitles", "automatic_captions"].iter().enumerate() {
-        let Some(tracks) = info.get(key).and_then(|v| v.as_object()) else {
-            continue;
-        };
-        for (language, formats) in tracks {
-            let Some(formats) = formats.as_array() else {
-                continue;
-            };
-            let track = formats
-                .iter()
-                .filter(|v| {
-                    v.get("url").and_then(|v| v.as_str()).is_some()
-                        && v.get("protocol")
-                            .is_none_or(|v| v.is_null() || v.as_str() == Some(""))
-                })
-                .min_by_key(|v| match v.get("ext").and_then(|v| v.as_str()) {
-                    Some("json3") => 0,
-                    Some("vtt") => 1,
-                    _ => 2,
-                });
-            let Some(track) = track else {
-                continue;
-            };
-            let url = track["url"].as_str().unwrap_or("");
-            let translation = url::Url::parse(url)
-                .ok()
-                .and_then(|u| {
-                    u.query_pairs()
-                        .find(|(k, _)| k == "tlang")
-                        .map(|(_, v)| v.into_owned())
-                })
-                .unwrap_or_default();
-            let rank = if !translation.is_empty() {
-                match language_match(&translation, ui_language) {
-                    Some(m) => (2, m),
-                    None => continue,
-                }
-            } else if let Some(m) = language_match(language, ui_language) {
-                (0, m)
-            } else if let Some(m) = language_match(language, "en") {
-                (1, m)
-            } else {
-                (
-                    if language_match(language, original).is_some() {
-                        3
-                    } else {
-                        4
-                    },
-                    0,
-                )
-            };
-            candidates.push((
-                rank,
-                kind_rank,
-                language.to_string(),
-                url.to_string(),
-                track["ext"].as_str().unwrap_or("vtt").to_string(),
-            ));
-        }
+/// `youtube_full_text_in_language` against an explicit
+/// executable (the seam the regression tests drive with a
+/// fake yt-dlp).
+pub fn youtube_full_text_with(exe: &Path, url: &str, ui_language: &str) -> Result<String, String> {
+    let info = crate::ytfull::extract_video_info_with(exe, url)?;
+    // An empty info dict means there is no video document
+    // (Python extract_article returns nothing for it); the
+    // failure reads the same as the plain reader's.
+    if info.as_object().is_some_and(|o| o.is_empty()) {
+        return Err("Could not retrieve YouTube video details.".to_string());
     }
-    candidates.sort_by(|a, b| (&a.0, &a.1, &a.2).cmp(&(&b.0, &b.1, &b.2)));
-    candidates
-        .into_iter()
-        .map(|(_, _, lang, url, ext)| {
-            (
-                lang.strip_suffix("-orig").unwrap_or(&lang).to_string(),
-                url,
-                ext,
-            )
-        })
-        .collect()
-}
-
-fn clean_subtitle_text(text: &str) -> String {
-    crate::extract::html_to_text(text)
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .trim_start_matches(['>', ' '])
-        .to_string()
-}
-
-fn json3_to_text(payload: &serde_json::Value) -> String {
-    let mut kept = Vec::new();
-    for event in payload
-        .get("events")
-        .and_then(|v| v.as_array())
-        .into_iter()
-        .flatten()
-    {
-        let text = event
-            .get("segs")
-            .and_then(|v| v.as_array())
-            .into_iter()
-            .flatten()
-            .filter_map(|v| v.get("utf8").and_then(|v| v.as_str()))
-            .collect::<String>();
-        let text = clean_subtitle_text(&text);
-        if !text.is_empty() && kept.last() != Some(&text) {
-            kept.push(text);
-        }
-    }
-    kept.join(" ")
-}
-
-fn youtube_comments_text(value: &serde_json::Value) -> String {
-    let Some(comments) = value.as_array() else {
-        return String::new();
-    };
-    let known: std::collections::HashSet<&str> =
-        comments.iter().filter_map(|v| v["id"].as_str()).collect();
-    let mut children: std::collections::HashMap<&str, Vec<usize>> =
-        std::collections::HashMap::new();
-    let mut roots = Vec::new();
-    for (index, comment) in comments.iter().enumerate() {
-        let parent = comment["parent"].as_str().unwrap_or("root");
-        if parent == "root" || !known.contains(parent) {
-            roots.push(index);
-        } else {
-            children.entry(parent).or_default().push(index);
-        }
-    }
-    let mut seen = std::collections::HashSet::new();
-    let mut lines = Vec::new();
-    // Include orphaned/cyclic comments after the ordinary root threads.
-    for root in roots.into_iter().chain(0..comments.len()) {
-        let mut stack = vec![(root, 0usize)];
-        while let Some((index, depth)) = stack.pop() {
-            if !seen.insert(index) {
-                continue;
-            }
-            let comment = &comments[index];
-            let author = comment["author"]
-                .as_str()
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or("Unknown author");
-            let label = if depth == 0 {
-                "Comment".to_string()
-            } else {
-                format!("Reply level {depth}")
-            };
-            lines.push(format!(
-                "{label} by {author}:\n{}",
-                comment["text"].as_str().unwrap_or("")
-            ));
-            if let Some(children) = comment["id"].as_str().and_then(|id| children.get(id)) {
-                stack.extend(children.iter().rev().map(|i| (*i, depth + 1)));
-            }
-        }
-    }
-    lines.join("\n\n")
+    let (_title, _author, text) =
+        crate::ytfull::article_fields_from_info_in_language(&info, url, ui_language);
+    Ok(text)
 }
 
 #[cfg(test)]
 mod parity_tests {
     use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn subtitle_candidates_prefer_ui_then_english_and_exclude_other_translations() {
-        let info = json!({
-            "subtitles": {"es": [{"url":"https://x/es", "ext":"vtt"}], "en": [{"url":"https://x/en", "ext":"vtt"}]},
-            "automatic_captions": {
-                "fr": [{"url":"https://x/fr", "ext":"json3"}],
-                "de": [{"url":"https://x/de?tlang=de", "ext":"vtt"}],
-                "zh-orig": [{"url":"https://x/zh", "ext":"vtt"}],
-                "live_chat": [{"url":"https://x/chat", "protocol":"youtube_live_chat"}]
-            }
-        });
-        let candidates = subtitle_candidates(&info, "fr-CA");
-        assert_eq!(
-            candidates.iter().map(|v| v.0.as_str()).collect::<Vec<_>>(),
-            ["fr", "en", "zh", "es"]
-        );
-    }
-
-    #[test]
-    fn json3_subtitles_decode_entities_and_remove_speaker_markers() {
-        let body = json!({"events":[
-            {"segs":[{"utf8":">> Hello &amp; welcome"}]},
-            {"segs":[{"utf8":">> Hello &amp; welcome"}]},
-            {"segs":[{"utf8":"x > 2"}]}
-        ]});
-        assert_eq!(json3_to_text(&body), "Hello & welcome x > 2");
-    }
-
-    #[test]
-    fn youtube_comments_keep_reply_order_and_break_cycles() {
-        let comments = json!([
-            {"id":"reply", "parent":"root-post", "author":"Reply", "text":"Second"},
-            {"id":"root-post", "parent":"root", "author":"Author", "text":"First"},
-            {"id":"cycle", "parent":"cycle", "author":"Cycle", "text":"Only once"}
-        ]);
-        let text = youtube_comments_text(&comments);
-        assert!(text.find("First").unwrap() < text.find("Second").unwrap());
-        assert!(text.contains("Reply level 1 by Reply:"));
-        assert_eq!(text.matches("Only once").count(), 1);
-    }
 
     #[test]
     fn ytdlp_reports_exact_completed_file_and_rejects_directory_or_partial() {

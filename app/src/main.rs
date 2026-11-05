@@ -5109,7 +5109,10 @@ fn main() {
             std::thread::spawn(move || {
                 // YouTube articles use the dedicated full-text path
                 // (description + chapters + transcript), like Python.
-                if url.contains("youtube.com") || url.contains("youtu.be") {
+                // The gate is the same strict video identity the
+                // reader paths use (Audit 8 Task 16), and the path
+                // itself is the one shared ytfull pipeline.
+                if blindrss_core::ytfull::is_youtube_video_url(&url) {
                     let result = blindrss_core::download::youtube_full_text_in_language(
                         &url,
                         &ui_language(),
