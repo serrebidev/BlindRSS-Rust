@@ -560,8 +560,16 @@ fn fixture_feed_refresh_recovers_through_the_browser() {
     let env = setup_fixture("feed", &cfg, pages);
     let db_path = env.dir.join("rss.db");
     let db = Db::open_or_create(&db_path).unwrap();
-    let recovered =
-        feeds::fetch_feed_document_cancellable(&db, &url, false, None, None, "").unwrap();
+    let recovered = feeds::fetch_feed_document_cancellable(
+        &db,
+        &url,
+        false,
+        None,
+        None,
+        "",
+        &feeds::FeedFetchOverrides::default(),
+    )
+    .unwrap();
     match recovered {
         feeds::FeedFetch::Fetched {
             parsed,
@@ -595,8 +603,16 @@ fn fixture_feed_refresh_honours_the_disabled_gate() {
     let env = setup_fixture("feedoff", &cfg, pages);
     let db_path = env.dir.join("rss.db");
     let db = Db::open_or_create(&db_path).unwrap();
-    let error =
-        feeds::fetch_feed_document_cancellable(&db, &url, false, None, None, "").unwrap_err();
+    let error = feeds::fetch_feed_document_cancellable(
+        &db,
+        &url,
+        false,
+        None,
+        None,
+        "",
+        &feeds::FeedFetchOverrides::default(),
+    )
+    .unwrap_err();
     assert!(error.contains("403"), "{error}");
     // The browser was never launched.
     assert_eq!(env.count("LAUNCH "), 0);

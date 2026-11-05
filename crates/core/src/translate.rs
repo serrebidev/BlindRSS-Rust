@@ -112,6 +112,366 @@ pub fn default_models(provider: &str) -> &'static [&'static str] {
     }
 }
 
+/// Readable language names for translation targets and the
+/// interface-language picker (Python
+/// `_TRANSLATION_LANGUAGE_PRESETS` in gui/dialogs.py): the
+/// English name a screen reader shows, mapped to the code
+/// that is actually stored. Names are display strings — the
+/// app translates them at display time; codes never change.
+pub const LANGUAGE_PRESETS: &[(&str, &str)] = &[
+    ("Abkhazian", "ab"),
+    ("Afar", "aa"),
+    ("Afrikaans", "af"),
+    ("Akan", "ak"),
+    ("Albanian", "sq"),
+    ("Amharic", "am"),
+    ("Arabic", "ar"),
+    ("Aragonese", "an"),
+    ("Armenian", "hy"),
+    ("Assamese", "as"),
+    ("Avaric", "av"),
+    ("Avestan", "ae"),
+    ("Aymara", "ay"),
+    ("Azerbaijani", "az"),
+    ("Bambara", "bm"),
+    ("Bashkir", "ba"),
+    ("Basque", "eu"),
+    ("Belarusian", "be"),
+    ("Bengali", "bn"),
+    ("Bislama", "bi"),
+    ("Bosnian", "bs"),
+    ("Breton", "br"),
+    ("Bulgarian", "bg"),
+    ("Burmese", "my"),
+    ("Catalan", "ca"),
+    ("Chamorro", "ch"),
+    ("Chechen", "ce"),
+    ("Chichewa", "ny"),
+    ("Chinese (Simplified)", "zh-CN"),
+    ("Chinese (Traditional)", "zh-TW"),
+    ("Chinese", "zh"),
+    ("Church Slavic", "cu"),
+    ("Chuvash", "cv"),
+    ("Cornish", "kw"),
+    ("Corsican", "co"),
+    ("Cree", "cr"),
+    ("Croatian", "hr"),
+    ("Czech", "cs"),
+    ("Danish", "da"),
+    ("Divehi", "dv"),
+    ("Dutch (Belgium)", "nl-BE"),
+    ("Dutch", "nl"),
+    ("Dzongkha", "dz"),
+    ("English", "en"),
+    ("Esperanto", "eo"),
+    ("Estonian", "et"),
+    ("Ewe", "ee"),
+    ("Faroese", "fo"),
+    ("Fijian", "fj"),
+    ("Finnish", "fi"),
+    ("French", "fr"),
+    ("Fulah", "ff"),
+    ("Galician", "gl"),
+    ("Ganda", "lg"),
+    ("Georgian", "ka"),
+    ("German", "de"),
+    ("Guarani", "gn"),
+    ("Gujarati", "gu"),
+    ("Haitian", "ht"),
+    ("Hausa", "ha"),
+    ("Hebrew", "he"),
+    ("Herero", "hz"),
+    ("Hindi", "hi"),
+    ("Hiri Motu", "ho"),
+    ("Hungarian", "hu"),
+    ("Icelandic", "is"),
+    ("Ido", "io"),
+    ("Igbo", "ig"),
+    ("Indonesian", "id"),
+    (
+        "Interlingua (International Auxiliary Language Association)",
+        "ia",
+    ),
+    ("Interlingue", "ie"),
+    ("Inuktitut", "iu"),
+    ("Inupiaq", "ik"),
+    ("Irish", "ga"),
+    ("Italian", "it"),
+    ("Japanese", "ja"),
+    ("Javanese", "jv"),
+    ("Kalaallisut", "kl"),
+    ("Kannada", "kn"),
+    ("Kanuri", "kr"),
+    ("Kashmiri", "ks"),
+    ("Kazakh", "kk"),
+    ("Khmer", "km"),
+    ("Kikuyu", "ki"),
+    ("Kinyarwanda", "rw"),
+    ("Kirghiz", "ky"),
+    ("Komi", "kv"),
+    ("Kongo", "kg"),
+    ("Korean", "ko"),
+    ("Kuanyama", "kj"),
+    ("Kurdish", "ku"),
+    ("Lao", "lo"),
+    ("Latin", "la"),
+    ("Latvian", "lv"),
+    ("Limburgan", "li"),
+    ("Lingala", "ln"),
+    ("Lithuanian", "lt"),
+    ("Luba-Katanga", "lu"),
+    ("Luxembourgish", "lb"),
+    ("Macedonian", "mk"),
+    ("Malagasy", "mg"),
+    ("Malay (macrolanguage)", "ms"),
+    ("Malayalam", "ml"),
+    ("Maltese", "mt"),
+    ("Manx", "gv"),
+    ("Maori", "mi"),
+    ("Marathi", "mr"),
+    ("Marshallese", "mh"),
+    ("Modern Greek (1453-)", "el"),
+    ("Mongolian", "mn"),
+    ("Nauruan", "na"),
+    ("Navajo", "nv"),
+    ("Ndonga", "ng"),
+    ("Nepali (macrolanguage)", "ne"),
+    ("North Ndebele", "nd"),
+    ("Northern Sami", "se"),
+    ("Norwegian", "no"),
+    ("Norwegian Bokmal", "nb"),
+    ("Norwegian Nynorsk", "nn"),
+    ("Occitan (post 1500)", "oc"),
+    ("Ojibwa", "oj"),
+    ("Oriya (macrolanguage)", "or"),
+    ("Oromo", "om"),
+    ("Ossetian", "os"),
+    ("Pali", "pi"),
+    ("Panjabi", "pa"),
+    ("Persian", "fa"),
+    ("Polish", "pl"),
+    ("Portuguese (Brazil)", "pt-BR"),
+    ("Portuguese (Portugal)", "pt-PT"),
+    ("Portuguese", "pt"),
+    ("Pushto", "ps"),
+    ("Quechua", "qu"),
+    ("Romanian", "ro"),
+    ("Romansh", "rm"),
+    ("Rundi", "rn"),
+    ("Russian", "ru"),
+    ("Samoan", "sm"),
+    ("Sango", "sg"),
+    ("Sanskrit", "sa"),
+    ("Sardinian", "sc"),
+    ("Scottish Gaelic", "gd"),
+    ("Serbian", "sr"),
+    ("Serbo-Croatian", "sh"),
+    ("Shona", "sn"),
+    ("Sichuan Yi", "ii"),
+    ("Sindhi", "sd"),
+    ("Sinhala", "si"),
+    ("Slovak", "sk"),
+    ("Slovenian", "sl"),
+    ("Somali", "so"),
+    ("South Ndebele", "nr"),
+    ("Southern Sotho", "st"),
+    ("Spanish", "es"),
+    ("Sundanese", "su"),
+    ("Swahili (macrolanguage)", "sw"),
+    ("Swati", "ss"),
+    ("Swedish", "sv"),
+    ("Tagalog", "tl"),
+    ("Tahitian", "ty"),
+    ("Tajik", "tg"),
+    ("Tamil", "ta"),
+    ("Tatar", "tt"),
+    ("Telugu", "te"),
+    ("Thai", "th"),
+    ("Tibetan", "bo"),
+    ("Tigrinya", "ti"),
+    ("Tonga (Tonga Islands)", "to"),
+    ("Tsonga", "ts"),
+    ("Tswana", "tn"),
+    ("Turkish", "tr"),
+    ("Turkmen", "tk"),
+    ("Twi", "tw"),
+    ("Uighur", "ug"),
+    ("Ukrainian", "uk"),
+    ("Urdu", "ur"),
+    ("Uzbek", "uz"),
+    ("Venda", "ve"),
+    ("Vietnamese", "vi"),
+    ("Volapuk", "vo"),
+    ("Walloon", "wa"),
+    ("Welsh", "cy"),
+    ("Western Frisian", "fy"),
+    ("Wolof", "wo"),
+    ("Xhosa", "xh"),
+    ("Yiddish", "yi"),
+    ("Yoruba", "yo"),
+    ("Zhuang", "za"),
+    ("Zulu", "zu"),
+];
+
+/// The preset name for a language code, trying the code
+/// as-is, then with `_` replaced by `-`, then its base
+/// language (Python's Settings picker name resolution:
+/// locale directories use underscores like `pt_BR`, the
+/// presets use BCP-47 hyphens like `pt-BR`, and a regional
+/// code with no preset of its own falls back to the base).
+pub fn language_name(code: &str) -> Option<&'static str> {
+    let by_code = |wanted: &str| {
+        LANGUAGE_PRESETS
+            .iter()
+            .find(|(_, c)| *c == wanted)
+            .map(|(name, _)| *name)
+    };
+    by_code(code)
+        .or_else(|| by_code(&code.replace('_', "-")))
+        .or_else(|| {
+            let base = code.split(['_', '-']).next().unwrap_or("");
+            by_code(base)
+        })
+}
+
+/// `Name (code)` for pickers, or the bare code when no preset
+/// name is known (Python's Settings display rule).
+pub fn language_display(code: &str) -> String {
+    match language_name(code) {
+        Some(name) => format!("{name} ({code})"),
+        None => code.to_string(),
+    }
+}
+
+/// The value the Translate page's target-language field shows
+/// for a stored code (Python
+/// `_translation_language_display_value`): the preset name
+/// for the code (matched case-insensitively), the raw value
+/// when unknown, and `English (en)` for an empty value.
+pub fn language_display_value(raw: &str) -> String {
+    let value = raw.trim();
+    if value.is_empty() {
+        return "English (en)".to_string();
+    }
+    let lowered = value.to_lowercase();
+    for (name, code) in LANGUAGE_PRESETS {
+        if code.to_lowercase() == lowered {
+            return name.to_string();
+        }
+    }
+    value.to_string()
+}
+
+/// Resolve the Translate page field's text back to a stored
+/// code (Python `_translation_language_code_from_ui`): an
+/// exact preset-name match wins, then a trailing
+/// `(code)` suffix is unwrapped, then the text is the code
+/// as typed. Empty resolves to English. Custom values are
+/// preserved verbatim — never rewritten to a preset.
+pub fn language_code_from_ui(raw: &str) -> String {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return "en".to_string();
+    }
+    for (name, code) in LANGUAGE_PRESETS {
+        if *name == raw {
+            return code.to_string();
+        }
+    }
+    if raw.ends_with(')')
+        && let Some(open) = raw.rfind('(')
+    {
+        let maybe = raw[open + 1..raw.len() - 1].trim();
+        if !maybe.is_empty() {
+            return maybe.to_string();
+        }
+    }
+    raw.to_string()
+}
+
+/// OpenRouter's public model list endpoint (Python
+/// `_OPENROUTER_MODELS_URL`).
+pub const OPENROUTER_MODELS_URL: &str = "https://openrouter.ai/api/v1/models";
+
+/// Extract the sorted, deduplicated model ids from an
+/// OpenRouter `/models` payload (Python
+/// `list_openrouter_models`): `data[].id` strings, sorted
+/// case-insensitively, duplicates removed case-insensitively
+/// keeping the first spelling.
+pub fn openrouter_models_from_payload(payload: &serde_json::Value) -> Vec<String> {
+    let mut models: Vec<String> = Vec::new();
+    if let Some(items) = payload.get("data").and_then(|d| d.as_array()) {
+        for item in items {
+            if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
+                let id = id.trim();
+                if !id.is_empty() {
+                    models.push(id.to_string());
+                }
+            }
+        }
+    }
+    models.sort_by_key(|a| a.to_lowercase());
+    let mut seen = std::collections::HashSet::new();
+    models.retain(|m| seen.insert(m.to_lowercase()));
+    models
+}
+
+/// The OpenRouter model combo's choices after a load
+/// (Python `_on_openrouter_models_loaded`): the built-in
+/// candidates first, then the loaded ids, deduplicated
+/// case-insensitively preserving order.
+pub fn openrouter_model_choices(loaded: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for item in default_models("openrouter")
+        .iter()
+        .map(|s| s.to_string())
+        .chain(loaded.iter().cloned())
+    {
+        if seen.insert(item.to_lowercase()) {
+            out.push(item);
+        }
+    }
+    out
+}
+
+/// Load every model id OpenRouter offers (Python
+/// `list_openrouter_models`, core/translation.py:331). The
+/// API key is optional (the list is public); failures return
+/// Python's error strings and never panic — the Settings
+/// caller keeps its current choices on an error
+/// (failure-safe model loading, Audit 8 S19).
+pub fn list_openrouter_models(api_key: &str, timeout_s: u64) -> Result<Vec<String>, String> {
+    let timeout = timeout_s.clamp(5, 60);
+    let mut req = crate::http::agent()
+        .get(OPENROUTER_MODELS_URL)
+        .config()
+        .timeout_global(Some(std::time::Duration::from_secs(timeout)))
+        .http_status_as_error(false)
+        .build()
+        .header("Accept", "application/json")
+        .header("HTTP-Referer", "https://github.com/serrebidev/BlindRSS")
+        .header("X-Title", "BlindRSS");
+    let key = api_key.trim();
+    if !key.is_empty() {
+        req = req.header("Authorization", &format!("Bearer {key}"));
+    }
+    let mut resp = req
+        .call()
+        .map_err(|e| format!("OpenRouter models request failed: {e}"))?;
+    let status = resp.status().as_u16();
+    let text = resp
+        .body_mut()
+        .read_to_string()
+        .map_err(|e| format!("OpenRouter models request failed: {e}"))?;
+    if !(200..300).contains(&status) {
+        return Err(format!("OpenRouter models request failed (HTTP {status})"));
+    }
+    let payload: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| format!("OpenRouter models response was not valid JSON: {e}"))?;
+    Ok(openrouter_models_from_payload(&payload))
+}
+
 /// Python `_looks_like_groq_key`: users often confuse Groq
 /// and Grok keys; a `gsk_` key is a Groq key.
 pub fn looks_like_groq_key(api_key: &str) -> bool {

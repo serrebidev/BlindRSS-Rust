@@ -40,16 +40,49 @@ fn defaults() -> Vec<ColumnLayout> {
         .collect()
 }
 
+/// Python truthiness for a stored `visible` value
+/// (`bool(entry.get("visible", True))`): only null-when-present
+/// is impossible here — a missing key defaults to true before
+/// this is called; false, 0 and "" are false, everything else
+/// true.
+fn python_truthy(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Null => false,
+        serde_json::Value::Bool(b) => *b,
+        serde_json::Value::Number(n) => n.as_f64().map(|f| f != 0.0).unwrap_or(true),
+        serde_json::Value::String(s) => !s.is_empty(),
+        _ => true,
+    }
+}
+
 /// Resolve the effective layout from a stored value (None =
 /// defaults). Title is forced first and visible.
+///
+/// Python's `normalize_layout` shapes are all accepted
+/// (Audit 8 S22): entries may be `{"key", "visible"}` objects
+/// or bare key strings (a visible column), keys are trimmed
+/// and matched case-insensitively, unknown keys are dropped,
+/// duplicates collapse to the first occurrence, and keys the
+/// stored layout lacks are appended in default order.
 pub fn resolve_layout(stored: Option<&serde_json::Value>) -> Vec<ColumnLayout> {
     let mut out = defaults();
     if let Some(items) = stored.and_then(|v| v.as_array()) {
         let mut custom: Vec<ColumnLayout> = Vec::new();
         for item in items {
-            let Some(key) = item.get("key").and_then(|v| v.as_str()) else {
-                continue;
+            // (raw key, visible, width) from either stored shape.
+            let (raw_key, visible, width) = match item {
+                serde_json::Value::String(s) => (s.as_str(), true, None),
+                serde_json::Value::Object(_) => {
+                    let Some(key) = item.get("key").and_then(|v| v.as_str()) else {
+                        continue;
+                    };
+                    let visible = item.get("visible").map(python_truthy).unwrap_or(true);
+                    let width = item.get("width").and_then(|v| v.as_i64()).map(|w| w as i32);
+                    (key, visible, width)
+                }
+                _ => continue,
             };
+            let key = raw_key.trim().to_lowercase();
             let Some(def) = COLUMNS.iter().find(|(k, _, _)| *k == key) else {
                 continue;
             };
@@ -57,17 +90,10 @@ pub fn resolve_layout(stored: Option<&serde_json::Value>) -> Vec<ColumnLayout> {
                 continue;
             }
             custom.push(ColumnLayout {
-                key: key.to_string(),
+                key,
                 label: def.1.to_string(),
-                width: item
-                    .get("width")
-                    .and_then(|v| v.as_i64())
-                    .map(|w| w as i32)
-                    .unwrap_or(def.2),
-                visible: item
-                    .get("visible")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(true),
+                width: width.unwrap_or(def.2),
+                visible,
             });
         }
         // Append any columns the saved layout predates.
@@ -85,6 +111,77 @@ pub fn resolve_layout(stored: Option<&serde_json::Value>) -> Vec<ColumnLayout> {
         out.insert(0, title);
     }
     out
+}
+
+/// The English display label for a column key (Python
+/// `label_for`); the app translates it at display time, the
+/// stored key never changes (Audit 8 S10).
+pub fn label_for(key: &str) -> Option<&'static str> {
+    COLUMNS
+        .iter()
+        .find(|(k, _, _)| *k == key)
+        .map(|(_, l, _)| *l)
+}
+
+/// Move `key` by `delta` rows (Python `move_key`): the pinned
+/// Title never moves and nothing moves above it, so the
+/// movable range is [1, len-1]. Returns the layout unchanged
+/// for the pinned key, an unknown key, or a move that would
+/// leave the range.
+pub fn move_key(layout: &[ColumnLayout], key: &str, delta: i32) -> Vec<ColumnLayout> {
+    let mut out = resolve_layout(Some(&layout_to_json(layout)));
+    if key == PINNED_KEY {
+        return out;
+    }
+    let Some(index) = out.iter().position(|c| c.key == key) else {
+        return out;
+    };
+    // Python clamps the target into the movable range instead
+    // of rejecting the move.
+    let target = (index as i32 + delta).clamp(1, out.len() as i32 - 1) as usize;
+    if target == index {
+        return out;
+    }
+    let entry = out.remove(index);
+    out.insert(target, entry);
+    out
+}
+
+/// Show or hide one column (Python `set_visible`); the pinned
+/// Title ignores hide requests.
+pub fn set_visible(layout: &[ColumnLayout], key: &str, visible: bool) -> Vec<ColumnLayout> {
+    let mut out = resolve_layout(Some(&layout_to_json(layout)));
+    if key == PINNED_KEY {
+        return out;
+    }
+    for entry in out.iter_mut() {
+        if entry.key == key {
+            entry.visible = visible;
+        }
+    }
+    out
+}
+
+/// Per-feed layout override out of a feed's settings object
+/// (Python `feed_layout_from_settings`): the `columns` value
+/// absent, null, empty or not a list means inherit (None);
+/// anything else normalizes like a global layout (Audit 8 S03).
+pub fn feed_layout_from_settings(settings: &serde_json::Value) -> Option<Vec<ColumnLayout>> {
+    let raw = settings.as_object()?.get("columns")?;
+    let items = raw.as_array()?;
+    if items.is_empty() {
+        return None;
+    }
+    Some(resolve_layout(Some(raw)))
+}
+
+/// The layout a view renders with (Python `resolve_layout`):
+/// the feed override when one applies, else the global layout.
+pub fn resolve_for_view(
+    global: &[ColumnLayout],
+    feed: Option<Vec<ColumnLayout>>,
+) -> Vec<ColumnLayout> {
+    feed.unwrap_or_else(|| global.to_vec())
 }
 
 /// The layout from the app config.

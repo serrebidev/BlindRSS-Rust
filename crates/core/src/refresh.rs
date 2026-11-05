@@ -365,19 +365,13 @@ pub fn refresh_feed_with_options(
         youtube_history_backfill(db, feed, cid, global_delete_behavior, retention_cutoff);
     }
     let stored = stored_body_digest(&feed.id);
-    // The feed's configured proxy reaches the browser
-    // recovery stage (Python local.py passes
-    // feed_settings["proxy"] to the browser fallback).
-    let feed_proxy = db
-        .feed_settings(&feed.id)
-        .ok()
-        .and_then(|settings| {
-            settings
-                .get("proxy")
-                .and_then(|v| v.as_str())
-                .map(|s| s.trim().to_string())
-        })
-        .unwrap_or_default();
+    // Per-feed HTTP overrides (Python local.py, issue #29;
+    // Audit 8 G08): custom headers, timeout, proxy and the
+    // feed encoding ride the plain fetch; the proxy also
+    // reaches the browser recovery stage.
+    let feed_settings = db.feed_settings(&feed.id).unwrap_or_default();
+    let overrides = crate::feeds::FeedFetchOverrides::from_settings(&feed_settings);
+    let feed_proxy = overrides.proxy.clone();
     let (parsed, body_digest) = match crate::feeds::fetch_feed_document_cancellable(
         db,
         &feed.url,
@@ -385,6 +379,7 @@ pub fn refresh_feed_with_options(
         stored.as_deref(),
         Some(cancel),
         &feed_proxy,
+        &overrides,
     ) {
         Ok(crate::feeds::FeedFetch::NotModified) => {
             return Ok(WorkerRefresh {

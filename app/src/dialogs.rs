@@ -208,15 +208,42 @@ fn refresh_cond_list(list: &ListBox, conds: &[Value]) {
 }
 
 /// Shared name row for the editors; returns the text control.
-fn name_row(dialog: &Dialog, sizer: &BoxSizer, label: &str, value: &str) -> TextCtrl {
+fn name_row(parent: &impl WxWidget, sizer: &BoxSizer, label: &str, value: &str) -> TextCtrl {
     let row = BoxSizer::builder(Orientation::Horizontal).build();
-    let text = StaticText::builder(dialog).with_label(label).build();
-    let ctrl = TextCtrl::builder(dialog).build();
+    let text = StaticText::builder(parent).with_label(label).build();
+    let ctrl = TextCtrl::builder(parent).build();
     ctrl.set_value(value);
     row.add(&text, 0, SizerFlag::All, 4);
     row.add(&ctrl, 1, SizerFlag::Expand | SizerFlag::All, 4);
     sizer.add_sizer(&row, 0, SizerFlag::Expand | SizerFlag::All, 2);
     ctrl
+}
+
+/// A labeled choice row (label + Choice); returns the choice.
+/// Display strings pass through tr(); selections are read by
+/// index only.
+fn choice_row(
+    parent: &impl WxWidget,
+    sizer: &BoxSizer,
+    label: &str,
+    items: &[String],
+    selected: usize,
+) -> Choice {
+    let row = BoxSizer::builder(Orientation::Horizontal).build();
+    let text = StaticText::builder(parent)
+        .with_label(&crate::tr(label))
+        .build();
+    let choice = Choice::builder(parent).build();
+    for item in items {
+        choice.append(&crate::tr(item));
+    }
+    if !items.is_empty() {
+        choice.set_selection(selected.min(items.len() - 1) as u32);
+    }
+    row.add(&text, 0, SizerFlag::All, 4);
+    row.add(&choice, 1, SizerFlag::Expand | SizerFlag::All, 4);
+    sizer.add_sizer(&row, 0, SizerFlag::Expand | SizerFlag::All, 2);
+    choice
 }
 
 /// OK / Cancel buttons wired to end the dialog with wx's
@@ -818,19 +845,47 @@ pub fn show_category_properties(frame: &Frame, db: &Db, category_path: &str) -> 
 }
 
 pub fn show_feed_properties(frame: &Frame, db: &Db, feed: &blindrss_core::Feed) -> bool {
+    use blindrss_core::feed_settings as fs;
+    let settings0 = db.feed_settings(&feed.id).unwrap_or(Value::Null);
     let dialog = Dialog::builder(frame, "Feed Properties").build();
-    bind_f1(frame, &dialog, "FeedPropertiesDialog");
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
-    let title_ctrl = name_row(&dialog, &sizer, "Title:", &feed.title);
-    let url_ctrl = name_row(&dialog, &sizer, "Feed URL:", &feed.url);
+    // Python's dialog is a notebook: General + List Headers.
+    // The existing General controls keep their order; the
+    // behavioral overrides (Audit 8 G08) are appended after
+    // them in Python's relative order, per the append-only
+    // rule.
+    let notebook = Notebook::builder(&dialog).build();
+    let general = ScrolledWindow::builder(&notebook).build();
+    general.set_scroll_rate(0, 12);
+    let gsizer = BoxSizer::builder(Orientation::Vertical).build();
+    notebook.add_page(&general, &crate::tr("General"), true, None);
+    let headers_page = ScrolledWindow::builder(&notebook).build();
+    headers_page.set_scroll_rate(0, 12);
+    let hsizer = BoxSizer::builder(Orientation::Vertical).build();
+    notebook.add_page(&headers_page, &crate::tr("List Headers"), false, None);
+    sizer.add(&notebook, 1, SizerFlag::Expand | SizerFlag::All, 2);
+    // F1 resolves through the current page (Python's per-page
+    // help topics for this dialog exist in core's table).
+    bind_f1_notebook(
+        frame,
+        &dialog,
+        "FeedPropertiesDialog",
+        &notebook,
+        &["General", "List Headers"],
+    );
+
+    let title_ctrl = name_row(&general, &gsizer, "Title:", &feed.title);
+    title_ctrl.set_name("Feed title");
+    let url_ctrl = name_row(&general, &gsizer, "Feed URL:", &feed.url);
+    url_ctrl.set_name("Feed URL");
     let cat0 = feed.category.clone().unwrap_or_default();
-    let cat_ctrl = name_row(&dialog, &sizer, "Category (blank = none):", &cat0);
+    let cat_ctrl = name_row(&general, &gsizer, "Category (blank = none):", &cat0);
     // Choose... opens the category picker (existing categories
     // plus inline creation) and fills the field.
-    let choose_cat_btn = Button::builder(&dialog)
+    let choose_cat_btn = Button::builder(&general)
         .with_label(&crate::tr("Choose Category..."))
         .build();
-    sizer.add(&choose_cat_btn, 0, SizerFlag::All, 4);
+    gsizer.add(&choose_cat_btn, 0, SizerFlag::All, 4);
     {
         let frame_cp = *frame;
         let cat_ctrl2 = cat_ctrl;
@@ -850,30 +905,196 @@ pub fn show_feed_properties(frame: &Frame, db: &Db, feed: &blindrss_core::Feed) 
         });
     }
     // Per-feed encoding override (feeds.feed_settings.encoding,
-    // issue #75): wins over header/meta charset detection when
-    // decoding this feed's article pages.
-    let encoding0 = Db::open(&crate::db_path())
-        .ok()
-        .and_then(|db| db.feed_settings(&feed.id).ok())
-        .and_then(|s| {
-            s.get("encoding")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-        })
-        .unwrap_or_default();
+    // issue #75): in Python this is the feed-document encoding;
+    // it also remains the extraction fallback (see the save).
+    let encoding0 = fs::text_value(&settings0, "encoding");
     let enc_ctrl = name_row(
-        &dialog,
-        &sizer,
+        &general,
+        &gsizer,
         "Encoding override (blank = auto-detect):",
         &encoding0,
     );
-    let reset_btn = Button::builder(&dialog)
+    enc_ctrl.set_name("Feed encoding");
+    let reset_btn = Button::builder(&general)
         .with_label(&crate::tr("Reset Title to Feed's Own"))
         .build();
-    sizer.add(&reset_btn, 0, SizerFlag::All, 4);
-    ok_cancel(&dialog, &sizer);
+    gsizer.add(&reset_btn, 0, SizerFlag::All, 4);
+
+    // ---- Behavioral overrides (Audit 8 G08; Python
+    // gui/dialogs.py FeedPropertiesDialog General page). Every
+    // value round-trips through one merged feed_settings patch
+    // (core feed_settings::build_patch) so keys this dialog
+    // does not show are never erased.
+    let interval_items: Vec<String> = fs::REFRESH_INTERVAL_CHOICES
+        .iter()
+        .map(|(_, label)| label.to_string())
+        .collect();
+    let interval_choice = choice_row(
+        &general,
+        &gsizer,
+        "Refresh interval:",
+        &interval_items,
+        fs::refresh_interval_index(&settings0),
+    );
+    // Custom request headers, one "Name: Value" per line.
+    let headers_label = StaticText::builder(&general)
+        .with_label(&crate::tr("Custom request headers:"))
+        .build();
+    gsizer.add(&headers_label, 0, SizerFlag::All, 4);
+    let headers_ctrl = TextCtrl::builder(&general)
+        .with_style(TextCtrlStyle::MultiLine)
+        .build();
+    headers_ctrl.set_value(&fs::headers_text(&settings0));
+    crate::msaa_names::set_name(&headers_ctrl, &crate::tr("Custom request headers"));
+    gsizer.add(&headers_ctrl, 1, SizerFlag::Expand | SizerFlag::All, 4);
+    let timeout_ctrl = name_row(
+        &general,
+        &gsizer,
+        "Request timeout seconds (blank = default):",
+        &fs::timeout_text(&settings0),
+    );
+    timeout_ctrl.set_name("Request timeout seconds");
+    let impersonate_items: Vec<String> = fs::IMPERSONATE_LABELS
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let impersonate_choice = choice_row(
+        &general,
+        &gsizer,
+        "Browser impersonation:",
+        &impersonate_items,
+        fs::IMPERSONATE_VALUES
+            .iter()
+            .position(|v| *v == fs::impersonate_value(&settings0))
+            .unwrap_or(0),
+    );
+    let proxy_ctrl = name_row(
+        &general,
+        &gsizer,
+        "Proxy URL (blank = none):",
+        &fs::text_value(&settings0, "proxy"),
+    );
+    proxy_ctrl.set_name("Proxy URL");
+    let fulltext_ctrl = name_row(
+        &general,
+        &gsizer,
+        "Full text extraction encoding (blank = auto-detect):",
+        &fs::text_value(&settings0, "fulltext_encoding"),
+    );
+    fulltext_ctrl.set_name("Full text extraction encoding");
+    // Delete behavior lives in its own feeds column, not in
+    // feed_settings (Python stores it the same way).
+    let (delete_sel0, delete_target0) = match db
+        .feed_delete_behavior(&feed.id)
+        .ok()
+        .flatten()
+        .as_deref()
+        .map(blindrss_core::rules::parse_delete_behavior)
+    {
+        None => (0usize, String::new()),
+        Some(blindrss_core::rules::DeleteBehavior::Deleted) => (1, String::new()),
+        Some(blindrss_core::rules::DeleteBehavior::Purge) => (2, String::new()),
+        Some(blindrss_core::rules::DeleteBehavior::Category(path)) => (3, path),
+    };
+    let delete_items: Vec<String> = [
+        "Use global setting",
+        "Move it to Deleted Articles",
+        "Remove it permanently",
+        "Move it to a category",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let delete_choice = choice_row(
+        &general,
+        &gsizer,
+        "When articles are deleted:",
+        &delete_items,
+        delete_sel0,
+    );
+    let delete_target_ctrl = name_row(
+        &general,
+        &gsizer,
+        "Delete target category (full path):",
+        &delete_target0,
+    );
+    delete_target_ctrl.enable(delete_sel0 == 3);
+    delete_choice.on_selection_changed(move |_| {
+        delete_target_ctrl.enable(delete_choice.get_selection() == Some(3));
+    });
+    general.set_sizer(gsizer, true);
+
+    // ---- List Headers page: the per-feed column editor
+    // (Audit 8 S03). "Use the global column layout" checked =
+    // inherit (no per-feed layout); unchecking edits the feed's
+    // own layout, starting from the inherited one.
+    let feed_layout0 = blindrss_core::article_columns::feed_layout_from_settings(&settings0);
+    let inherit0 = feed_layout0.is_none();
+    let global_layout = blindrss_core::article_columns::layout_from_config(
+        &Config::load(&crate::config_path()).unwrap_or_default(),
+    );
+    let inherit_cb = CheckBox::builder(&headers_page)
+        .with_label(&crate::tr("Use the global column layout"))
+        .build();
+    inherit_cb.set_value(inherit0);
+    hsizer.add(&inherit_cb, 0, SizerFlag::All, 4);
+    let editor = ColumnEditor::build(
+        &headers_page,
+        &hsizer,
+        feed_layout0.unwrap_or(global_layout),
+        true,
+    );
+    editor.set_enabled(!inherit0);
+    {
+        let editor = editor.clone();
+        inherit_cb.on_toggled(move |_| {
+            editor.set_enabled(!inherit_cb.is_checked());
+        });
+    }
+    headers_page.set_sizer(hsizer, true);
+
+    // OK validates the encoding fields before anything is
+    // saved (Python refuses the dialog with its codec error).
+    let btn_row = BoxSizer::builder(Orientation::Horizontal).build();
+    let ok_btn = Button::builder(&dialog)
+        .with_label(&crate::tr("OK"))
+        .build();
+    let cancel_btn = Button::builder(&dialog)
+        .with_label(&crate::tr("Cancel"))
+        .build();
+    btn_row.add(&ok_btn, 0, SizerFlag::All, 4);
+    btn_row.add(&cancel_btn, 0, SizerFlag::All, 4);
+    sizer.add_sizer(&btn_row, 0, SizerFlag::All, 2);
+    {
+        let d = dialog;
+        ok_btn.on_click(move |_| {
+            for ctrl in [enc_ctrl, fulltext_ctrl] {
+                let value = ctrl.get_value();
+                if !fs::valid_encoding(value.trim()) {
+                    let md = MessageDialog::builder(
+                        &d,
+                        &format!(
+                            "Unknown text encoding: {}. Use a Python codec name such as utf-8, windows-1251 or koi8-r, or leave the field blank for automatic detection.",
+                            value.trim()
+                        ),
+                        "Feed Properties",
+                    )
+                    .with_style(MessageDialogStyle::OK | MessageDialogStyle::IconError)
+                    .build();
+                    md.show_modal();
+                    md.destroy();
+                    return;
+                }
+            }
+            d.end_modal(5100);
+        });
+    }
+    {
+        let d = dialog;
+        cancel_btn.on_click(move |_| d.end_modal(5101));
+    }
     dialog.set_sizer(sizer, true);
-    dialog.set_size(Size::new(560, 380));
+    dialog.set_size(Size::new(560, 520));
     let feed_id = feed.id.clone();
     let reset = Rc::new(RefCell::new(false));
     {
@@ -922,8 +1143,47 @@ pub fn show_feed_properties(frame: &Frame, db: &Db, feed: &blindrss_core::Feed) 
                 Some(cat.trim())
             },
         );
-        let enc = enc_ctrl.get_value();
-        let _ = db.set_feed_settings(&feed_id, &serde_json::json!({"encoding": enc.trim()}));
+        // One merged patch (Audit 8 G08): set_feed_settings
+        // merges top-level keys, so settings this dialog does
+        // not show survive; null values mean "inherit".
+        let columns_patch = if inherit_cb.is_checked() {
+            None
+        } else {
+            Some(blindrss_core::article_columns::layout_to_json(
+                &editor.layout(),
+            ))
+        };
+        let patch = fs::build_patch(
+            &headers_ctrl.get_value(),
+            &timeout_ctrl.get_value(),
+            fs::IMPERSONATE_VALUES[impersonate_choice.get_selection().unwrap_or(0) as usize],
+            &proxy_ctrl.get_value(),
+            &enc_ctrl.get_value(),
+            &fulltext_ctrl.get_value(),
+            interval_choice.get_selection().unwrap_or(0) as usize,
+            columns_patch,
+        );
+        let _ = db.set_feed_settings(&feed_id, &patch);
+        let delete_encoded: Option<String> = match delete_choice.get_selection().unwrap_or(0) {
+            1 => Some("deleted".to_string()),
+            2 => Some("purge".to_string()),
+            3 => {
+                let target = delete_target_ctrl
+                    .get_value()
+                    .split('/')
+                    .map(|part| part.trim())
+                    .filter(|part| !part.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(blindrss_core::db::CATEGORY_PATH_SEP);
+                if target.is_empty() {
+                    None
+                } else {
+                    Some(format!("category:{target}"))
+                }
+            }
+            _ => None,
+        };
+        let _ = db.set_feed_delete_behavior(&feed_id, delete_encoded.as_deref());
         changed = true;
     }
     dialog.destroy();
@@ -1096,142 +1356,222 @@ pub fn show_article_history(frame: &Frame, db: &Db, article: &blindrss_core::Art
     dialog.destroy();
 }
 
+/// A reusable column-layout editor (Python's ColumnLayoutPanel):
+/// list order is column order, checked is shown, Move Up / Move
+/// Down reorder through core's move_key (Title pinned first),
+/// Title stays visible. Used by the global Article Columns
+/// dialog and by the per-feed editor in Feed Properties
+/// (Audit 8 S03/S22). Display labels pass through tr(); the
+/// stored keys never change (Audit 8 S10).
+#[derive(Clone)]
+struct ColumnEditor {
+    state: Rc<RefCell<Vec<blindrss_core::article_columns::ColumnLayout>>>,
+    list: CheckListBox,
+    up_btn: Button,
+    down_btn: Button,
+    reset_btn: Button,
+    sync_checks: Rc<dyn Fn()>,
+}
+
+impl ColumnEditor {
+    fn build(
+        parent: &impl WxWidget,
+        sizer: &BoxSizer,
+        initial: Vec<blindrss_core::article_columns::ColumnLayout>,
+        with_help_text: bool,
+    ) -> ColumnEditor {
+        use blindrss_core::article_columns::{ColumnLayout, move_key, resolve_layout, set_visible};
+        let state: Rc<RefCell<Vec<ColumnLayout>>> = Rc::new(RefCell::new(initial));
+        if with_help_text {
+            let help = StaticText::builder(parent)
+                .with_label(&crate::tr(
+                    "Columns (checked = shown). Use Move Up / Move Down to reorder:",
+                ))
+                .build();
+            sizer.add(&help, 0, SizerFlag::All, 4);
+        }
+        let list = CheckListBox::builder(parent).build();
+        crate::msaa_names::set_name(&list, &crate::tr("Columns"));
+        sizer.add(&list, 1, SizerFlag::Expand | SizerFlag::All, 4);
+        let note = StaticText::builder(parent)
+            .with_label(&crate::tr(
+                "Title is always the first column and cannot be hidden.",
+            ))
+            .build();
+        sizer.add(&note, 0, SizerFlag::All, 4);
+        let row = BoxSizer::builder(Orientation::Horizontal).build();
+        let up_btn = Button::builder(parent)
+            .with_label(&crate::tr("Move Up"))
+            .build();
+        let down_btn = Button::builder(parent)
+            .with_label(&crate::tr("Move Down"))
+            .build();
+        let reset_btn = Button::builder(parent)
+            .with_label(&crate::tr("Reset All to Defaults"))
+            .build();
+        row.add(&up_btn, 0, SizerFlag::All, 4);
+        row.add(&down_btn, 0, SizerFlag::All, 4);
+        row.add(&reset_btn, 0, SizerFlag::All, 4);
+        sizer.add_sizer(&row, 0, SizerFlag::All, 2);
+
+        let rebuild: Rc<dyn Fn(Option<usize>)> = {
+            let state = state.clone();
+            Rc::new(move |select: Option<usize>| {
+                let st = state.borrow();
+                list.clear();
+                for (i, c) in st.iter().enumerate() {
+                    if c.key == blindrss_core::article_columns::PINNED_KEY {
+                        list.append(&format!(
+                            "{} {}",
+                            crate::tr(&c.label),
+                            crate::tr("(always first)")
+                        ));
+                    } else {
+                        list.append(&crate::tr(&c.label));
+                    }
+                    list.check(i as u32, c.visible);
+                }
+                if let Some(sel) = select.or(Some(0))
+                    && sel < st.len()
+                {
+                    list.set_selection(sel as u32, true);
+                }
+            })
+        };
+        // Pull the widget's check states back into the layout
+        // (Title's check is forced on, like Python).
+        let sync_checks: Rc<dyn Fn()> = {
+            let state = state.clone();
+            Rc::new(move || {
+                let mut st = state.borrow_mut();
+                for (i, c) in st.iter_mut().enumerate() {
+                    c.visible = if c.key == blindrss_core::article_columns::PINNED_KEY {
+                        true
+                    } else {
+                        list.is_checked(i as u32)
+                    };
+                }
+            })
+        };
+        rebuild(Some(0));
+        {
+            let state = state.clone();
+            let rebuild = rebuild.clone();
+            let sync_checks = sync_checks.clone();
+            up_btn.on_click(move |_| {
+                sync_checks();
+                let Some(sel) = list.get_selection().map(|s| s as usize) else {
+                    return;
+                };
+                let key = state.borrow()[sel].key.clone();
+                let mut st = state.borrow_mut();
+                *st = move_key(&st, &key, -1);
+                let new_sel = st.iter().position(|c| c.key == key).unwrap_or(sel);
+                drop(st);
+                rebuild(Some(new_sel));
+                list.set_focus();
+            });
+        }
+        {
+            let state = state.clone();
+            let rebuild = rebuild.clone();
+            let sync_checks = sync_checks.clone();
+            down_btn.on_click(move |_| {
+                sync_checks();
+                let Some(sel) = list.get_selection().map(|s| s as usize) else {
+                    return;
+                };
+                let key = state.borrow()[sel].key.clone();
+                let mut st = state.borrow_mut();
+                *st = move_key(&st, &key, 1);
+                let new_sel = st.iter().position(|c| c.key == key).unwrap_or(sel);
+                drop(st);
+                rebuild(Some(new_sel));
+                list.set_focus();
+            });
+        }
+        {
+            let state = state.clone();
+            let rebuild = rebuild.clone();
+            reset_btn.on_click(move |_| {
+                *state.borrow_mut() = resolve_layout(None);
+                rebuild(Some(0));
+                list.set_focus();
+            });
+        }
+        // Check toggles route through core's set_visible, so
+        // Title can never be hidden even by a stray event.
+        {
+            let state = state.clone();
+            let rebuild = rebuild.clone();
+            list.on_toggled(move |e| {
+                let Some(idx) = e.get_selection().map(|s| s as usize) else {
+                    return;
+                };
+                let checked = list.is_checked(idx as u32);
+                let mut st = state.borrow_mut();
+                if let Some(key) = st.get(idx).map(|c| c.key.clone()) {
+                    *st = set_visible(&st, &key, checked);
+                }
+                drop(st);
+                rebuild(Some(idx));
+            });
+        }
+        ColumnEditor {
+            state,
+            list,
+            up_btn,
+            down_btn,
+            reset_btn,
+            sync_checks,
+        }
+    }
+
+    /// Enable or disable the whole editor (the Feed Properties
+    /// inherit state disables it, as Python's panel does).
+    fn set_enabled(&self, on: bool) {
+        self.list.enable(on);
+        self.up_btn.enable(on);
+        self.down_btn.enable(on);
+        self.reset_btn.enable(on);
+    }
+
+    /// The current layout with the widget's check states
+    /// pulled in.
+    fn layout(&self) -> Vec<blindrss_core::article_columns::ColumnLayout> {
+        (self.sync_checks)();
+        self.state.borrow().clone()
+    }
+}
+
 /// Article column layout editor (Python's ArticleColumnsPanel
 /// in Settings): list order is column order, checked is shown,
 /// Move Up / Move Down reorder, Title stays first and visible.
-/// Writes config "article_columns" on OK.
+/// Writes config "article_columns" on OK, in Python's stored
+/// shape ({"key", "visible"} entries — no widths; Python's
+/// layout carries none).
 pub fn show_article_columns(frame: &Frame, config_path: &Path) {
-    use blindrss_core::article_columns::{ColumnLayout, layout_from_config, resolve_layout};
+    use blindrss_core::article_columns::{layout_from_config, layout_to_json};
     let cfg = Config::load(config_path).unwrap_or_default();
-    let state: Rc<RefCell<Vec<ColumnLayout>>> = Rc::new(RefCell::new(layout_from_config(&cfg)));
     let dialog = Dialog::builder(frame, "Article Columns").build();
     bind_f1(frame, &dialog, "list-headers");
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
-    let help = StaticText::builder(&dialog)
-        .with_label(&crate::tr(
-            "Columns (checked = shown). Use Move Up / Move Down to reorder:",
-        ))
-        .build();
-    sizer.add(&help, 0, SizerFlag::All, 4);
-    let list = CheckListBox::builder(&dialog).build();
-    sizer.add(&list, 1, SizerFlag::Expand | SizerFlag::All, 4);
-    let note = StaticText::builder(&dialog)
-        .with_label(&crate::tr(
-            "Title is always the first column and cannot be hidden.",
-        ))
-        .build();
-    sizer.add(&note, 0, SizerFlag::All, 4);
+    let editor = ColumnEditor::build(&dialog, &sizer, layout_from_config(&cfg), true);
     let row = BoxSizer::builder(Orientation::Horizontal).build();
-    let up_btn = Button::builder(&dialog)
-        .with_label(&crate::tr("Move Up"))
-        .build();
-    let down_btn = Button::builder(&dialog)
-        .with_label(&crate::tr("Move Down"))
-        .build();
-    let reset_btn = Button::builder(&dialog)
-        .with_label(&crate::tr("Reset All to Defaults"))
-        .build();
     let ok_btn = Button::builder(&dialog)
         .with_label(&crate::tr("OK"))
         .build();
     let cancel_btn = Button::builder(&dialog)
         .with_label(&crate::tr("Cancel"))
         .build();
-    row.add(&up_btn, 0, SizerFlag::All, 4);
-    row.add(&down_btn, 0, SizerFlag::All, 4);
-    row.add(&reset_btn, 0, SizerFlag::All, 4);
     row.add(&ok_btn, 0, SizerFlag::All, 4);
     row.add(&cancel_btn, 0, SizerFlag::All, 4);
     sizer.add_sizer(&row, 0, SizerFlag::All, 2);
-
-    let rebuild: Rc<dyn Fn(Option<usize>)> = {
-        let state = state.clone();
-        Rc::new(move |select: Option<usize>| {
-            let st = state.borrow();
-            list.clear();
-            for (i, c) in st.iter().enumerate() {
-                if c.key == blindrss_core::article_columns::PINNED_KEY {
-                    list.append(&format!("{} (always first)", c.label));
-                } else {
-                    list.append(&c.label);
-                }
-                list.check(i as u32, c.visible);
-            }
-            if let Some(sel) = select.or(Some(0))
-                && sel < st.len()
-            {
-                list.set_selection(sel as u32, true);
-            }
-        })
-    };
-    // Pull the widget's check states back into the layout
-    // (Title's check is forced on, like Python).
-    let sync_checks: Rc<dyn Fn()> = {
-        let state = state.clone();
-        Rc::new(move || {
-            let mut st = state.borrow_mut();
-            for (i, c) in st.iter_mut().enumerate() {
-                c.visible = if c.key == blindrss_core::article_columns::PINNED_KEY {
-                    true
-                } else {
-                    list.is_checked(i as u32)
-                };
-            }
-        })
-    };
-    rebuild(Some(0));
-    {
-        let state = state.clone();
-        let rebuild = rebuild.clone();
-        let sync_checks = sync_checks.clone();
-        up_btn.on_click(move |_| {
-            sync_checks();
-            let Some(sel) = list.get_selection().map(|s| s as usize) else {
-                return;
-            };
-            // Title (row 0) never moves; nothing moves above it.
-            if sel < 2 {
-                return;
-            }
-            state.borrow_mut().swap(sel, sel - 1);
-            rebuild(Some(sel - 1));
-            list.set_focus();
-        });
-    }
-    {
-        let state = state.clone();
-        let rebuild = rebuild.clone();
-        let sync_checks = sync_checks.clone();
-        down_btn.on_click(move |_| {
-            sync_checks();
-            let Some(sel) = list.get_selection().map(|s| s as usize) else {
-                return;
-            };
-            let len = state.borrow().len();
-            if sel == 0 || sel + 1 >= len {
-                return;
-            }
-            state.borrow_mut().swap(sel, sel + 1);
-            rebuild(Some(sel + 1));
-            list.set_focus();
-        });
-    }
-    {
-        let state = state.clone();
-        let rebuild = rebuild.clone();
-        reset_btn.on_click(move |_| {
-            *state.borrow_mut() = resolve_layout(None);
-            rebuild(Some(0));
-            list.set_focus();
-        });
-    }
     let saved: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
     {
         let saved = saved.clone();
-        let sync_checks = sync_checks.clone();
         let d = dialog;
         ok_btn.on_click(move |_| {
-            sync_checks();
             *saved.borrow_mut() = true;
             d.end_modal(5100);
         });
@@ -1240,15 +1580,10 @@ pub fn show_article_columns(frame: &Frame, config_path: &Path) {
     cancel_btn.on_click(move |_| d.end_modal(5101));
     dialog.set_sizer(sizer, true);
     dialog.set_size(Size::new(480, 460));
-    list.set_focus();
+    editor.list.set_focus();
     if dialog.show_modal() == 5100 && *saved.borrow() {
-        let items: Vec<Value> = state
-            .borrow()
-            .iter()
-            .map(|c| json!({"key": c.key, "visible": c.visible, "width": c.width}))
-            .collect();
         let mut cfg = Config::load(config_path).unwrap_or_default();
-        cfg.set_path("article_columns", Value::Array(items));
+        cfg.set_path("article_columns", layout_to_json(&editor.layout()));
         let _ = cfg.save(config_path);
     }
     dialog.destroy();
@@ -1709,13 +2044,42 @@ pub fn show_video_search(
     picked
 }
 
+/// Normalize a saved-search list the way Python's
+/// `_normalize_persistent_searches` does: trim, drop empties,
+/// dedupe case-insensitively keeping the first entry.
+pub(crate) fn normalize_saved_searches(items: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for item in items {
+        let q = item.trim();
+        if q.is_empty() || out.iter().any(|e: &String| e.eq_ignore_ascii_case(q)) {
+            continue;
+        }
+        out.push(q.to_string());
+    }
+    out
+}
+
+/// Whether a query is already in the list (Python's
+/// `_has_query`: trimmed, case-insensitive; an empty query
+/// counts as present so it can never be added).
+pub(crate) fn saved_search_present(list: &[String], query: &str) -> bool {
+    let q = query.trim();
+    if q.is_empty() {
+        return true;
+    }
+    list.iter().any(|e| e.trim().eq_ignore_ascii_case(q))
+}
+
 /// Manage persistent searches (Python's
-/// PersistentSearchDialog): the saved query list lives in
-/// config "persistent_searches". Returns a query to run when
-/// the user picks Run on one, None otherwise.
+/// PersistentSearchDialog): edits are STAGED in a working
+/// copy (Audit 8 G17) — Add/Remove change only the copy, OK
+/// applies it to config "persistent_searches", Cancel
+/// discards it. Returns a query to run when the user picks
+/// Run on one (Run applies the staged edits too, as the
+/// dialog closes with OK), None otherwise.
 pub fn show_persistent_searches(frame: &Frame, config_path: &Path) -> Option<String> {
     let cfg = Config::load(config_path).unwrap_or_default();
-    let searches: Vec<String> = cfg
+    let stored: Vec<String> = cfg
         .raw()
         .get("persistent_searches")
         .and_then(|v| v.as_array())
@@ -1725,11 +2089,16 @@ pub fn show_persistent_searches(frame: &Frame, config_path: &Path) -> Option<Str
                 .collect()
         })
         .unwrap_or_default();
-    let searches = Rc::new(RefCell::new(searches));
-    let dialog = Dialog::builder(frame, "Persistent Search").build();
+    let searches = Rc::new(RefCell::new(normalize_saved_searches(&stored)));
+    let dialog = Dialog::builder(frame, "Configure Persistent Search").build();
     bind_f1(frame, &dialog, "PersistentSearchDialog");
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
+    let list_label = StaticText::builder(&dialog)
+        .with_label(&crate::tr("Saved searches:"))
+        .build();
+    sizer.add(&list_label, 0, SizerFlag::All, 4);
     let list = ListBox::builder(&dialog).build();
+    crate::msaa_names::set_name(&list, &crate::tr("Saved searches"));
     sizer.add(&list, 1, SizerFlag::Expand | SizerFlag::All, 4);
     let reload = {
         let searches = searches.clone();
@@ -1748,10 +2117,11 @@ pub fn show_persistent_searches(frame: &Frame, config_path: &Path) -> Option<Str
         row.add(&b, 0, SizerFlag::All, 4);
         b
     };
-    let run_btn = mk("Run Search");
-    let add_btn = mk("Add...");
-    let remove_btn = mk("Remove");
-    let close_btn = mk("Close");
+    let run_btn = mk(&crate::tr("Run Search"));
+    let add_btn = mk(&crate::tr("Add..."));
+    let remove_btn = mk(&crate::tr("Remove"));
+    let ok_btn = mk(&crate::tr("OK"));
+    let cancel_btn = mk(&crate::tr("Cancel"));
     sizer.add_sizer(&row, 0, SizerFlag::Expand | SizerFlag::All, 2);
 
     let chosen: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
@@ -1771,17 +2141,19 @@ pub fn show_persistent_searches(frame: &Frame, config_path: &Path) -> Option<Str
         let chosen = chosen.clone();
         let list2 = list;
         let searches = searches.clone();
+        let save = save.clone();
         run_btn.on_click(move |_| {
             if let Some(sel) = list2.get_selection() {
                 let q = searches.borrow().get(sel as usize).cloned();
                 *chosen.borrow_mut() = q;
             }
+            // Run closes with OK: the staged edits apply.
+            save();
             d.end_modal(5100);
         });
     }
     {
         let reload = reload.clone();
-        let save = save.clone();
         let searches = searches.clone();
         let d = dialog;
         add_btn.on_click(move |_| {
@@ -1789,10 +2161,11 @@ pub fn show_persistent_searches(frame: &Frame, config_path: &Path) -> Option<Str
             if entry.show_modal() == 5100
                 && let Some(q) = entry.get_value()
             {
-                let q = q.trim().to_string();
-                if !q.is_empty() && !searches.borrow().contains(&q) {
-                    searches.borrow_mut().push(q);
-                    save();
+                // Staged only (Audit 8 G17): OK applies,
+                // Cancel discards. Duplicates are detected
+                // case-insensitively, like Python.
+                if !saved_search_present(&searches.borrow(), &q) {
+                    searches.borrow_mut().push(q.trim().to_string());
                     reload();
                 }
             }
@@ -1801,7 +2174,6 @@ pub fn show_persistent_searches(frame: &Frame, config_path: &Path) -> Option<Str
     }
     {
         let reload = reload.clone();
-        let save = save.clone();
         let searches = searches.clone();
         let list2 = list;
         remove_btn.on_click(move |_| {
@@ -1811,19 +2183,346 @@ pub fn show_persistent_searches(frame: &Frame, config_path: &Path) -> Option<Str
                     s.remove(sel as usize);
                 }
                 drop(s);
-                save();
                 reload();
             }
         });
     }
+    {
+        let d = dialog;
+        let save = save.clone();
+        ok_btn.on_click(move |_| {
+            save();
+            d.end_modal(5100);
+        });
+    }
     let d = dialog;
-    close_btn.on_click(move |_| d.end_modal(5101));
+    cancel_btn.on_click(move |_| d.end_modal(5101));
     dialog.set_sizer(sizer, true);
     dialog.set_size(Size::new(520, 420));
     dialog.show_modal();
     dialog.destroy();
 
     chosen.borrow().clone()
+}
+
+/// Heading line for the Feed Errors dialog (Python's wording).
+pub(crate) fn feed_errors_heading(count: usize) -> String {
+    if count == 0 {
+        crate::tr("No feeds reported errors during their most recent update.")
+    } else {
+        format!(
+            "{count} {}",
+            crate::tr("feed(s) failed to update during their most recent attempt:")
+        )
+    }
+}
+
+/// The one-line form of a stored error for the report list:
+/// whitespace collapsed, truncated at 220 characters with an
+/// ellipsis (Python's list cell text).
+pub(crate) fn feed_error_oneline(error: &str) -> String {
+    let collapsed = error.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() > 220 {
+        let cut: String = collapsed.chars().take(220).collect();
+        format!("{cut}…")
+    } else {
+        collapsed
+    }
+}
+
+/// The failures sentence in the detail text (Python's two
+/// shapes).
+pub(crate) fn feed_error_failures_line(count: i64) -> String {
+    if count <= 1 {
+        crate::tr("1 failed attempt so far (this may be a one-off glitch).")
+    } else {
+        format!(
+            "{count} {}",
+            crate::tr("consecutive failed attempt(s) (likely a persistent problem).")
+        )
+    }
+}
+
+/// A stored timestamp in the detail text: the app's shared
+/// formatter, or Python's "Unknown" when none was recorded.
+fn feed_error_ts(ts: Option<f64>) -> String {
+    match ts {
+        Some(t) if t > 0.0 => crate::fmt_ts(Some(t)),
+        _ => crate::tr("Unknown"),
+    }
+}
+
+/// The read-only detail text for one errored feed (Python's
+/// exact layout; the error itself is preserved in full,
+/// newlines included).
+pub(crate) fn feed_error_detail(e: &blindrss_core::db::FeedError) -> String {
+    format!(
+        "Feed: {}\nURL: {}\nCategory: {}\nLast update attempt: {}\nLast successful update: {}\n{}\n\nError:\n{}",
+        e.title,
+        e.url,
+        e.category.as_deref().unwrap_or(""),
+        feed_error_ts(e.error_at),
+        match e.success_at {
+            Some(t) if t > 0.0 => crate::fmt_ts(Some(t)),
+            _ => crate::tr("No successful update recorded."),
+        },
+        feed_error_failures_line(e.consecutive_failures),
+        e.error,
+    )
+}
+
+/// Feed Errors dialog (Audit 8 G10; Python's "Feeds with
+/// Errors", gui/dialogs.py:4881): the error report with full
+/// details, Copy, retry (button or Enter on the list) wired
+/// to a real single-feed refresh, Feed Properties, and feed
+/// removal. A resolved retry clears the stored error, exactly
+/// like the main window's refresh drain. Returns true when
+/// the feed set changed (removal or a properties edit), so
+/// the caller can rebuild its views. Opens with the empty
+/// state too — Python shows the explanatory dialog rather
+/// than nothing.
+pub fn show_feed_errors(frame: &Frame) -> bool {
+    let changed = Rc::new(RefCell::new(false));
+    let dialog = Dialog::builder(frame, "Feeds with Errors").build();
+    bind_f1(frame, &dialog, "FeedErrorsDialog");
+    let sizer = BoxSizer::builder(Orientation::Vertical).build();
+    let heading = StaticText::builder(&dialog).with_label("").build();
+    sizer.add(&heading, 0, SizerFlag::All, 4);
+    let list = ListCtrl::builder(&dialog)
+        .with_style(ListCtrlStyle::Report | ListCtrlStyle::SingleSel)
+        .build();
+    crate::msaa_names::set_name(&list, &crate::tr("Feeds with errors"));
+    list.insert_column(0, &crate::tr("Feed"), ListColumnFormat::Left, 250);
+    list.insert_column(1, &crate::tr("Last attempt"), ListColumnFormat::Left, 160);
+    list.insert_column(2, &crate::tr("Failures"), ListColumnFormat::Left, 80);
+    list.insert_column(3, &crate::tr("Error"), ListColumnFormat::Left, 320);
+    sizer.add(&list, 1, SizerFlag::Expand | SizerFlag::All, 4);
+    let detail_label = StaticText::builder(&dialog)
+        .with_label(&crate::tr("Error details:"))
+        .build();
+    sizer.add(&detail_label, 0, SizerFlag::All, 4);
+    let detail = TextCtrl::builder(&dialog)
+        .with_style(TextCtrlStyle::MultiLine | TextCtrlStyle::ReadOnly)
+        .build();
+    crate::msaa_names::set_name(&detail, &crate::tr("Error details"));
+    sizer.add(&detail, 1, SizerFlag::Expand | SizerFlag::All, 4);
+    let btn_row = BoxSizer::builder(Orientation::Horizontal).build();
+    let refresh_btn = Button::builder(&dialog)
+        .with_label(&crate::tr("Refresh Selected"))
+        .build();
+    let copy_btn = Button::builder(&dialog)
+        .with_label(&crate::tr("Copy Details"))
+        .build();
+    let props_btn = Button::builder(&dialog)
+        .with_label(&crate::tr("Feed Properties..."))
+        .build();
+    let remove_btn = Button::builder(&dialog)
+        .with_label(&crate::tr("Remove Feed"))
+        .build();
+    let close_btn = Button::builder(&dialog)
+        .with_label(&crate::tr("Close"))
+        .build();
+    for b in [&refresh_btn, &copy_btn, &props_btn, &remove_btn, &close_btn] {
+        btn_row.add(b, 0, SizerFlag::All, 4);
+    }
+    sizer.add_sizer(&btn_row, 0, SizerFlag::All, 2);
+    dialog.set_sizer(sizer, true);
+    dialog.set_size(Size::new(840, 580));
+
+    let errors: Rc<RefCell<Vec<blindrss_core::db::FeedError>>> = Rc::new(RefCell::new(Vec::new()));
+    let busy = Rc::new(RefCell::new(false));
+    let selected_feed_id: Rc<dyn Fn() -> Option<String>> = {
+        let errors = errors.clone();
+        Rc::new(move || {
+            let sel = list.get_first_selected_item();
+            if sel < 0 {
+                return None;
+            }
+            errors.borrow().get(sel as usize).map(|e| e.feed_id.clone())
+        })
+    };
+    // Reload the report from the database and restore the
+    // selection (the feed that was selected, else the row now
+    // in its slot, clamped — Python's behavior after a retry).
+    let reload: Rc<dyn Fn(Option<usize>)> = {
+        let errors = errors.clone();
+        Rc::new(move |want: Option<usize>| {
+            let fresh = Db::open(&crate::db_path())
+                .ok()
+                .and_then(|db| db.feed_errors().ok())
+                .unwrap_or_default();
+            heading.set_label(&feed_errors_heading(fresh.len()));
+            list.delete_all_items();
+            for (i, e) in fresh.iter().enumerate() {
+                let i = i as i64;
+                list.insert_item(i, &e.title, None);
+                list.set_item_text_by_column(i, 1, &feed_error_ts(e.error_at));
+                list.set_item_text_by_column(i, 2, &e.consecutive_failures.to_string());
+                list.set_item_text_by_column(i, 3, &feed_error_oneline(&e.error));
+            }
+            let has = !fresh.is_empty();
+            *errors.borrow_mut() = fresh;
+            refresh_btn.enable(has);
+            copy_btn.enable(has);
+            props_btn.enable(has);
+            remove_btn.enable(has);
+            if !has {
+                detail.set_value(&crate::tr(
+                    "No feeds reported errors during their most recent update.\n\nWhen a feed cannot be updated, its error appears here with options to refresh it, copy the details, open its properties, or remove it.",
+                ));
+                return;
+            }
+            let sel = want
+                .unwrap_or(0)
+                .min(errors.borrow().len().saturating_sub(1));
+            list.set_item_state(
+                sel as i64,
+                ListItemState::Selected | ListItemState::Focused,
+                ListItemState::Selected | ListItemState::Focused,
+            );
+            if let Some(e) = errors.borrow().get(sel) {
+                detail.set_value(&feed_error_detail(e));
+            }
+        })
+    };
+    reload(None);
+    {
+        let errors = errors.clone();
+        list.on_item_selected(move |_| {
+            let sel = list.get_first_selected_item();
+            if sel >= 0
+                && let Some(e) = errors.borrow().get(sel as usize)
+            {
+                detail.set_value(&feed_error_detail(e));
+            }
+        });
+    }
+    copy_btn.on_click(move |_| {
+        let _ = Clipboard::get().set_text(&detail.get_value());
+    });
+    // Retry: a real single-feed refresh on a worker, using the
+    // main refresh path's knobs (global delete behavior,
+    // retention cutoff, forced). The drain semantics mirror
+    // the main window's: success clears the stored error,
+    // failure records the new one.
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    let done_rx = Rc::new(RefCell::new(done_rx));
+    let timer = Box::leak(Box::new(Timer::new(&dialog)));
+    timer.start(200, false);
+    {
+        let reload = reload.clone();
+        let busy = busy.clone();
+        let errors_tick = errors.clone();
+        timer.on_tick(move |_| {
+            if done_rx.borrow().try_recv().is_err() {
+                return;
+            }
+            *busy.borrow_mut() = false;
+            refresh_btn.enable(true);
+            // Re-select the refreshed feed when it still
+            // errors, else keep the slot it occupied.
+            let slot = list.get_first_selected_item().max(0) as usize;
+            reload(Some(slot));
+            list.set_focus();
+            if errors_tick.borrow().is_empty() {
+                close_btn.set_focus();
+            }
+        });
+    }
+    let do_refresh: Rc<dyn Fn()> = {
+        let busy = busy.clone();
+        let selected_feed_id = selected_feed_id.clone();
+        let errors = errors.clone();
+        Rc::new(move || {
+            if *busy.borrow() {
+                return;
+            }
+            let Some(feed_id) = selected_feed_id() else {
+                return;
+            };
+            let title = errors
+                .borrow()
+                .iter()
+                .find(|e| e.feed_id == feed_id)
+                .map(|e| e.title.clone())
+                .unwrap_or_default();
+            *busy.borrow_mut() = true;
+            refresh_btn.enable(false);
+            heading.set_label(&format!("{} '{title}'...", crate::tr("Refreshing")));
+            let done_tx = done_tx.clone();
+            std::thread::spawn(move || {
+                if let Ok(db) = Db::open(&crate::db_path())
+                    && let Ok(feeds) = db.feeds()
+                    && let Some(feed) = feeds.iter().find(|f| f.id == feed_id)
+                {
+                    let cfg = Config::load(&crate::config_path()).unwrap_or_default();
+                    let behavior = cfg.get_str("delete_behavior", "deleted").to_string();
+                    let cutoff = crate::article_retention_cutoff();
+                    let cancel = std::sync::atomic::AtomicBool::new(false);
+                    let result = blindrss_core::refresh::refresh_feed_with_options(
+                        &db,
+                        feed,
+                        &behavior,
+                        cutoff.as_deref(),
+                        true,
+                        &cancel,
+                    );
+                    match &result {
+                        Ok(_) => {
+                            let _ = db.clear_feed_error(&feed.id);
+                        }
+                        Err(e) => {
+                            let _ = db.record_feed_error(&feed.id, e);
+                        }
+                    }
+                }
+                let _ = done_tx.send(());
+            });
+        })
+    };
+    {
+        let do_refresh = do_refresh.clone();
+        refresh_btn.on_click(move |_| do_refresh());
+    }
+    list.on_item_activated(move |_| do_refresh());
+    {
+        let frame_p = *frame;
+        let changed = changed.clone();
+        let selected_feed_id = selected_feed_id.clone();
+        props_btn.on_click(move |_| {
+            let Some(feed_id) = selected_feed_id() else {
+                return;
+            };
+            if let Ok(db) = Db::open(&crate::db_path())
+                && let Ok(feeds) = db.feeds()
+                && let Some(feed) = feeds.iter().find(|f| f.id == feed_id)
+                && show_feed_properties(&frame_p, &db, feed)
+            {
+                *changed.borrow_mut() = true;
+            }
+        });
+    }
+    {
+        let changed = changed.clone();
+        let reload = reload.clone();
+        let selected_feed_id = selected_feed_id.clone();
+        remove_btn.on_click(move |_| {
+            let Some(feed_id) = selected_feed_id() else {
+                return;
+            };
+            let slot = list.get_first_selected_item().max(0) as usize;
+            if let Ok(db) = Db::open(&crate::db_path()) {
+                let _ = db.remove_feed(&feed_id);
+                *changed.borrow_mut() = true;
+            }
+            reload(Some(slot));
+        });
+    }
+    let d = dialog;
+    close_btn.on_click(move |_| d.end_modal(5100));
+    dialog.show_modal();
+    dialog.destroy();
+    *changed.borrow()
 }
 
 /// Messages from the archive dialog's worker threads (scan,
@@ -4023,7 +4722,11 @@ pub fn show_add_shortcuts(frame: &Frame) {
 
 #[cfg(test)]
 mod category_properties_tests {
-    use super::{category_edited_path, category_leaf_parent, category_parent_choices};
+    use super::{
+        category_edited_path, category_leaf_parent, category_parent_choices,
+        feed_error_failures_line, feed_error_oneline, feed_errors_heading,
+        normalize_saved_searches, saved_search_present,
+    };
 
     #[test]
     fn parent_choices_exclude_self_and_descendants() {
@@ -4061,5 +4764,49 @@ mod category_properties_tests {
             ("Tech".to_string(), Some("News".to_string()))
         );
         assert_eq!(category_leaf_parent("News"), ("News".to_string(), None));
+    }
+
+    #[test]
+    fn saved_searches_normalize_like_python() {
+        // Audit 8 G17: trim, drop empties, dedupe
+        // case-insensitively keeping the first.
+        let raw: Vec<String> = [" News ", "news", "", "  ", "Tech", "TECH"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            normalize_saved_searches(&raw),
+            vec!["News".to_string(), "Tech".to_string()]
+        );
+        assert!(saved_search_present(&raw, " NEWS "));
+        assert!(saved_search_present(&raw, ""));
+        assert!(!saved_search_present(&raw, "Sports"));
+    }
+
+    #[test]
+    fn feed_error_texts_match_python_shape() {
+        // Audit 8 G10 pure builders (defined with
+        // show_feed_errors below).
+        assert_eq!(
+            feed_errors_heading(0),
+            "No feeds reported errors during their most recent update."
+        );
+        assert_eq!(
+            feed_errors_heading(2),
+            "2 feed(s) failed to update during their most recent attempt:"
+        );
+        assert_eq!(feed_error_oneline("a\n\n  b\tc"), "a b c");
+        let long = "x".repeat(300);
+        let cut = feed_error_oneline(&long);
+        assert_eq!(cut.chars().count(), 221);
+        assert!(cut.ends_with('…'));
+        assert_eq!(
+            feed_error_failures_line(1),
+            "1 failed attempt so far (this may be a one-off glitch)."
+        );
+        assert_eq!(
+            feed_error_failures_line(3),
+            "3 consecutive failed attempt(s) (likely a persistent problem)."
+        );
     }
 }

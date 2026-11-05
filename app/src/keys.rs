@@ -157,13 +157,15 @@ pub fn show_shortcuts(frame: &Frame, config_path: &Path) {
     list.insert_column(1, "Command", ListColumnFormat::Left, 230);
     list.insert_column(2, "Shortcut", ListColumnFormat::Left, 150);
     for (i, cmd) in commands.iter().enumerate() {
-        list.insert_item(i as i64, &cmd.category, None);
-        list.set_item_text_by_column(i as i64, 1, &cmd.label);
+        // Display strings pass through tr() (Audit 8 S10); the
+        // stored command ids and binding keys never change.
+        list.insert_item(i as i64, &crate::tr(&cmd.category), None);
+        list.set_item_text_by_column(i as i64, 1, &crate::tr(&cmd.label));
     }
     for (j, (keys, desc)) in sc::fixed_key_rows().iter().enumerate() {
         let i = (commands.len() + j) as i64;
-        list.insert_item(i, "Fixed keys", None);
-        list.set_item_text_by_column(i, 1, desc);
+        list.insert_item(i, &crate::tr("Fixed keys"), None);
+        list.set_item_text_by_column(i, 1, &crate::tr(desc));
         list.set_item_text_by_column(i, 2, keys);
     }
     refresh_list(&list, &working.borrow());
@@ -235,7 +237,7 @@ pub fn show_shortcuts(frame: &Frame, config_path: &Path) {
                 return;
             };
             let cmd = &commands[*ci];
-            let Some(accel) = capture_shortcut(&dialog, &cmd.label) else {
+            let Some(accel) = capture_shortcut(&dialog, &crate::tr(&cmd.label)) else {
                 return;
             };
             let bindings = sc::resolve_bindings(&working.borrow());
@@ -247,7 +249,9 @@ pub fn show_shortcuts(frame: &Frame, config_path: &Path) {
                     &dialog,
                     &format!(
                         "{} is already assigned to {}. Reassign it to {}?",
-                        accel, other.label, cmd.label
+                        accel,
+                        crate::tr(&other.label),
+                        crate::tr(&cmd.label)
                     ),
                     "Shortcut Conflict",
                 )

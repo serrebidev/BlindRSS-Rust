@@ -35,7 +35,9 @@ fn add_field(
     password: bool,
 ) -> TextCtrl {
     let row = BoxSizer::builder(Orientation::Horizontal).build();
-    let text = StaticText::builder(parent).with_label(label).build();
+    let text = StaticText::builder(parent)
+        .with_label(&crate::tr(label))
+        .build();
     let style = if password {
         TextCtrlStyle::Password
     } else {
@@ -51,7 +53,9 @@ fn add_field(
 
 /// A labeled checkbox row; returns the checkbox.
 fn add_check(parent: &impl WxWidget, sizer: &Sizer, label: &str, value: bool) -> CheckBox {
-    let cb = CheckBox::builder(parent).with_label(label).build();
+    let cb = CheckBox::builder(parent)
+        .with_label(&crate::tr(label))
+        .build();
     cb.set_value(value);
     sizer.add(&cb, 0, SizerFlag::All, 2);
     cb
@@ -66,10 +70,15 @@ fn add_choice(
     selected: usize,
 ) -> Choice {
     let row = BoxSizer::builder(Orientation::Horizontal).build();
-    let text = StaticText::builder(parent).with_label(label).build();
+    let text = StaticText::builder(parent)
+        .with_label(&crate::tr(label))
+        .build();
     let choice = Choice::builder(parent).build();
+    // Display strings pass through tr() (Audit 8 S10); callers
+    // always read the selection by index, never by comparing
+    // the shown text, so stored keys stay stable.
     for item in items {
-        choice.append(item);
+        choice.append(&crate::tr(item));
     }
     choice.set_selection(selected.min(items.len().saturating_sub(1)) as u32);
     row.add(&text, 0, SizerFlag::All, 4);
@@ -82,6 +91,85 @@ fn add_choice(
 fn add_note(parent: &impl WxWidget, sizer: &Sizer, text: &str) {
     let note = StaticText::builder(parent).with_label(text).build();
     sizer.add(&note, 0, SizerFlag::All, 4);
+}
+
+/// One custom-sound row (Audit 8 S13; Python's `_add_sound_field`
+/// plus the preview the audit asks for): path field, Browse...
+/// (a WAV file dialog) and Play (the app's own sound player,
+/// resolving the path exactly like the refresh sounds do:
+/// beside the executable, then the data dir, then as given).
+fn add_sound_row(
+    dialog: &Dialog,
+    parent: &impl WxWidget,
+    sizer: &Sizer,
+    label: &str,
+    value: &str,
+    default_rel: &'static str,
+) -> TextCtrl {
+    let row = BoxSizer::builder(Orientation::Horizontal).build();
+    let text = StaticText::builder(parent)
+        .with_label(&crate::tr(label))
+        .build();
+    let ctrl = TextCtrl::builder(parent).build();
+    ctrl.set_value(value);
+    let field_name = label.trim_end_matches(':').to_string();
+    crate::msaa_names::set_name(&ctrl, &field_name);
+    let browse_btn = Button::builder(parent)
+        .with_label(&crate::tr("Browse..."))
+        .build();
+    crate::msaa_names::set_name(
+        &browse_btn,
+        &format!("{} {}", crate::tr("Browse for"), field_name),
+    );
+    let play_btn = Button::builder(parent)
+        .with_label(&crate::tr("Play"))
+        .build();
+    crate::msaa_names::set_name(&play_btn, &format!("{} {}", crate::tr("Play"), field_name));
+    row.add(&text, 0, SizerFlag::All, 4);
+    row.add(&ctrl, 1, SizerFlag::Expand | SizerFlag::All, 4);
+    row.add(&browse_btn, 0, SizerFlag::All, 4);
+    row.add(&play_btn, 0, SizerFlag::All, 4);
+    sizer.add_sizer(&row, 0, SizerFlag::Expand | SizerFlag::All, 2);
+    let dialog_b = *dialog;
+    let label_owned = label.to_string();
+    browse_btn.on_click(move |_| {
+        let dlg = FileDialog::builder(&dialog_b)
+            .with_message(&crate::tr(&label_owned))
+            .with_wildcard("WAV files (*.wav)|*.wav|All files (*.*)|*.*")
+            .with_style(FileDialogStyle::Open)
+            .build();
+        if dlg.show_modal() == 5100
+            && let Some(path) = dlg.get_path()
+        {
+            ctrl.set_value(&path);
+        }
+    });
+    play_btn.on_click(move |_| {
+        let raw = ctrl.get_value();
+        let raw = if raw.trim().is_empty() {
+            default_rel
+        } else {
+            raw.trim()
+        };
+        let rel = std::path::Path::new(raw);
+        let path = if rel.is_absolute() {
+            rel.to_path_buf()
+        } else if let Ok(exe) = std::env::current_exe()
+            && let Some(dir) = exe.parent()
+            && dir.join(rel).exists()
+        {
+            dir.join(rel)
+        } else {
+            let in_data = crate::data_dir().join(rel);
+            if in_data.exists() {
+                in_data
+            } else {
+                rel.to_path_buf()
+            }
+        };
+        crate::play_sound_file(&path);
+    });
+    ctrl
 }
 
 /// One page of the settings notebook: a scrolled window (long
@@ -661,6 +749,66 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
         false,
     );
 
+    // Interface language (Audit 8 S09; Python gui/dialogs.py:1640).
+    // Python places the picker above the Translation Updates
+    // group; here it is appended at the end of the General page
+    // per the append-only rule, so no existing control's tab
+    // position moves. The stored `language` key is honored at
+    // startup (crate::ui_language); the change applies on the
+    // next launch — Python's "requires restart" — and no
+    // hot-swap is invented.
+    let (lang_codes, lang_items) = {
+        let mut codes: Vec<String> = vec!["auto".to_string()];
+        let mut items: Vec<String> = vec!["Automatic (system language)".to_string()];
+        let mut roots = vec![blindrss_core::translation_updates::override_root(
+            &crate::data_dir(),
+        )];
+        roots.extend(crate::locale_roots());
+        let mut avail = blindrss_core::i18n::Catalog::available_languages(&roots);
+        if !avail.iter().any(|c| c == "en") {
+            avail.push("en".to_string());
+        }
+        let mut rest: Vec<(String, String)> = avail
+            .into_iter()
+            .filter(|c| c != "auto")
+            .map(|code| {
+                let display = match blindrss_core::translate::language_name(&code) {
+                    Some(name) => format!("{} ({})", crate::tr(name), code),
+                    None => code.clone(),
+                };
+                (display, code)
+            })
+            .collect();
+        rest.sort_by(|a, b| a.0.cmp(&b.0));
+        for (display, code) in rest {
+            items.push(display);
+            codes.push(code);
+        }
+        (codes, items)
+    };
+    let lang_sel = lang_codes
+        .iter()
+        .position(|c| c == cfg.get_str("language", "auto"))
+        .unwrap_or(0);
+    let lang_refs: Vec<&str> = lang_items.iter().map(|s| s.as_str()).collect();
+    let lang_choice = add_choice(
+        &general.win,
+        &general.sizer,
+        "Interface language (requires restart):",
+        &lang_refs,
+        lang_sel,
+    );
+
+    // Debug mode (Audit 8 S18; Python's General-panel checkbox):
+    // opt-in rotating diagnostics log + the Windows console.
+    // The runtime wiring lives in main.rs (diag_init).
+    let debug_cb = add_check(
+        &general.win,
+        &general.sizer,
+        "Debug mode (show console on startup)",
+        cfg.get_bool("debug_mode", false),
+    );
+
     // ---- Feeds & Articles page (Python's order) ----
     // Refresh scheduling (Python keys: refresh_interval is in
     // seconds, 300 default, 0 = off; Python picks from presets,
@@ -1153,6 +1301,25 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
         "Enable Sound Notifications",
         cfg.get_bool("sounds_enabled", true),
     );
+    // Custom refresh sounds (Audit 8 S13): the runtime already
+    // plays the configured paths; the fields default to the
+    // bundled relative paths like Python's config defaults.
+    let sound_complete_field = add_sound_row(
+        &dialog,
+        &media.win,
+        &sounds_group,
+        "Refresh Complete Sound:",
+        cfg.get_str("sound_refresh_complete", "sounds/refresh_complete.wav"),
+        "sounds/refresh_complete.wav",
+    );
+    let sound_error_field = add_sound_row(
+        &dialog,
+        &media.win,
+        &sounds_group,
+        "Refresh Error Sound:",
+        cfg.get_str("sound_refresh_error", "sounds/refresh_error.wav"),
+        "sounds/refresh_error.wav",
+    );
 
     // Range-cache debug (Audit 8 S17, Python's "Verbose
     // range-cache proxy debug logs" on its media panel):
@@ -1265,6 +1432,54 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
         .sizer
         .add_sizer(&provider_btn_row, 0, SizerFlag::All, 2);
 
+    // Source credentials (Audit 8 S14; Python's groups on its
+    // provider page, gui/dialogs.py:3088,3107): masked fields,
+    // stored under the same top-level keys Python uses and
+    // consumed by the existing Groups.io and GitHub source
+    // code (core threads source_key resolution). Groups are
+    // appended at the end of the page (append-only rule).
+    // A group is announced by a screen reader with the field,
+    // which is why each credential gets its own group.
+    let gio_group = provider.group(&crate::tr("Groups.io"));
+    add_note(
+        &provider.win,
+        &gio_group,
+        &crate::tr(
+            "Groups.io API key (optional). Public groups and RSS work without a key; the key enables complete paginated topics and member-only archives. Create one at groups.io/settings/apikeys.",
+        ),
+    );
+    let gio_key_field = add_field(
+        &provider.win,
+        &gio_group,
+        "Groups.io API key:",
+        cfg.get_str("groups_io_api_key", ""),
+        true,
+    );
+    crate::msaa_names::set_name(&gio_key_field, &crate::tr("Groups.io API key"));
+    add_note(
+        &provider.win,
+        &gio_group,
+        &crate::tr(
+            "Search subscriptions keep the search URL and refresh results in the background. Browser cookies are imported only from Groups.io domains.",
+        ),
+    );
+    let gh_group = provider.group(&crate::tr("GitHub"));
+    add_note(
+        &provider.win,
+        &gh_group,
+        &crate::tr(
+            "GitHub personal access token (optional). Full text of pull requests, issues and commits works without one, but GitHub allows only 60 page reads an hour per connection; a token raises that limit and reaches private repositories. Create one at github.com/settings/tokens.",
+        ),
+    );
+    let gh_token_field = add_field(
+        &provider.win,
+        &gh_group,
+        "GitHub personal access token:",
+        cfg.get_str("github_token", ""),
+        true,
+    );
+    crate::msaa_names::set_name(&gh_token_field, &crate::tr("GitHub personal access token"));
+
     // ---- Notifications page (Python's order, with the
     // Announcements group it absorbs) ----
     add_note(
@@ -1362,25 +1577,92 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
         &blindrss_core::translate::PROVIDER_LABELS,
         tr_sel,
     );
-    let tr_target_field = add_field(
+    // Target language (Audit 8 S19; Python gui/dialogs.py:3622):
+    // an editable combo of "Name (code)" choices sorted by
+    // display text, showing the stored code's preset name.
+    // Saving resolves the text back to a code; custom values
+    // are preserved verbatim (core language_code_from_ui plus
+    // the display-string map for translated names).
+    let tr_lang_map: std::rc::Rc<Vec<(String, String)>> = {
+        let mut map: Vec<(String, String)> = Vec::new();
+        for (name, code) in blindrss_core::translate::LANGUAGE_PRESETS {
+            map.push((format!("{} ({})", crate::tr(name), code), code.to_string()));
+            map.push((crate::tr(name), code.to_string()));
+            map.push((format!("{name} ({code})"), code.to_string()));
+            map.push((name.to_string(), code.to_string()));
+        }
+        std::rc::Rc::new(map)
+    };
+    let target_row = BoxSizer::builder(Orientation::Horizontal).build();
+    let target_label = StaticText::builder(&translate.win)
+        .with_label(&crate::tr("Target language:"))
+        .build();
+    target_row.add(&target_label, 0, SizerFlag::All, 4);
+    let tr_target_combo = ComboBox::builder(&translate.win).build();
+    {
+        let mut choices: Vec<String> = blindrss_core::translate::LANGUAGE_PRESETS
+            .iter()
+            .map(|(name, code)| format!("{} ({})", crate::tr(name), code))
+            .collect();
+        choices.sort();
+        choices.dedup();
+        for choice in &choices {
+            tr_target_combo.append(choice);
+        }
+    }
+    {
+        let saved_lang = cfg.get_str("translation_target_language", "en");
+        let initial = if saved_lang.trim().is_empty() {
+            format!("{} (en)", crate::tr("English"))
+        } else {
+            let disp = blindrss_core::translate::language_display_value(saved_lang);
+            if disp == saved_lang.trim() {
+                disp
+            } else {
+                crate::tr(&disp)
+            }
+        };
+        tr_target_combo.set_value(&initial);
+    }
+    crate::msaa_names::set_name(&tr_target_combo, &crate::tr("Target language"));
+    target_row.add(&tr_target_combo, 1, SizerFlag::Expand | SizerFlag::All, 4);
+    translate
+        .sizer
+        .add_sizer(&target_row, 0, SizerFlag::Expand | SizerFlag::All, 2);
+    add_note(
         &translate.win,
         &translate.sizer,
-        "Target language:",
-        cfg.get_str("translation_target_language", "en"),
-        false,
+        &crate::tr("Choose a language or type a code (e.g. en, es, fr, pt-BR)."),
     );
-    let mut tr_fields: Vec<(TextCtrl, TextCtrl)> = Vec::new();
+    // Per-provider model + API key rows (Python's order: model
+    // before key). Models are editable combos seeded with the
+    // provider's candidate list (Audit 8 S19); a stored custom
+    // model stays the field text even when it is not a
+    // candidate, and is saved back verbatim.
+    let mut tr_fields: Vec<(TextCtrl, ComboBox)> = Vec::new();
+    let mut or_model_combo: Option<ComboBox> = None;
+    let mut or_key_field: Option<TextCtrl> = None;
+    let mut or_load_btn: Option<Button> = None;
+    let mut or_status: Option<StaticText> = None;
     for (key, label) in blindrss_core::translate::PROVIDERS
         .iter()
         .zip(blindrss_core::translate::PROVIDER_LABELS.iter())
     {
-        let model_field = add_field(
-            &translate.win,
-            &translate.sizer,
-            &format!("{label} model (optional):"),
-            cfg.get_str(&format!("translation_{key}_model"), ""),
-            false,
-        );
+        let model_row = BoxSizer::builder(Orientation::Horizontal).build();
+        let model_label = StaticText::builder(&translate.win)
+            .with_label(&crate::tr(&format!("{label} model (optional):")))
+            .build();
+        model_row.add(&model_label, 0, SizerFlag::All, 4);
+        let model_combo = ComboBox::builder(&translate.win).build();
+        for model in blindrss_core::translate::default_models(key) {
+            model_combo.append(model);
+        }
+        model_combo.set_value(cfg.get_str(&format!("translation_{key}_model"), ""));
+        crate::msaa_names::set_name(&model_combo, &crate::tr(&format!("{label} model")));
+        model_row.add(&model_combo, 1, SizerFlag::Expand | SizerFlag::All, 4);
+        translate
+            .sizer
+            .add_sizer(&model_row, 0, SizerFlag::Expand | SizerFlag::All, 2);
         let key_field = add_field(
             &translate.win,
             &translate.sizer,
@@ -1388,7 +1670,93 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
             cfg.get_str(&format!("translation_{key}_api_key"), ""),
             true,
         );
-        tr_fields.push((key_field, model_field));
+        if *key == "openrouter" {
+            or_model_combo = Some(model_combo);
+            or_key_field = Some(key_field);
+            // OpenRouter model discovery (Python's tools row):
+            // loads every model id the service offers into the
+            // combo above, failure-safe.
+            let tools_row = BoxSizer::builder(Orientation::Horizontal).build();
+            let load_btn = Button::builder(&translate.win)
+                .with_label(&crate::tr("Load OpenRouter Models"))
+                .build();
+            let status = StaticText::builder(&translate.win)
+                .with_label(&crate::tr("Loads all available model IDs from OpenRouter."))
+                .build();
+            tools_row.add(&load_btn, 0, SizerFlag::All, 4);
+            tools_row.add(&status, 0, SizerFlag::All, 4);
+            translate
+                .sizer
+                .add_sizer(&tools_row, 0, SizerFlag::Expand | SizerFlag::All, 2);
+            or_load_btn = Some(load_btn);
+            or_status = Some(status);
+        }
+        tr_fields.push((key_field, model_combo));
+    }
+    // The OpenRouter load runs on a worker; a dialog timer
+    // drains the result (the Translation Updates pattern).
+    if let (Some(load_btn), Some(status), Some(model_combo), Some(key_field)) =
+        (or_load_btn, or_status, or_model_combo, or_key_field)
+    {
+        let (or_tx, or_rx) = std::sync::mpsc::channel::<Result<Vec<String>, String>>();
+        let or_rx = std::rc::Rc::new(std::cell::RefCell::new(or_rx));
+        let or_loading = std::rc::Rc::new(std::cell::RefCell::new(false));
+        let or_timer = Box::leak(Box::new(Timer::new(&dialog)));
+        or_timer.start(250, false);
+        {
+            let or_rx_tick = or_rx.clone();
+            let or_loading_tick = or_loading.clone();
+            or_timer.on_tick(move |_| {
+                let Ok(result) = or_rx_tick.borrow().try_recv() else {
+                    return;
+                };
+                *or_loading_tick.borrow_mut() = false;
+                load_btn.enable(true);
+                match result {
+                    Ok(models) => {
+                        let current = model_combo.get_value();
+                        let choices = blindrss_core::translate::openrouter_model_choices(&models);
+                        model_combo.clear();
+                        for choice in &choices {
+                            model_combo.append(choice);
+                        }
+                        if !current.trim().is_empty() {
+                            model_combo.set_value(&current);
+                        }
+                        status.set_label(&if models.len() == 1 {
+                            crate::tr("Loaded 1 OpenRouter model.")
+                        } else {
+                            format!(
+                                "{} {} {}",
+                                crate::tr("Loaded"),
+                                models.len(),
+                                crate::tr("OpenRouter models.")
+                            )
+                        });
+                    }
+                    Err(error) => {
+                        status.set_label(&format!(
+                            "{}: {}",
+                            crate::tr("OpenRouter model load failed"),
+                            error
+                        ));
+                    }
+                }
+            });
+        }
+        load_btn.on_click(move |_| {
+            if *or_loading.borrow() {
+                return;
+            }
+            *or_loading.borrow_mut() = true;
+            load_btn.enable(false);
+            status.set_label(&crate::tr("Loading OpenRouter models..."));
+            let key = key_field.get_value();
+            let or_tx = or_tx.clone();
+            std::thread::spawn(move || {
+                let _ = or_tx.send(blindrss_core::translate::list_openrouter_models(&key, 25));
+            });
+        });
     }
 
     // ---- List Headers page ----
@@ -1470,6 +1838,7 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
             ),
         );
     }
+    let ua_options = std::rc::Rc::new(ua_options);
     let ua_sel = ua_options
         .iter()
         .position(|(key, _)| key == &ua_mode0)
@@ -1482,6 +1851,77 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
         "Custom User-Agent:",
         cfg.get_str("user_agent_custom", ""),
         false,
+    );
+    // Resolved User-Agent preview (Audit 8 S16; Python's
+    // "Current User-Agent" readout, gui/dialogs.py:4116): the
+    // exact string the selected identity resolves to, refreshed
+    // as the choice or the custom text changes, so the choice
+    // is verifiable without leaving the dialog. The custom
+    // field is enabled only in Custom mode, as in Python.
+    let ua_preview = StaticText::builder(&advanced.win).with_label("").build();
+    crate::msaa_names::set_name(&ua_preview, &crate::tr("Current User-Agent"));
+    ua_group.add(&ua_preview, 0, SizerFlag::All, 4);
+    let update_ua_preview: std::rc::Rc<dyn Fn()> = {
+        let ua_options = ua_options.clone();
+        std::rc::Rc::new(move || {
+            let sel = ua_choice.get_selection().unwrap_or(0) as usize;
+            let mode = ua_options
+                .get(sel)
+                .map(|(key, _)| key.as_str())
+                .unwrap_or("auto");
+            let is_custom = mode == "custom";
+            ua_custom_field.enable(is_custom);
+            let effective = if is_custom {
+                let text = ua_custom_field.get_value();
+                let text = text.trim();
+                if text.is_empty() {
+                    String::new()
+                } else {
+                    text.to_string()
+                }
+            } else {
+                blindrss_core::user_agents::resolve(mode, "")
+            };
+            ua_preview.set_label(&format!(
+                "{}: {}",
+                crate::tr("Current User-Agent"),
+                if effective.is_empty() {
+                    crate::tr("(not set)")
+                } else {
+                    effective
+                }
+            ));
+        })
+    };
+    update_ua_preview();
+    {
+        let update = update_ua_preview.clone();
+        ua_choice.on_selection_changed(move |_| update());
+    }
+    {
+        let update = update_ua_preview.clone();
+        ua_custom_field.on_text_updated(move |_| update());
+    }
+
+    // Video Search content opt-in (Audit 8 S16; Python's group,
+    // gui/dialogs.py:4126): adult sites stay out of the Video
+    // Search site list until this is explicitly enabled — the
+    // registry gate (videosearch searchable_sites) reads the
+    // key, and even when on, an adult site must still be
+    // selected explicitly to be searched.
+    let adult_group = advanced.group(&crate::tr("Video Search"));
+    let adult_cb = add_check(
+        &advanced.win,
+        &adult_group,
+        "Enable adult sites in Video Search",
+        cfg.get_bool("enable_adult_search", false),
+    );
+    add_note(
+        &advanced.win,
+        &adult_group,
+        &crate::tr(
+            "When off, adult sites never appear in the Video Search site list.\nWhen on, adult sites are added and must still be selected explicitly to search them.",
+        ),
     );
 
     // ---- CAPTCHA Solving page (Python's order) ----
@@ -1856,6 +2296,41 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
                 serde_json::json!(notif_summary_cb.is_checked()),
             );
             cfg.set_path("sounds_enabled", serde_json::json!(sounds_cb.is_checked()));
+            // Custom refresh sounds (Audit 8 S13): stored as
+            // typed, like Python (no trim).
+            cfg.set_path(
+                "sound_refresh_complete",
+                serde_json::json!(sound_complete_field.get_value()),
+            );
+            cfg.set_path(
+                "sound_refresh_error",
+                serde_json::json!(sound_error_field.get_value()),
+            );
+            // Interface language (Audit 8 S09): the picker index
+            // maps to its code ("auto" included).
+            if let Some(sel) = lang_choice.get_selection()
+                && let Some(code) = lang_codes.get(sel as usize)
+            {
+                cfg.set_path("language", serde_json::json!(code));
+            }
+            // Debug mode (Audit 8 S18).
+            cfg.set_path("debug_mode", serde_json::json!(debug_cb.is_checked()));
+            // Source credentials (Audit 8 S14): stored trimmed,
+            // like Python; secrets, never logged (the
+            // diagnostics redactor covers these keys).
+            cfg.set_path(
+                "groups_io_api_key",
+                serde_json::json!(gio_key_field.get_value().trim()),
+            );
+            cfg.set_path(
+                "github_token",
+                serde_json::json!(gh_token_field.get_value().trim()),
+            );
+            // Adult-site opt-in (Audit 8 S16).
+            cfg.set_path(
+                "enable_adult_search",
+                serde_json::json!(adult_cb.is_checked()),
+            );
             cfg.set_path(
                 "close_to_tray",
                 serde_json::json!(close_tray_cb.is_checked()),
@@ -1911,9 +2386,19 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
             {
                 cfg.set_path("translation_provider", serde_json::json!(p));
             }
+            // The combo text resolves back to a code through
+            // the display map first (translated names
+            // included), then core's parser (Audit 8 S19);
+            // custom values stay verbatim.
+            let tr_lang_raw = tr_target_combo.get_value();
+            let tr_lang_code = tr_lang_map
+                .iter()
+                .find(|(display, _)| display == tr_lang_raw.trim())
+                .map(|(_, code)| code.clone())
+                .unwrap_or_else(|| blindrss_core::translate::language_code_from_ui(&tr_lang_raw));
             cfg.set_path(
                 "translation_target_language",
-                serde_json::json!(tr_target_field.get_value()),
+                serde_json::json!(tr_lang_code),
             );
             cfg.set_path(
                 blindrss_core::translation_updates::CFG_ENABLED,

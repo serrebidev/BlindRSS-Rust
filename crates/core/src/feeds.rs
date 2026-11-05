@@ -48,6 +48,123 @@ fn request(agent: ureq::Agent, url: &str) -> ureq::RequestBuilder<ureq::typestat
 
 type CachedFeed = (Option<String>, Option<String>, Vec<u8>);
 
+/// Per-feed HTTP overrides for one feed fetch (Python
+/// `providers/local.py` issue #29 handling, Audit 8 G08):
+/// custom request headers, a timeout override, a proxy, and
+/// the feed-document encoding override. Built from the feed's
+/// `feed_settings`; an all-default value takes the shared
+/// agent path exactly as before.
+#[derive(Debug, Clone, Default)]
+pub struct FeedFetchOverrides {
+    pub headers: Vec<(String, String)>,
+    pub timeout_secs: Option<u64>,
+    pub proxy: String,
+    pub encoding: String,
+}
+
+impl FeedFetchOverrides {
+    pub fn from_settings(settings: &serde_json::Value) -> Self {
+        let headers = settings
+            .get("custom_headers")
+            .and_then(|v| v.as_object())
+            .map(|map| {
+                map.iter()
+                    .map(|(k, v)| {
+                        let value = match v {
+                            serde_json::Value::String(s) => s.clone(),
+                            other => other.to_string(),
+                        };
+                        (k.clone(), value)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let timeout_secs = settings
+            .get("timeout_seconds")
+            .and_then(|v| v.as_i64())
+            .filter(|t| *t > 0)
+            .map(|t| t as u64);
+        Self {
+            headers,
+            timeout_secs,
+            proxy: crate::feed_settings::text_value(settings, "proxy")
+                .trim()
+                .to_string(),
+            encoding: crate::feed_settings::text_value(settings, "encoding")
+                .trim()
+                .to_string(),
+        }
+    }
+
+    fn is_plain(&self) -> bool {
+        self.headers.is_empty() && self.timeout_secs.is_none() && self.proxy.is_empty()
+    }
+}
+
+/// The site-root Referer for a URL (`scheme://host/`, Python
+/// `utils.referer_for_url`): the refresh fetch sends the
+/// feed's own site as Referer so the request looks like an
+/// in-site navigation past anti-bot WAFs (issue #29).
+pub fn referer_for_url(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return String::new();
+    };
+    if scheme.is_empty() {
+        return String::new();
+    }
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if host.is_empty() {
+        return String::new();
+    }
+    format!("{scheme}://{host}/")
+}
+
+/// An agent for a fetch with per-feed overrides: the shared
+/// agent's User-Agent, the override timeout (or the global
+/// one), the override proxy, and — for the issue #42 retry —
+/// optionally disabled certificate verification.
+fn feed_agent(overrides: &FeedFetchOverrides, insecure: bool) -> Result<ureq::Agent, String> {
+    let mut config = ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_secs(
+            overrides
+                .timeout_secs
+                .unwrap_or_else(crate::http::timeout_secs)
+                .max(1),
+        )))
+        .user_agent(crate::http::user_agent());
+    if !overrides.proxy.is_empty() {
+        let proxy =
+            ureq::Proxy::new(&overrides.proxy).map_err(|e| format!("invalid proxy: {e}"))?;
+        config = config.proxy(Some(proxy));
+    }
+    if insecure {
+        let tls = ureq::tls::TlsConfig::builder()
+            .disable_verification(true)
+            .build();
+        config = config.tls_config(tls);
+    }
+    Ok(ureq::Agent::new_with_config(config.build()))
+}
+
+/// Decode a feed body with the feed's encoding override
+/// (Python local.py applies `feed_settings["encoding"]` when
+/// decoding the document): the decoded text re-encoded as
+/// UTF-8 for the parser. Without a usable override the body
+/// passes through untouched (the parser reads the XML
+/// declaration itself). The cached body and the stored-body
+/// digest always stay the original bytes.
+pub fn decode_feed_body<'a>(body: &'a [u8], encoding: &str) -> std::borrow::Cow<'a, [u8]> {
+    let label = encoding.trim();
+    if label.is_empty() {
+        return std::borrow::Cow::Borrowed(body);
+    }
+    let Some(enc) = encoding_rs::Encoding::for_label(label.as_bytes()) else {
+        return std::borrow::Cow::Borrowed(body);
+    };
+    let (text, _, _) = enc.decode(body);
+    std::borrow::Cow::Owned(text.into_owned().into_bytes())
+}
+
 /// One conditional request for a feed document: validators from
 /// the cached copy unless `force_full`, with the Python issue #42
 /// SSL fallback on certificate errors.
@@ -55,6 +172,7 @@ fn fetch_response(
     url: &str,
     force_full: bool,
     cached: &Option<CachedFeed>,
+    overrides: &FeedFetchOverrides,
 ) -> Result<ureq::http::Response<ureq::Body>, String> {
     let fetch = |agent| {
         let mut request = request(agent, url);
@@ -66,14 +184,35 @@ fn fetch_response(
                 request = request.header("If-Modified-Since", value);
             }
         }
+        // Per-feed overrides (issue #29): a site-root Referer
+        // unless the feed's own headers carry one, then the
+        // feed's custom headers.
+        if !overrides
+            .headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("referer"))
+        {
+            let referer = referer_for_url(url);
+            if !referer.is_empty() {
+                request = request.header("Referer", &referer);
+            }
+        }
+        for (name, value) in &overrides.headers {
+            request = request.header(name.as_str(), value.as_str());
+        }
         request.call().map_err(|e| format!("fetch failed: {e}"))
     };
-    match fetch(crate::http::agent()) {
+    let (agent, insecure_agent) = if overrides.is_plain() {
+        (crate::http::agent(), crate::http::insecure_agent())
+    } else {
+        (feed_agent(overrides, false)?, feed_agent(overrides, true)?)
+    };
+    match fetch(agent) {
         Err(error)
             if crate::http::ssl_fallback_allowed()
                 && crate::http::looks_like_ssl_cert_error(&error) =>
         {
-            fetch(crate::http::insecure_agent())
+            fetch(insecure_agent)
         }
         result => result,
     }
@@ -175,7 +314,15 @@ pub fn fetch_feed_document(
     force_full: bool,
     stored_digest: Option<&str>,
 ) -> Result<FeedFetch, String> {
-    fetch_feed_document_cancellable(db, url, force_full, stored_digest, None, "")
+    fetch_feed_document_cancellable(
+        db,
+        url,
+        force_full,
+        stored_digest,
+        None,
+        "",
+        &FeedFetchOverrides::default(),
+    )
 }
 
 /// `fetch_feed_document` with the refresh worker's
@@ -192,6 +339,7 @@ pub fn fetch_feed_document(
 /// body REPLACES the response exactly as Python's does:
 /// its validators are cleared and its digest is never
 /// recorded, so the next refresh fetches in full again.
+#[allow(clippy::too_many_arguments)]
 pub fn fetch_feed_document_cancellable(
     db: &crate::Db,
     url: &str,
@@ -199,6 +347,7 @@ pub fn fetch_feed_document_cancellable(
     stored_digest: Option<&str>,
     cancel: Option<&std::sync::atomic::AtomicBool>,
     proxy: &str,
+    overrides: &FeedFetchOverrides,
 ) -> Result<FeedFetch, String> {
     if let Some(result) = crate::forum_sources::fetch_feed(url) {
         // Forum documents have no HTTP body to digest; they never
@@ -211,7 +360,7 @@ pub fn fetch_feed_document_cancellable(
     let cached = db
         .cached_feed(url)
         .map_err(|e| format!("feed cache: {e}"))?;
-    let mut response = match fetch_response(url, force_full, &cached) {
+    let mut response = match fetch_response(url, force_full, &cached, overrides) {
         Ok(response) => response,
         Err(error) => {
             if crate::browser::refresh_error_qualifies(&error)
@@ -230,7 +379,7 @@ pub fn fetch_feed_document_cancellable(
             return Ok(FeedFetch::NotModified);
         }
         return Ok(FeedFetch::Fetched {
-            parsed: parse_feed(&body)?,
+            parsed: parse_feed(&decode_feed_body(&body, &overrides.encoding))?,
             body_digest: digest,
         });
     }
@@ -252,7 +401,9 @@ pub fn fetch_feed_document_cancellable(
     // advance the validators, or the next conditional request
     // would 304 against content that was never stored (Python
     // persists validators only inside its store/unchanged paths).
-    let parsed = match parse_feed(&body) {
+    // The encoding override re-decodes the body for parsing
+    // only; the cache and the digest keep the original bytes.
+    let parsed = match parse_feed(&decode_feed_body(&body, &overrides.encoding)) {
         Ok(parsed) => parsed,
         Err(parse_error) => {
             let body_text = String::from_utf8_lossy(&body);
@@ -319,7 +470,7 @@ pub fn fetch_with_cache(db: &crate::Db, url: &str, force_full: bool) -> Result<P
     let cached = db
         .cached_feed(url)
         .map_err(|e| format!("feed cache: {e}"))?;
-    let mut response = fetch_response(url, force_full, &cached)?;
+    let mut response = fetch_response(url, force_full, &cached, &FeedFetchOverrides::default())?;
     if response.status().as_u16() == 304 {
         return cached
             .map(|(_, _, body)| body)

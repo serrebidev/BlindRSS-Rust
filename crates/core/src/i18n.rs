@@ -111,6 +111,36 @@ impl Catalog {
         self.entries.get(msgid).map(|s| s.as_str()).unwrap_or(msgid)
     }
 
+    /// Language codes with a catalog on disk under any of the
+    /// given locale roots (Python `available_languages`, for
+    /// the Settings interface-language picker, Audit 8 S09):
+    /// a code counts when its `LC_MESSAGES/blindrss.po`
+    /// exists, mirroring `Catalog::load`'s path. Sorted,
+    /// deduplicated; English is NOT force-added here (the
+    /// picker adds it, since the source strings always exist).
+    pub fn available_languages(roots: &[std::path::PathBuf]) -> Vec<String> {
+        let mut found: Vec<String> = Vec::new();
+        for root in roots {
+            let Ok(entries) = std::fs::read_dir(root) else {
+                continue;
+            };
+            let mut names: Vec<String> = entries
+                .flatten()
+                .filter(|e| e.path().is_dir())
+                .filter_map(|e| e.file_name().into_string().ok())
+                .collect();
+            names.sort();
+            for name in names {
+                let catalog = root.join(&name).join("LC_MESSAGES").join("blindrss.po");
+                if catalog.is_file() && !found.contains(&name) {
+                    found.push(name);
+                }
+            }
+        }
+        found.sort();
+        found
+    }
+
     pub fn len(&self) -> usize {
         self.entries.len()
     }

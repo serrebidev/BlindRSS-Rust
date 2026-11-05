@@ -5935,3 +5935,215 @@ edit was needed). No workflow files touched.
 clean onto main. Merged gate: fmt clean, clippy clean
 (workspace and core windows-gnu), 882 passed / 0 failed,
 build OK.
+
+## Audit 8 Task 29 resolution — settings, help, and smaller main-window controls (S03, S07, S08, S09, S10, S13, S14, S16, S18, S19, S22, G08, G10, G14, G17) (2026-11-05)
+
+Every behavior below was ported from the Python source named in
+Audit 8 and the Task 29 plan section, regression-first: the new
+suite `crates/core/tests/audit8_task29_slice.rs` plus inline tests in
+`textfind.rs`, `diagnostics.rs`, `feed_settings.rs` and the app-crate
+tests in `dialogs.rs`. The accessibility pass ran before any UI edit:
+all new controls are appended (never inserted mid-list), carry
+Python's accessible names, and put no instructional text in control
+descriptions.
+
+**S03 — per-feed article columns resolve and apply.** Core
+`article_columns::resolve_for_view(global, Option<feed layout>)`
+returns the feed's stored layout when the view is a single plain
+feed, the global layout otherwise. The main window computes the
+effective layout per refill: the column-rebuild signature now
+includes the feed id and that feed's stored `article_columns` JSON,
+so switching feeds rebuilds columns exactly when the effective
+layout changes; category, smart-folder and favorites views keep the
+global layout. Feed Properties gains the List Headers page (below,
+G08) with an inherit checkbox and the shared column editor.
+
+**S07 — Help Find and continuous reading.** Core `help.rs` now
+parses the guide into the Python document model (sections/blocks,
+`help_docs.py` port) and `render_plain_text` produces one continuous
+document. The viewer shows the full rendered guide in one read-only
+text control ("User guide text"), a contents list ("Guide contents")
+that moves the caret to the section's line without announcing, and a
+Find row: Ctrl+F focuses the find box, F3 / Shift+F3 step forward /
+backward, Esc closes. Search is core `textfind` (see G14) over the
+whole guide: a wrapped search announces "Wrapped to the start/end of
+the guide.", a miss announces "Not found: {term}", a match is
+selected with the caret at its end and focus returned to the guide.
+
+**S08 — help locale fallback, announced.** The loader tries the
+regional file, the base language, then English (fr_CA →
+`fr-CA`, `fr_CA`, `fr-ca`, `fr`, `en`). When the document that loads
+is not in the requested language, the viewer shows Python's fallback
+notice verbatim above the guide, in a control named "Guide
+language". Slice tests cover the candidate chain and the real-guide
+fallback.
+
+**S09 — interface-language picker.** Settings' General page appends
+the picker: "auto" plus `Catalog::available_languages` over the
+translation-override root and the bundled locale roots, displayed
+sorted as "Name (code)". The choice is stored under the existing
+`language` key, which `ui_language()` already honors at startup; no
+hot-swap was invented — the app's existing restart behavior applies.
+
+**S10 — display strings translated, stored keys stable.** Settings
+field/choice labels, the shortcut list (keys.rs categories, command
+labels, capture prompt, conflict message), article-column headers
+and the reader's Read/Unread/Favorite/Media strings pass through
+`crate::tr()`; stored ids, keys and bindings are unchanged. The
+slice suite verifies against the shipped German catalog (Title →
+Titel, Author → Autor, Date → Datum, Description → Beschreibung,
+Media → Medien, and the sound/language labels).
+
+**S13 — custom sound browse and preview.** The Sounds group gains
+the refresh-complete and refresh-error rows the runtime already
+reads (`sounds/refresh_complete.wav`, `sounds/refresh_error.wav`
+defaults), each with a path field (named without the colon), a
+"Browse..." button named "Browse for {name}" opening a WAV file
+dialog, and a "Play" preview button resolving the path against the
+exe dir, then the data dir, then as-is. Paths save raw, as Python
+stores them.
+
+**S14 — source credentials.** The Provider page appends Groups.io
+and GitHub groups with Python's note texts verbatim and masked
+fields named "Groups.io API key" and "GitHub personal access
+token". Values are trimmed on save into the existing config keys
+and consumed only by the existing consumers; they join the
+diagnostics redaction set (S18) and are never logged.
+
+**S16 — adult opt-in and User-Agent preview.** The Advanced page
+appends a "Video Search" group: the "Enable adult sites in Video
+Search" checkbox writes `enable_adult_search` — the key Task 26's
+F06 gate consumes, so discovery stays off until explicit opt-in —
+with Python's explanatory note. The User-Agent group gains a
+"Current User-Agent" preview line recomputed when the identity
+choice changes or the custom field is edited, resolved through core
+`user_agents::resolve` (custom mode shows the typed string verbatim,
+"(not set)" when empty).
+
+**S18 — debug mode, rotating diagnostics log, redaction.** Core
+`diagnostics.rs` ports Python's shape: a rotating log (5 MiB, three
+backups) plus secret redaction — configured secret values
+(provider keys, cookies, Authorization/solver material collected by
+`secrets_from_config`) and key-shaped patterns are masked by
+`redact_line`. Settings' General page appends the "Debug mode (show
+console on startup)" checkbox writing `debug_mode`. At startup, and
+only when the flag is set, `diag_init` opens the rotating log at
+`blindrss.log` in the data dir, installs the config-derived secret
+set, and on Windows allocates the console; `log_line` then routes
+through the redacting rotating writer, and refresh failures are
+logged beside their recorded feed errors. With the flag off,
+startup writes nothing extra — `log_line` keeps its previous plain
+append. Tests prove the redaction on the diagnostics path itself:
+lines written through the rotating log to disk contain no secret.
+Per the audit's hard rule, no Max Cached Views control was added —
+the Rust implementation has no per-view cache for it to set.
+
+**S19 — translation configuration.** Core `translate.rs` carries
+`LANGUAGE_PRESETS`: the 189 name/code pairs extracted mechanically
+from Python's `translation.py`, with display ↔ code round-trips
+(`language_display_value`, `language_code_from_ui`). The Translate
+page's target language becomes an editable combo seeded from the
+presets as "{name} ({code})"; the stored value stays the code.
+Per-provider model fields become editable combos seeded with the
+provider's `default_models` suggestions, and the entered text saves
+verbatim — custom models are never rewritten. The OpenRouter row
+gains "Load OpenRouter Models": the fetch runs on a worker thread
+behind a loading guard; success rebuilds the model combo from the
+sorted, deduped ID list and restores the prior text; failure leaves
+the combo untouched and reports "OpenRouter model load failed:
+{e}" in the status line.
+
+**S22 — legacy column normalization.** `resolve_layout` accepts
+Python's legacy shapes: bare string lists, trimmed case-insensitive
+keys, unknown keys dropped, duplicates deduped keeping the first.
+Title is pinned: it resolves first, `move_key` clamps movement to
+[1, len−1], and `set_visible` refuses to hide it. The editor saves
+Python's `{"key", "visible"}` shape via `layout_to_json`. S03 and
+S22 share the slice-suite vectors.
+
+**G08 — Feed Properties behavioral overrides.** The dialog is now a
+Notebook (General / List Headers, Python's shape). General keeps
+its existing controls in place and appends, in Python's relative
+order: refresh interval (the 15 `REFRESH_INTERVAL_CHOICES`, "Use
+global setting" first), custom request headers (multiline), request
+timeout, browser impersonation, proxy URL, full-text extraction
+encoding, and the delete-behavior choice with its target-category
+field enabled only for the category behavior. OK validates both
+encoding fields with Python's error text and writes exactly one
+merged `set_feed_settings(build_patch(...))`, so feed_settings keys
+the dialog does not show are preserved. Consumers are wired and
+verified: refresh builds `FeedFetchOverrides` from the stored
+settings (headers, Python's referer rule, per-feed proxy agent,
+timeout, body decode through the feed encoding); the scheduler
+honors a per-feed `refresh_interval_seconds` with session attempt
+times like Python (tick shortened to 30 s so the 30-second override
+is real) and falls back to the untouched global path when no feed
+carries an override; full-text extraction prefers a non-empty
+`fulltext_encoding` over the feed `encoding`. A live loopback test
+proves the headers, referer and windows-1251 decode on the wire.
+
+**G10 — functional Feed Errors dialog.** `show_feed_errors` replaces
+the status-text stub: Python's heading (including the zero-error
+text), a list (Feed / Last attempt / Failures / Error) named "Feeds
+with errors", and a detail pane ("Error details") with Python's
+layout — feed, URL, category, last attempt, last success, the
+consecutive-failures line, then the full multiline error. Copy
+Details writes the detail text to the clipboard; Refresh Selected
+(button or list activation) re-fetches on a worker with the feed's
+own settings and clears the recorded error on success or records
+the new failure; Feed Properties... and Remove Feed are wired; a
+changed result reloads the main window. The dialog opens with zero
+errors and explains itself. The pure text builders are unit-tested
+in the app crate.
+
+**G14 — reader Find reverse and terminal semantics.** The reader's
+search is core `textfind::find_in_text`, an exact port of Python's
+`_find_in_text` (direction, wrap, caret rules). Find starts at the
+caret and wraps; Find Next (F3 / Ctrl+G) starts at the selection
+end without wrapping and fails with `No more occurrences of
+"{query}".`; new Find Previous (Shift+F3) starts at the selection
+start, searches backward, and fails with `No previous occurrences
+of "{query}".`. A match is selected with the caret at its end and
+reported as "Found: {line}".
+
+**G17 — staged saved searches.** The persistent-search manager
+edits a working copy: Add and Remove mutate only the copy,
+duplicates are detected case-insensitively on trimmed text, OK and
+Run Search apply the staged list, Cancel discards it. The
+normalize/dedupe helpers are pure and unit-tested in the app crate.
+
+**Deviations, stated plainly.** (1) The impersonation override is
+persisted verbatim (auto/always/never) but not wired to a transport:
+the Rust impersonation stage is the recorded B16 residual, and the
+browser fallback is not gated by it — Python keeps the two separate
+as well. (2) The language picker and debug toggle are appended at
+the end of the General page (Python has them mid-page) under the
+append-only rule; Feed Properties' pre-existing Encoding and Reset
+Title controls keep their positions, with the new controls after
+them in Python's relative order. (3) Full-text encoding precedence
+is `fulltext_encoding` (non-empty) over the shipped `encoding`
+field. (4) The sound rows carry a Play button per the plan, though
+Python's field builder shows Browse only. (5) Feed Errors
+timestamps use the app's existing `fmt_ts` (UTC, minute precision)
+rather than Python's localtime format. (6) The global column editor
+now saves Python's `{"key","visible"}` shape without the Rust-only
+width field; widths re-derive from defaults on load, as in Python.
+
+**Adjacent finds.** None new beyond the B16 dependency above:
+`close_to_tray` defaults were not touched (owner-disposition item,
+out of scope), and no workflow files changed.
+
+**Task 29 gate:** the worker gate on branch audit8/task29-settings
+ran fmt (last, clean), clippy (workspace --all-targets and core
+x86_64-pc-windows-gnu, both -D warnings clean), the full workspace
+test suite (911 passed / 0 failed: baseline 882 on main 3923f83
+plus 29 new) and `cargo build -p blindrss` (OK). The clippy pass
+caught a real defect in this task's own new code — the column
+editor's move/visibility calls dropped the functional core API's
+returned layout — fixed by assigning the result before the gate
+closed. Accessibility pass: performed before the UI edits above;
+new pages/controls appended only, Python's accessible names used
+throughout ("Find in guide", "Guide contents", "User guide text",
+"Guide language", "Feeds with errors", "Error details", "Saved
+searches", "Current User-Agent", "Groups.io API key", "GitHub
+personal access token"), no instructional descriptions on controls.

@@ -195,18 +195,144 @@ fn article_retention_cutoff() -> Option<String> {
     ))
 }
 
+/// Debug-mode diagnostics state (Audit 8 S18): the rotating
+/// log + the secret values its redactor scrubs, installed by
+/// diag_init when (and only when) config `debug_mode` is on.
+static DIAG_LOG: std::sync::Mutex<Option<blindrss_core::diagnostics::RotatingLog>> =
+    std::sync::Mutex::new(None);
+static DIAG_SECRETS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Install the debug diagnostics (Python main.py's debug
+/// mode): the rotating blindrss.log (5 MiB, three backups)
+/// with secret redaction, and on Windows the console window
+/// Python allocates. Called once at the very start of main;
+/// with debug mode off it does nothing at all — no file, no
+/// console, no extra writes.
+fn diag_init() {
+    let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+    if !cfg.get_bool("debug_mode", false) {
+        return;
+    }
+    #[cfg(windows)]
+    show_debug_console();
+    let path = data_dir().join("blindrss.log");
+    if let Ok(log) = blindrss_core::diagnostics::RotatingLog::open(&path) {
+        if let Ok(mut slot) = DIAG_LOG.lock() {
+            *slot = Some(log);
+        }
+        if let Ok(mut secrets) = DIAG_SECRETS.lock() {
+            *secrets = blindrss_core::diagnostics::secrets_from_config(&cfg);
+        }
+        log_line(&format!("Debug logging to {}", path.display()));
+    }
+}
+
+/// Windows only (Python main.py:109): when debug mode is on
+/// and no console window exists, allocate one and point the
+/// standard handles at it (the Win32 equivalent of Python's
+/// CONOUT$/CONIN$ rebinding). Raw API loading follows the
+/// house pattern (hotkey.rs) — no extra dependency.
+#[cfg(windows)]
+fn show_debug_console() {
+    use std::os::raw::{c_char, c_void};
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn LoadLibraryA(name: *const c_char) -> *mut c_void;
+        fn GetProcAddress(module: *mut c_void, name: *const c_char) -> *mut c_void;
+    }
+    unsafe {
+        let module = LoadLibraryA(c"kernel32.dll".as_ptr());
+        if module.is_null() {
+            return;
+        }
+        type GetConsoleWindowFn = unsafe extern "system" fn() -> *mut c_void;
+        type AllocConsoleFn = unsafe extern "system" fn() -> i32;
+        type CreateFileFn = unsafe extern "system" fn(
+            *const c_char,
+            u32,
+            u32,
+            *mut c_void,
+            u32,
+            u32,
+            *mut c_void,
+        ) -> *mut c_void;
+        type SetStdHandleFn = unsafe extern "system" fn(u32, *mut c_void) -> i32;
+        let resolve = |name: &std::ffi::CStr| GetProcAddress(module, name.as_ptr());
+        let get_console: Option<GetConsoleWindowFn> =
+            std::mem::transmute(resolve(c"GetConsoleWindow"));
+        let alloc: Option<AllocConsoleFn> = std::mem::transmute(resolve(c"AllocConsole"));
+        let create_file: Option<CreateFileFn> = std::mem::transmute(resolve(c"CreateFileA"));
+        let set_std: Option<SetStdHandleFn> = std::mem::transmute(resolve(c"SetStdHandle"));
+        let (Some(get_console), Some(alloc), Some(create_file), Some(set_std)) =
+            (get_console, alloc, create_file, set_std)
+        else {
+            return;
+        };
+        if !get_console().is_null() {
+            return; // A console already exists.
+        }
+        if alloc() == 0 {
+            return;
+        }
+        const GENERIC_READ: u32 = 0x8000_0000;
+        const GENERIC_WRITE: u32 = 0x4000_0000;
+        const OPEN_EXISTING: u32 = 3;
+        const STD_INPUT: u32 = 0xFFFF_FFF6; // -10
+        const STD_OUTPUT: u32 = 0xFFFF_FFF5; // -11
+        const STD_ERROR: u32 = 0xFFFF_FFF4; // -12
+        let out = create_file(
+            c"CONOUT$".as_ptr(),
+            GENERIC_WRITE,
+            0,
+            std::ptr::null_mut(),
+            OPEN_EXISTING,
+            0,
+            std::ptr::null_mut(),
+        );
+        if !out.is_null() && out as isize != -1 {
+            set_std(STD_OUTPUT, out);
+            set_std(STD_ERROR, out);
+        }
+        let input = create_file(
+            c"CONIN$".as_ptr(),
+            GENERIC_READ,
+            0,
+            std::ptr::null_mut(),
+            OPEN_EXISTING,
+            0,
+            std::ptr::null_mut(),
+        );
+        if !input.is_null() && input as isize != -1 {
+            set_std(STD_INPUT, input);
+        }
+    }
+}
+
 /// Append one line to blindrss.log in the data dir (startup and
 /// panic diagnostics, the BlindFB startup.log pattern). Never fails
-/// the caller.
+/// the caller. When debug mode installed the rotating log
+/// (diag_init), the line goes through it REDACTED (Audit 8
+/// S18: the diagnostics path itself never carries secrets);
+/// disabled mode keeps the plain startup/panic append and
+/// writes nothing extra.
 fn log_line(msg: &str) {
-    let path = data_dir().join("blindrss.log");
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
+    if let Ok(mut slot) = DIAG_LOG.lock()
+        && let Some(log) = slot.as_mut()
+    {
+        let secrets = DIAG_SECRETS.lock().map(|s| s.clone()).unwrap_or_default();
+        let secret_refs: Vec<&str> = secrets.iter().map(|s| s.as_str()).collect();
+        let clean = blindrss_core::diagnostics::redact_line(msg, &secret_refs);
+        let _ = log.write_line(&format!("[{secs}] {clean}"));
+        return;
+    }
+    let path = data_dir().join("blindrss.log");
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -1650,6 +1776,10 @@ struct State {
     refresh_stopped: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// When the last refresh finished (scheduled-refresh timer).
     last_refresh_end: Option<std::time::Instant>,
+    /// Per-feed scheduled-refresh attempt times (epoch
+    /// seconds) for feeds with a refresh-interval override
+    /// (Audit 8 G08; Python's `_scheduled_attempts`).
+    sched_attempts: std::collections::HashMap<String, f64>,
     refresh_paused_until: Option<std::time::Instant>,
     /// Article view filters (Python's Ctrl+1..6): read filter
     /// 0 = all, 1 = unread only, 2 = read only; media filter
@@ -2257,39 +2387,9 @@ fn build_keymap() -> std::collections::HashMap<String, String> {
     blindrss_core::shortcuts::accel_map(&blindrss_core::shortcuts::overrides_from_config(&cfg))
 }
 
-/// Case-insensitive substring search over chars, starting at
-/// `from` (a char index) and wrapping once. Returns the match's
-/// (start, end) char positions.
-fn find_in_text(text: &str, query: &str, from: usize) -> Option<(i64, i64)> {
-    let hay: Vec<char> = text.chars().collect();
-    let needle: Vec<char> = query.chars().collect();
-    if needle.is_empty() || hay.len() < needle.len() {
-        return None;
-    }
-    let eq = |a: char, b: char| {
-        a.to_lowercase().next().unwrap_or(a) == b.to_lowercase().next().unwrap_or(b)
-    };
-    let matches_at = |start: usize| -> bool {
-        needle
-            .iter()
-            .enumerate()
-            .all(|(i, n)| eq(hay[start + i], *n))
-    };
-    let last_start = hay.len() - needle.len();
-    let from = from.min(last_start);
-    for start in from..=last_start {
-        if matches_at(start) {
-            return Some((start as i64, (start + needle.len()) as i64));
-        }
-    }
-    for start in 0..from {
-        if matches_at(start) {
-            return Some((start as i64, (start + needle.len()) as i64));
-        }
-    }
-    None
-}
-
+// Reader/guide substring search lives in core
+// (`blindrss_core::textfind`, the `_find_in_text` port —
+// Audit 8 G14/S07).
 fn feed_label(counts: &std::collections::HashMap<String, i64>, feed: &Feed) -> String {
     match counts.get(&feed.id) {
         Some(&n) if n > 0 => format!("{} ({n})", feed.title),
@@ -2524,18 +2624,65 @@ fn rebuild_tree(state: &mut State, tree: &TreeCtrl) {
     state.selected_feed = if keep { Some(previous) } else { None };
 }
 
-/// (Re)build the article list's columns from the configured
-/// layout (core/article_columns.rs). Title is pinned first.
-fn setup_article_columns(list: &ListCtrl) {
-    let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
-    let layout = blindrss_core::article_columns::layout_from_config(&cfg);
+/// (Re)build the article list's columns from a layout
+/// (core/article_columns.rs). Title is pinned first. Header
+/// labels pass through tr() (Audit 8 S10).
+fn set_list_columns(list: &ListCtrl, layout: &[blindrss_core::article_columns::ColumnLayout]) {
     list.clear_all();
-    for (i, col) in blindrss_core::article_columns::visible_columns(&layout)
+    for (i, col) in blindrss_core::article_columns::visible_columns(layout)
         .iter()
         .enumerate()
     {
-        list.insert_column(i as i64, &col.label, ListColumnFormat::Left, col.width);
+        list.insert_column(
+            i as i64,
+            &crate::tr(&col.label),
+            ListColumnFormat::Left,
+            col.width,
+        );
     }
+}
+
+/// Columns from the global configured layout.
+fn setup_article_columns(list: &ListCtrl) {
+    let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+    let layout = blindrss_core::article_columns::layout_from_config(&cfg);
+    set_list_columns(list, &layout);
+}
+
+/// The feed id when the current view is exactly one feed
+/// (Python's `_feed_column_override` gate: the view id must be
+/// a plain feed id present in the feed map).
+fn single_feed_view_id(state: &State) -> Option<String> {
+    let sel = state.selected_feed.as_deref()?;
+    if sel == "favorites:all" || sel.starts_with("cat:") || sel.starts_with("smart:") {
+        return None;
+    }
+    if state.feeds.iter().any(|f| f.id == sel) {
+        Some(sel.to_string())
+    } else {
+        None
+    }
+}
+
+/// The column layout effective for the current view (Audit 8
+/// S03): a single-feed view uses the feed's own layout when
+/// the feed has one; every other view (All, category,
+/// favorites, smart, virtual) uses the global layout.
+fn effective_column_layout(state: &State) -> Vec<blindrss_core::article_columns::ColumnLayout> {
+    let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+    let global = blindrss_core::article_columns::layout_from_config(&cfg);
+    let feed_layout = single_feed_view_id(state).and_then(|fid| {
+        let db = state.db.as_ref()?;
+        let settings = db.feed_settings(&fid).ok()?;
+        blindrss_core::article_columns::feed_layout_from_settings(&settings)
+    });
+    blindrss_core::article_columns::resolve_for_view(&global, feed_layout)
+}
+
+/// Columns for the current view (per-feed override aware).
+fn setup_article_columns_for_view(state: &State, list: &ListCtrl) {
+    let layout = effective_column_layout(state);
+    set_list_columns(list, &layout);
 }
 
 /// One article cell for a column key.
@@ -2552,7 +2699,7 @@ fn article_cell(
             .filter(|t| !t.is_empty())
             .or_else(|| {
                 if a.media_url.as_deref().is_some_and(|m| !m.is_empty()) {
-                    Some("Media".to_string())
+                    Some(tr("Media"))
                 } else {
                     None
                 }
@@ -2571,9 +2718,9 @@ fn article_cell(
             .map(|d| d.split_whitespace().collect::<Vec<_>>().join(" "))
             .unwrap_or_default(),
         "status" => {
-            let mut parts = vec![if a.is_read { "Read" } else { "Unread" }];
+            let mut parts = vec![if a.is_read { tr("Read") } else { tr("Unread") }];
             if a.is_favorite {
-                parts.push("Favorite");
+                parts.push(tr("Favorite"));
             }
             parts.join(", ")
         }
@@ -2782,9 +2929,7 @@ fn load_more_articles(state: &mut State, list: &ListCtrl) {
         .iter()
         .map(|f| (f.id.as_str(), f.title.as_str()))
         .collect();
-    let layout = blindrss_core::article_columns::layout_from_config(
-        &blindrss_core::config::Config::load(&config_path()).unwrap_or_default(),
-    );
+    let layout = effective_column_layout(state);
     let visible = blindrss_core::article_columns::visible_columns(&layout);
     insert_article_rows(
         list,
@@ -3000,14 +3145,32 @@ fn refill_inner(state: &mut State, list: &ListCtrl) {
     // the common refill just clears the rows (clear_all also
     // tears down and recreates every column).
     let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
-    let sig = serde_json::to_string(
+    // The signature covers the global layout AND the current
+    // feed's own layout (Audit 8 S03), so switching feeds or
+    // editing a feed's columns rebuilds the column set.
+    let mut sig = serde_json::to_string(
         cfg.raw()
             .get("article_columns")
             .unwrap_or(&serde_json::Value::Null),
     )
     .unwrap_or_default();
+    if let Some(fid) = single_feed_view_id(state) {
+        let feed_cols = state
+            .db
+            .as_ref()
+            .and_then(|db| db.feed_settings(&fid).ok())
+            .and_then(|s| {
+                s.get("columns")
+                    .map(|c| serde_json::to_string(c).unwrap_or_default())
+            })
+            .unwrap_or_default();
+        sig.push('|');
+        sig.push_str(&fid);
+        sig.push('|');
+        sig.push_str(&feed_cols);
+    }
     if sig != state.cols_sig {
-        setup_article_columns(list);
+        setup_article_columns_for_view(state, list);
         state.cols_sig = sig;
     } else {
         list.delete_all_items();
@@ -3157,9 +3320,7 @@ fn finish_refill_ordered(state: &mut State, list: &ListCtrl, loaded: Vec<Article
 /// Render a finished article set into the list and arm the
 /// paging placeholder when the view has more rows.
 fn render_refill_rows(state: &mut State, list: &ListCtrl, loaded: Vec<Article>) {
-    let layout = blindrss_core::article_columns::layout_from_config(
-        &blindrss_core::config::Config::load(&config_path()).unwrap_or_default(),
-    );
+    let layout = effective_column_layout(state);
     let visible = blindrss_core::article_columns::visible_columns(&layout);
     // A fresh render replaces the annotation cache wholesale
     // (chapter counts for rows no longer shown are dropped,
@@ -3350,6 +3511,10 @@ fn run_watcher_once(tx: &std::sync::mpsc::Sender<RefreshMsg>) {
 }
 
 fn main() {
+    // Debug diagnostics first (Audit 8 S18): when debug_mode
+    // is configured, the rotating redacted log and the Windows
+    // console are in place before anything can log.
+    diag_init();
     // Packaged runtime smoke test (Python main.py's
     // --blindrss-runtime-self-test, core/runtime_self_test.py;
     // Audit 8 O15): verify the bundled tools resolve and run and
@@ -3723,6 +3888,7 @@ fn main() {
             cancel_refresh: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             refresh_stopped: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_refresh_end: None,
+            sched_attempts: std::collections::HashMap::new(),
             refresh_paused_until: None,
             read_filter: 0,
             media_filter: 0,
@@ -4179,6 +4345,11 @@ fn main() {
                                 }
                                 Err(e) => {
                                     let _ = db.record_feed_error(&feed.id, e);
+                                    // The diagnostics log carries
+                                    // refresh failures (Audit 8
+                                    // S18); log_line redacts when
+                                    // debug mode installed it.
+                                    log_line(&format!("refresh failed for {}: {e}", feed.title));
                                 }
                             }
                         }
@@ -4350,6 +4521,39 @@ fn main() {
             refresh_btn.on_click(move |_| a());
         }
         *tray_refresh_slot.borrow_mut() = Some(act_refresh.clone());
+
+        // Scheduled refresh of a feed subset (Audit 8 G08):
+        // act_refresh's local-provider path for just the due
+        // feeds, used by the scheduler when per-feed refresh
+        // interval overrides exist.
+        let act_refresh_subset: Rc<dyn Fn(Vec<blindrss_core::Feed>, bool)> = {
+            let state_sub = state.clone();
+            let frame_sub = frame;
+            let tx_sub = tx.clone();
+            Rc::new(move |feeds: Vec<blindrss_core::Feed>, force_full: bool| {
+                if feeds.is_empty() {
+                    return;
+                }
+                let (cancel, stopped) = {
+                    let mut st = state_sub.borrow_mut();
+                    if st.refreshing {
+                        return;
+                    }
+                    st.refresh_paused_until = None;
+                    st.refreshing = true;
+                    st.refresh_new.clear();
+                    st.refresh_failed = false;
+                    st.cancel_refresh
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                    st.refresh_stopped
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                    (st.cancel_refresh.clone(), st.refresh_stopped.clone())
+                };
+                frame_sub.set_status_text(&format!("Refreshing {} feeds...", feeds.len()), 0);
+                announce("start_update", "Refresh Feeds");
+                spawn_refresh(feeds, tx_sub.clone(), cancel, stopped, force_full);
+            })
+        };
 
         // Refresh Feed (menu/context only): fetch just the feed
         // selected in the tree, reusing the same worker + channel +
@@ -5217,14 +5421,21 @@ fn main() {
                 } else {
                     let jar = blindrss_core::cookies::load_jar_beside(&config_path());
                     let header = blindrss_core::cookies::cookie_header_for(&jar, &url);
-                    // Per-feed encoding override (feeds.feed_settings).
+                    // Per-feed extraction encoding: Python's
+                    // fulltext_encoding wins; the shipped
+                    // feed_settings.encoding remains the fallback
+                    // (Audit 8 G08).
                     let encoding = Db::open(&db_path())
                         .ok()
                         .and_then(|db| db.feed_settings(&article_feed).ok())
                         .and_then(|s| {
-                            s.get("encoding")
-                                .and_then(|v| v.as_str())
-                                .map(|s| s.to_string())
+                            let pick = |key: &str| {
+                                s.get(key)
+                                    .and_then(|v| v.as_str())
+                                    .map(|v| v.trim().to_string())
+                                    .filter(|v| !v.is_empty())
+                            };
+                            pick("fulltext_encoding").or_else(|| pick("encoding"))
                         })
                         .unwrap_or_default();
                     let (outcome, first_html) = blindrss_core::extract::fetch_full_text_opts(
@@ -7026,7 +7237,7 @@ fn main() {
         let act_columns: Rc<dyn Fn()> = Rc::new(move || {
             dialogs::show_article_columns(&frame_col, &config_path());
             let mut st = state_col.borrow_mut();
-            setup_article_columns(&list_col);
+            setup_article_columns_for_view(&st, &list_col);
             refill_articles(&mut st, &list_col);
             restore_focus(&st, &tree_col, &list_col);
         });
@@ -8116,50 +8327,24 @@ fn main() {
             })
         };
 
-        // Feed Errors dialog (Python's "Feeds with Errors" view,
-        // fed by the error columns the refresh drain maintains).
+        // Feed Errors dialog (Audit 8 G10): the functional
+        // dialog lives in dialogs.rs — details, copy, retry
+        // wired to a real refresh, properties, removal. It
+        // opens on the empty state too, like Python's.
         let act_feed_errors: Rc<dyn Fn()> = {
             let state_fe = state.clone();
             let frame_fe = frame;
             Rc::new(move || {
-                let errors = {
-                    let st = state_fe.borrow();
-                    let Some(db) = st.db.as_ref() else { return };
-                    db.feed_errors().unwrap_or_default()
-                };
-                if errors.is_empty() {
-                    frame_fe.set_status_text("No feed errors", 0);
-                    return;
+                if dialogs::show_feed_errors(&frame_fe) {
+                    let mut st = state_fe.borrow_mut();
+                    st.feeds = st
+                        .db
+                        .as_ref()
+                        .and_then(|db| db.feeds().ok())
+                        .unwrap_or_default();
+                    rebuild_tree(&mut st, &tree);
+                    refill_articles(&mut st, &list);
                 }
-                let dlg = Dialog::builder(&frame_fe, "Feeds with Errors").build();
-                dlg.set_size(Size::new(960, 420));
-                let lc = ListCtrl::builder(&dlg)
-                    .with_style(ListCtrlStyle::Report)
-                    .build();
-                lc.insert_column(0, "Feed", ListColumnFormat::Left, 240);
-                lc.insert_column(1, "Category", ListColumnFormat::Left, 120);
-                lc.insert_column(2, "Failures", ListColumnFormat::Left, 70);
-                lc.insert_column(3, "Last error", ListColumnFormat::Left, 360);
-                lc.insert_column(4, "Last success", ListColumnFormat::Left, 140);
-                for (i, e) in errors.iter().enumerate() {
-                    let i = i as i64;
-                    lc.insert_item(i, &e.title, None);
-                    lc.set_item_text_by_column(i, 1, e.category.as_deref().unwrap_or(""));
-                    lc.set_item_text_by_column(i, 2, &e.consecutive_failures.to_string());
-                    lc.set_item_text_by_column(i, 3, &e.error);
-                    lc.set_item_text_by_column(i, 4, &fmt_ts(e.success_at));
-                }
-                let close_btn = Button::builder(&dlg).with_label("Close").build();
-                let ds = BoxSizer::builder(Orientation::Vertical).build();
-                ds.add(&lc, 1, SizerFlag::Expand | SizerFlag::All, 4);
-                ds.add(&close_btn, 0, SizerFlag::All, 4);
-                dlg.set_sizer(ds, true);
-                let dlg_close = dlg;
-                close_btn.on_click(move |_| {
-                    dlg_close.end_modal(ID_OK);
-                });
-                dlg.show_modal();
-                dlg.destroy();
                 restore_focus(&state_fe.borrow(), &tree, &list);
             })
         };
@@ -8250,13 +8435,27 @@ fn main() {
             })
         };
 
-        fn run_find(reader: &TextCtrl, frame: &Frame, query: &str, from: Option<i64>) {
+        // Reader Find (Audit 8 G14; Python mainframe.py's
+        // find state machine over core's _find_in_text port):
+        // the initial Find starts at the insertion point,
+        // forward, WRAPPING; Find Next starts at the END of
+        // the current selection, forward, no wrap; Find
+        // Previous starts at the START of the selection,
+        // backward, no wrap. Terminal misses announce Python's
+        // exact sentences (also mirrored to the status bar).
+        fn run_find(
+            reader: &TextCtrl,
+            frame: &Frame,
+            query: &str,
+            start: usize,
+            forward: bool,
+            wrap: bool,
+            fail_message: &str,
+        ) {
             let text = reader.get_value();
-            let start = from
-                .unwrap_or_else(|| reader.get_insertion_point().max(0))
-                .max(0) as usize;
-            match find_in_text(&text, query, start) {
+            match blindrss_core::textfind::find_in_text(&text, query, start, forward, wrap) {
                 Some((a, b)) => {
+                    let (a, b) = (a as i64, b as i64);
                     reader.set_selection(a, b);
                     reader.set_insertion_point(b);
                     reader.set_focus();
@@ -8269,8 +8468,8 @@ fn main() {
                     announce("general", &format!("Found: {line}"));
                 }
                 None => {
-                    frame.set_status_text(&format!("Not found: {query}"), 0);
-                    announce("general", "Not found");
+                    frame.set_status_text(fail_message, 0);
+                    announce("general", fail_message);
                 }
             }
         }
@@ -8292,7 +8491,16 @@ fn main() {
                     return;
                 };
                 state_fd.borrow_mut().find_query = query.clone();
-                run_find(&reader, &frame_fd, &query, Some(0));
+                let start = reader.get_insertion_point().max(0) as usize;
+                run_find(
+                    &reader,
+                    &frame_fd,
+                    &query,
+                    start,
+                    true,
+                    true,
+                    &format!("\"{query}\" was not found."),
+                );
             })
         };
         let act_find_next: Rc<dyn Fn()> = {
@@ -8305,7 +8513,38 @@ fn main() {
                     act_find_again();
                     return;
                 }
-                run_find(&reader, &frame_fn, &query, None);
+                let (_, end) = reader.get_selection();
+                run_find(
+                    &reader,
+                    &frame_fn,
+                    &query,
+                    end.max(0) as usize,
+                    true,
+                    false,
+                    &format!("No more occurrences of \"{query}\"."),
+                );
+            })
+        };
+        let act_find_prev: Rc<dyn Fn()> = {
+            let state_fp2 = state.clone();
+            let frame_fp2 = frame;
+            let act_find_again = act_find.clone();
+            Rc::new(move || {
+                let query = state_fp2.borrow().find_query.clone();
+                if query.is_empty() {
+                    act_find_again();
+                    return;
+                }
+                let (start, _) = reader.get_selection();
+                run_find(
+                    &reader,
+                    &frame_fp2,
+                    &query,
+                    start.max(0) as usize,
+                    false,
+                    false,
+                    &format!("No previous occurrences of \"{query}\"."),
+                );
             })
         };
 
@@ -9469,6 +9708,7 @@ fn main() {
             let h_activate = act_activate.clone();
             let h_find = act_find.clone();
             let h_find_next = act_find_next.clone();
+            let h_find_prev = act_find_prev.clone();
             let f1_frame = frame;
             let f1_language = language.clone();
             let f1_tree = tree.get_handle() as usize;
@@ -9580,6 +9820,11 @@ fn main() {
                 }
                 if accel == "F3" || accel == "Ctrl+G" {
                     h_find_next();
+                    ev.skip(false);
+                    return;
+                }
+                if accel == "Shift+F3" {
+                    h_find_prev();
                     ev.skip(false);
                     return;
                 }
@@ -10716,10 +10961,79 @@ fn main() {
         let sched_timer = Box::leak(Box::new(Timer::new(&frame)));
         let state_sched = state.clone();
         let refresh_sched = act_refresh.clone();
+        let subset_sched = act_refresh_subset.clone();
         let force_sched = refresh_force.clone();
         sched_timer.on_tick(move |_| {
             let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
             let interval = cfg.get_i64("refresh_interval", 300);
+            // Per-feed refresh-interval overrides (Audit 8
+            // G08): when any local feed carries one, due-ness is
+            // computed per feed (core feed_settings) and only
+            // the due feeds refresh; with no overrides the
+            // global behavior below is exactly as before.
+            let overrides_local = blindrss_core::provider::active_name(&cfg) == "local";
+            let subset_due: Option<Vec<blindrss_core::Feed>> = if overrides_local {
+                let mut st = state_sched.borrow_mut();
+                if st.refreshing
+                    || st
+                        .refresh_paused_until
+                        .is_some_and(|until| std::time::Instant::now() < until)
+                {
+                    return;
+                }
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs_f64())
+                    .unwrap_or(0.0);
+                let mut any_override = false;
+                let mut due: Vec<blindrss_core::Feed> = Vec::new();
+                if let Some(db) = st.db.as_ref() {
+                    let feeds = st.feeds.clone();
+                    for feed in feeds {
+                        let settings = db
+                            .feed_settings(&feed.id)
+                            .unwrap_or(serde_json::Value::Null);
+                        if settings
+                            .get("refresh_interval_seconds")
+                            .is_some_and(|v| v.is_number())
+                        {
+                            any_override = true;
+                        }
+                        let effective = blindrss_core::feed_settings::effective_refresh_interval(
+                            interval, &settings,
+                        );
+                        let last = st.sched_attempts.get(&feed.id).copied();
+                        if blindrss_core::feed_settings::scheduled_due(effective, last, now) {
+                            due.push(feed);
+                        }
+                    }
+                }
+                if !any_override {
+                    None
+                } else {
+                    for feed in &due {
+                        st.sched_attempts.insert(feed.id.clone(), now);
+                    }
+                    Some(due)
+                }
+            } else {
+                None
+            };
+            if let Some(due) = subset_due {
+                if due.is_empty() {
+                    return;
+                }
+                let workload = cfg.get_str(
+                    "automatic_feed_refresh_workload",
+                    if cfg.get_bool("ignore_feed_cache", false) {
+                        "always_full"
+                    } else {
+                        "startup_full"
+                    },
+                );
+                subset_sched(due, workload == "always_full");
+                return;
+            }
             if interval <= 0 {
                 return;
             }
@@ -10757,7 +11071,10 @@ fn main() {
                 refresh_sched();
             }
         });
-        sched_timer.start(60_000, false);
+        // 30 s ticks (was 60) so the shortest per-feed override
+        // (30 seconds) is honored; the tick's work is a config
+        // load plus early returns.
+        sched_timer.start(30_000, false);
 
         // Python parity: start_maximized opens the window
         // maximized (Python skips this only when starting hidden
@@ -11030,6 +11347,7 @@ mod ui_parity_tests {
                 cancel_refresh: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 refresh_stopped: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 last_refresh_end: None,
+                sched_attempts: std::collections::HashMap::new(),
                 refresh_paused_until: None,
                 read_filter: 1,
                 media_filter: 2,
