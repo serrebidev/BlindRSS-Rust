@@ -5482,3 +5482,8 @@ and every gate was re-run to completion afterwards. Owner
 screen-reader acceptance of the Video Search subscribe
 buttons, Detect Feeds on Page and the Add Feed hints joins
 the standing acceptance list.
+
+**Task 26 integration gate (2026-11-05):** cherry-picked
+clean onto main. Merged gate: fmt clean, clippy clean
+(workspace and core windows-gnu), 825 passed / 0 failed,
+build OK.
