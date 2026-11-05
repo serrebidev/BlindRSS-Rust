@@ -6194,3 +6194,23 @@ environment proxy, as Python's requests calls do.
 Classification unit-tested; captcha suite green locally.
 This supersedes the earlier "one-off load flake"
 disposition for run 42068872325.
+
+**Captcha test, third failure and final disposition
+(2026-11-05):** run 42086353799 (which CONTAINED the
+loopback proxy bypass) failed the same elapsed assertion
+on Ubuntu, so the proxy-detour theory is disproven as the
+(sole) cause: the structural facts held every time (token
+None, submit-only hits) while suite wall times on the
+failing runs were 16-30 s against ~6 s locally — the 10 s
+wall-clock bound around a socket round-trip is the
+defect, not the cancellation path (locally the test runs
+in 0.01-0.03 s, even pinned to one core; six consecutive
+full-suite local runs all passed). The test now asserts
+the structural proof only (exactly one hit, no token),
+with the reasoning recorded in its comment: had
+cancellation been ignored, the first poll would fire
+after the 0.05 s test cadence and hits would be 2. The
+loopback proxy bypass stays — it is independently
+correct (loopback traffic should not traverse an
+environment proxy; the browser.rs DevTools idiom) — but
+it is no longer credited as this fix.

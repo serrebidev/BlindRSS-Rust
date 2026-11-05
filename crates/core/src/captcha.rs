@@ -507,14 +507,21 @@ mod tests {
     fn cancellation_stops_the_solve() {
         // Pre-set cancel: the submission still happens
         // (Python checks cancellation in its sleeps), then
-        // the first poll delay aborts promptly and no poll
-        // request is ever sent.
+        // the first poll delay aborts and no poll request
+        // is ever sent. The proof is structural — exactly
+        // one hit (the submit) and no token. A wall-clock
+        // bound used to stand here; it failed three times
+        // on loaded CI runners (suite times 16-30 s vs
+        // ~6 s locally) while the structural facts held,
+        // because a socket round-trip's latency under load
+        // is not the property under test. If cancellation
+        // were ignored, the first poll would fire after
+        // the 0.05 s FAST delay and hits would be 2.
         let (base, hits, _b) = mock_solver(vec![
             r#"{"status":1,"request":"task-11"}"#,
             r#"{"status":1,"request":"tok"}"#,
         ]);
         let cancel = AtomicBool::new(true);
-        let began = Instant::now();
         let token = solve_at(
             &format!("{base}/in.php"),
             &format!("{base}/res.php"),
@@ -525,7 +532,6 @@ mod tests {
             &FAST,
         );
         assert!(token.is_none());
-        assert!(began.elapsed() < Duration::from_secs(10));
         assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
 
