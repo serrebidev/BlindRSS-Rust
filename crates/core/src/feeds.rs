@@ -175,6 +175,31 @@ pub fn fetch_feed_document(
     force_full: bool,
     stored_digest: Option<&str>,
 ) -> Result<FeedFetch, String> {
+    fetch_feed_document_cancellable(db, url, force_full, stored_digest, None, "")
+}
+
+/// `fetch_feed_document` with the refresh worker's
+/// cancellation flag and the feed's configured proxy
+/// (`feed_settings["proxy"]`), for the browser recovery
+/// stage (Audit 8 B01, Python
+/// `providers/local.py::_try_browser_feed_fallback`):
+/// when the plain fetch fails with a qualifying error, or
+/// the fetched body is not a feed and qualifies (gate
+/// status, Cloudflare challenge shape, challenge page),
+/// the document is fetched once through the warm browser
+/// — only when the fallback is enabled in Settings and
+/// the refresh has not been cancelled. A browser-recovered
+/// body REPLACES the response exactly as Python's does:
+/// its validators are cleared and its digest is never
+/// recorded, so the next refresh fetches in full again.
+pub fn fetch_feed_document_cancellable(
+    db: &crate::Db,
+    url: &str,
+    force_full: bool,
+    stored_digest: Option<&str>,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+    proxy: &str,
+) -> Result<FeedFetch, String> {
     if let Some(result) = crate::forum_sources::fetch_feed(url) {
         // Forum documents have no HTTP body to digest; they never
         // take the fast path (empty digest = never recorded).
@@ -186,7 +211,17 @@ pub fn fetch_feed_document(
     let cached = db
         .cached_feed(url)
         .map_err(|e| format!("feed cache: {e}"))?;
-    let mut response = fetch_response(url, force_full, &cached)?;
+    let mut response = match fetch_response(url, force_full, &cached) {
+        Ok(response) => response,
+        Err(error) => {
+            if crate::browser::refresh_error_qualifies(&error)
+                && let Some(recovered) = browser_recover_feed(db, url, proxy, cancel)
+            {
+                return recovered;
+            }
+            return Err(error);
+        }
+    };
     if response.status().as_u16() == 304 {
         let (_, _, body) =
             cached.ok_or_else(|| "Feed returned 304 without cached content".to_string())?;
@@ -199,6 +234,12 @@ pub fn fetch_feed_document(
             body_digest: digest,
         });
     }
+    let status = response.status().as_u16();
+    let cf_mitigated = response
+        .headers()
+        .get("cf-mitigated")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
     let (etag, modified) = response_validators(&response);
     let body = read_body(&mut response)?;
     let digest = feed_body_digest(&body);
@@ -211,13 +252,62 @@ pub fn fetch_feed_document(
     // advance the validators, or the next conditional request
     // would 304 against content that was never stored (Python
     // persists validators only inside its store/unchanged paths).
-    let parsed = parse_feed(&body)?;
+    let parsed = match parse_feed(&body) {
+        Ok(parsed) => parsed,
+        Err(parse_error) => {
+            let body_text = String::from_utf8_lossy(&body);
+            if crate::browser::refresh_response_qualifies(
+                status,
+                cf_mitigated.as_deref(),
+                &body_text,
+            ) && let Some(recovered) = browser_recover_feed(db, url, proxy, cancel)
+            {
+                return recovered;
+            }
+            return Err(parse_error);
+        }
+    };
     db.cache_feed(url, etag.as_deref(), modified.as_deref(), &body)
         .map_err(|e| format!("feed cache: {e}"))?;
     Ok(FeedFetch::Fetched {
         parsed,
         body_digest: digest,
     })
+}
+
+/// The browser recovery attempt behind
+/// `fetch_feed_document_cancellable`: None when the
+/// fallback is disabled in Settings, the fetch was
+/// cancelled, the browser produced no validated feed, or
+/// the recovered document still does not parse — the
+/// caller then reports its original failure, exactly as
+/// Python falls back to the plain-fetch outcome.
+fn browser_recover_feed(
+    db: &crate::Db,
+    url: &str,
+    proxy: &str,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Option<Result<FeedFetch, String>> {
+    if !crate::browser::fallback_enabled()
+        || cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+    {
+        return None;
+    }
+    let timeout = crate::browser::fallback_timeout_seconds();
+    let response = crate::browser::fetch_feed(url, timeout, proxy, cancel).ok()?;
+    let parsed = parse_feed(response.text.as_bytes()).ok()?;
+    // The recovered body replaces the response: cache it
+    // with its validators cleared (Python sets etag /
+    // last_modified to None and body_digest to None), so
+    // no later conditional request can 304 against the
+    // gated body it replaces. A cache write failure does
+    // not undo the recovery; the refresh's own store path
+    // reports database trouble itself.
+    let _ = db.cache_feed(url, None, None, response.text.as_bytes());
+    Some(Ok(FeedFetch::Fetched {
+        parsed,
+        body_digest: String::new(),
+    }))
 }
 
 /// Conditional refresh keeps the validated response body, so a failed later

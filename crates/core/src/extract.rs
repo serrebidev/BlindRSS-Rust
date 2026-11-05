@@ -2613,18 +2613,50 @@ fn extract_article_impl(
 // Fetch layer: byte-accurate decoding + the fallback chain
 // (Python `_fetch_page` / `_try_fallbacks`).
 //
-// Order (Python's, minus the two stages a desktop app without
-// a browser engine or a TLS-impersonation library cannot run —
-// curl_cffi impersonation and the warm-browser fetch are
-// documented non-ports in PARITY §7):
+// Order (Python's, Audit 8 Task 24):
 //   direct (with stored site cookies)
+//   -> clearance refresh + one refetch (only when a gate
+//      was seen; Task 25's recovery functions, wired here)
 //   -> Sky News via Google Translate (news.sky.com only)
+//   -> TLS-impersonated refetch (skipped when the site's
+//      pinned session already forced that handshake on
+//      the direct fetch, unless stale clearance was just
+//      dropped; the transport itself is the pending B16
+//      fidelity recorded in PARITY.md — the stage keeps
+//      its position and target selection and resolves to
+//      no body until a compatible transport lands)
 //   -> Jina reader as text (only when a gate was seen)
 //   -> Smry (always)
-//   -> Wayback Machine (always, last resort)
+//   -> Wayback Machine (always)
+//   -> the warm browser (only when a gate was seen, the
+//      site holds no stored clearance, and the per-host
+//      failure cooldown has lapsed)
 // Every fallback body is re-checked against the gate markers
 // before it is trusted, exactly like Python.
 // ---------------------------------------------------------------------------
+
+/// The config path the app configured for the cookie
+/// store (feeds.rs keeps its own copy for the same
+/// purpose); the Task 25 recovery functions key off it.
+static CONFIG_PATH: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
+
+pub fn configure_cookies(config_path: &std::path::Path) {
+    *CONFIG_PATH.lock().unwrap_or_else(|e| e.into_inner()) = Some(config_path.to_owned());
+}
+
+fn configured_config_path() -> Option<std::path::PathBuf> {
+    CONFIG_PATH
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+fn now_epoch_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
 
 /// Decode an HTTP body the Python way (issue #75): a per-feed
 /// override wins, then BOM, then the Content-Type charset,
@@ -2941,6 +2973,202 @@ pub fn fetch_via_sky_translate(url: &str) -> Option<String> {
     } else {
         Some(body)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Audit 8 Task 24 stages: clearance refresh, impersonation,
+// and the warm browser (Python `_try_fallbacks` head/tail).
+// ---------------------------------------------------------------------------
+
+/// Python `_retry_with_refreshed_clearance`: re-read the
+/// browsers' current clearance for this site (Task 25's
+/// `cookies::refresh_clearance_from_browsers`, rate
+/// limited inside) and, when it changed, refetch the URL
+/// once with the fresh stored identity. Returns the body
+/// only for a 200..400 response that is not a bot
+/// interstitial.
+fn clearance_recovery_body(url: &str) -> Option<String> {
+    let config_path = configured_config_path()?;
+    if !crate::cookies::refresh_clearance_from_browsers(&config_path, url) {
+        return None;
+    }
+    let (cookie, ua) = crate::cookies::site_headers_for(&config_path, url);
+    let mut request = crate::http::status_agent()
+        .get(url)
+        .header(
+            "Accept",
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        )
+        .header("Accept-Language", "en-US,en;q=0.9");
+    if !cookie.is_empty() {
+        request = request.header("Cookie", cookie);
+    }
+    if let Some(ua) = &ua {
+        request = request.header("User-Agent", ua.clone());
+        for (key, value) in crate::user_agents::client_hints(ua) {
+            request = request.header(key, value);
+        }
+    }
+    let mut response = request.call().ok()?;
+    let status = response.status().as_u16();
+    if !(200..400).contains(&status) {
+        return None;
+    }
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let bytes = response.body_mut().read_to_vec().ok()?;
+    let body = decode_bytes(&bytes, &content_type, "");
+    if body.trim().is_empty() || looks_gated(&body) {
+        return None;
+    }
+    Some(body)
+}
+
+/// Whether the jar currently holds clearance for `url`
+/// (Python `_has_stored_clearance`).
+fn has_stored_clearance(url: &str) -> bool {
+    let Some(config_path) = configured_config_path() else {
+        return false;
+    };
+    let jar = crate::cookies::load_jar_beside(&config_path);
+    crate::cookies::has_clearance_for(&jar, url, now_epoch_seconds())
+}
+
+/// Python `user_agents.impersonate_target_for_ua` (with
+/// `_CURL_TARGET_BY_ENGINE`): the impersonation target
+/// whose handshake matches a User-Agent, or "" when the
+/// engine is unknown. Safari identities map to "" — the
+/// table has no Safari entry.
+fn impersonate_target_for_ua(ua: &str) -> &'static str {
+    if ua.contains("Firefox/") || ua.contains("Gecko/") {
+        "firefox"
+    } else if ua.contains("Edg/")
+        || ua.contains("Edge/")
+        || ua.contains("Chrome/")
+        || ua.contains("Chromium/")
+    {
+        "chrome"
+    } else {
+        ""
+    }
+}
+
+/// Python `utils._site_cookie_impersonation`: the target
+/// a site's pinned-UA session forces onto every request,
+/// or "" when the site holds no UA-paired session. A
+/// non-empty result means the direct fetch conceptually
+/// already went out on that handshake, so the fallback
+/// stage would only repeat it.
+fn site_impersonation_target(url: &str) -> String {
+    let Some(config_path) = configured_config_path() else {
+        return String::new();
+    };
+    let jar = crate::cookies::load_jar_beside(&config_path);
+    let ua = crate::cookies::user_agent_for(&config_path, &jar, url, now_epoch_seconds());
+    impersonate_target_for_ua(&ua).to_string()
+}
+
+/// Python `_IMPERSONATE_TARGETS` plus the pinned-session
+/// restriction: (default Chrome target, "safari184"), or
+/// the single pinned target when a session pins one.
+/// Targets are fingerprint profile keys, never
+/// User-Agent strings; the UA on the wire still comes
+/// from the user_agents policy.
+fn impersonation_target_list(pinned: &str) -> Vec<&'static str> {
+    if pinned.is_empty() {
+        vec!["", "safari184"]
+    } else if pinned == "firefox" {
+        vec!["firefox"]
+    } else {
+        vec!["chrome"]
+    }
+}
+
+/// One impersonated request. TRANSPORT PENDING (Audit 8
+/// B16): the research record in PARITY.md shows no
+/// compatible, supported Rust TLS-impersonation transport
+/// exists yet — the maintained candidates are async-only
+/// stacks whose stable releases are yanked or only
+/// release candidates (wreq/BoringSSL), or unpublished
+/// git-patched forks of the whole HTTP stack (impit) —
+/// so this seam resolves to no body, the same shape
+/// Python takes when every impersonated request failed.
+/// Certificate validation is never weakened here, and a
+/// future transport drops into this one function.
+fn impersonated_fetch(url: &str, target: &str, cookie_header: &str) -> Option<String> {
+    let _ = (url, target, cookie_header);
+    None
+}
+
+/// Python `_download_via_impersonation`: refetch the
+/// live page on a real-browser TLS/HTTP fingerprint,
+/// trying each target in order and trusting only a
+/// 200..400 non-interstitial body (the successful-body
+/// discipline lives in `impersonated_fetch`'s contract).
+pub fn fetch_via_impersonation(url: &str, cookie_header: &str) -> Option<String> {
+    let pinned = site_impersonation_target(url);
+    for target in impersonation_target_list(&pinned) {
+        if let Some(body) = impersonated_fetch(url, target, cookie_header)
+            && !body.trim().is_empty()
+            && !looks_gated(&body)
+        {
+            return Some(body);
+        }
+    }
+    None
+}
+
+/// Per-host browser-failure cooldown (Python
+/// `_BROWSER_GATE_FAILURES`): one failed launch covers
+/// the host for ten minutes.
+static BROWSER_GATE_FAILURES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, Instant>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+const BROWSER_GATE_FAILURE_COOLDOWN_SECONDS: u64 = 600;
+const BROWSER_GATE_FAILURE_CACHE_LIMIT: usize = 256;
+
+fn browser_gate_cooling_down(host: &str) -> bool {
+    BROWSER_GATE_FAILURES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(host)
+        .is_some_and(|at| at.elapsed().as_secs() < BROWSER_GATE_FAILURE_COOLDOWN_SECONDS)
+}
+
+fn record_browser_gate_failure(host: &str) {
+    let mut map = BROWSER_GATE_FAILURES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if map.len() >= BROWSER_GATE_FAILURE_CACHE_LIMIT {
+        map.clear();
+    }
+    map.insert(host.to_string(), Instant::now());
+}
+
+/// Python `_download_via_browser`: last-resort render of
+/// the page in the warm browser, at the extractor's
+/// timeout floor of 90 s, with failure memory on (the
+/// browser stage records its own per-URL cooldown; the
+/// per-host cooldown here is the extractor's own gate).
+/// Callers apply Python's remaining gates (gate seen, no
+/// stored clearance) before calling.
+fn fetch_via_browser(url: &str) -> Option<String> {
+    let host = host_of(url).to_lowercase();
+    if browser_gate_cooling_down(&host) {
+        return None;
+    }
+    let body = crate::browser::fetch_page_with_options(url, 90.0, true, "", None)
+        .ok()
+        .map(|response| response.html)
+        .filter(|html| !html.trim().is_empty() && !looks_gated(html));
+    if body.is_none() {
+        record_browser_gate_failure(&host);
+    }
+    body
 }
 
 // ---------------------------------------------------------------------------
@@ -4179,6 +4407,82 @@ pub(crate) fn reconstructed_article_html(url: &str) -> Option<(String, String)> 
         .or_else(|| crate::threads::lemmy_html(url))
 }
 
+/// Process one fetched page body the way the direct
+/// fetch is processed: Sky Flourish expansion, the
+/// extraction cascade, and multi-page following with the
+/// metered-preview notice (Python's extract_full_article
+/// main loop). Ok is an Article win; Err is the
+/// non-article outcome for the caller to remember.
+fn process_fetched_page(
+    html: &str,
+    url: &str,
+    feed_text: Option<&str>,
+    encoding_override: &str,
+    keep_alt: bool,
+    cookie_header: &str,
+) -> Result<ExtractOutcome, ExtractOutcome> {
+    let expanded = expand_sky_flourish_tables(html, url);
+    let outcome = extract_article_opts(&expanded, url, feed_text, keep_alt);
+    let ExtractOutcome::Article {
+        title,
+        text,
+        source,
+    } = outcome
+    else {
+        return Err(outcome);
+    };
+    let mut texts = vec![text];
+    let mut cur_html = expanded;
+    let mut cur_url = url.to_string();
+    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+    visited.insert(url.to_string());
+    for _ in 0..5 {
+        let Some(next) = find_next_page(&cur_html, &cur_url) else {
+            break;
+        };
+        if !visited.insert(next.clone()) {
+            break;
+        }
+        let Ok((bytes, ct)) = fetch_page_bytes(&next, cookie_header) else {
+            break;
+        };
+        let page_html = decode_bytes(&bytes, &ct, encoding_override);
+        let page_html = expand_sky_flourish_tables(&page_html, &next);
+        match extract_article_opts(&page_html, &next, None, keep_alt) {
+            ExtractOutcome::Article { text: t2, .. } if !t2.trim().is_empty() => {
+                texts.push(t2);
+                cur_html = page_html;
+                cur_url = next;
+            }
+            _ => break,
+        }
+    }
+    // Each page's extractor adds its own notice; keep one at the end of the merged story.
+    for text in &mut texts {
+        if let Some(body) = text.trim_end().strip_suffix(METERED_NOTICE) {
+            *text = body.trim_end().to_string();
+        }
+    }
+    let mut merged = if texts.len() > 1 {
+        merge_texts(&texts)
+    } else {
+        texts.into_iter().next().unwrap_or_default()
+    };
+    if source != "feed" && looks_like_metered_preview(html) {
+        merged = format!("{}\n\n{}", merged.trim_end(), metered_preview_notice());
+    }
+    Ok(ExtractOutcome::Article {
+        title,
+        text: merged,
+        source,
+    })
+}
+
+/// HTTP status codes Python's `_fetch_page` treats as a
+/// gate (`_GATE_STATUS_CODES`): 401 is deliberately absent
+/// — a genuine credential prompt a browser cannot satisfy.
+const GATE_STATUS_CODES: &[u16] = &[402, 403, 429, 451, 503];
+
 /// Fetch a page and extract its full text, running Python's
 /// fallback chain when the direct fetch is gated or empty.
 /// Returns the outcome plus the direct-fetch HTML when there
@@ -4342,73 +4646,66 @@ pub fn fetch_full_text_opts(
             return (outcome, Some(html));
         }
     }
-    let direct = fetch_page_bytes(url, cookie_header)
-        .map(|(bytes, ct)| decode_bytes(&bytes, &ct, encoding_override));
+    // The direct fetch is status-aware (Python `_fetch_page`
+    // inspects error-status bodies too): gate statuses and
+    // interstitial bodies mark the gate even when no usable
+    // page came back, which is what unlocks the gate-only
+    // fallback stages below.
+    let direct = (|| -> Result<(u16, String), String> {
+        let request = crate::http::status_agent().get(url);
+        let request = if cookie_header.is_empty() {
+            request
+        } else {
+            request.header("Cookie", cookie_header)
+        };
+        let mut response = request.call().map_err(|e| format!("fetch failed: {e}"))?;
+        let status = response.status().as_u16();
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let bytes = response
+            .body_mut()
+            .read_to_vec()
+            .map_err(|e| format!("read failed: {e}"))?;
+        Ok((
+            status,
+            decode_bytes(&bytes, &content_type, encoding_override),
+        ))
+    })();
     let mut direct_outcome: Option<ExtractOutcome> = None;
     let mut gate_seen = false;
-    if let Ok(html) = &direct {
-        first_html = Some(html.clone());
-        let expanded = expand_sky_flourish_tables(html, url);
-        let outcome = extract_article_opts(&expanded, url, feed_text, keep_alt);
-        gate_seen = matches!(outcome, ExtractOutcome::Gate { .. });
-        if let ExtractOutcome::Article {
-            title,
-            text,
-            source,
-        } = outcome
-        {
-            // Multi-page following + the metered-preview notice
-            // (Python's extract_full_article main loop).
-            let mut texts = vec![text];
-            let mut cur_html = expanded;
-            let mut cur_url = url.to_string();
-            let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
-            visited.insert(url.to_string());
-            for _ in 0..5 {
-                let Some(next) = find_next_page(&cur_html, &cur_url) else {
-                    break;
-                };
-                if !visited.insert(next.clone()) {
-                    break;
-                }
-                let Ok((bytes, ct)) = fetch_page_bytes(&next, cookie_header) else {
-                    break;
-                };
-                let page_html = decode_bytes(&bytes, &ct, encoding_override);
-                let page_html = expand_sky_flourish_tables(&page_html, &next);
-                match extract_article_opts(&page_html, &next, None, keep_alt) {
-                    ExtractOutcome::Article { text: t2, .. } if !t2.trim().is_empty() => {
-                        texts.push(t2);
-                        cur_html = page_html;
-                        cur_url = next;
+    let mut direct_error: Option<String> = None;
+    match &direct {
+        Ok((status, html)) => {
+            first_html = Some(html.clone());
+            if (200..400).contains(status) {
+                match process_fetched_page(
+                    html,
+                    url,
+                    feed_text,
+                    encoding_override,
+                    keep_alt,
+                    cookie_header,
+                ) {
+                    Ok(win) => return (win, first_html),
+                    Err(outcome) => {
+                        gate_seen = matches!(outcome, ExtractOutcome::Gate { .. });
+                        direct_outcome = Some(outcome);
                     }
-                    _ => break,
                 }
-            }
-            // Each page's extractor adds its own notice; keep one at the end of the merged story.
-            for text in &mut texts {
-                if let Some(body) = text.trim_end().strip_suffix(METERED_NOTICE) {
-                    *text = body.trim_end().to_string();
-                }
-            }
-            let mut merged = if texts.len() > 1 {
-                merge_texts(&texts)
             } else {
-                texts.into_iter().next().unwrap_or_default()
-            };
-            if source != "feed" && looks_like_metered_preview(html) {
-                merged = format!("{}\n\n{}", merged.trim_end(), metered_preview_notice());
+                gate_seen = GATE_STATUS_CODES.contains(status) || looks_gated(html);
+                direct_outcome = Some(ExtractOutcome::Gate {
+                    reason: format!("fetch failed: http status: {status}"),
+                });
             }
-            return (
-                ExtractOutcome::Article {
-                    title,
-                    text: merged,
-                    source,
-                },
-                first_html,
-            );
         }
-        direct_outcome = Some(outcome);
+        Err(error) => {
+            direct_error = Some(error.clone());
+        }
     }
     let relabel = |outcome: ExtractOutcome, label: &'static str| match outcome {
         ExtractOutcome::Article { title, text, .. } => ExtractOutcome::Article {
@@ -4418,12 +4715,65 @@ pub fn fetch_full_text_opts(
         },
         other => other,
     };
+    // Python `_try_fallbacks`, in order. The clearance
+    // refresh runs first when a gate was seen: a current
+    // cookie fetches the page outright, beating the whole
+    // chain below.
+    let mut dropped_stale_clearance = false;
+    if gate_seen {
+        if let Some(body) = clearance_recovery_body(url) {
+            first_html = Some(body.clone());
+            // The recovered body IS the fetch result
+            // (Python returns it from `_try_fallbacks`);
+            // its extraction outcome is the answer either
+            // way.
+            return (
+                match process_fetched_page(
+                    &body,
+                    url,
+                    feed_text,
+                    encoding_override,
+                    keep_alt,
+                    cookie_header,
+                ) {
+                    Ok(win) => win,
+                    Err(outcome) => outcome,
+                },
+                first_html,
+            );
+        }
+        if has_stored_clearance(url) {
+            let config_path = configured_config_path();
+            if let Some(config_path) = config_path {
+                dropped_stale_clearance = crate::cookies::forget_clearance_for(&config_path, url);
+            }
+        }
+    }
     // Sky via Google Translate (host-gated inside the fn).
     if let Some(html) = fetch_via_sky_translate(url) {
         let outcome = extract_article_opts(&html, url, feed_text, keep_alt);
         if matches!(outcome, ExtractOutcome::Article { .. }) {
             return (relabel(outcome, "sky"), first_html);
         }
+    }
+    // Impersonated refetch: skipped when the site's
+    // pinned session already forced that handshake on the
+    // direct fetch, unless stale clearance was just
+    // dropped (Python's rule). The transport is the
+    // pending B16 fidelity; the stage resolves to no body
+    // until it lands.
+    if (site_impersonation_target(url).is_empty() || dropped_stale_clearance)
+        && let Some(html) = fetch_via_impersonation(url, cookie_header)
+        && let Ok(win) = process_fetched_page(
+            &html,
+            url,
+            feed_text,
+            encoding_override,
+            keep_alt,
+            cookie_header,
+        )
+    {
+        return (win, first_html);
     }
     // Jina as text, only when a gate was seen.
     if gate_seen
@@ -4450,12 +4800,35 @@ pub fn fetch_full_text_opts(
             first_html,
         );
     }
-    // Wayback (last resort).
+    // Wayback (always tried).
     if let Some(html) = fetch_via_wayback(url, cookie_header) {
         let outcome = extract_article_opts(&html, url, feed_text, keep_alt);
         if matches!(outcome, ExtractOutcome::Article { .. }) {
             return (relabel(outcome, "wayback"), first_html);
         }
+    }
+    // The warm browser: genuinely last, only when a gate
+    // was actually seen and the site holds no stored
+    // clearance (a session the browser itself won would
+    // have been tried by the clearance stages already).
+    if gate_seen
+        && !has_stored_clearance(url)
+        && let Some(html) = fetch_via_browser(url)
+    {
+        return (
+            match process_fetched_page(
+                &html,
+                url,
+                feed_text,
+                encoding_override,
+                keep_alt,
+                cookie_header,
+            ) {
+                Ok(win) => relabel(win, "browser"),
+                Err(outcome) => outcome,
+            },
+            first_html,
+        );
     }
     // Nothing worked: report the direct outcome (Gate/Empty)
     // or the fetch failure as a Gate with its reason.
@@ -4470,7 +4843,7 @@ pub fn fetch_full_text_opts(
         Some(outcome) => (outcome, first_html),
         None => (
             ExtractOutcome::Gate {
-                reason: direct.err().unwrap_or_else(|| "fetch failed".to_string()),
+                reason: direct_error.unwrap_or_else(|| "fetch failed".to_string()),
             },
             first_html,
         ),

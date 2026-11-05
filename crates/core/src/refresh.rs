@@ -365,54 +365,71 @@ pub fn refresh_feed_with_options(
         youtube_history_backfill(db, feed, cid, global_delete_behavior, retention_cutoff);
     }
     let stored = stored_body_digest(&feed.id);
-    let (parsed, body_digest) =
-        match crate::feeds::fetch_feed_document(db, &feed.url, force, stored.as_deref()) {
-            Ok(crate::feeds::FeedFetch::NotModified) => {
+    // The feed's configured proxy reaches the browser
+    // recovery stage (Python local.py passes
+    // feed_settings["proxy"] to the browser fallback).
+    let feed_proxy = db
+        .feed_settings(&feed.id)
+        .ok()
+        .and_then(|settings| {
+            settings
+                .get("proxy")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+        })
+        .unwrap_or_default();
+    let (parsed, body_digest) = match crate::feeds::fetch_feed_document_cancellable(
+        db,
+        &feed.url,
+        force,
+        stored.as_deref(),
+        Some(cancel),
+        &feed_proxy,
+    ) {
+        Ok(crate::feeds::FeedFetch::NotModified) => {
+            return Ok(WorkerRefresh {
+                outcome: StoreOutcome::default(),
+                not_modified: true,
+            });
+        }
+        Ok(crate::feeds::FeedFetch::Fetched {
+            parsed,
+            body_digest,
+        }) => (parsed, body_digest),
+        Err(e) => {
+            // YouTube channel feeds answer 404/500 at random for
+            // some channels (issue #107): fall back to listing the
+            // uploads playlist through yt-dlp. An empty listing is
+            // not a recovery — Python re-raises the RSS error.
+            if let Some(cid) = &channel_id {
+                let (title, items) =
+                    crate::sources::fetch_youtube_channel_items(cid, 30).map_err(|_| e.clone())?;
+                if items.is_empty() {
+                    return Err(e);
+                }
+                if cancelled(cancel) {
+                    return Err(REFRESH_CANCELLED.to_string());
+                }
+                let parsed = crate::feeds::ParsedFeed {
+                    title,
+                    entries: crate::sources::items_to_entries(shape_stable_ids(db, feed, items)),
+                };
+                let outcome = store_parsed_with_retention(
+                    db,
+                    feed,
+                    &parsed,
+                    global_delete_behavior,
+                    retention_cutoff,
+                )?;
+                forget_body_digest(&feed.id);
                 return Ok(WorkerRefresh {
-                    outcome: StoreOutcome::default(),
-                    not_modified: true,
+                    outcome,
+                    not_modified: false,
                 });
             }
-            Ok(crate::feeds::FeedFetch::Fetched {
-                parsed,
-                body_digest,
-            }) => (parsed, body_digest),
-            Err(e) => {
-                // YouTube channel feeds answer 404/500 at random for
-                // some channels (issue #107): fall back to listing the
-                // uploads playlist through yt-dlp. An empty listing is
-                // not a recovery — Python re-raises the RSS error.
-                if let Some(cid) = &channel_id {
-                    let (title, items) = crate::sources::fetch_youtube_channel_items(cid, 30)
-                        .map_err(|_| e.clone())?;
-                    if items.is_empty() {
-                        return Err(e);
-                    }
-                    if cancelled(cancel) {
-                        return Err(REFRESH_CANCELLED.to_string());
-                    }
-                    let parsed = crate::feeds::ParsedFeed {
-                        title,
-                        entries: crate::sources::items_to_entries(shape_stable_ids(
-                            db, feed, items,
-                        )),
-                    };
-                    let outcome = store_parsed_with_retention(
-                        db,
-                        feed,
-                        &parsed,
-                        global_delete_behavior,
-                        retention_cutoff,
-                    )?;
-                    forget_body_digest(&feed.id);
-                    return Ok(WorkerRefresh {
-                        outcome,
-                        not_modified: false,
-                    });
-                }
-                return Err(e);
-            }
-        };
+            return Err(e);
+        }
+    };
     if cancelled(cancel) {
         return Err(REFRESH_CANCELLED.to_string());
     }

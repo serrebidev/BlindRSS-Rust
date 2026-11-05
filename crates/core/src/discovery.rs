@@ -396,6 +396,34 @@ fn resolve_source_listing(listing_url: &str) -> Result<(String, crate::feeds::Pa
     ))
 }
 
+/// Page HTML for discovery, with Python's browser
+/// escalation (`core/discovery.py::detect_page_feeds`,
+/// Audit 8 B01): the plain fetch first; when it fails or
+/// the body it returns is a challenge page, one browser
+/// fetch — only when the fallback is enabled in Settings.
+/// A failed plain fetch with a failed browser fetch
+/// reports the plain error; a challenge shell the browser
+/// could not clear is still scanned as a page (Python
+/// proceeds with it and finds no feeds). The impersonated
+/// discovery retry Python runs between the two is part of
+/// the pending B16 transport (see PARITY.md).
+fn discovery_page_html(url: &str) -> Result<String, String> {
+    match crate::extract::fetch_html(url) {
+        Ok(html) if !crate::browser::is_challenge_page(&html) => Ok(html),
+        Ok(html) => Ok(browser_page_html(url).unwrap_or(html)),
+        Err(error) => browser_page_html(url).map_err(|_| error),
+    }
+}
+
+fn browser_page_html(url: &str) -> Result<String, String> {
+    if !crate::browser::fallback_enabled() {
+        return Err("browser fallback is disabled".to_string());
+    }
+    let timeout = crate::browser::fallback_timeout_seconds();
+    crate::browser::fetch_page_with_options(url, timeout, false, "", None)
+        .map(|response| response.html)
+}
+
 /// Find all advertised feeds, falling back to common paths when necessary.
 pub fn discover_feed_urls(url: &str) -> Result<Vec<String>, String> {
     if let Some(feed_url) =
@@ -409,7 +437,7 @@ pub fn discover_feed_urls(url: &str) -> Result<Vec<String>, String> {
     if crate::feeds::fetch_and_parse(url).is_ok() {
         return Ok(vec![url.trim().to_string()]);
     }
-    let html = crate::extract::fetch_html(url)?;
+    let html = discovery_page_html(url)?;
     let advertised = discover_in_html(&html, url);
     if !advertised.is_empty() {
         return Ok(advertised);
@@ -448,7 +476,7 @@ pub fn resolve_subscribe_url(url: &str) -> Result<(String, crate::feeds::ParsedF
     if let Ok(parsed) = crate::feeds::fetch_and_parse(url) {
         return Ok((url.trim().to_string(), parsed));
     }
-    let html = crate::extract::fetch_html(url)
+    let html = discovery_page_html(url)
         .map_err(|e| format!("no feed at URL and page fetch failed: {e}"))?;
     for candidate in discover_in_html(&html, url) {
         if let Ok(parsed) = crate::feeds::fetch_and_parse(&candidate) {

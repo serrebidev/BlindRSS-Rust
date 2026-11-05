@@ -4985,3 +4985,263 @@ joins the standing acceptance list.
 clean onto main over the v0.1.57 release tree. Merged gate:
 fmt clean, clippy clean (workspace and core windows-gnu),
 786 passed / 0 failed, build OK.
+
+## Audit 8 Task 24 resolution — reachable browser/challenge transport (B01, B02, B15, B16) (2026-11-04)
+
+**B01 (P1) — the browser fallback has production callers in
+all three paths now.** `browser.rs` was rewritten from a
+per-fetch cold launch with no callers into Python
+`core/browser_feed.py`'s shape (warm session, below), and
+each Python call site is wired:
+
+- *Refresh* (`feeds.rs::fetch_feed_document_cancellable`,
+  called by `refresh.rs` with the worker's cancel flag and
+  the feed's `feed_settings["proxy"]`): the plain fetch's
+  failure modes route through the ported qualification
+  deciders in `browser.rs` (Python
+  `_browser_fallback_error_qualifies` /
+  `_browser_fallback_response_qualifies` /
+  `_response_looks_cloudflare_challenge`). A terminal fetch
+  error qualifies when the status it carries (ureq's
+  rendered `http status: NNN`, the counterpart of Python's
+  `error.response.status_code`) is in {401, 403, 429, 503}
+  or >= 520, or when the error text carries a
+  connection-reset marker; timeouts and name-resolution
+  failures never qualify. A fetched body that fails feed
+  parsing qualifies on its status, a `Cf-Mitigated:
+  challenge` header, the Cloudflare challenge body shape,
+  or a challenge page. Qualification also requires the
+  Settings gate (`browser_feed_fallback_enabled`, default
+  True) and an un-cancelled refresh, and fires at most once
+  per feed per refresh (the error path and the parse path
+  are mutually exclusive in one call). A browser-recovered
+  document REPLACES the response with Python's semantics:
+  parsed entries flow into the normal store, the HTTP
+  cache entry is rewritten with its validators cleared,
+  and the returned `body_digest` is empty so the digest is
+  never recorded.
+- *Discovery* (`discovery.rs::discovery_page_html`, used
+  by `discover_feed_urls` and `resolve_subscribe_url`):
+  the plain page fetch escalates once to the browser when
+  it fails or returns a challenge page, gated on the same
+  Settings flag and the configured
+  `browser_feed_fallback_timeout_seconds`, with failure
+  memory OFF (Python's `detect_page_feeds` passes
+  `remember_failures=False`; one-shot detection must
+  always retry). A challenge shell the browser could not
+  clear is still scanned as a page, as in Python.
+- *Extraction* (`extract.rs::fetch_full_text_opts`): the
+  chain now runs Python `_try_fallbacks`' full order. The
+  direct fetch became status-aware (Python `_fetch_page`
+  inspects error-status bodies too), so a gate status
+  (402/403/429/451/503 — 401 deliberately absent) or an
+  interstitial body sets `gate_seen` even when no page
+  came back; previously only an extraction Gate outcome
+  could. On a gate: (1) the clearance-refresh retry —
+  Task 25 deviation (5) is CLOSED here: `cookies::
+  refresh_clearance_from_browsers` runs first, a changed
+  clearance refetches the URL once with the fresh stored
+  identity (site headers + client hints, Python's HTML
+  accept headers), and a recovered body becomes the fetch
+  result outright; (2) unrecovered stored clearance is
+  forgotten via `cookies::forget_clearance_for` and the
+  forget result arms the impersonation stage; (3) Sky,
+  impersonation, Jina (gate-only), Smry and Wayback run
+  in Python's order (impersonation below); (4) the warm
+  browser runs genuinely last — gate seen, no stored
+  clearance, per-host failure cooldown (600 s, 256-entry
+  clear-all cap, Python `_BROWSER_GATE_FAILURES`) — at the
+  extractor's own 90 s floor with failure memory on.
+  Every recovered/fallback body is re-checked against the
+  gate markers before it is trusted, and a stage's body
+  only ever replaces the direct outcome through the same
+  `process_fetched_page` path (cascade + multi-page
+  following) the direct fetch uses, so browser-recovered
+  content can never displace fuller content already in
+  hand: the direct Article still returns before any
+  fallback runs. The app now calls `browser::configure`
+  and `extract::configure_cookies` from
+  `apply_http_config`, and `browser::shutdown` on exit.
+
+**B02 (P1) — CAPTCHA solving carries the full challenge
+data and delivers through the callback.** `captcha.rs`
+was rewritten to Python `core/captcha_solver.py`'s
+contract: the submission carries `data` (cData),
+`pagedata` (chlPageData), `action` and `userAgent`
+whenever the intercepted `turnstile.render` parameters
+provide them (new `ChallengeParams`); the deadline floor
+is `max(15, timeout_s)`; poll transport errors are logged
+and polling CONTINUES to the deadline (the previous port
+returned None on the first poll error); an empty solved
+token fails closed; cancellation is honoured in 0.25 s
+sleep slices. The browser stage's tier-4
+(`browser.rs::solve_with_service`) installs Python's
+`_TURNSTILE_HOOK_JS` verbatim via
+`Page.addScriptToEvaluateOnNewDocument` before reloading
+the challenge page, waits up to 25 s for the hook to
+capture the parameters, solves with the remaining budget,
+and delivers the token by invoking
+`window.__blindrssTurnstileCallback` — then removes the
+hook script so the warm session is not left with a
+stalled widget. Authorization is structural:
+`solve_turnstile` returns None before any request is
+built when the solver is disabled, has no API key, or
+names an unknown provider, and the fixture tests assert
+ZERO solver requests in that state (counting loopback
+mock). The API key, challenge parameters and token are
+never logged.
+
+**B15 — browser session lifecycle is Python's.**
+One warm CDP session is kept across fetches and reused
+while its options match (the proxy is the only varying
+member; the profile directory is the persistent
+`feed_browser_profile`, images always blocked); an idle
+reaper closes it after 120 s (15 s interval); a warm
+session that fails on use is closed and the fetch
+retried once from scratch; the per-URL negative-result
+cooldown (6 h, 512-entry cap, expired pruned then
+clear-all) is recorded and honoured ONLY on the
+remembering paths (feed refresh, extraction), never for
+one-shot discovery, and never for a cancelled fetch or a
+runtime-unavailable failure; runtime failures (no
+installed browser, unwritable profile directories) start
+the separate 5-minute runtime-unavailable cooldown.
+Fetches serialize on one lock acquired in cancel-aware
+slices; cancellation is checked before launch, during
+launch, and through the settle, and never leaves an
+orphan: the session's child is killed on close, on
+options-mismatch replacement, on retry, and on
+`shutdown()` (now called by the app on exit). Proxy
+support reaches the launch as `--proxy-server`. The
+settle loop is Python `_settle_page`'s: 0.35 s polls, a
+document is usable at >= 2048 chars and not a challenge
+page (feed fetches: structural feed validation instead),
+and a Turnstile click (the CDP counterpart of
+SeleniumBase's `solve_captcha` — locate the challenge
+iframe, click its checkbox through trusted
+`Input.dispatchMouseEvent`s) is retried on the 2 s / 3 s
+cadence while a challenge is on screen. After a settle
+that lands on an uncleared challenge, the escalation
+runs on the remaining budget (min(max(timeout, 20), 90)
+s, or 240 s with a solver configured, its auto-click
+phase capped at 45 s so the paid solve fits) and ends in
+the tier-4 solver flow above. After any success the
+session's cookies for the final URL and the browser's
+real `navigator.userAgent` are harvested into
+`cookies::record_browser_session` under Task 25's
+consent model (clearance-only). This supersedes the
+v0.1.23 residual-audit statement that the warm-browser
+stage "is a Python library with no Rust counterpart
+short of bundling Python": the CDP-driven session is
+that counterpart. Tests are fixture-only: a local fake
+browser (`crates/core/tests/fixtures/fake_browser.py`,
+driven through the `BLINDRSS_BROWSER` pointer) speaks
+enough CDP to prove warm reuse (one launch across two
+fetches), proxy relaunch, click-to-clear, cooldown
+discipline, shutdown killing the process, the tier-4
+flow end to end, and all three production wirings
+(refresh recovery + disabled gate, discovery escalation,
+extraction clearance recovery against a seeded Firefox
+profile). The one live-Chromium test stays `#[ignore]`d.
+
+**B16 — TLS impersonation: investigated under the full
+research protocol; transport fidelity PENDING, stage
+wired.** Evidence (2026-11-04): GitHub by stars —
+`0x676e67/wreq` (1094 stars, pushed 2026-11-05,
+BoringSSL, Apache-2.0), `apify/impit` (632, pushed
+2026-11-04, Apache-2.0), `deedy5/primp` (622, pushed
+2026-09-13, a wrapper over the wreq stack). GitHub by
+most recent — the same projects plus small forks; no
+other maintained candidate. crates.io state is the
+blocker: wreq's stable 5.2.0/5.3.0 are YANKED, the
+resolvable lines are 6.0.0-rc.31 and a renumbered
+0.16.x, and wreq-util is likewise rc-only (3.0.0-rc.14);
+impit's crates.io crate is only 0.1.0 (2025-01) while
+its current impersonation architecture exists solely as
+git-pinned `[patch.crates-io]` forks of rustls, h2,
+reqwest, hyper-util and tower-http — adopting either
+means pinning a release pipeline to yanked/RC releases
+or vendored git forks of the whole HTTP stack, against
+this repo's dependency discipline. Codeberg search
+found only curl-impersonate and wreq/rnet mirrors;
+GitLab search found no Rust impersonation client (one
+curl_cffi mirror). A bounded spike (scratch crate,
+`wreq = 6.0.0-rc.31` + `wreq-util = 3.0.0-rc.14`,
+2026-11-04) FAILED to build on this box in both of its
+runs: the first died after ~4.5 minutes inside
+`boring-sys2` 5.1.2's build script (bindgen could not be
+executed; "Failed to find OpenSSL compatibility
+layer"), and a re-run died in the same toolchain area
+(`bindgen`'s archive build, `zstd-sys`'s build command)
+when the 512 MB tmpfs scratch `/tmp` filled — and a
+successful spike would still leave every release leg
+compiling BoringSSL plus a tokio runtime island inside
+the blocking core. Both
+credible transports are also async-only, while the
+extraction workers are blocking ureq callers. The stage
+itself IS wired with Python's semantics, so a future
+transport drops into one function
+(`extract.rs::impersonated_fetch`): target selection is
+ported (`_IMPERSONATE_TARGETS` = default Chrome target
+then `safari184`; a pinned-UA session restricts the list
+to its single matching target via the ported
+`impersonate_target_for_ua`), the stage is skipped when
+the site's session already forced that handshake on the
+direct fetch unless stale clearance was just dropped,
+and its position (after Sky, before Jina) and
+interstitial re-check match `_try_fallbacks`. Targets
+are fingerprint profile keys, never User-Agent strings;
+the UA on the wire still comes only from
+`user_agents`/`http`. Certificate validation is
+untouched everywhere. No live-host parity is claimed:
+like Python on a host without curl_cffi taking its
+degraded path, the stage currently resolves to no body
+and the chain proceeds.
+
+**Deviations (stated plainly).** (1) Python's tier-3
+escalation runs in a SECOND engine (pydoll, a
+WebDriver-free CDP client with its own profile); the
+port has one CDP engine, so the escalation's clicks and
+the solver tier run on the warm session itself, and
+pydoll's separate anti-detection fingerprint is not
+reproduced. (2) Refresh error qualification: Python's
+sub-case where a non-qualifying status's attached
+response itself qualifies has no counterpart — ureq
+does not expose error bodies. (3) Python refresh call
+site (d) (a parsed document with 0 entries that is
+bozo or not feed-like) has no feed-rs signal to key on;
+the port escalates on parse failures and challenge
+shapes, which cover the observed cases. (4) Python
+downloads Chrome-for-Testing when no Chrome is
+installed (SeleniumBase); the port launches only an
+installed browser (now also selectable via the
+`BLINDRSS_BROWSER` pointer) and takes the
+runtime-unavailable cooldown otherwise — no browser
+downloading. (5) The harvest reads cookies for the
+final URL (`Network.getCookies` with `urls`) rather
+than Python's all-cookies read; `record_browser_session`'s
+host filtering makes the stored result the same under
+the consent model. (6) Bloomberg pages: Python fetches
+them impersonation-first; that ordering awaits the same
+pending B16 transport, and the cascade's existing
+Bloomberg handling is unchanged.
+
+**Adjacent finds (not fixed, out of scope).** Python
+refresh also has an HTTP-level retry layer the port
+does not mirror (`_response_looks_blocked` driving
+Cloudflare/WordPress retries in `providers/local.py`);
+it is refresh retry policy, not the browser/challenge
+transport of this task, and is left for the
+reconciliation pass. Task 25's adjacent find (YouTube
+`ST-` token pruning in `chromium::merge_into_jar`)
+remains open, likewise for reconciliation.
+
+**Task 24 gate (2026-11-04):** fmt clean, clippy clean
+(workspace `--all-targets` and core `x86_64-pc-windows-gnu`,
+`-D warnings`), 803 passed / 0 failed / 2 ignored (786
+baseline + 17 new: 6 captcha unit tests, 1 browser tier-4
+unit test, 10 browser_parity additions incl. the
+qualification deciders and the three production wirings),
+`cargo build -p blindrss` OK. Owner screen-reader
+acceptance of the browser-recovery behaviour joins the
+standing acceptance list.

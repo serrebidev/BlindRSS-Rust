@@ -240,6 +240,21 @@ Python `core/casting.py`, in that order.
   import happens only through the explicit user action. Chromium v20
   app-bound cookies need the privileged component and remain a
   documented non-port in PARITY.md.
+- `browser.rs` / `captcha.rs`: the warm-CDP Chromium fallback
+  (Audit 8 Task 24), wired into refresh (`feeds.rs`), discovery
+  and extraction (`extract.rs`) behind the
+  `browser_feed_fallback_enabled` Settings gate and Python's
+  qualification deciders; one warm session, per-URL negative
+  cooldown only on the remembering paths, harvest through
+  `cookies::record_browser_session` (clearance-only consent).
+  `captcha.rs` is the configured-solver Turnstile client: full
+  challenge params, callback delivery, and zero requests when
+  the solver is disabled, keyless or unconfigured. Solver keys,
+  challenge params and tokens are never logged. Extraction's
+  TLS-impersonation stage is a seam in `extract.rs` pending a
+  supportable transport (B16, see PARITY.md) — certificate
+  validation is never weakened and wire UAs come only from
+  `user_agents`/`http`.
 - `rules.rs`: the Filter Rules pipeline port (ordered rules, pure
   evaluation, one DB-writing apply step; the abstract "delete" action
   resolves through the delete behaviour exactly as in `db.rs` above).
