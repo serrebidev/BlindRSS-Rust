@@ -6165,3 +6165,32 @@ assertion is load-sensitive by construction. Disposition:
 rerun once per the standing rule; if the same assertion
 fails again, harden the test to bound by poll-slice count
 rather than wall time.
+
+**CI fixes on the Task 29 tree (2026-11-05):** CI run
+42082869004 failed on Windows (MSVC clippy) and Ubuntu.
+(1) Windows: Task 29's S18 debug console declared
+`GetProcAddress` with `*mut c_void` signatures while
+hotkey.rs declares the same symbol `(usize, *const u8) ->
+usize` — a second declaration with a different signature
+is a hard error on Windows, invisible locally (the block
+is cfg(windows) and the app crate's windows-gnu check is
+blocked by the known build.rs issue; MSVC CI is the
+arbiter and caught it). main.rs now matches the house
+signature exactly and resolves through a transmute_copy
+helper like hotkey.rs. (2) Ubuntu: the captcha
+cancellation test failed a SECOND time (first on run
+42068872325, passed on its re-run; again here), which by
+the standing rule means root-cause, not another rerun.
+Root cause: `solve_at`'s ureq agent reads a proxy from
+the environment by default; whether NO_PROXY covers
+loopback depends on the machine — this VM's does, the
+Ubuntu runner's evidently does not reliably — so the
+loopback submit intermittently detoured through a proxy
+and blew the test's 10 s bound. Fix: loopback solver
+endpoints (both in/res) bypass the proxy explicitly
+(`is_loopback_url` + `.proxy(None)`, the browser.rs
+DevTools idiom); remote solver endpoints keep the
+environment proxy, as Python's requests calls do.
+Classification unit-tested; captcha suite green locally.
+This supersedes the earlier "one-off load flake"
+disposition for run 42068872325.

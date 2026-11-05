@@ -103,6 +103,30 @@ pub const PYTHON_CADENCE: PollCadence = PollCadence {
     interval_s: 5.0,
 };
 
+/// True when `url`'s host is loopback (localhost,
+/// 127.0.0.0/8, ::1). Used to keep local endpoints off
+/// environment proxies (see solve_at).
+fn is_loopback_url(url: &str) -> bool {
+    let authority = url
+        .split("://")
+        .nth(1)
+        .unwrap_or("")
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("");
+    let host_port = authority.rsplit('@').next().unwrap_or("");
+    let host = if let Some(bracketed) = host_port.strip_prefix('[') {
+        bracketed.split(']').next().unwrap_or("")
+    } else {
+        host_port.split(':').next().unwrap_or("")
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false)
+}
+
 /// The submit/poll core against explicit endpoints (the
 /// unit tests drive it against a loopback mock; production
 /// goes through `solve_turnstile`). Python's contract: a
@@ -129,12 +153,24 @@ fn solve_at(
     // Python's solver calls carry their own 30 s HTTP
     // timeout and read error bodies as JSON, so the agent
     // does not turn statuses into transport errors.
-    let agent: ureq::Agent = ureq::Agent::config_builder()
+    let mut agent_config = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(30)))
         .user_agent(crate::http::user_agent())
-        .http_status_as_error(false)
-        .build()
-        .into();
+        .http_status_as_error(false);
+    // Loopback endpoints are local services (a self-hosted
+    // solver, or the test fixture): an environment proxy
+    // must never sit between us and them — ureq's default
+    // config reads one from the environment, and whether
+    // NO_PROXY covers loopback depends on the machine (CI
+    // runners differ), which made submits intermittently
+    // take seconds-to-timeout through a proxy that has no
+    // business relaying 127.0.0.1. Remote solver endpoints
+    // keep the environment proxy, as Python's requests
+    // calls do.
+    if is_loopback_url(in_url) && is_loopback_url(res_url) {
+        agent_config = agent_config.proxy(None);
+    }
+    let agent: ureq::Agent = agent_config.build().into();
     let mut form: Vec<(&str, &str)> = vec![
         ("key", api_key),
         ("method", "turnstile"),
@@ -454,6 +490,17 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn loopback_endpoints_are_classified_for_proxy_bypass() {
+        assert!(is_loopback_url("http://127.0.0.1:8080/in.php"));
+        assert!(is_loopback_url("http://localhost:9000/res.php"));
+        assert!(is_loopback_url("http://[::1]:8080/in.php"));
+        assert!(is_loopback_url("http://127.5.0.9/in.php"));
+        assert!(!is_loopback_url("https://2captcha.com/in.php"));
+        assert!(!is_loopback_url("http://192.168.1.20:8080/in.php"));
+        assert!(!is_loopback_url("http://user@127.0.0.1.evil.test/in.php"));
     }
 
     #[test]

@@ -235,14 +235,17 @@ fn diag_init() {
 #[cfg(windows)]
 fn show_debug_console() {
     use std::os::raw::{c_char, c_void};
+    // Signatures match the house declarations in hotkey.rs
+    // exactly: a second declaration of the same symbol with
+    // a different signature is a hard error on Windows.
     #[link(name = "kernel32")]
     unsafe extern "system" {
-        fn LoadLibraryA(name: *const c_char) -> *mut c_void;
-        fn GetProcAddress(module: *mut c_void, name: *const c_char) -> *mut c_void;
+        fn LoadLibraryA(name: *const u8) -> usize;
+        fn GetProcAddress(module: usize, name: *const u8) -> usize;
     }
     unsafe {
-        let module = LoadLibraryA(c"kernel32.dll".as_ptr());
-        if module.is_null() {
+        let module = LoadLibraryA(c"kernel32.dll".as_ptr() as *const u8);
+        if module == 0 {
             return;
         }
         type GetConsoleWindowFn = unsafe extern "system" fn() -> *mut c_void;
@@ -257,12 +260,18 @@ fn show_debug_console() {
             *mut c_void,
         ) -> *mut c_void;
         type SetStdHandleFn = unsafe extern "system" fn(u32, *mut c_void) -> i32;
-        let resolve = |name: &std::ffi::CStr| GetProcAddress(module, name.as_ptr());
-        let get_console: Option<GetConsoleWindowFn> =
-            std::mem::transmute(resolve(c"GetConsoleWindow"));
-        let alloc: Option<AllocConsoleFn> = std::mem::transmute(resolve(c"AllocConsole"));
-        let create_file: Option<CreateFileFn> = std::mem::transmute(resolve(c"CreateFileA"));
-        let set_std: Option<SetStdHandleFn> = std::mem::transmute(resolve(c"SetStdHandle"));
+        let resolve = |name: &std::ffi::CStr| GetProcAddress(module, name.as_ptr() as *const u8);
+        fn as_fn<T>(addr: usize) -> Option<T> {
+            if addr == 0 {
+                None
+            } else {
+                Some(unsafe { std::mem::transmute_copy(&addr) })
+            }
+        }
+        let get_console: Option<GetConsoleWindowFn> = as_fn(resolve(c"GetConsoleWindow"));
+        let alloc: Option<AllocConsoleFn> = as_fn(resolve(c"AllocConsole"));
+        let create_file: Option<CreateFileFn> = as_fn(resolve(c"CreateFileA"));
+        let set_std: Option<SetStdHandleFn> = as_fn(resolve(c"SetStdHandle"));
         let (Some(get_console), Some(alloc), Some(create_file), Some(set_std)) =
             (get_console, alloc, create_file, set_std)
         else {
