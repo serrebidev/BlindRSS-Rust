@@ -6147,3 +6147,21 @@ throughout ("Find in guide", "Guide contents", "User guide text",
 "Guide language", "Feeds with errors", "Error details", "Saved
 searches", "Current User-Agent", "Groups.io API key", "GitHub
 personal access token"), no instructional descriptions on controls.
+
+**Task 29 integration gate (2026-11-05):** cherry-picked
+clean onto main. Merged gate: fmt clean, clippy clean
+(workspace and core windows-gnu), 911 passed / 0 failed,
+build OK.
+
+**Flake note (2026-11-05):** CI run 42068872325 (the Task 28
+tree) failed once on Ubuntu in
+`captcha::tests::cancellation_stops_the_solve` — the test's
+10 s wall-clock bound on a pre-cancelled solve was exceeded
+under runner load (the cancellation itself worked: no poll
+request was asserted sent, and the re-run passed; run
+finished fully green on all three platforms after
+rerun-failed-jobs, macOS included). First occurrence; the
+assertion is load-sensitive by construction. Disposition:
+rerun once per the standing rule; if the same assertion
+fails again, harden the test to bound by poll-slice count
+rather than wall time.
