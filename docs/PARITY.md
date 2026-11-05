@@ -6388,3 +6388,8 @@ preview entity decoder never ran for text without literal
 angle brackets (Python's queue-side preview always decodes),
 and an unterminated `<` in preview text swallowed the rest
 of the string instead of staying literal.
+
+**Task 30 integration gate (2026-11-05):** cherry-picked
+onto the CI-fix tree; PARITY append conflict resolved by
+union. Merged gate: fmt clean, clippy clean (workspace
+and core windows-gnu), 936 passed / 0 failed, build OK.
