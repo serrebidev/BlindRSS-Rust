@@ -5245,3 +5245,8 @@ qualification deciders and the three production wirings),
 `cargo build -p blindrss` OK. Owner screen-reader
 acceptance of the browser-recovery behaviour joins the
 standing acceptance list.
+
+**Task 24 integration gate (2026-11-04):** cherry-picked
+clean onto main. Merged gate: fmt clean, clippy clean
+(workspace and core windows-gnu), 803 passed / 0 failed,
+build OK.
