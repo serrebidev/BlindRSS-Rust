@@ -4980,3 +4980,8 @@ hygiene); `chromium::merge_into_jar` does not. Not among Task
 4 jar regressions, 11 in `audit8_task25_slice`), build OK.
 Owner screen-reader acceptance of the appended dialog section
 joins the standing acceptance list.
+
+**Task 25 integration gate (2026-11-04):** cherry-picked
+clean onto main over the v0.1.57 release tree. Merged gate:
+fmt clean, clippy clean (workspace and core windows-gnu),
+786 passed / 0 failed, build OK.
