@@ -12,6 +12,10 @@
 use blindrss_core::cast::{
     CastClock, CastDevice, CastQueue, CastQueueItem, CastStatus, QueueAdvance,
 };
+use blindrss_core::castmedia::{
+    ChromecastLoadChain, LiveWatchdog, WatchdogAction, prepare_roku_target, prepare_upnp_target,
+    probe_media,
+};
 use blindrss_core::castsession::CastSession;
 use blindrss_core::castupnp::{self, KodiAuth};
 use blindrss_core::config::Config;
@@ -183,11 +187,90 @@ struct Worker {
     device: CastDevice,
     auth: KodiAuth,
     cast: Option<CastSession>,
+    /// The source URL whose HLS relay the current item plays
+    /// through, when it plays through one (C01): the relay is
+    /// stopped when the item is replaced or the cast ends.
+    relay_source: Option<String>,
+    /// Live-stall watchdog state (C01) and the live load it
+    /// would reload, Chromecast only.
+    watchdog: LiveWatchdog,
+    live_load: Option<(String, String, &'static str, String)>,
+}
+
+/// Percent-decode a proxy target the way `proxy::url_decode`
+/// does (`+` is a space, `%XX` a byte).
+fn url_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => {
+                let hex = |b: u8| -> Option<u8> {
+                    match b {
+                        b'0'..=b'9' => Some(b - b'0'),
+                        b'a'..=b'f' => Some(b - b'a' + 10),
+                        b'A'..=b'F' => Some(b - b'A' + 10),
+                        _ => None,
+                    }
+                };
+                match (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                    (Some(h), Some(l)) => {
+                        out.push(h * 16 + l);
+                        i += 3;
+                    }
+                    _ => {
+                        out.push(bytes[i]);
+                        i += 1;
+                    }
+                }
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// The original target behind a proxy URL (`/stream?url=`,
+/// `/file?path=`), when this item came through the local proxy.
+fn proxy_target(url: &str) -> Option<String> {
+    for key in ["?url=", "?path="] {
+        if let Some((_, rest)) = url.split_once(key) {
+            let encoded = rest.split('&').next().unwrap_or(rest);
+            return Some(url_decode(encoded));
+        }
+    }
+    None
+}
+
+/// Start the HLS relay for a cast load (Caster's `_start_relay`
+/// through the proxy's relay surface).
+fn start_relay(source: &str, live: bool) -> Result<String, String> {
+    blindrss_core::proxy::start_hls_relay(source, live)
 }
 
 impl Worker {
+    /// Stop the current item's HLS relay, if it has one.
+    fn stop_relay(&mut self) {
+        if let Some(source) = self.relay_source.take() {
+            blindrss_core::proxy::stop_hls_relay(&source);
+        }
+    }
+
     /// Load `item` from `start` on the device, returning the
-    /// engine that now owns it.
+    /// engine that now owns it. Every protocol that Caster
+    /// probes is probed here first (C01): the item's claimed
+    /// MIME is never trusted — bytes, playlist headers and
+    /// liveness decide the load, TS goes through the HLS relay,
+    /// and a Chromecast load the receiver rejects climbs
+    /// Caster's retry ladder before it may fail.
     fn start_item(
         &mut self,
         item: &CastQueueItem,
@@ -195,6 +278,9 @@ impl Worker {
         volume: f64,
         updates: &mpsc::Sender<Result<String, String>>,
     ) -> Result<Engine, String> {
+        self.stop_relay();
+        self.watchdog.disarm();
+        self.live_load = None;
         match self.device.kind.as_str() {
             "chromecast" => {
                 if self.cast.is_none() {
@@ -202,11 +288,64 @@ impl Worker {
                     session.launch_default_receiver()?;
                     self.cast = Some(session);
                 }
+                let probe = probe_media(&item.url);
+                let native = if probe.is_ts() && probe.is_live {
+                    blindrss_core::castmedia::native_hls_url(&item.url).or_else(|| {
+                        proxy_target(&item.url)
+                            .and_then(|t| blindrss_core::castmedia::native_hls_url(&t))
+                    })
+                } else {
+                    None
+                };
+                let mut chain =
+                    ChromecastLoadChain::new(&item.url, probe.clone(), native, start_relay);
                 let session = self.cast.as_mut().expect("connected above");
-                session.load_media_at(&item.url, &item.mime, &item.title, start)?;
-                // The session stays in self.cast; the marker
-                // variant carries no payload for Chromecast.
-                Ok(Engine::Upnp)
+                let mut attempt = chain.first().ok_or_else(|| {
+                    format!("{} did not start playing (no answer)", self.device.name)
+                })?;
+                loop {
+                    let previous = session.media_session_id;
+                    let live_relay =
+                        attempt.relay_source.is_some() && attempt.stream_type == "LIVE";
+                    session.load_media_prepared(
+                        &attempt.url,
+                        &attempt.mime,
+                        &item.title,
+                        attempt.stream_type,
+                        start,
+                        live_relay,
+                    )?;
+                    match session.await_playing(previous) {
+                        blindrss_core::castsession::SettleOutcome::Settled => {
+                            if attempt.stream_type == "BUFFERED" {
+                                session.correct_resume_seek(start);
+                            }
+                            self.relay_source = attempt.relay_source.clone();
+                            if probe.is_live {
+                                self.live_load = Some((
+                                    attempt.url.clone(),
+                                    attempt.mime.clone(),
+                                    attempt.stream_type,
+                                    item.title.clone(),
+                                ));
+                                self.watchdog.arm(true);
+                            }
+                            return Ok(Engine::Upnp);
+                        }
+                        blindrss_core::castsession::SettleOutcome::Failed(reason) => {
+                            match chain.advance() {
+                                Some(next) => attempt = next,
+                                None => {
+                                    return Err(format!(
+                                        "{} did not start playing ({})",
+                                        self.device.name,
+                                        reason.as_deref().unwrap_or("no answer")
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
             }
             "airplay" => Ok(Engine::Raop(start_raop(
                 &self.device,
@@ -215,6 +354,53 @@ impl Worker {
                 volume,
                 updates,
             )?)),
+            "dlna" => {
+                let probe = probe_media(&item.url);
+                let (play_url, mime, relay) = prepare_upnp_target(&item.url, &probe, &start_relay)?;
+                castupnp::play_at(
+                    &self.device,
+                    &play_url,
+                    &item.title,
+                    &mime,
+                    start,
+                    &self.auth,
+                )?;
+                self.relay_source = relay;
+                Ok(Engine::Upnp)
+            }
+            "roku" => {
+                let probe = probe_media(&item.url);
+                let (play_url, mime, relay) = prepare_roku_target(&item.url, &probe, &start_relay)?;
+                castupnp::play_at(
+                    &self.device,
+                    &play_url,
+                    &item.title,
+                    &mime,
+                    start,
+                    &self.auth,
+                )?;
+                self.relay_source = relay;
+                Ok(Engine::Upnp)
+            }
+            "sonos" => {
+                // Python `_play_sonos`: the probed type when the
+                // probe says audio, else audio/mpeg.
+                let probe = probe_media(&item.url);
+                let mime = if probe.is_audio == Some(true) {
+                    probe.mime.clone()
+                } else {
+                    "audio/mpeg".to_string()
+                };
+                castupnp::play_at(
+                    &self.device,
+                    &item.url,
+                    &item.title,
+                    &mime,
+                    start,
+                    &self.auth,
+                )?;
+                Ok(Engine::Upnp)
+            }
             _ => {
                 castupnp::play_at(
                     &self.device,
@@ -231,6 +417,36 @@ impl Worker {
 
     fn is_chromecast(&self) -> bool {
         self.device.kind == "chromecast"
+    }
+
+    /// One live-watchdog tick (C01): when the armed watchdog
+    /// calls for a recovery, reload the recorded live load the
+    /// way `_recover_live_cast` does — same URL, MIME and
+    /// stream type, settle-watched, rate-limited by the policy.
+    fn watchdog_tick(&mut self, now: f64) {
+        if !self.watchdog.is_armed() {
+            return;
+        }
+        let Some((url, mime, stream_type, title)) = self.live_load.clone() else {
+            return;
+        };
+        let Some(session) = self.cast.as_mut() else {
+            return;
+        };
+        let Ok(status) = session.media_status() else {
+            return;
+        };
+        if self.watchdog.note(
+            Some(&status.state),
+            status.media_session_id,
+            Some(status.position),
+            now,
+        ) == WatchdogAction::Reload
+        {
+            let previous = session.media_session_id;
+            let _ = session.load_media_prepared(&url, &mime, &title, stream_type, 0.0, true);
+            let _ = session.await_playing(previous);
+        }
     }
 }
 
@@ -338,7 +554,11 @@ pub fn open_queue(device: CastDevice, items: Vec<CastQueueItem>) {
                     password: cfg.get_str("cast_kodi_password", "").to_string(),
                 },
                 cast: None,
+                relay_source: None,
+                watchdog: LiveWatchdog::new(),
+                live_load: None,
             };
+            let run_started = Instant::now();
             let mut queue = CastQueue::new(items);
             let Some(first) = queue.start().cloned() else {
                 return Err("Nothing to cast".into());
@@ -450,6 +670,11 @@ pub fn open_queue(device: CastDevice, items: Vec<CastQueueItem>) {
                     continue;
                 }
                 poll = Instant::now();
+                // A stalled live Chromecast load recovers
+                // itself (bounded by the watchdog policy).
+                if worker.is_chromecast() {
+                    worker.watchdog_tick(run_started.elapsed().as_secs_f64());
+                }
                 // Poll the receiver: position for the resume
                 // save, and the queue's end-of-media event.
                 let mut status = engine_status(&mut worker, &engine);
@@ -703,6 +928,11 @@ fn engine_status(worker: &mut Worker, engine: &Engine) -> CastStatus {
 }
 
 fn stop_engine(worker: &mut Worker, engine: &mut Engine) {
+    // Every stop path tears the item's relay down too: nothing
+    // keeps transcoding for a cast that has moved on (C01).
+    worker.watchdog.disarm();
+    worker.live_load = None;
+    worker.stop_relay();
     match engine {
         Engine::Raop(run) => run.handle.request_stop(),
         _ if worker.is_chromecast() => {

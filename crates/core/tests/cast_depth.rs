@@ -185,7 +185,10 @@ fn upnp_resume_play_seeks_once_playing() {
             soap_ok()
         }
     });
-    let dev = device("sonos", format!("{base}/AVTransport/control"));
+    // The seek-after-playing mechanics are protocol-generic;
+    // a plain DLNA renderer keeps this test off the Sonos
+    // coordinator path (covered by its own fixtures below).
+    let dev = device("dlna", format!("{base}/AVTransport/control"));
     castupnp::play_upnp_at(&dev, "http://media.test/ep.mp3", "Ep", "audio/mpeg", 65.0).unwrap();
     let log = log.lock().unwrap();
     let actions: Vec<String> = log
@@ -293,12 +296,42 @@ fn roku_toggle_is_gated_by_clock_state_and_seek_is_refused() {
 
     let log = log.lock().unwrap();
     let paths: Vec<&str> = log.iter().map(|r| r.path.as_str()).collect();
+    // C03: Caster's exact ECP launch — the Roku Media Player
+    // channel (2213) with t/u/audioName/audioFormat.
     assert!(
-        paths.iter().any(|p| p.starts_with("/launch/15985")),
+        paths.contains(
+            &"/launch/2213?t=a&u=http%3A%2F%2Fmedia.test%2Fep.mp3&audioName=Ep&audioFormat=mp3"
+        ),
         "{paths:?}"
     );
     assert_eq!(paths.iter().filter(|p| **p == "/keypress/Play").count(), 2);
     assert_eq!(paths.last().copied(), Some("/keypress/Home"));
+}
+
+#[test]
+fn roku_launch_queries_are_casters_exact_ecp_parameters() {
+    // C03: audio, video and HLS each carry their own name/format
+    // pair; the query is asserted byte-for-byte.
+    assert_eq!(
+        castupnp::roku_launch_path("http://x.test/a b.mp3", "My Song", "audio/mpeg"),
+        "/launch/2213?t=a&u=http%3A%2F%2Fx.test%2Fa+b.mp3&audioName=My+Song&audioFormat=mp3"
+    );
+    assert_eq!(
+        castupnp::roku_launch_path("http://x.test/v.mkv", "Film", "video/x-matroska"),
+        "/launch/2213?t=v&u=http%3A%2F%2Fx.test%2Fv.mkv&videoName=Film&videoFormat=mp4"
+    );
+    assert_eq!(
+        castupnp::roku_launch_path(
+            "http://x.test/live.m3u8",
+            "Channel",
+            "application/vnd.apple.mpegurl"
+        ),
+        "/launch/2213?t=v&u=http%3A%2F%2Fx.test%2Flive.m3u8&videoName=Channel&videoFormat=hls"
+    );
+    assert_eq!(
+        castupnp::roku_launch_path("http://x.test/w.wav", "W", "audio/wav"),
+        "/launch/2213?t=a&u=http%3A%2F%2Fx.test%2Fw.wav&audioName=W&audioFormat=wav"
+    );
 }
 
 #[test]
@@ -393,6 +426,307 @@ fn queue_advances_only_after_a_live_item_finishes() {
         QueueAdvance::Finished
     );
     assert_eq!(queue.current(), None);
+}
+
+/// fake_server with an explicit bind address (the Sonos and
+/// MusicCast fixtures need well-known hosts/ports).
+fn fake_server_on(
+    addr: &str,
+    respond: impl Fn(&str, &str) -> String + Send + Sync + 'static,
+) -> Option<(String, Arc<Mutex<Vec<Recorded>>>)> {
+    let listener = std::net::TcpListener::bind(addr).ok()?;
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let log2 = log.clone();
+    let respond = Arc::new(respond);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .ok();
+            let mut bytes = Vec::new();
+            let mut buf = [0u8; 8192];
+            let header_end = loop {
+                match stream.read(&mut buf) {
+                    Ok(0) => break None,
+                    Ok(n) => {
+                        bytes.extend_from_slice(&buf[..n]);
+                        if let Some(pos) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break Some(pos + 4);
+                        }
+                    }
+                    Err(_) => break None,
+                }
+            };
+            let Some(header_end) = header_end else {
+                continue;
+            };
+            let head = String::from_utf8_lossy(&bytes[..header_end]).to_string();
+            let content_length: usize = head
+                .lines()
+                .find_map(|l| {
+                    let (k, v) = l.split_once(':')?;
+                    k.trim()
+                        .eq_ignore_ascii_case("content-length")
+                        .then(|| v.trim().parse().ok())?
+                })
+                .unwrap_or(0);
+            let mut body_bytes = bytes[header_end..].to_vec();
+            while body_bytes.len() < content_length {
+                match stream.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => body_bytes.extend_from_slice(&buf[..n]),
+                    Err(_) => break,
+                }
+            }
+            let request_line = head.lines().next().unwrap_or("").to_string();
+            let path = request_line
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or("")
+                .to_string();
+            let body = String::from_utf8_lossy(&body_bytes).to_string();
+            log2.lock().unwrap().push(Recorded {
+                path: path.clone(),
+                body: body.clone(),
+            });
+            let reply = respond(&path, &body);
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/xml; charset=\"utf-8\"\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                reply.len(),
+                reply
+            );
+        }
+    });
+    Some((base, log))
+}
+
+fn yxc_responder(path: &str, _body: &str) -> Option<String> {
+    if path.contains("main/getStatus") {
+        Some(r#"{"response_code":0,"power":"on","input":"hdmi1"}"#.into())
+    } else if path.contains("system/getFeatures") {
+        Some(
+            r#"{"response_code":0,"zone":[{"id":"main","func_list":["prepare_input_change","volume"]}]}"#
+                .into(),
+        )
+    } else if path.contains("prepareInputChange") || path.contains("setInput") {
+        Some(r#"{"response_code":0}"#.into())
+    } else {
+        None
+    }
+}
+
+#[test]
+fn musiccast_input_is_prepared_before_the_transport_push() {
+    // C06: a Yamaha renderer's input is switched to server
+    // (prepareInputChange first, as its feature list requires)
+    // BEFORE SetAVTransportURI is pushed.
+    let (base, log) = fake_server(|path, body| {
+        if let Some(reply) = yxc_responder(path, body) {
+            return reply;
+        }
+        soap_ok()
+    });
+    let hostport = base.trim_start_matches("http://").to_string();
+    assert!(castupnp::yxc_available(&hostport));
+    castupnp::musiccast_prepare_host(&hostport);
+    let dev = device("dlna", format!("{base}/AVTransport/control"));
+    castupnp::play_upnp(&dev, "http://media.test/ep.mp3", "Ep", "audio/mpeg").unwrap();
+    let log = log.lock().unwrap();
+    let order: Vec<String> = log
+        .iter()
+        .map(|r| {
+            if r.path.contains("getStatus") {
+                "getStatus"
+            } else if r.path.contains("getFeatures") {
+                "getFeatures"
+            } else if r.path.contains("prepareInputChange") {
+                "prepare"
+            } else if r.path.contains("setInput") {
+                "setInput"
+            } else if r.body.contains("SetAVTransportURI") {
+                "push"
+            } else if r.body.contains("<u:Play") {
+                "play"
+            } else {
+                "?"
+            }
+            .to_string()
+        })
+        .collect();
+    let pos = |name: &str| order.iter().position(|o| o == name).expect(name);
+    assert!(pos("getStatus") < pos("getFeatures"), "{order:?}");
+    assert!(pos("getFeatures") < pos("prepare"), "{order:?}");
+    assert!(pos("prepare") < pos("setInput"), "{order:?}");
+    assert!(pos("setInput") < pos("push"), "{order:?}");
+    assert!(pos("push") < pos("play"), "{order:?}");
+}
+
+#[test]
+fn musiccast_preparation_wires_through_play_on_port_80() {
+    // The full wiring: play_upnp itself prepares the input.
+    // YXC listens on the plain HTTP port, so this binds :80 and
+    // skips where that is not permitted.
+    let Some((base, log)) = fake_server_on("127.0.0.1:80", |path, body| {
+        if let Some(reply) = yxc_responder(path, body) {
+            return reply;
+        }
+        soap_ok()
+    }) else {
+        return;
+    };
+    let dev = device("dlna", format!("{base}/AVTransport/control"));
+    castupnp::play_upnp(&dev, "http://media.test/ep.mp3", "Ep", "audio/mpeg").unwrap();
+    let log = log.lock().unwrap();
+    // Ordering only: another test's renderer probe may also
+    // knock on port 80 while this server is bound.
+    let first_set_input = log
+        .iter()
+        .position(|r| r.path.contains("setInput"))
+        .expect("setInput sent");
+    let first_push = log
+        .iter()
+        .position(|r| r.body.contains("SetAVTransportURI"))
+        .expect("push sent");
+    assert!(first_set_input < first_push, "input prepared before push");
+}
+
+#[test]
+fn non_musiccast_renderer_skips_preparation() {
+    // A renderer that does not answer YXC is not one: the probe
+    // says unavailable and preparation is a no-op (the cast
+    // proceeds regardless).
+    assert!(!castupnp::yxc_available("127.0.0.1:1"));
+    castupnp::musiccast_prepare_host("127.0.0.1:1");
+}
+
+fn sonos_description(avt_control: &str, zgt_control: Option<&str>) -> String {
+    let zgt = zgt_control
+        .map(|c| {
+            format!(
+                "<service><serviceType>urn:schemas-upnp-org:service:ZoneGroupTopology:1</serviceType>\
+                 <controlURL>{c}</controlURL></service>"
+            )
+        })
+        .unwrap_or_default();
+    format!(
+        "<root><device><friendlyName>Sonos</friendlyName>\
+         <manufacturer>Sonos, Inc.</manufacturer>\
+         <serviceList>\
+         <service><serviceType>urn:schemas-upnp-org:service:AVTransport:1</serviceType>\
+         <controlURL>{avt_control}</controlURL></service>{zgt}\
+         </serviceList></device></root>"
+    )
+}
+
+fn zone_group_state_reply() -> String {
+    // One household on one loopback host (the sandbox's proxy
+    // bypass list covers 127.0.0.1 only): the coordinator's
+    // description lives at a distinct path, the member's at the
+    // canonical one — members match by exact Location.
+    let inner = "<ZoneGroupState><ZoneGroups>\
+        <ZoneGroup Coordinator=\"RINCON_COORD\" ID=\"RINCON_COORD:57\">\
+        <ZoneGroupMember UUID=\"RINCON_COORD\" Location=\"http://127.0.0.1:1400/coord/device_description.xml\" ZoneName=\"Living Room\"/>\
+        <ZoneGroupMember UUID=\"RINCON_MEMBER\" Location=\"http://127.0.0.1:1400/xml/device_description.xml\" ZoneName=\"Kitchen\"/>\
+        </ZoneGroup></ZoneGroups></ZoneGroupState>";
+    let escaped = inner
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;");
+    format!(
+        "<s:Envelope><s:Body><u:GetZoneGroupStateResponse>\
+         <ZoneGroupState>{escaped}</ZoneGroupState>\
+         </u:GetZoneGroupStateResponse></s:Body></s:Envelope>"
+    )
+}
+
+#[test]
+fn sonos_group_state_parsing_finds_the_coordinator() {
+    // C04 parse level: the member's group coordinator is the
+    // other member; when this device coordinates, there is
+    // nothing to reroute.
+    let reply = zone_group_state_reply();
+    assert_eq!(
+        castupnp::parse_zone_group_coordinator(
+            &reply,
+            "http://127.0.0.1:1400/xml/device_description.xml"
+        ),
+        Some("http://127.0.0.1:1400/coord/device_description.xml".to_string())
+    );
+    assert_eq!(
+        castupnp::parse_zone_group_coordinator(
+            &reply,
+            "http://127.0.0.1:1400/coord/device_description.xml"
+        ),
+        None
+    );
+    assert_eq!(
+        castupnp::parse_zone_group_coordinator(
+            &reply,
+            "http://192.0.2.9:1400/xml/device_description.xml"
+        ),
+        None
+    );
+}
+
+#[test]
+fn sonos_play_and_stop_route_to_the_group_coordinator() {
+    // C04: play and stop addressed to a group MEMBER land on
+    // the coordinator's AVTransport instead. One server plays
+    // the whole household, routed by path: the member answers
+    // description + group state, the coordinator (a different
+    // description path) takes the transport calls.
+    let Some((_base, log)) = fake_server_on("127.0.0.1:1400", |path, body| {
+        if path == "/xml/device_description.xml" {
+            sonos_description(
+                "/member/AVTransport/Control",
+                Some("/ZoneGroupTopology/Control"),
+            )
+        } else if path == "/coord/device_description.xml" {
+            sonos_description("/coord/AVTransport/Control", None)
+        } else if body.contains("GetZoneGroupState") {
+            zone_group_state_reply()
+        } else {
+            soap_ok()
+        }
+    }) else {
+        return; // cannot bind the Sonos fixture port here
+    };
+    let dev = CastDevice {
+        name: "Kitchen".into(),
+        host: "127.0.0.1".into(),
+        port: 1400,
+        kind: "sonos".into(),
+        model: String::new(),
+        endpoint: "http://127.0.0.1:1400/member/AVTransport/Control".into(),
+    };
+    castupnp::play_upnp(&dev, "http://media.test/ep.mp3", "Ep", "audio/mpeg").unwrap();
+    castupnp::stop_upnp(&dev).unwrap();
+    let log = log.lock().unwrap();
+    assert!(
+        log.iter().any(|r| r.body.contains("GetZoneGroupState")),
+        "group state consulted"
+    );
+    assert!(
+        !log.iter()
+            .any(|r| r.path.contains("/member/") && r.body.contains("SetAVTransportURI")),
+        "member must not receive the push"
+    );
+    assert!(
+        log.iter()
+            .any(|r| r.path.contains("/coord/") && r.body.contains("SetAVTransportURI")),
+        "coordinator receives the push: {:?}",
+        log.iter().map(|r| r.path.clone()).collect::<Vec<_>>()
+    );
+    assert!(
+        log.iter()
+            .any(|r| r.path.contains("/coord/") && r.body.contains("<u:Stop")),
+        "coordinator receives the stop"
+    );
 }
 
 #[test]

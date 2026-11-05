@@ -5737,3 +5737,196 @@ focus behavior after activation from the dialog (F04).
 onto main (PARITY union, 1 region). Merged gate: fmt
 clean, clippy clean (workspace and core windows-gnu),
 852 passed / 0 failed, build OK.
+
+## Audit 8 Task 28 resolution — Caster discovery/protocol fidelity (C01, C02, C03, C04, C05, C06) (2026-11-05)
+
+The Caster engine is the port unit throughout: every behavior below is a
+port of `caster_engine.py` / `caster_devices.py` / `caster_extras.py` as
+adapted by Python `core/casting.py`, verified against fake SSDP / mDNS /
+TXT / ECP / UPnP / YXC fixtures on loopback. No live receiver test ran:
+this sandbox refuses multicast, so "RB Room" is unreachable from here —
+the physical cast acceptance remains the owner's manual item, as it has
+been since v0.1.42.
+
+**C01 — media probing, preparation and live recovery connected.** New
+GUI-free module `crates/core/src/castmedia.rs`. `probe_media` ports
+`caster_engine.probe_media`: up to 5 Range attempts inside the 8 s
+budget keeping the longest body, early stop once enough bytes prove
+TS; magic bytes beat the Content-Type (ID3 / frame sync / OggS / fLaC
+/ RIFF-WAVE / ftyp), the TS stride test needs the sync byte at byte 0
+plus one stride (aligned) or four consecutive strides (mid-packet); a
+playlist Content-Type is live HLS at once; a probe with no bytes and
+no Content-Type at all is treated as LIVE (Caster: calling a stream
+VOD on no evidence is the expensive mistake); local files probe by
+magic + extension and are never live. `native_hls_url` ports
+`_native_hls_url` (segment-shaped sibling `.m3u8`, validated by
+fetching it: `#EXTM3U`, TARGETDURATION + EXTINF + a segment line, no
+ENDLIST, longest listed segment <= 8.0 s). The Chromecast load path in
+`app/src/casting.rs` no longer loads the caller-claimed MIME once as
+BUFFERED: it probes, then climbs `ChromecastLoadChain` — a state
+machine port of `_play_chromecast`'s ladder (native playlist when TS +
+live, else the HLS relay for TS, else the probed direct load;
+streamType LIVE/BUFFERED from the probe; on a non-settle: native ->
+live relay, then the stream-type flip, then — direct on-demand loads
+only — the conversion relay; at most 4 loads, then
+"{device} did not start playing ({idle reason|no answer})").
+Settling is `_await_playing`'s rule, implemented in `castsession.rs`
+(`settle_verdict` / `await_playing_from`, status source injected for
+tests): PLAYING/PAUSED on a session other than the previous one
+settles; IDLE with a non-stale reason rejects; stale-session reports
+and INTERRUPTED/CANCELLED idles are not verdicts; LOAD_TIMEOUT 12 s.
+The LOAD payload itself is `_load`'s (`load_payload`): currentTime is
+0 for a live relay, the resume position for a BUFFERED load, absent
+for a live load; the post-settle corrective seek (start > 5 s,
+receiver more than 5 s short) is `correct_resume_seek`. The HLS relay
+is now a managed process in `proxy.rs`: `start_hls_relay` spawns
+ffmpeg in the background (live mode: `-hls_time 2 -hls_list_size 8
+-hls_flags delete_segments`, Caster's balanced-preset shape; VOD mode
+keeps the established transcode), waits for playlist + first segment,
+and registers the child; `stop_hls_relay` kills it and removes the
+segment directory. The cast worker records the relay source per item
+and stops it on Stop, on Next, on queue advance and before every new
+load — stop/cancel tears relays down, nothing transcodes for a cast
+that moved on. The `/hls` route serves a running relay's playlist
+instead of starting a second transcode, and starts the live relay on
+demand. Live recovery is `LiveWatchdog` (clock-injected port of
+`_recover_live_cast`): armed only for loads recorded live; a stall is
+20 s (`CAST_STALL_TIMEOUT`) with neither a new session nor position
+movement; an idle live session recovers; a pause is the user's and
+clears progress; recoveries are at most one per 30 s
+(`CAST_RECOVERY_INTERVAL`). UPnP and Roku loads are prepared from the
+probe too (`prepare_upnp_target`: TS or non-HTTP -> relay, else the
+probed MIME; `prepare_roku_target`: TS -> relay, else `roku_mime`);
+Sonos keeps `_play_sonos`'s rule (probed MIME when audio, else
+audio/mpeg).
+
+**C02 — Chromecast mDNS discovery.** `cast.rs` gained a record-level
+mDNS parser (`parse_mdns_records`: PTR -> SRV/TXT/A joined, TXT
+key/value pairs preserved; the triple parser remains as a wrapper) and
+an explicit `_googlecast._tcp` browse (`discover_chromecasts_mdns`).
+Names come from the TXT `fn` friendly name (instance label otherwise),
+the model from TXT `md`, the port from SRV (8009 default); a name two
+hosts claim is disambiguated `"{fn} ({host})"`, as Caster keys its
+found dict. `discover_all` merges SSDP DIAL and mDNS results per host
+(`merge_chromecast_discovery`): the mDNS name replaces an SSDP entry
+that only had its host to go by, and the mDNS model fills an empty
+one — mDNS-only TVs (Caster: pychromecast's browser misses them) are
+now found with their friendly names intact.
+
+**C03 — Roku ECP parameters.** `play_roku` now sends Caster's exact
+launch (`caster_devices.roku_play`): channel `2213`
+(`ROKU_MEDIA_PLAYER`), parameters `t=a|v`, `u=<url>`, then
+`audioName`/`audioFormat` (mp3 default; wav/aac/flac mapped) or
+`videoName`/`videoFormat` (mp4 default; the HLS MIME maps to `hls`),
+form-encoded the way Python's `urlencode` encodes (quote_plus: space
+is `+`). The old `url=/title=/contentType=mp4` query on channel 15985
+is gone. `roku_launch_path` is pure and the fixtures assert the query
+byte-for-byte for audio, video and HLS — HTTP success is never treated
+as evidence media loaded. Roku discovery also tries Caster's
+device-info name order (friendly-, user-, default-, model-name).
+
+**C04 — Sonos coordinator routing and duplicate exclusion.** Discovery
+excludes Sonos from the generic MediaRenderer list by name OR
+manufacturer (`looks_like_sonos`, ported; `parse_upnp_description_full`
+now reads the manufacturer and the ZoneGroupTopology control URL), and
+a final merge pass drops any generic entry carrying a Sonos player's
+name (Sonos merges last and wins). Play and stop for a Sonos device
+resolve the group coordinator first (`sonos_coordinator_endpoint`:
+description -> ZoneGroupTopology `GetZoneGroupState` ->
+`parse_zone_group_coordinator`, members matched by exact description
+Location with a host fallback, 192.168.1.5 never matching
+192.168.1.50) and address the coordinator's AVTransport — Sonos
+rejects play and stop sent to a non-coordinator member. Any failure
+keeps the device's own endpoint.
+
+**C05 — AirPlay filtering.** `discover_airplay` runs on the record
+parser and keeps an announcement only when `raop_supported` passes:
+not Sonos (name or TXT `am`), and the TXT `pw` flag is not true
+(password/pairing required). Pairing itself stays unsupported, exactly
+as in Python — the parity gap was the filtering. Fixtures cover a
+classic RAOP receiver (kept), a pairing-required receiver (excluded)
+and a Sonos RAOP announcement (excluded).
+
+**C06 — MusicCast input preparation.** `castupnp.rs` ports the YXC
+family (`yxc_available` via `main/getStatus` with a 2 s budget,
+`yxc_set_input` with `prepareInputChange` first when the zone's
+feature list advertises `prepare_input_change`, all with
+`yxc_try`'s failure-is-an-empty-answer semantics). `play_upnp_on`
+prepares before the push for DLNA renderers: host from the control
+URL (Python `upnp_host`), available -> set input "server",
+best-effort. A mocked-YXC fixture asserts the order
+getStatus -> getFeatures -> prepareInputChange -> setInput ->
+SetAVTransportURI -> Play, and a second fixture binds port 80 to prove
+`play_upnp` itself performs the preparation.
+
+**Tests (+30).** `crates/core/tests/castmedia_slice.rs` (new, 18):
+TS stride shapes and the lone-0x47 false positive, probe fixtures
+(lying Content-Type, playlist type, retry/longest-body, no-evidence
+live, local files), native-HLS validation (VOD playlist, over-long
+segments, non-segment URL never fetched), all four load-ladder shapes
+with bounds, UPnP/Roku preparation, LOAD payload rules, the settle
+policy (stale sessions, stale reasons, rejection reasons, timeout),
+the watchdog timeline (stall bound, recovery interval, pause clears,
+movement is progress), and a real-ffmpeg relay lifecycle test
+(start -> playlist served through the proxy -> stop removes process
+and directory). `cast_slice.rs` (+6): mDNS-only Chromecast with its
+TXT name, SSDP/mDNS merge preserving friendly names, name-collision
+disambiguation, the three RAOP fixture classes, `looks_like_sonos`,
+and the full description parse (manufacturer, service URLs).
+`cast_depth.rs` (+6): byte-exact Roku launch queries (the pre-existing
+toggle test's channel assertion updated from the wrong 15985 query to
+Caster's), MusicCast preparation order + port-80 wiring + the
+unavailable case, ZoneGroupState parsing, and coordinator routing of
+play and stop against a two-player household fixture. One pre-existing
+test (`upnp_resume_play_seeks_once_playing`) now drives a DLNA device
+instead of a Sonos one: its subject is `play_upnp_at`'s
+seek-after-playing mechanics, and a Sonos device would now (correctly)
+take the coordinator path its own fixtures cover.
+
+**Deviations, stated plainly.** (1) Caster's `HlsRelay` internals —
+the piped TsSource reader, replay dedupe, under-feed rotation and the
+`_probe_codecs`-driven re-encode decisions — are NOT ported; the Rust
+relay is the proxy's ffmpeg `-c copy` HLS route made managed and
+live-capable. The ladder's final "conversion" step therefore remuxes
+rather than re-encodes: a receiver rejecting the codec itself (not
+the TS container) still will not play, where Caster's relay would
+transcode. (2) The watchdog observes status on the controls window's
+existing 2 s poll rather than Python's dedicated 5 s thread;
+thresholds and intervals are identical. (3) The RAOP pairing filter
+reads the TXT `pw` signal and Sonos identity; pyatv's full
+pairing-requirement derivation from device info is not reproduced.
+(4) Sonos seek/volume/status still address the member directly;
+Caster documents coordinator routing for play and stop, which is what
+is routed here. Soco's seed-based household discovery is not ported;
+discovery remains the SSDP ZonePlayer sweep. (5) The native-HLS check
+also runs against the proxy-decoded target URL — a deliberate
+superset: Python checks only the post-proxy source, and because the
+Rust app flow always proxies, the native path would otherwise never
+fire; the sibling playlist is fetched and validated before use, so a
+protected origin simply falls back to the relay. (6) Probing reads
+through ureq with a Range header; Python's probe reads the response
+stream — the byte windows can differ by a few bytes per attempt, the
+classification is unchanged.
+
+**Adjacent finds (recorded, not fixed — out of this task's scope).**
+The shared `crate::http::agent()` honors the process proxy
+environment: in this sandbox, requests to a LAN address outside
+`NO_PROXY` (observed with 127.0.0.2) detour to the egress proxy and
+hang — raw-UDP discovery (SSDP/mDNS) is unaffected, but description
+and SOAP fetches in a proxied environment inherit it; this is
+pre-existing shared-agent behavior used by every provider, not a
+casting regression. Python's discovery merge dedupes by NAME across
+all protocols (a later same-name device with sinks + video replaces
+an earlier one); the Rust merge dedupes per protocol plus the Sonos
+name rule — the full cross-protocol name merge is not ported. The
+SSDP DIAL sweep still sends one M-SEARCH where Caster repeats
+searches across the window.
+
+**Task 28 gate:** the worker gate on branch audit8/task28-caster
+ran fmt (last, clean), clippy (workspace --all-targets and core
+x86_64-pc-windows-gnu, both -D warnings clean), the full workspace
+test suite (882 passed / 0 failed: baseline 852 on main 942c800
+plus 30 new) and `cargo build -p blindrss` (OK). No UI code
+changed shape: the casting window's controls, names and order are
+untouched (the accessibility pass consisted of confirming no dialog
+edit was needed). No workflow files touched.

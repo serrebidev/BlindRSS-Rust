@@ -75,6 +75,114 @@ pub fn parse_media_status(value: &serde_json::Value) -> Result<MediaStatus, Stri
     })
 }
 
+/// Idle reasons that mean the OLD session ended, not that the
+/// new load was rejected (Python `STALE_IDLE_REASONS`).
+pub const STALE_IDLE_REASONS: [&str; 2] = ["INTERRUPTED", "CANCELLED"];
+
+/// Build the LOAD payload (Python `_load` / pychromecast
+/// `play_media`): the media carries the probed stream type, and
+/// currentTime follows `_load`'s rule — 0 for a live relay's
+/// buffered start, the resume position for a buffered load,
+/// absent for a live load.
+pub fn load_payload(
+    url: &str,
+    content_type: &str,
+    title: &str,
+    stream_type: &str,
+    start_seconds: f64,
+    live_relay: bool,
+) -> serde_json::Value {
+    let start = if start_seconds.is_finite() {
+        start_seconds.max(0.0)
+    } else {
+        0.0
+    };
+    let mut payload = serde_json::json!({
+        "type": "LOAD",
+        "autoplay": true,
+        "media": {
+            "contentId": url,
+            "streamType": stream_type,
+            "contentType": content_type,
+            "metadata": {
+                "metadataType": 0,
+                "title": title,
+            }
+        },
+    });
+    if live_relay {
+        payload["currentTime"] = serde_json::json!(0.0);
+    } else if start > 0.0 && stream_type == "BUFFERED" {
+        payload["currentTime"] = serde_json::json!(start);
+    }
+    payload
+}
+
+/// How a load settle watch ended (Python `_await_playing`'s
+/// boolean, with the failure's idle reason kept for the caller's
+/// "did not start playing" message).
+#[derive(Debug, Clone, PartialEq)]
+pub enum SettleOutcome {
+    Settled,
+    /// The receiver rejected the load (idle with a real reason),
+    /// or never settled before the deadline; the reason is the
+    /// last idle reason seen, when any.
+    Failed(Option<String>),
+}
+
+/// One status observation against the settle rule. `None` means
+/// keep polling: statuses from the previous session are stale
+/// news, and an idle report with no reason (or a stale reason)
+/// is not a verdict.
+pub fn settle_verdict(
+    status: &MediaStatus,
+    previous_session: Option<i64>,
+) -> Option<SettleOutcome> {
+    let stale = previous_session.is_some() && status.media_session_id == previous_session;
+    if stale {
+        return None;
+    }
+    match status.state.as_str() {
+        "PLAYING" | "PAUSED" => Some(SettleOutcome::Settled),
+        "IDLE" => match status.idle_reason.as_deref() {
+            Some(reason) if !reason.is_empty() && !STALE_IDLE_REASONS.contains(&reason) => {
+                Some(SettleOutcome::Failed(Some(reason.to_string())))
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Drive the settle rule over a status source until it decides
+/// or the deadline passes. The source is injected so the policy
+/// is testable without a TLS session.
+pub fn await_playing_from(
+    source: &mut dyn FnMut() -> Option<MediaStatus>,
+    previous_session: Option<i64>,
+    timeout: Duration,
+    poll: Duration,
+) -> SettleOutcome {
+    let deadline = Instant::now() + timeout;
+    let mut last_reason: Option<String> = None;
+    loop {
+        if let Some(status) = source() {
+            if status.media_session_id != previous_session
+                && let Some(reason) = status.idle_reason.clone()
+            {
+                last_reason = Some(reason);
+            }
+            if let Some(verdict) = settle_verdict(&status, previous_session) {
+                return verdict;
+            }
+        }
+        if Instant::now() >= deadline {
+            return SettleOutcome::Failed(last_reason);
+        }
+        std::thread::sleep(poll);
+    }
+}
+
 fn seek_payload(session: i64, seconds: f64) -> Result<serde_json::Value, String> {
     if !seconds.is_finite() || seconds < 0.0 {
         return Err("Seek position must be a finite, nonnegative number".into());
@@ -324,34 +432,47 @@ impl CastSession {
         title: &str,
         start_seconds: f64,
     ) -> Result<(), String> {
-        let transport = self
-            .app_transport
-            .clone()
-            .ok_or("launch the receiver first")?;
+        let status =
+            self.load_media_prepared(url, content_type, title, "BUFFERED", start_seconds, false)?;
         let start = if start_seconds.is_finite() {
             start_seconds.max(0.0)
         } else {
             0.0
         };
-        let mut media = serde_json::json!({
-            "contentId": url,
-            "streamType": "BUFFERED",
-            "contentType": content_type,
-            "metadata": {
-                "metadataType": 0,
-                "title": title,
-            }
-        });
-        let mut payload = serde_json::json!({
-            "type": "LOAD",
-            "autoplay": true,
-            "media": media,
-        });
-        if start > 0.0 {
-            payload["currentTime"] = serde_json::json!(start);
-            media["currentTime"] = serde_json::json!(start);
-            payload["media"] = media;
+        if start > 5.0 && status.position < start - 5.0 {
+            // The receiver ignored currentTime on load; one
+            // bounded seek puts the resume where it belongs.
+            let _ = self.seek(start);
         }
+        Ok(())
+    }
+
+    /// Load with Caster's preparation applied (C01): the stream
+    /// type comes from the probe (LIVE or BUFFERED), and the
+    /// currentTime rule is `_load`'s — a live relay starts at 0,
+    /// a buffered load carries the resume position, a live load
+    /// carries none. Returns the status the LOAD answered with.
+    pub fn load_media_prepared(
+        &mut self,
+        url: &str,
+        content_type: &str,
+        title: &str,
+        stream_type: &str,
+        start_seconds: f64,
+        live_relay: bool,
+    ) -> Result<MediaStatus, String> {
+        let transport = self
+            .app_transport
+            .clone()
+            .ok_or("launch the receiver first")?;
+        let payload = load_payload(
+            url,
+            content_type,
+            title,
+            stream_type,
+            start_seconds,
+            live_relay,
+        );
         let status = self.request(
             &transport,
             NS_MEDIA,
@@ -359,24 +480,39 @@ impl CastSession {
             "MEDIA_STATUS",
             Duration::from_secs(15),
         )?;
-        if let Some(id) = status
-            .get("status")
-            .and_then(|s| s.as_array())
-            .and_then(|a| a.first())
-            .and_then(|m| m.get("mediaSessionId"))
-            .and_then(|v| v.as_i64())
-        {
+        let parsed = parse_media_status(&status)?;
+        if let Some(id) = parsed.media_session_id {
             self.media_session_id = Some(id);
         }
-        if start > 5.0
-            && let Ok(now) = parse_media_status(&status)
-            && now.position < start - 5.0
+        Ok(parsed)
+    }
+
+    /// Wait for the receiver to settle on the load just sent
+    /// (Python `_await_playing`): PLAYING or PAUSED on a session
+    /// other than the previous one settles; an idle report with
+    /// a real reason rejects; everything else keeps polling
+    /// until LOAD_TIMEOUT. The previous session id is the one
+    /// recorded before the load.
+    pub fn await_playing(&mut self, previous_session: Option<i64>) -> SettleOutcome {
+        let mut source = || self.media_status().ok();
+        await_playing_from(
+            &mut source,
+            previous_session,
+            Duration::from_secs_f64(crate::castmedia::LOAD_TIMEOUT),
+            Duration::from_millis(150),
+        )
+    }
+
+    /// Python's post-load resume correction, applied once the
+    /// load has settled: a buffered start over 5 s that the
+    /// receiver under-shot by more than 5 s gets one seek.
+    pub fn correct_resume_seek(&mut self, start_seconds: f64) {
+        if start_seconds > 5.0
+            && let Ok(now) = self.media_status()
+            && now.position < start_seconds - 5.0
         {
-            // The receiver ignored currentTime on load; one
-            // bounded seek puts the resume where it belongs.
-            let _ = self.seek(start);
+            let _ = self.seek(start_seconds);
         }
-        Ok(())
     }
 
     /// Play / pause / stop the loaded media.

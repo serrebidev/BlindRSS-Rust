@@ -140,8 +140,19 @@ pub fn parse_transport_state(xml: &str) -> Option<String> {
 }
 
 /// Play on a DLNA MediaRenderer or a Sonos player:
-/// SetAVTransportURI then Play.
+/// SetAVTransportURI then Play. A MusicCast receiver is first
+/// switched to its network/server input (C06, Python
+/// `_upnp_push`); a Sonos member is routed to its group
+/// coordinator (C04).
 pub fn play_upnp(device: &CastDevice, url: &str, title: &str, mime: &str) -> Result<(), String> {
+    let effective = sonos_effective(device);
+    play_upnp_on(&effective, url, title, mime)
+}
+
+fn play_upnp_on(device: &CastDevice, url: &str, title: &str, mime: &str) -> Result<(), String> {
+    if device.kind == "dlna" {
+        musiccast_prepare(device);
+    }
     let metadata = didl_metadata(url, title, mime);
     avt(
         device,
@@ -168,17 +179,18 @@ pub fn play_upnp_at(
     mime: &str,
     start_seconds: f64,
 ) -> Result<(), String> {
-    play_upnp(device, url, title, mime)?;
+    let effective = sonos_effective(device);
+    play_upnp_on(&effective, url, title, mime)?;
     if start_seconds > 0.0 {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
         while std::time::Instant::now() < deadline {
-            match upnp_status(device) {
+            match upnp_status(&effective) {
                 Ok(s) if s.player_state.as_deref() == Some("PLAYING") => break,
                 Ok(_) => std::thread::sleep(std::time::Duration::from_millis(500)),
                 Err(_) => break,
             }
         }
-        let _ = seek_upnp(device, start_seconds);
+        let _ = seek_upnp(&effective, start_seconds);
     }
     Ok(())
 }
@@ -192,7 +204,10 @@ pub fn resume_upnp(device: &CastDevice) -> Result<(), String> {
 }
 
 pub fn stop_upnp(device: &CastDevice) -> Result<(), String> {
-    avt(device, "Stop", "<InstanceID>0</InstanceID>").map(|_| ())
+    // Sonos rejects stop sent to a group member that is not the
+    // coordinator, so stop routes like play does (C04).
+    let effective = sonos_effective(device);
+    avt(&effective, "Stop", "<InstanceID>0</InstanceID>").map(|_| ())
 }
 
 /// Seek to an absolute position (AVTransport Seek, REL_TIME).
@@ -246,15 +261,71 @@ pub fn upnp_status(device: &CastDevice) -> Result<CastStatus, String> {
     })
 }
 
-/// Play on a Roku through the External Control Protocol: the
-/// Roku Media Player channel (15985) accepts the media URL as
-/// launch parameters.
-pub fn play_roku(device: &CastDevice, url: &str, title: &str) -> Result<(), String> {
-    let base = roku_base(device);
+/// The Roku Media Player channel id (Caster
+/// `ROKU_MEDIA_PLAYER`).
+pub const ROKU_MEDIA_PLAYER: &str = "2213";
+
+/// Form-encode one query value the way Python's
+/// `urllib.parse.urlencode` (quote_plus) does: alphanumerics and
+/// `_.-~` pass, a space becomes `+`, everything else is
+/// percent-escaped.
+pub fn form_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 2);
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+fn roku_audio_format(mime: &str) -> &'static str {
+    match mime {
+        "audio/wav" => "wav",
+        "audio/aac" => "aac",
+        "audio/flac" => "flac",
+        _ => "mp3",
+    }
+}
+
+fn roku_video_format(mime: &str) -> &'static str {
+    match mime {
+        "application/vnd.apple.mpegurl" => "hls",
+        _ => "mp4",
+    }
+}
+
+/// The exact ECP launch path Caster sends (C03,
+/// `caster_devices.roku_play`): launch the Roku Media Player
+/// with `t` (a/v), `u` (the URL) and the audio or video
+/// name/format pair for the media's probed MIME. An HTTP success
+/// alone never proved media loaded — the query IS the contract.
+pub fn roku_launch_path(url: &str, title: &str, mime: &str) -> String {
+    let mut params = String::new();
+    if mime.starts_with("audio/") {
+        params.push_str("t=a");
+        params.push_str(&format!("&u={}", form_encode(url)));
+        params.push_str(&format!("&audioName={}", form_encode(title)));
+        params.push_str(&format!("&audioFormat={}", roku_audio_format(mime)));
+    } else {
+        params.push_str("t=v");
+        params.push_str(&format!("&u={}", form_encode(url)));
+        params.push_str(&format!("&videoName={}", form_encode(title)));
+        params.push_str(&format!("&videoFormat={}", roku_video_format(mime)));
+    }
+    format!("/launch/{ROKU_MEDIA_PLAYER}?{params}")
+}
+
+/// Play on a Roku through the External Control Protocol.
+pub fn play_roku(device: &CastDevice, url: &str, title: &str, mime: &str) -> Result<(), String> {
     let launch = format!(
-        "{base}/launch/15985?url={}&title={}&contentType=mp4",
-        url_encode(url),
-        url_encode(title)
+        "{}{}",
+        roku_base(device),
+        roku_launch_path(url, title, mime)
     );
     crate::http::agent()
         .post(&launch)
@@ -533,6 +604,247 @@ pub fn kodi_status(device: &CastDevice, user: &str, password: &str) -> Result<Ca
 }
 
 // ---------------------------------------------------------------------------
+// MusicCast input preparation (C06; caster_devices.py's YXC
+// family, called from core/casting.py's `_upnp_push`)
+// ---------------------------------------------------------------------------
+
+/// One YXC call. `None` on any transport failure or a non-zero
+/// MusicCast response code (Python `yxc_try` semantics: callers
+/// decorate a cast that works regardless, so failure is an empty
+/// answer, never an error).
+fn yxc_try(host: &str, path: &str, timeout: std::time::Duration) -> Option<serde_json::Value> {
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(timeout))
+        .build()
+        .into();
+    let mut resp = agent
+        .get(&format!("http://{host}/YamahaExtendedControl/v1/{path}"))
+        .header("User-Agent", crate::castmedia::CASTER_UA)
+        .call()
+        .ok()?;
+    let text = resp.body_mut().read_to_string().ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    match value.get("response_code").and_then(|c| c.as_i64()) {
+        Some(0) | None => Some(value),
+        Some(_) => None,
+    }
+}
+
+/// True if the device speaks MusicCast (Python `yxc_available`:
+/// a real `main/getStatus` answer within 2 s).
+pub fn yxc_available(host: &str) -> bool {
+    yxc_try(host, "main/getStatus", std::time::Duration::from_secs(2)).is_some()
+}
+
+/// Whether the main zone advertises a function in its feature
+/// list (Python `yxc_can`).
+fn yxc_can(host: &str, func: &str) -> bool {
+    let Some(features) = yxc_try(
+        host,
+        "system/getFeatures",
+        std::time::Duration::from_secs(8),
+    ) else {
+        return false;
+    };
+    features
+        .get("zone")
+        .and_then(|z| z.as_array())
+        .and_then(|zones| {
+            zones
+                .iter()
+                .find(|z| z.get("id").and_then(|i| i.as_str()) == Some("main"))
+        })
+        .and_then(|zone| zone.get("func_list"))
+        .and_then(|f| f.as_array())
+        .is_some_and(|funcs| funcs.iter().any(|f| f.as_str() == Some(func)))
+}
+
+/// Switch a zone's input, preparing it first when the unit says
+/// preparation is required (Python `yxc_set_input` /
+/// `yxc_prepare_input`).
+pub fn yxc_set_input(host: &str, input: &str) -> bool {
+    if yxc_can(host, "prepare_input_change") {
+        let _ = yxc_try(
+            host,
+            &format!("main/prepareInputChange?input={input}"),
+            std::time::Duration::from_secs(4),
+        );
+    }
+    yxc_try(
+        host,
+        &format!("main/setInput?input={input}"),
+        std::time::Duration::from_secs(4),
+    )
+    .is_some()
+}
+
+/// The `_upnp_push` preparation for one host: when the renderer
+/// is a MusicCast unit, switch it to the network/server input
+/// before the transport push. Best-effort by design.
+pub fn musiccast_prepare_host(host: &str) {
+    if yxc_available(host) {
+        let _ = yxc_set_input(host, "server");
+    }
+}
+
+/// MusicCast preparation for a renderer device (Python
+/// `upnp_host(control_url)`: the control URL's host part —
+/// YXC listens on the device's plain HTTP port).
+pub fn musiccast_prepare(device: &CastDevice) {
+    let host = url::Url::parse(&device.endpoint)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| h.to_string()))
+        .unwrap_or_else(|| device.host.clone());
+    if !host.is_empty() {
+        musiccast_prepare_host(&host);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sonos group-coordinator routing (C04; caster_devices.py's
+// `_sonos_coordinator` / `sonos_play`)
+// ---------------------------------------------------------------------------
+
+const ZONE_GROUP_TOPOLOGY: &str = "urn:schemas-upnp-org:service:ZoneGroupTopology:1";
+
+fn xml_attr(tag: &str, attr: &str) -> Option<String> {
+    let needle = format!("{attr}=\"");
+    let start = tag.find(&needle)? + needle.len();
+    let end = tag[start..].find('"')? + start;
+    Some(tag[start..end].to_string())
+}
+
+/// Parse a GetZoneGroupState reply: the description Location of
+/// the coordinator of the group this device belongs to, or
+/// `None` when this device IS its group's coordinator (or the
+/// state does not mention it). `self_description_url` is this
+/// device's own description Location — members are matched by
+/// it exactly, falling back to a host match. The state document
+/// arrives entity-escaped inside the SOAP element.
+pub fn parse_zone_group_coordinator(
+    state_reply: &str,
+    self_description_url: &str,
+) -> Option<String> {
+    let raw = xml_text(state_reply, "ZoneGroupState")?;
+    let state = crate::cast::xml_unescape(&raw);
+    let mut rest = state.as_str();
+    while let Some(pos) = rest.find("<ZoneGroup ") {
+        let Some(rel_end) = rest[pos..].find("</ZoneGroup>") else {
+            break;
+        };
+        let block = &rest[pos..pos + rel_end];
+        rest = &rest[pos + rel_end..];
+        let Some(group_tag_end) = block.find('>') else {
+            continue;
+        };
+        let Some(coordinator_uuid) = xml_attr(&block[..group_tag_end], "Coordinator") else {
+            continue;
+        };
+        let mut members: Vec<(String, String)> = Vec::new(); // (uuid, location)
+        let mut mrest = block;
+        while let Some(mpos) = mrest.find("<ZoneGroupMember ") {
+            let Some(mend) = mrest[mpos..].find('>') else {
+                break;
+            };
+            let mtag = &mrest[mpos..mpos + mend];
+            if let (Some(uuid), Some(location)) =
+                (xml_attr(mtag, "UUID"), xml_attr(mtag, "Location"))
+            {
+                members.push((uuid, location));
+            }
+            mrest = &mrest[mpos + mend..];
+        }
+        // Match this device's member entry: by its exact
+        // description Location first, then by host — taking
+        // care that 192.168.1.5 does not match 192.168.1.50.
+        let self_host = self_description_url
+            .split("://")
+            .nth(1)
+            .and_then(|r| r.split([':', '/']).next())
+            .unwrap_or("");
+        let Some((self_uuid, _)) = members
+            .iter()
+            .find(|(_, location)| location == self_description_url)
+            .or_else(|| {
+                members.iter().find(|(_, location)| {
+                    location.contains(&format!("://{self_host}:"))
+                        || location.contains(&format!("://{self_host}/"))
+                })
+            })
+        else {
+            continue;
+        };
+        if *self_uuid == coordinator_uuid {
+            return None; // this device coordinates its own group
+        }
+        return members
+            .iter()
+            .find(|(uuid, _)| *uuid == coordinator_uuid)
+            .map(|(_, location)| location.clone());
+    }
+    None
+}
+
+/// The AVTransport endpoint playback should actually go to for
+/// a Sonos device: its group coordinator's, when it is a group
+/// member (Sonos rejects play and stop sent to a non-coordinator
+/// member). Any failure along the way keeps the device's own
+/// endpoint — a standalone player is its own coordinator.
+pub fn sonos_coordinator_endpoint(device: &CastDevice) -> String {
+    let own = device.endpoint.clone();
+    let description_url = format!("http://{}:1400/xml/device_description.xml", device.host);
+    let Some(desc_xml) = crate::http::agent()
+        .get(&description_url)
+        .call()
+        .ok()
+        .and_then(|mut r| r.body_mut().read_to_string().ok())
+    else {
+        return own;
+    };
+    let Some(desc) = crate::cast::parse_upnp_description_full(&desc_xml, &description_url) else {
+        return own;
+    };
+    if desc.zone_group_topology_url.is_empty() {
+        return own;
+    }
+    let Ok(state) = soap_action(
+        &desc.zone_group_topology_url,
+        ZONE_GROUP_TOPOLOGY,
+        "GetZoneGroupState",
+        "",
+    ) else {
+        return own;
+    };
+    let Some(coordinator_desc_url) = parse_zone_group_coordinator(&state, &description_url) else {
+        return own;
+    };
+    let Some(coord_xml) = crate::http::agent()
+        .get(&coordinator_desc_url)
+        .call()
+        .ok()
+        .and_then(|mut r| r.body_mut().read_to_string().ok())
+    else {
+        return own;
+    };
+    crate::cast::parse_upnp_description_full(&coord_xml, &coordinator_desc_url)
+        .map(|d| d.av_transport_url)
+        .filter(|u| !u.is_empty())
+        .unwrap_or(own)
+}
+
+/// The device playback should target: for a Sonos group member,
+/// a clone whose endpoint is the group coordinator's
+/// AVTransport URL; every other kind passes through unchanged.
+pub fn sonos_effective(device: &CastDevice) -> CastDevice {
+    if device.kind != "sonos" {
+        return device.clone();
+    }
+    let mut effective = device.clone();
+    effective.endpoint = sonos_coordinator_endpoint(device);
+    effective
+}
+
+// ---------------------------------------------------------------------------
 // Unified dispatch (Python CastingManager's per-kind branches)
 // ---------------------------------------------------------------------------
 
@@ -558,7 +870,7 @@ pub fn play_at(
 ) -> Result<(), String> {
     match device.kind.as_str() {
         "dlna" | "sonos" => play_upnp_at(device, url, title, mime, start_seconds),
-        "roku" => play_roku(device, url, title),
+        "roku" => play_roku(device, url, title, mime),
         "kodi" => play_kodi_at(device, url, start_seconds, &auth.user, &auth.password),
         other => Err(format!("unsupported cast device kind: {other}")),
     }
@@ -668,19 +980,6 @@ pub fn status(device: &CastDevice, auth: &KodiAuth) -> Result<CastStatus, String
     }
 }
 
-fn url_encode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() * 2);
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char)
-            }
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
-}
-
 fn base64_encode(data: &str) -> String {
     const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let bytes = data.as_bytes();
@@ -718,7 +1017,8 @@ mod tests {
         assert!(didl.contains("A &amp; B"));
         assert!(didl.contains("audioItem"));
         assert_eq!(base64_encode("user:pass"), "dXNlcjpwYXNz");
-        assert_eq!(url_encode("a b&c"), "a%20b%26c");
+        // Python urlencode (quote_plus): a space is `+`, not %20.
+        assert_eq!(form_encode("a b&c"), "a+b%26c");
     }
 
     #[test]

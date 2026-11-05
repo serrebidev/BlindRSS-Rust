@@ -14,6 +14,7 @@ pub mod article_lang;
 pub mod browser;
 pub mod captcha;
 pub mod cast;
+pub mod castmedia;
 pub mod castsession;
 pub mod castupnp;
 pub mod castwire;

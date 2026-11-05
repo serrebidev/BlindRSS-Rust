@@ -77,6 +77,156 @@ pub fn hls_url(target: &str) -> String {
     format!("{}/hls?url={}", ensure_started(), url_encode(target))
 }
 
+/// A proxy URL for the LIVE HLS relay of `target` (Audit 8
+/// Task 28, C01): the relay serves a windowed, still-growing
+/// playlist (Caster's `HlsRelay` shape: 2 s segments, a short
+/// trail, old segments deleted) instead of a completed VOD
+/// transcode.
+pub fn hls_relay_url(target: &str) -> String {
+    format!(
+        "{}/hls?url={}&mode=live",
+        ensure_started(),
+        url_encode(target)
+    )
+}
+
+// ---------------------------------------------------------------------------
+// HLS relay processes (C01): a relay is an ffmpeg child turning
+// one source (usually MPEG-TS, which Chromecast/Roku cannot
+// demux) into HLS under the per-source directory. Relays are
+// registered so a cast can stop exactly the relay it started —
+// stop/cancel tears relays down, nothing runs when idle
+// (Caster's relay rule).
+// ---------------------------------------------------------------------------
+
+struct RelayEntry {
+    child: std::process::Child,
+}
+
+static RELAYS: OnceLock<std::sync::Mutex<std::collections::HashMap<String, RelayEntry>>> =
+    OnceLock::new();
+
+fn relays() -> &'static std::sync::Mutex<std::collections::HashMap<String, RelayEntry>> {
+    RELAYS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn relay_running(url: &str) -> bool {
+    let mut map = relays().lock().unwrap_or_else(|p| p.into_inner());
+    match map.get_mut(url) {
+        Some(entry) => matches!(entry.child.try_wait(), Ok(None)),
+        None => false,
+    }
+}
+
+/// Whether a relay is currently producing HLS for `url`.
+pub fn hls_relay_active(url: &str) -> bool {
+    relay_running(url)
+}
+
+/// Stop the relay for `url` (if any): kill its ffmpeg and drop
+/// its segment directory. A no-op when nothing is running.
+pub fn stop_hls_relay(url: &str) {
+    let entry = relays()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(url);
+    if let Some(mut entry) = entry {
+        let _ = entry.child.kill();
+        let _ = entry.child.wait();
+    }
+    let _ = std::fs::remove_dir_all(hls_dir(url));
+}
+
+/// Start (or reuse) the HLS relay for `source`, waiting until
+/// its playlist and first segment exist, and return the playlist
+/// URL to hand a receiver. A live relay restarts fresh — a
+/// re-load must not inherit a stale window. Errors name the
+/// failure plainly; a failed relay is deregistered, never left
+/// as a zombie entry.
+pub fn start_hls_relay(source: &str, live: bool) -> Result<String, String> {
+    if live {
+        stop_hls_relay(source);
+    } else {
+        if relay_running(source) {
+            return Ok(hls_url(source));
+        }
+        // A completed transcode from the player path serves a
+        // cast just as well; don't produce it twice.
+        let playlist = hls_dir(source).join("index.m3u8");
+        if playlist.exists()
+            && std::fs::read_to_string(&playlist)
+                .map(|t| t.contains("#EXT-X-ENDLIST"))
+                .unwrap_or(false)
+        {
+            return Ok(hls_url(source));
+        }
+    }
+    let ffmpeg = crate::silence::find_ffmpeg().ok_or("ffmpeg not found")?;
+    let dir = hls_dir(source);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("relay dir: {e}"))?;
+    let playlist = dir.join("index.m3u8");
+    let mut args: Vec<String> = vec![
+        "-y".into(),
+        "-i".into(),
+        source.into(),
+        "-c".into(),
+        "copy".into(),
+        "-f".into(),
+        "hls".into(),
+        "-hls_time".into(),
+        if live { "2".into() } else { "6".into() },
+    ];
+    if live {
+        args.push("-hls_list_size".into());
+        args.push("8".into());
+        args.push("-hls_flags".into());
+        args.push("delete_segments".into());
+    }
+    args.push("-hls_segment_filename".into());
+    args.push(dir.join("seg%05d.ts").to_string_lossy().into_owned());
+    args.push(playlist.to_string_lossy().into_owned());
+    let child = std::process::Command::new(&ffmpeg)
+        .args(&args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("relay spawn: {e}"))?;
+    relays()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(source.to_string(), RelayEntry { child });
+    // Wait for the playlist and a first segment (the receiver
+    // loads the URL as soon as we return it).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        let has_segment = std::fs::read_dir(&dir)
+            .map(|mut entries| {
+                entries.any(|e| {
+                    e.map(|e| e.file_name().to_string_lossy().starts_with("seg"))
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false);
+        if playlist.exists() && has_segment {
+            return Ok(if live {
+                hls_relay_url(source)
+            } else {
+                hls_url(source)
+            });
+        }
+        if !relay_running(source) {
+            stop_hls_relay(source);
+            return Err("HLS relay failed to start".into());
+        }
+        if std::time::Instant::now() >= deadline {
+            stop_hls_relay(source);
+            return Err("HLS relay did not produce a playlist in time".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
 /// A proxy URL that plays `target` through the ffmpeg audio
 /// filter chain `af` (the equalizer path for the built-in
 /// player: MediaCtrl has no EQ, so when the EQ is enabled the
@@ -249,7 +399,8 @@ fn handle(mut stream: std::net::TcpStream) {
             let Some(u) = query_param(query, "url") else {
                 return respond(&mut stream, "400 Bad Request", &[], b"missing url");
             };
-            serve_hls(&mut stream, &u);
+            let live = query_param(query, "mode").as_deref() == Some("live");
+            serve_hls(&mut stream, &u, live);
         }
         "/eq" => {
             let (Some(u), Some(af)) = (query_param(query, "url"), query_param(query, "af")) else {
@@ -448,10 +599,20 @@ fn hls_dir(url: &str) -> std::path::PathBuf {
         .join(format!("{hash:x}"))
 }
 
-fn serve_hls(stream: &mut std::net::TcpStream, url: &str) {
+fn serve_hls(stream: &mut std::net::TcpStream, url: &str, live: bool) {
     let dir = hls_dir(url);
     let playlist = dir.join("index.m3u8");
-    if !playlist.exists() {
+    if live {
+        // The live relay produces the playlist in the
+        // background; start it on demand if a receiver asks
+        // before the cast layer did.
+        if !relay_running(url) && start_hls_relay(url, true).is_err() {
+            return respond(stream, "502 Bad Gateway", &[], b"relay failed");
+        }
+    } else if !relay_running(url) && !playlist.exists() {
+        // (A running cast relay owns the directory when there
+        // is one; serve its current playlist below instead of
+        // starting a second transcode into it.)
         let Some(ffmpeg) = crate::silence::find_ffmpeg() else {
             return respond(stream, "503 Unavailable", &[], b"ffmpeg not found");
         };
