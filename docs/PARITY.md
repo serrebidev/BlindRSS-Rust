@@ -5930,3 +5930,8 @@ plus 30 new) and `cargo build -p blindrss` (OK). No UI code
 changed shape: the casting window's controls, names and order are
 untouched (the accessibility pass consisted of confirming no dialog
 edit was needed). No workflow files touched.
+
+**Task 28 integration gate (2026-11-05):** cherry-picked
+clean onto main. Merged gate: fmt clean, clippy clean
+(workspace and core windows-gnu), 882 passed / 0 failed,
+build OK.
