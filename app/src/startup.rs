@@ -38,6 +38,45 @@ fn launch_command() -> Option<String> {
     }
 }
 
+/// Python `core/macos_integration.py`'s launchctl deadline:
+/// no startup command may wait longer than this.
+#[cfg(any(target_os = "macos", test))]
+pub const STARTUP_COMMAND_TIMEOUT_S: u64 = 20;
+
+/// Run a startup-registration command under a hard deadline
+/// (Audit 8 B13): `dependency::run_tool` kills and reaps the
+/// child on timeout and reports it as an error, so a hanging
+/// `launchctl` surfaces as a failure message instead of
+/// blocking the Settings toggle forever. Returns
+/// (success, output) in Python `_run_launchctl`'s shape:
+/// stdout on success, stderr (else stdout) on failure.
+#[cfg(any(target_os = "macos", test))]
+fn run_startup_command(
+    exe: &std::path::Path,
+    args: &[&str],
+    timeout: std::time::Duration,
+) -> (bool, String) {
+    match blindrss_core::dependency::run_tool(exe, args, timeout) {
+        Ok(run) => {
+            if run.success {
+                (true, run.stdout.trim().to_string())
+            } else {
+                let err = run.stderr.trim();
+                let out = run.stdout.trim();
+                let text = if !err.is_empty() {
+                    err
+                } else if !out.is_empty() {
+                    out
+                } else {
+                    "command failed"
+                };
+                (false, text.to_string())
+            }
+        }
+        Err(e) => (false, e),
+    }
+}
+
 /// Register or unregister start-at-login (Python
 /// `set_startup_enabled`). Err carries the user-facing message.
 pub fn set_enabled(enabled: bool) -> Result<(), String> {
@@ -173,14 +212,14 @@ mod mac {
     }
 
     fn launchctl(args: &[&str]) -> (bool, String) {
-        match std::process::Command::new("launchctl").args(args).output() {
-            Ok(out) => {
-                let mut text = String::from_utf8_lossy(&out.stdout).to_string();
-                text.push_str(&String::from_utf8_lossy(&out.stderr));
-                (out.status.success(), text)
-            }
-            Err(e) => (false, e.to_string()),
-        }
+        // Python caps every launchctl call at 20 s
+        // (`_LAUNCHCTL_TIMEOUT_S`); the previous unbounded
+        // `.output()` could hang the toggle forever (B13).
+        super::run_startup_command(
+            std::path::Path::new("launchctl"),
+            args,
+            std::time::Duration::from_secs(super::STARTUP_COMMAND_TIMEOUT_S),
+        )
     }
 
     pub fn set_enabled(enabled: bool) -> Result<(), String> {
@@ -215,5 +254,73 @@ mod mac {
             return Err(format!("launchctl load failed: {}", msg.trim()));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch_script(tag: &str, body: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "blindrss_startup_{tag}_{}_{}.sh",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, body).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        path
+    }
+
+    /// B13: a hanging startup command hits the deadline,
+    /// reports the timeout as its failure, and is killed
+    /// rather than waited out (run_tool reaps it). The fake
+    /// `exec`s the sleep so the hanging process IS the direct
+    /// child, launchctl's shape; a grandchild would keep the
+    /// output pipes open past the kill, in Python's
+    /// subprocess pipeline as here.
+    #[cfg(unix)]
+    #[test]
+    fn hanging_command_times_out_and_is_killed() {
+        let script = scratch_script("hang", "#!/bin/sh\nexec sleep 60\n");
+        let began = std::time::Instant::now();
+        let (ok, msg) = run_startup_command(&script, &[], std::time::Duration::from_secs(1));
+        assert!(!ok);
+        assert!(
+            msg.contains("timed out"),
+            "timeout must surface in the message: {msg}"
+        );
+        assert!(
+            began.elapsed() < std::time::Duration::from_secs(10),
+            "the deadline, not the command, ends the wait"
+        );
+        let _ = std::fs::remove_file(&script);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quick_command_reports_stdout_and_stderr() {
+        let ok_script = scratch_script("ok", "#!/bin/sh\necho out-text\nexit 0\n");
+        let (ok, msg) = run_startup_command(
+            &ok_script,
+            &[],
+            std::time::Duration::from_secs(STARTUP_COMMAND_TIMEOUT_S),
+        );
+        assert!(ok);
+        assert_eq!(msg, "out-text");
+
+        let err_script = scratch_script("err", "#!/bin/sh\necho bad-news >&2\nexit 3\n");
+        let (ok, msg) = run_startup_command(&err_script, &[], std::time::Duration::from_secs(10));
+        assert!(!ok);
+        assert_eq!(msg, "bad-news");
+        let _ = std::fs::remove_file(&ok_script);
+        let _ = std::fs::remove_file(&err_script);
     }
 }

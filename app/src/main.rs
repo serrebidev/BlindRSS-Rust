@@ -69,6 +69,29 @@ fn app_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// Folders that may hold bundled resources (locale/,
+/// sounds/, docs/), best first: the executable's own folder
+/// (the flat release layout), then — when the executable
+/// runs from inside a macOS .app bundle
+/// (`Contents/MacOS/blindrss`, Audit 8 B14) — the bundle's
+/// `Contents/Resources`, which is where the bundle builder
+/// places them.
+pub(crate) fn resource_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        dirs.push(dir.to_path_buf());
+        if dir.file_name().is_some_and(|n| n == "MacOS")
+            && let Some(contents) = dir.parent()
+            && contents.file_name().is_some_and(|n| n == "Contents")
+        {
+            dirs.push(contents.join("Resources"));
+        }
+    }
+    dirs
+}
+
 /// True for the Program Files Windows installer distribution
 /// (Python's `is_windows_installed_build`): Windows plus the
 /// `.windows-installed` marker beside the executable. The Rust
@@ -1085,9 +1108,7 @@ fn resolve_sound(
     if rel.is_absolute() {
         return rel.to_path_buf();
     }
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(dir) = exe.parent()
-    {
+    for dir in resource_dirs() {
         let candidate = dir.join(rel);
         if candidate.exists() {
             return candidate;
@@ -1156,8 +1177,21 @@ fn startup_maintenance() {
 
 /// Side effects at the end of a refresh (Python's Sounds +
 /// Notifications pages): completion/error sounds and desktop
-/// notifications for feeds with new articles.
-fn refresh_side_effects(tray: &TaskBarIcon, new_by_feed: &[(String, String, usize)], failed: bool) {
+/// notifications for feeds with new articles. The
+/// notification set is planned by core (Audit 8 B09): one
+/// notification per eligible article with its title, preview
+/// and click payload — never a bare feed count — under the
+/// shared per-refresh cap, with an honest suppressed-count
+/// summary. `pending` receives each shown notification's
+/// payload in show order; the balloon surface displays one
+/// notification at a time (each show replaces the previous),
+/// so the payload a click can reach is the latest one stored.
+fn refresh_side_effects(
+    tray: &TaskBarIcon,
+    batches: &[blindrss_core::notify::FeedBatch],
+    failed: bool,
+    pending: &std::cell::RefCell<Option<blindrss_core::notify::ActivationPayload>>,
+) {
     let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
     if cfg.get_bool("sounds_enabled", true) {
         let (key, default) = if failed {
@@ -1167,48 +1201,14 @@ fn refresh_side_effects(tray: &TaskBarIcon, new_by_feed: &[(String, String, usiz
         };
         play_sound_file(&resolve_sound(&cfg, key, default));
     }
-    if !cfg.get_bool("windows_notifications_enabled", false) {
-        return;
+    let plan = blindrss_core::notify::plan_notifications(&cfg, batches);
+    for note in &plan.notifications {
+        notify_desktop(tray, &note.title, &note.body);
+        *pending.borrow_mut() = note.payload.clone();
     }
-    let excluded: Vec<String> = cfg
-        .raw()
-        .get("windows_notifications_excluded_feeds")
-        .and_then(|v| v.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                .collect()
-        })
-        .unwrap_or_default();
-    let include_name = cfg.get_bool("windows_notifications_include_feed_name", true);
-    let items: Vec<&(String, String, usize)> = new_by_feed
-        .iter()
-        .filter(|(id, _, _)| !excluded.iter().any(|x| x == id))
-        .collect();
-    if items.is_empty() {
-        return;
-    }
-    let cap = cfg.get_i64("windows_notifications_max_per_refresh", 0);
-    let shown = if cap <= 0 {
-        items.len()
-    } else {
-        (cap as usize).min(items.len())
-    };
-    for (_, title, n) in &items[..shown] {
-        let body = if include_name {
-            format!("{n} new article(s) in {title}")
-        } else {
-            format!("{n} new article(s)")
-        };
-        notify_desktop(tray, "BlindRSS", &body);
-    }
-    if shown < items.len() && cfg.get_bool("windows_notifications_show_summary_when_capped", true) {
-        let total: usize = items.iter().map(|(_, _, n)| n).sum();
-        notify_desktop(
-            tray,
-            "BlindRSS",
-            &format!("{total} new article(s) in {} feed(s)", items.len()),
-        );
+    if let Some(summary) = &plan.summary {
+        notify_desktop(tray, &summary.title, &summary.body);
+        *pending.borrow_mut() = None;
     }
 }
 
@@ -1838,9 +1838,11 @@ struct State {
     /// runs it once for the node the user lands on instead of
     /// refilling for every node arrowed past.
     refill_pending: bool,
-    /// Per-feed new-article counts for the running refresh
-    /// (sounds/notifications at AllDone consume them).
-    refresh_new: Vec<(String, String, usize)>,
+    /// Per-feed new articles for the running refresh
+    /// (sounds/notifications at AllDone consume them): the
+    /// notification-eligible articles themselves, so
+    /// notifications carry per-article payloads (Audit 8 B09).
+    refresh_new: Vec<blindrss_core::notify::FeedBatch>,
     /// Any feed failed in the running refresh (error sound).
     refresh_failed: bool,
     /// Article stub for an in-flight queue playback resolve (the
@@ -3376,9 +3378,7 @@ static I18N: std::sync::OnceLock<blindrss_core::i18n::Catalog> = std::sync::Once
 /// releases, the repo's locale/ in dev).
 pub fn locale_roots() -> Vec<std::path::PathBuf> {
     let mut roots = vec![std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../locale")];
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(dir) = exe.parent()
-    {
+    for dir in resource_dirs().into_iter().rev() {
         roots.insert(0, dir.join("locale"));
     }
     roots
@@ -3655,6 +3655,15 @@ fn main() {
         type ActionSlot = Rc<RefCell<Option<Rc<dyn Fn()>>>>;
         let tray_refresh_slot: ActionSlot = Rc::new(RefCell::new(None));
         let tray_play_slot: ActionSlot = Rc::new(RefCell::new(None));
+        let notify_activate_slot: ActionSlot = Rc::new(RefCell::new(None));
+        // The latest shown notification's click payload
+        // (Audit 8 B09): refresh_side_effects stores each
+        // shown notification's payload here in show order; a
+        // balloon click runs the activation action (filled
+        // once activate_article exists), which resolves the
+        // payload and opens the article normally.
+        let notify_payload: Rc<RefCell<Option<blindrss_core::notify::ActivationPayload>>> =
+            Rc::new(RefCell::new(None));
         let quit_flag = Rc::new(std::cell::Cell::new(false));
         {
             // wx has no taskbar mouse events on macOS; the tray
@@ -3666,6 +3675,20 @@ fn main() {
                     frame_tray.iconize(false);
                     frame_tray.show(true);
                     frame_tray.raise();
+                });
+            }
+        }
+        {
+            // Balloon click (Windows, Audit 8 B09): activate
+            // the article the current balloon names, through
+            // the slot filled once the real action exists.
+            #[cfg(target_os = "windows")]
+            {
+                let slot = notify_activate_slot.clone();
+                tray.on_balloon_click(move |_| {
+                    if let Some(action) = slot.borrow().as_ref() {
+                        action();
+                    }
                 });
             }
         }
@@ -6085,6 +6108,41 @@ fn main() {
                 frame_act.set_status_text("Article has no media or link", 0);
             }
         });
+        // Notification activation (Audit 8 B09, Python's
+        // `_handle_notification_activation`): a balloon click
+        // resolves the stored payload — the current list
+        // first, then the store, then the payload itself —
+        // and opens the article through the same activation
+        // core as Enter in the article list; an unresolvable
+        // payload falls back to opening its URL.
+        {
+            let state_na = state.clone();
+            let frame_na = frame;
+            let payload_na = notify_payload.clone();
+            let activate_na = activate_article.clone();
+            *notify_activate_slot.borrow_mut() = Some(Rc::new(move || {
+                let Some(payload) = payload_na.borrow_mut().take() else {
+                    return;
+                };
+                let article = {
+                    let st = state_na.borrow();
+                    blindrss_core::notify::resolve_payload_article(
+                        &payload,
+                        &st.articles,
+                        st.db.as_ref(),
+                    )
+                };
+                match article {
+                    Some(article) => activate_na(article),
+                    None => {
+                        let url = payload.url.trim();
+                        if !url.is_empty() {
+                            open_article_link(&frame_na, url);
+                        }
+                    }
+                }
+            }));
+        }
         let act_activate: Rc<dyn Fn()> = {
             let state_aa = state.clone();
             let frame_aa = frame;
@@ -9872,6 +9930,7 @@ fn main() {
 
         let timer = Box::leak(Box::new(Timer::new(&frame)));
         let tray_menu_tick = tray_menu.clone();
+        let notify_payload_tick = notify_payload.clone();
         let tray_unread_last = Rc::new(std::cell::Cell::new(tray_unread0));
         let state_tick = state.clone();
         let frame_tick = frame;
@@ -10042,11 +10101,23 @@ fn main() {
                         // articles do not count (Audit 8 D13).
                         new_total += outcome.notify_count;
                         if outcome.notify_count > 0 {
-                            st.refresh_new.push((
-                                feed.id.clone(),
-                                feed.title.clone(),
-                                outcome.notify_count,
-                            ));
+                            st.refresh_new.push(blindrss_core::notify::FeedBatch {
+                                feed_id: feed.id.clone(),
+                                feed_title: feed.title.clone(),
+                                // Python records at most 500
+                                // notification summaries per
+                                // feed (`_record_new_article`);
+                                // the count above is uncapped,
+                                // as Python's new_items is.
+                                articles: outcome
+                                    .new_articles
+                                    .iter()
+                                    .take(500)
+                                    .map(blindrss_core::notify::NewArticleNote::from)
+                                    .collect(),
+                                generic_count: 0,
+                                resolved: Vec::new(),
+                            });
                         }
                     }
                     Ok(RefreshMsg::FeedDone(path, feed, Err(e))) => {
@@ -10229,7 +10300,7 @@ fn main() {
                                 frame_tick.set_status_text(&msg, 0);
                                 announce("general", &msg);
                                 drop(st);
-                                refresh_side_effects(&tray, &[], false);
+                                refresh_side_effects(&tray, &[], false, &notify_payload_tick);
                             }
                             Err(e) => frame_tick.set_status_text(&format!("Provider: {e}"), 0),
                         }
@@ -10932,12 +11003,12 @@ fn main() {
                         &format!("Refresh complete: {new_total} new articles"),
                     );
                 }
-                let new_by_feed = std::mem::take(&mut st.refresh_new);
+                let new_batches = std::mem::take(&mut st.refresh_new);
                 let failed = std::mem::take(&mut st.refresh_failed);
                 let store_path = st.store_path.clone();
                 let refreshed_feeds = st.feeds.clone();
                 drop(st);
-                refresh_side_effects(&tray, &new_by_feed, failed);
+                refresh_side_effects(&tray, &new_batches, failed, &notify_payload_tick);
                 // Podcast archive (gap 6): every refresh has
                 // committed, so queue the due feeds' archive
                 // scans — Python claims and queues only after

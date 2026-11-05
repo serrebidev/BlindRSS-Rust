@@ -44,6 +44,7 @@ pub mod i18n;
 pub mod maintenance;
 pub mod media;
 pub mod media_url;
+pub mod notify;
 pub mod oauth;
 pub mod opencmd;
 pub mod opml;

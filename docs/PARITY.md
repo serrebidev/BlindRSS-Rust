@@ -6214,3 +6214,177 @@ loopback proxy bypass stays — it is independently
 correct (loopback traffic should not traverse an
 environment proxy; the browser.rs DevTools idiom) — but
 it is no longer credited as this fix.
+## Audit 8 Task 30 resolution — notifications and OS app identity (B09, B10, B11, B13, B14) (2026-11-05)
+
+**B09 (P2) — notifications carry article payloads again.** New
+GUI-free `crates/core/src/notify.rs` owns the payload policy,
+ported from Python `gui/mainframe.py`'s assembly
+(`_queue_new_article_notifications_from_state`,
+`_notification_preview_text`, `_build_notification_body`,
+`_build_notification_activation_payload`,
+`_resolve_notification_article`): one notification per
+eligible article with the article's title, a plain-text
+preview (tags stripped, entities decoded, whitespace
+collapsed, 180-character cap — the shared shape of
+`_notification_preview_text` and `providers/local.py`'s
+`_plain_text_preview`), body `"{feed} - {preview}"` under
+`windows_notifications_include_feed_name`, a shared
+per-refresh budget from `windows_notifications_max_per_refresh`
+(0/absent = unlimited), cross-feed dedupe by article id,
+per-feed exclusion via `windows_notifications_excluded_feeds`,
+and Python's generic branch (count-only states resolve
+per-article first, generic bodies for the remainder). The
+capped summary now states the true suppressed count
+("{n} new article notification(s) were suppressed by your
+cap.", gated by `windows_notifications_show_summary_when_capped`);
+the old port's summary reported the TOTAL new count across
+all feeds as if it were the suppressed figure, and its
+per-feed notifications were bare counts with no article
+content and no click action at all. Rule exclusions hold by
+construction: the drain feeds the planner
+`StoreOutcome::new_articles`, which since D13 contains
+exactly the stored, not-rule-removed, not-notification-
+suppressed articles. The drain caps each feed's batch at
+500 articles, mirroring Python's per-feed summary cap in
+`_record_new_article` (the new-items count itself stays
+uncapped, as Python's does). Click activation is wired on
+Windows: each shown notification's payload is stored
+(latest wins — the tray balloon replaces the previous
+balloon, so only the most recent is clickable), and
+`TaskBarIcon::on_balloon_click` runs an action that resolves
+the payload through core `resolve_payload_article` (current
+article list by id/url, then `Db::article_by_id`, then an
+article constructed from the payload) and opens it through
+the same `activate_article` core as Enter in the article
+list — mark read, play or open per the normal activation
+decision; an unresolvable payload falls back to opening its
+URL, as Python's `_handle_notification_activation` does.
+Deviations, stated plainly: (1) Python keys payloads per
+notification object (wx NotificationMessage stack in the
+Action Center); the wxDragon balloon has no per-notification
+identity, so only the latest shown payload is clickable —
+earlier notifications in a burst are display-only on
+Windows. Linux (notify-send) and macOS (osascript) surfaces
+have no click routing, as before this task. (2) Python's
+two refresh drivers word the summary differently (the
+single-feed driver uses the "(s)" form, the full-refresh
+driver ngettext); the port has one drain and uses the
+grammatical singular/plural pair. (3) Hosted-provider
+refreshes complete through `RefreshMsg::ProviderAction`,
+which carries no per-article states in this port, so hosted
+notifications remain silent (sounds still fire) — unchanged
+from before this task, recorded here rather than papered
+over; Python's hosted providers emit `new_articles` states.
+
+**B10 (P2) — foreground-right transfer.** `signal_existing`
+now calls `AllowSetForegroundWindow(pid)` with the pid from
+the instance state BEFORE sending the authenticated
+activation, exactly Python `activate_existing`'s order, via
+a `cfg(windows)` FFI declaration in
+`crates/core/src/single_instance.rs`. The non-Windows path
+is byte-identical to before. Manual verification stays the
+owner's: second-instance activation from the tray/minimized
+state while another application owns the foreground (plan's
+platform-acceptance item) — not claimed here.
+
+**B11 (P2) — exclusive private state creation.**
+`write_state_file` unlinks whatever sits at the state path
+(never writes through a planted symlink), then creates with
+`create_new` (O_EXCL) and mode 0600 on Unix — Python's
+`os.open(path, O_WRONLY | O_CREAT | O_EXCL, 0o600)` shape.
+A racer's file appearing between unlink and create fails
+the create instead of being overwritten, and `serve` then
+reports the listener unstarted, as Python does. Tests
+(module + `tests/single_instance_contract.rs`): created
+file is a regular 0600 file; a planted symlink's target is
+untouched and the path becomes a real file; exclusive
+create refuses an existing file; a stale state file (dead
+port/token) is replaced by serve; valid-token signal
+activates exactly once; wrong-token and garbage state are
+rejected without activation. The internals were
+path-parameterized (`serve_at`/`signal_existing_at`) so the
+contract runs against scratch paths; the public API is
+unchanged.
+
+**B13 (P2) — launchctl bounded at 20 s.** `app/src/startup.rs`'s
+macOS `launchctl` wrapper no longer blocks on unbounded
+`.output()`; it runs through
+`blindrss_core::dependency::run_tool` with Python
+`core/macos_integration.py`'s `_LAUNCHCTL_TIMEOUT_S` = 20 s
+deadline (`run_startup_command`, returning Python
+`_run_launchctl`'s (ok, stdout | stderr) shape). `run_tool`
+kills and reaps on timeout and reports "timed out after
+20.0s" as the failure message, which propagates into the
+Settings toggle's error text the way Python's
+TimeoutExpired string does. Tests: `run_tool`'s own
+kill-and-reap timeout test (`dependency_parity.rs`), plus
+new app tests driving `run_startup_command` against a fake
+hanging script (deadline fires at 1 s, timeout in the
+message, call returns promptly) and quick success/failure
+scripts (stdout/stderr selection). The macOS call sites
+(load/unload, "already loaded" acceptance) are unchanged
+beyond the wrapper.
+
+**B14 (P2) — macOS application bundle builder.**
+`cargo xtask bundle-app <staging> <out_dir> <version>`
+(new in `crates/xtask`) assembles
+`<out_dir>/BlindRSS.app` from the release staging folder
+with the metadata of Python `portable.spec`'s BUNDLE step:
+bundle identifier `com.serrebi.BlindRSS`, name/display name
+`BlindRSS`, category `public.app-category.news`,
+`NSPrincipalClass` `NSApplication`, the passed version as
+both `CFBundleVersion` and `CFBundleShortVersionString`.
+Layout: the executable at `Contents/MacOS/blindrss`
+(mode 0755), every other staging entry (locale/, sounds/,
+docs/, vlc/, README.md, PARITY.md, minisign.pub) under
+`Contents/Resources/`, plus `Contents/PkgInfo`. The dmg
+contract holds: the workflow's macOS leg would stage the
+bundle so `BlindRSS.app` sits at the dmg root, keeping the
+fixed `BlindRSS.dmg` asset name and ship-shape's
+contents-at-root Portable apply. App-side, resource
+resolution learned the bundle: `resource_dirs()` (exe
+folder, then `Contents/Resources` when the exe runs from
+`Contents/MacOS`) now feeds `locale_roots()`,
+`resolve_sound` and the help viewer's `docs/help` lookup,
+so a bundled build finds its catalogs, sounds and guide.
+xtask tests inspect the built bundle: layout, executable
+bit, Resources placement (no duplicate executable), and
+every Info.plist key above; staging without the executable
+is refused with a named error. **Pending owner approval
+(not done here): the release.yml integration** — in the
+macOS leg only, after the Package step's staging is
+complete, run `cargo xtask bundle-app dist/BlindRSS
+dist/bundle "$VERSION"` and point the existing `hdiutil
+create -srcfolder` at `dist/bundle` instead of
+`dist/BlindRSS`; no other leg changes. Finder/VoiceOver/
+start-at-login behaviour of the bundled app is the owner's
+manual acceptance item (plan's platform-acceptance list),
+not claimed here. `app/build.rs` needed no change: the
+Windows identity it embeds (manifest + version resource)
+is the Windows counterpart and already present.
+
+**Accessibility pass (before the UI-visible changes):**
+notifications are system surfaces, not controls; the pass
+checked that (a) notification titles/bodies are plain text a
+screen reader speaks as-is (no markup — previews are
+tag-stripped in core), (b) balloon-click activation lands
+through the standard article activation, so focus and read
+marking behave exactly like pressing Enter on the article,
+with no focus manipulation of its own, and (c) the launchctl
+deadline removes a path where the Settings toggle could hang
+the UI thread silently. No controls were added, moved or
+renamed in this task.
+
+**Task 30 gate:** the worker gate on branch
+audit8/task30-notifications ran fmt (last, clean), clippy
+(workspace --all-targets and core x86_64-pc-windows-gnu,
+both -D warnings clean), the full workspace test suite
+(935 passed / 0 failed: baseline 911 on main 50e6339 plus
+24 new — notify 3 unit + 13 slice, single_instance 3 unit +
+1 contract, startup 2, xtask bundle 2) and
+`cargo build -p blindrss` (OK). Two defects in this task's
+own new code were caught and fixed during the gate: the
+preview entity decoder never ran for text without literal
+angle brackets (Python's queue-side preview always decodes),
+and an unterminated `<` in preview text swallowed the rest
+of the string instead of staying literal.

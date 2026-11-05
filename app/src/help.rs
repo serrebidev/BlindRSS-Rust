@@ -15,13 +15,14 @@ pub fn help_dir() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("BLINDRSS_HELP") {
         return Some(PathBuf::from(p));
     }
-    let candidates = [
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../docs/help"),
-        std::env::current_exe()
-            .ok()
-            .and_then(|e| e.parent().map(|p| p.join("docs/help")))
-            .unwrap_or_default(),
-    ];
+    let mut candidates = vec![PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../docs/help")];
+    // Release layouts: docs/help beside the executable, or in
+    // the .app bundle's Resources (Audit 8 B14).
+    candidates.extend(
+        crate::resource_dirs()
+            .into_iter()
+            .map(|d| d.join("docs/help")),
+    );
     candidates.into_iter().find(|p| p.join("en.md").exists())
 }
 
