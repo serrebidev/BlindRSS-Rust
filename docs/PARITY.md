@@ -6505,3 +6505,17 @@ clean onto main. Merged gate: fmt clean, clippy clean
 build OK. All 31 Audit 8 tasks are now integrated; the
 Wave 4 release (v0.1.58) and the closing reconciliation
 follow.
+
+**CI fix on the Task 30 tree (2026-11-05):** run
+42095130853 failed Windows MSVC clippy in
+app/src/startup.rs: Task 30's B13 items
+(`STARTUP_COMMAND_TIMEOUT_S`, `run_startup_command`) were
+gated `cfg(any(macos, test))` and their tests are
+unix-only (shell-script fakes), so in the Windows test
+binary the items were dead code and the test module's
+`use super::*` was unused — four -D warnings errors,
+invisible locally (Linux runs the tests; the app crate's
+windows-gnu check is blocked by the known build.rs
+issue). Fix: items gated `cfg(any(macos, all(test,
+unix)))`, test module gated `cfg(all(test, unix))`.
+Behavior unchanged everywhere the code runs.

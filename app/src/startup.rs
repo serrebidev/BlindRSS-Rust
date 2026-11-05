@@ -40,7 +40,7 @@ fn launch_command() -> Option<String> {
 
 /// Python `core/macos_integration.py`'s launchctl deadline:
 /// no startup command may wait longer than this.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", all(test, unix)))]
 pub const STARTUP_COMMAND_TIMEOUT_S: u64 = 20;
 
 /// Run a startup-registration command under a hard deadline
@@ -50,7 +50,7 @@ pub const STARTUP_COMMAND_TIMEOUT_S: u64 = 20;
 /// blocking the Settings toggle forever. Returns
 /// (success, output) in Python `_run_launchctl`'s shape:
 /// stdout on success, stderr (else stdout) on failure.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", all(test, unix)))]
 fn run_startup_command(
     exe: &std::path::Path,
     args: &[&str],
@@ -257,7 +257,7 @@ mod mac {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
