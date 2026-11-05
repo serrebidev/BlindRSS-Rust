@@ -403,7 +403,7 @@ pub fn search_configured(
             }
             return Ok(results);
         }
-        SearchProvider::Awesome => return awesome_search(query, limit),
+        SearchProvider::Awesome => return awesome_search(query, limit, config),
         SearchProvider::YouTube => return youtube_search(query, limit),
         SearchProvider::SoundCloud => return soundcloud_search(query, limit),
         SearchProvider::NewsApis => return news_api_search(query, limit, config),
@@ -1167,100 +1167,374 @@ pub fn parse_html_results(
     )
 }
 
-fn awesome_search(query: &str, limit: usize) -> Result<Vec<FeedResult>, String> {
-    let countries = [
-        "Canada",
-        "United States",
-        "United Kingdom",
-        "Australia",
-        "France",
-        "Germany",
-        "India",
-        "Ireland",
-        "Italy",
-        "Japan",
-        "Mexico",
-        "Poland",
-        "Spain",
-        "Ukraine",
-        "Brazil",
-        "South Africa",
-    ];
-    let topics = [
-        "Android",
-        "Apple",
-        "Business & Economy",
-        "Cyber security",
-        "Environment",
-        "Food",
-        "Football",
-        "Gaming",
-        "History",
-        "Movies",
-        "Music",
-    ];
-    let query = query.to_lowercase();
-    let (tx, rx) = std::sync::mpsc::channel();
-    for (folder, names) in [
-        ("countries/with_category", countries.as_slice()),
-        ("recommended/without_category", topics.as_slice()),
-    ] {
-        for name in names {
-            let (tx, name) = (tx.clone(), name.to_string());
-            std::thread::spawn(move || {
-                let mut address = url::Url::parse(
-                    "https://raw.githubusercontent.com/plenaryapp/awesome-rss-feeds/master/",
-                )
-                .unwrap();
-                address.set_path(&format!(
-                    "/plenaryapp/awesome-rss-feeds/master/{folder}/{name}.opml"
-                ));
-                let result = fetch(address.as_str()).and_then(|body| parse_catalogue(&body, &name));
-                let _ = tx.send(result);
-            });
-        }
-    }
-    drop(tx);
-    let mut matches = Vec::new();
-    let mut successes = 0;
-    for entries in rx.into_iter().flatten() {
-        successes += 1;
-        for entry in entries {
-            let haystack =
-                format!("{} {} {}", entry.title, entry.description, entry.url).to_lowercase();
-            if haystack.contains(&query)
-                || query
-                    .split_whitespace()
-                    .any(|word| word.len() > 3 && haystack.contains(word))
-            {
-                matches.push(entry);
+/// One Awesome RSS catalogue entry, in the exact JSON
+/// shape Python's `awesome_rss_catalogue.json` cache uses,
+/// so both apps share the cache file in the data dir.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct AwesomeEntry {
+    pub title: String,
+    pub detail: String,
+    pub url: String,
+    pub category: String,
+    pub country: String,
+}
+
+/// Python `_AWESOME_TTL_S`: the catalogue cache lives a
+/// week.
+const AWESOME_TTL_S: u64 = 7 * 24 * 3600;
+
+const AWESOME_COUNTRIES: &[&str] = &[
+    "Canada",
+    "United States",
+    "United Kingdom",
+    "Australia",
+    "France",
+    "Germany",
+    "India",
+    "Ireland",
+    "Italy",
+    "Japan",
+    "Mexico",
+    "Poland",
+    "Spain",
+    "Ukraine",
+    "Brazil",
+    "South Africa",
+];
+
+const AWESOME_TOPICS: &[&str] = &[
+    "Android",
+    "Apple",
+    "Business & Economy",
+    "Cyber security",
+    "Environment",
+    "Food",
+    "Football",
+    "Gaming",
+    "History",
+    "Movies",
+    "Music",
+];
+
+/// One OPML outline carrying a feed URL, with the titles
+/// of the container outlines above it.
+struct OutlineEvent {
+    title: String,
+    detail: String,
+    url: String,
+    path: Vec<String>,
+}
+
+fn outline_events_strict(xml: &str) -> Option<Vec<OutlineEvent>> {
+    let doc = opml::OPML::from_str(xml).ok()?;
+    fn walk(outlines: &[opml::Outline], path: &[String], out: &mut Vec<OutlineEvent>) {
+        for outline in outlines {
+            if let Some(url) = &outline.xml_url {
+                let url = url.trim().to_string();
+                if url.is_empty() {
+                    continue;
+                }
+                let title = {
+                    let t = outline
+                        .title
+                        .clone()
+                        .unwrap_or_else(|| outline.text.clone());
+                    let t = t.trim().to_string();
+                    if t.is_empty() { url.clone() } else { t }
+                };
+                out.push(OutlineEvent {
+                    title,
+                    detail: outline
+                        .description
+                        .clone()
+                        .unwrap_or_default()
+                        .trim()
+                        .to_string(),
+                    url,
+                    path: path.to_vec(),
+                });
+            } else {
+                let mut child = path.to_vec();
+                let title = outline.text.trim().to_string();
+                if !title.is_empty() {
+                    child.push(title);
+                }
+                walk(&outline.outlines, &child, out);
             }
         }
     }
-    if successes == 0 {
+    let mut out = Vec::new();
+    walk(&doc.body.outlines, &[], &mut out);
+    Some(out)
+}
+
+/// Python `_parse_opml_outlines`' tolerant fallback: some
+/// published OPML files are not well-formed XML (unescaped
+/// & in URLs), so scan the outline tags with a stack
+/// (Audit 8 F17).
+fn outline_events_tolerant(text: &str) -> Vec<OutlineEvent> {
+    let tag_re = regex::Regex::new(r"(?is)<(/?)outline\b([^>]*?)(/?)>").expect("static regex");
+    let attr_re =
+        regex::Regex::new(r#"(\w+)\s*=\s*"([^"]*)"|(\w+)\s*=\s*'([^']*)'"#).expect("static regex");
+    let attrs = |raw: &str| -> std::collections::HashMap<String, String> {
+        let mut out = std::collections::HashMap::new();
+        for cap in attr_re.captures_iter(raw) {
+            let key = cap
+                .get(1)
+                .or_else(|| cap.get(3))
+                .map(|m| m.as_str().to_lowercase())
+                .unwrap_or_default();
+            let val = cap
+                .get(2)
+                .or_else(|| cap.get(4))
+                .map(|m| m.as_str())
+                .unwrap_or("");
+            out.insert(key, val.replace("&amp;", "&").trim().to_string());
+        }
+        out
+    };
+    let mut stack: Vec<String> = Vec::new();
+    let mut out = Vec::new();
+    for cap in tag_re.captures_iter(text) {
+        let closing = !cap.get(1).unwrap().as_str().is_empty();
+        let raw = cap.get(2).map(|m| m.as_str()).unwrap_or("");
+        let selfclose = !cap.get(3).unwrap().as_str().is_empty();
+        if closing {
+            stack.pop();
+            continue;
+        }
+        let a = attrs(raw);
+        let url = a.get("xmlurl").cloned().unwrap_or_default();
+        let title = a
+            .get("title")
+            .filter(|t| !t.is_empty())
+            .or_else(|| a.get("text"))
+            .cloned()
+            .unwrap_or_default();
+        if !url.is_empty() {
+            out.push(OutlineEvent {
+                title: if title.is_empty() { url.clone() } else { title },
+                detail: a.get("description").cloned().unwrap_or_default(),
+                url,
+                path: stack.clone(),
+            });
+        } else if !selfclose && !title.is_empty() {
+            stack.push(title);
+        }
+    }
+    out
+}
+
+/// All feed outlines in an OPML document, strictly when it
+/// parses and through the tolerant tokenizer when it does
+/// not (Python `_parse_opml_outlines`).
+fn outline_events(xml: &str) -> Vec<OutlineEvent> {
+    match outline_events_strict(xml) {
+        Some(events) => events,
+        None => outline_events_tolerant(xml),
+    }
+}
+
+/// Python `_parse_opml_outlines` for the catalogue files.
+fn awesome_entries_from_opml(
+    text: &str,
+    country: &str,
+    fallback_category: &str,
+) -> Vec<AwesomeEntry> {
+    outline_events(text)
+        .into_iter()
+        .map(|event| AwesomeEntry {
+            title: event.title,
+            detail: event.detail,
+            url: event.url,
+            category: if event.path.is_empty() {
+                fallback_category.to_string()
+            } else {
+                event.path.join(" / ")
+            },
+            country: country.to_string(),
+        })
+        .collect()
+}
+
+/// The catalogue cache path (Python `_awesome_cache_path`):
+/// beside the config in the data dir.
+pub fn awesome_cache_path(data_dir: &std::path::Path) -> std::path::PathBuf {
+    data_dir.join("awesome_rss_catalogue.json")
+}
+
+fn read_awesome_cache(path: &std::path::Path) -> Option<Vec<AwesomeEntry>> {
+    let meta = std::fs::metadata(path).ok()?;
+    let modified = meta.modified().ok()?;
+    if std::time::SystemTime::now()
+        .duration_since(modified)
+        .map(|age| age.as_secs() >= AWESOME_TTL_S)
+        .unwrap_or(true)
+    {
+        return None;
+    }
+    let text = std::fs::read_to_string(path).ok()?;
+    let entries: Vec<AwesomeEntry> = serde_json::from_str(&text).ok()?;
+    if entries.is_empty() {
+        None
+    } else {
+        Some(entries)
+    }
+}
+
+/// Python `load_awesome_rss_catalogue`: the 7-day disk
+/// cache first (Audit 8 F17), otherwise fetch every
+/// country/topic OPML (file order preserved), dedupe by
+/// normalized URL, and write the cache when anything came
+/// back.
+pub fn load_awesome_catalogue(data_dir: Option<&std::path::Path>) -> Vec<AwesomeEntry> {
+    if let Some(dir) = data_dir
+        && let Some(entries) = read_awesome_cache(&awesome_cache_path(dir))
+    {
+        return entries;
+    }
+    let mut files: Vec<(String, String, String)> = Vec::new();
+    for country in AWESOME_COUNTRIES {
+        files.push((
+            format!(
+                "https://raw.githubusercontent.com/plenaryapp/awesome-rss-feeds/master/countries/with_category/{}.opml",
+                percent_encode_path(country)
+            ),
+            country.to_string(),
+            String::new(),
+        ));
+    }
+    for topic in AWESOME_TOPICS {
+        files.push((
+            format!(
+                "https://raw.githubusercontent.com/plenaryapp/awesome-rss-feeds/master/recommended/without_category/{}.opml",
+                percent_encode_path(topic)
+            ),
+            String::new(),
+            topic.to_string(),
+        ));
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    for (index, (address, _, _)) in files.iter().enumerate() {
+        let tx = tx.clone();
+        let address = address.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send((index, fetch(&address)));
+        });
+    }
+    drop(tx);
+    let mut bodies: Vec<Option<String>> = vec![None; files.len()];
+    for (index, body) in rx.into_iter() {
+        bodies[index] = body.ok();
+    }
+    let mut out: Vec<AwesomeEntry> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
+    for ((_, country, fallback), body) in files.iter().zip(bodies.iter()) {
+        let Some(body) = body else { continue };
+        for entry in awesome_entries_from_opml(body, country, fallback) {
+            let key = entry
+                .url
+                .trim()
+                .to_lowercase()
+                .trim_end_matches('/')
+                .to_string();
+            if !key.is_empty() && !seen.contains(&key) {
+                seen.push(key);
+                out.push(entry);
+            }
+        }
+    }
+    if !out.is_empty()
+        && let Some(dir) = data_dir
+        && std::fs::create_dir_all(dir).is_ok()
+        && let Ok(text) = serde_json::to_string(&out)
+    {
+        let _ = std::fs::write(awesome_cache_path(dir), text);
+    }
+    out
+}
+
+fn percent_encode_path(name: &str) -> String {
+    name.replace(' ', "%20").replace('&', "%26")
+}
+
+/// Python `search_awesome_rss_feeds`' matching over a
+/// loaded catalogue: match on title/detail/category/
+/// country/URL, whole term or any long word.
+pub fn awesome_matches(entries: &[AwesomeEntry], query: &str) -> Vec<FeedResult> {
+    let term = query.trim().to_lowercase();
+    let mut out = Vec::new();
+    for entry in entries {
+        let hay = format!(
+            "{} {} {} {} {}",
+            entry.title, entry.detail, entry.category, entry.country, entry.url
+        )
+        .to_lowercase();
+        if term.is_empty()
+            || hay.contains(&term)
+            || term
+                .split_whitespace()
+                .any(|word| word.len() > 3 && hay.contains(word))
+        {
+            out.push(FeedResult {
+                title: if entry.title.is_empty() {
+                    entry.url.clone()
+                } else {
+                    entry.title.clone()
+                },
+                description: if !entry.detail.is_empty() {
+                    entry.detail.clone()
+                } else if !entry.category.is_empty() {
+                    entry.category.clone()
+                } else {
+                    "Publisher catalogue".to_string()
+                },
+                url: entry.url.clone(),
+            });
+        }
+    }
+    out
+}
+
+/// Python `search_awesome_rss_feeds` over the catalogue
+/// cached beside the active config.
+pub fn search_awesome_rss(query: &str, data_dir: Option<&std::path::Path>) -> Vec<FeedResult> {
+    awesome_matches(&load_awesome_catalogue(data_dir), query)
+}
+
+fn awesome_search(
+    query: &str,
+    limit: usize,
+    config: &crate::config::Config,
+) -> Result<Vec<FeedResult>, String> {
+    let data_dir = config
+        .source_path()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+    let entries = load_awesome_catalogue(data_dir.as_deref());
+    if entries.is_empty() {
         return Err("Publisher catalogue could not be downloaded".into());
     }
-    matches.sort_by(|a, b| a.url.cmp(&b.url));
-    matches.dedup_by(|a, b| a.url == b.url);
+    let mut matches = awesome_matches(&entries, query);
     matches.truncate(limit);
     Ok(matches)
 }
 
 pub fn parse_catalogue(xml: &str, category: &str) -> Result<Vec<FeedResult>, String> {
-    let doc = opml::OPML::from_str(xml).map_err(|_| "Invalid publisher catalogue".to_string())?;
-    fn walk(outlines: &[opml::Outline], category: &str, results: &mut Vec<Value>) {
-        for outline in outlines {
-            if let Some(url) = &outline.xml_url {
-                results.push(
-                    serde_json::json!({"url": url, "title": outline.text, "site_name": category}),
-                );
-            }
-            let child = format!("{category} {}", outline.text);
-            walk(&outline.outlines, &child, results);
-        }
-    }
+    // Python `_parse_opml_outlines` semantics with the
+    // port's established FeedResult mapping (the category
+    // path rides in the description); malformed OPML
+    // recovers through the tolerant tokenizer instead of
+    // failing (Audit 8 F17).
     let mut rows = Vec::new();
-    walk(&doc.body.outlines, category, &mut rows);
+    for event in outline_events(xml) {
+        let mut site_name = category.to_string();
+        if !event.path.is_empty() {
+            site_name = format!("{site_name} {}", event.path.join(" "));
+        }
+        rows.push(
+            serde_json::json!({"url": event.url, "title": event.title, "site_name": site_name}),
+        );
+    }
     let mut results = Vec::new();
     for chunk in rows.chunks(100) {
         results.extend(parse_results(

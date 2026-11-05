@@ -596,3 +596,41 @@ fn google_support_thread_view_decodes_the_whole_conversation() {
         ""
     );
 }
+
+// ---------------------------------------------------------------------------
+// Audit 8 Task 26 — Rumble login-wall detection (F14)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn rumble_login_page_detection_matches_python() {
+    use blindrss_core::sources::rumble_looks_like_login_page;
+    // Redirected to a login route.
+    assert!(rumble_looks_like_login_page(
+        "<html><body>listing</body></html>",
+        "https://rumble.com/login"
+    ));
+    assert!(rumble_looks_like_login_page(
+        "<html><body>listing</body></html>",
+        "https://rumble.com/signin?next=/c/channel"
+    ));
+    // Sign-in document shapes.
+    assert!(rumble_looks_like_login_page(
+        "<html><head><title>Sign In - Rumble</title></head></html>",
+        "https://rumble.com/c/channel"
+    ));
+    assert!(rumble_looks_like_login_page(
+        r#"<html><body><form><input name="password" type="password">Log in</form></body></html>"#,
+        "https://rumble.com/c/channel"
+    ));
+    // A real listing is not a login page, even with a
+    // password field in an unrelated widget (no sign-in
+    // wording) or "login" in a video title.
+    assert!(!rumble_looks_like_login_page(
+        "<html><head><title>Channel Videos</title></head><body>videos</body></html>",
+        "https://rumble.com/c/channel"
+    ));
+    assert!(!rumble_looks_like_login_page(
+        r#"<html><body><input name="password"></body></html>"#,
+        "https://rumble.com/c/channel"
+    ));
+}

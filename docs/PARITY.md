@@ -5250,3 +5250,235 @@ standing acceptance list.
 clean onto main. Merged gate: fmt clean, clippy clean
 (workspace and core windows-gnu), 803 passed / 0 failed,
 build OK.
+
+## Audit 8 Task 26 resolution — subscription discovery/search end to end (F05, F06, F07, F08, F09, F10, F14, F17, F18, F19, G09, G18) (2026-11-04)
+
+**F05 — Video Search retains subscription targets.** `VideoResult`
+now carries `native_feed_url` and `source_subscribe_url`, derived
+at normalization time by a faithful port of Python's
+`_derive_subscribe_targets_for_search_result` (with
+`_native_youtube_feed_from_search_entry` and
+`_choose_entry_subscribe_source_url`): feed results target
+themselves, user/playlist results resolve the native YouTube feed
+(playlist_id / channel_id) or `get_ytdlp_feed_url`, media results
+subscribe to the owning channel/source. The dialog keeps its
+existing buttons in their existing order and appends "Subscribe
+(Native Feed)" and "Subscribe (Source)" after Close; Subscribe
+(best) uses native else source. Every subscribe action goes
+through the one provider-aware subscribe action (G09) and never
+the bare video URL. Regression tests in `videosearch.rs` cover
+video, channel, playlist and Mixcloud targets. Deviation: Python's
+dialog stays open with a status label after subscribing and asks
+the category through `add_feed_from_url_prompt`; the port's modal
+dialog returns the chosen action and subscribes without a
+category, as its subscribe flow already did.
+
+**F06 — the site registry derives from the installed yt-dlp.**
+`yt-dlp --list-extractors` is enumerated on a background warm
+thread at startup (Python preloads its extractor classes the same
+way), and `sites_from_extractor_names` applies Python's rules:
+the label-override map, the redundant gvsearch/yvsearch drop, the
+Mixcloud extra, dedupe by site id with losing keys recorded as
+`search_key_aliases`, sort by (label, id), and the Pornhub adult
+template appended after the sort only when adult sites are
+enabled. The previous hard-coded seven sites (which offered Vimeo
+and TikTok, neither of which exists in yt-dlp 2026.08.19) are
+gone. Deviation, stated plainly: the CLI bridge exposes extractor
+NAMES only — no `_SEARCH_KEY`, `IE_DESC` or `_WORKING` — so search
+keys come from a table verified empirically against yt-dlp
+2026.08.19 (ytsearch/ytsearchdate, scsearch, bilisearch,
+nicosearch/nicosearchdate, rkfnsearch, prxseries, prxstories,
+gvsearch, yvsearch; each key exercised against the CLI), and a
+site is offered only when its key is in that table. Search
+extractors with no CLI-derivable key (dailymotion:search,
+CiscoLiveSearch, GameJoltSearch, RedGifsSearch on 2026.08.19) are
+enumerated but not offered, matching the effect of Python's
+non-empty-`_SEARCH_KEY` filter; `_WORKING` is assumed true; labels
+for non-overridden colon sites derive from the IE_NAME base
+(IE_DESC is not exposed). Until the enumeration lands, derivation
+runs over the observed 2026.08.19 search-name set. Tests cover
+derivation, extra/missing extractor tracking, alias recording,
+adult gating and adult ordering.
+
+**F07 — YouTube handle/custom-channel metadata recovery.**
+`ytdlp_feed_url` ports `get_ytdlp_feed_url` in full: direct feed
+URLs, playlist ids, `/channel/` and `/user/` shapes resolve
+locally; `/@handle`, `/c/` and other channel pages go through the
+metadata recovery — `yt-dlp --dump-single-json --flat-playlist
+--playlist-items 0` over `ytdlp_recovery::cookie_attempts(None)`
+(the anonymous attempt, then the configured cookie file, then
+every consented browser source, the same ladder Python's
+`_build_cookie_sources` builds) — accepting a `channel_id` only
+from a playlist/channel document, so a consent or challenge shell
+falls through to the next discovery stage instead of inventing a
+feed. `detect_page_feeds` tries this native channel feed before
+fetching the page, like Python. Deviation: the port passes
+`--ignore-config` on this dump for consistency with its other
+yt-dlp calls; Python's discovery call omits it.
+
+**F08 — full discovery chain.** `discover_feed_urls` now mirrors
+`discover_feeds`: a feed-shaped URL returns itself; the native
+yt-dlp feed; social/forum/listing transforms; a page fetch (with
+Task 24's browser recovery behind it on gate statuses and
+challenge pages); a feed-shaped body returns the effective URL;
+then RANKED alternate candidates (Python's scoring — page-token
+overlap ×8, title-token overlap ×10, slug bonuses, −1/−3 path
+penalties, comment-feed −12 — with document order breaking ties),
+then anchor candidates, then the probed common paths, and only
+when all of those are empty the validated OpenRSS fallback.
+`looks_like_feed_url` and `body_looks_like_feed` (JSON Feed, RSS,
+Atom, RDF) are ported, as are the vBulletin candidates used by
+Detect Feeds on Page. One pre-existing test's expected order
+changed: ranked enumeration now outranks document order when a
+candidate's path shares the page's tokens, which is Python's
+behaviour; the test's attribute-boundary and URL-resolution
+assertions are unchanged. Tests cover comment-first ranking,
+anchor-only pages, JSON/RDF detection and OpenRSS success/failure
+shapes (offline).
+
+**F09 — effective-URL resolution.** Page transport carries the
+effective response URL end to end (`PageResponse.effective_url`
+from the response URI after redirects); alternate links and
+anchors resolve against it, and detection returns it for
+feed-shaped bodies. A loopback test redirects /old/page to
+/new/dir/page and resolves a relative feed link against /new/.
+
+**F10 — Detect Feeds on Page has its own handler.** New menu id
+M_DETECT_PAGE (the Feeds-menu item and the `feeds.detect_page`
+shortcut action; the Tools-menu directory search keeps
+M_FEED_SEARCH), a prompt → worker `detect_page_feeds` → drain
+presentation matching Python's `_present_detected_page_feeds`:
+none → "No feeds detected on this page.", one → Add Feed
+prefilled with it, many → a "Detected Feeds" picker feeding the
+same prefilled Add Feed flow. Errors follow Python's two
+messages verbatim: a challenge → "BlindRSS could not complete
+this site's browser verification page automatically." plus the
+Tools > Import Site Cookies guidance; any other failure →
+"Unable to retrieve the page." `detect_page_feeds` ports
+Python's function: native YouTube channel feed first, plain
+fetch, Task 24 browser recovery for gate statuses
+(401/403/429/503/≥520) and challenge-looking 200 bodies,
+`PageFetchError { is_challenge }` decided by
+`looks_like_challenge_response`, wide-type alternates in document
+order, vBulletin candidates appended. The B16 impersonated retry
+remains a seam here as it is in extraction; it is not re-wired.
+
+**F14 — authenticated source retries.** Odysee listing fetches
+retry after any anonymous failure with
+`--cookies-from-browser` for each consented source from
+`ytdlp_recovery::cookie_sources()` — the same sources Python's
+odysee.py cycles — first success wins, the last error surfaces;
+yt-dlp reads the browser cookies itself, nothing is stored or
+logged. Deviation: Rumble's login-page retry uses the app's
+managed cookie jar (`cookies::site_headers_for` — cookies the
+user imported or the app harvested under the Task 25 consent
+model) instead of Python's live read of browser cookies through
+yt_dlp's library; no live browser profile is read outside the
+consented paths, and Chromium v20 app-bound live reading stays
+the documented non-port. `rumble_looks_like_login_page` ports
+Python's three login signals, with regression tests.
+
+**F17 — Awesome RSS catalogue cache and tolerant OPML.** The
+catalogue ports Python exactly: the same 16 country and 11 topic
+files, parsed entries in Python's dict shape, dedupe by
+lowercased URL, cache at `<data dir>/awesome_rss_catalogue.json`
+with a 7-day TTL — a fresh cache serves search fully offline —
+and the cache is written after a successful load. OPML parsing
+uses the strict parser first with Python's tolerant tokenizer as
+the recovery path, so malformed markup (e.g. an unescaped `&` in
+an xmlUrl) recovers its entries instead of failing the
+catalogue; the Feed Search `parse_catalogue` path shares the
+recovery. Tests cover cached offline search against a
+Python-shaped cache file and malformed-OPML recovery. The
+stale-cache refresh and cache-write paths are not covered by
+offline tests (they need the network catalogue).
+
+**F18 — case-faithful video dedupe.** `canonical_key` is
+Python's `canonical_search_result_key`: host lowercased with
+`www.` stripped, path lowercased after the trailing-slash trim,
+query preserved verbatim; YouTube video ids keep their case in
+every form (watch `v`, youtu.be, /shorts/, /embed/). Case-variant
+watch URLs collapse to one key; ids differing only in case stay
+distinct. Regression tests cover both, plus host/path folding
+and query-case preservation. Minor difference: the `v` parameter
+is read through the URL parser's percent-decoding pairs where
+Python uses `parse_qs` — equivalent for video ids.
+
+**F19 — Python's result normalization and merging.**
+Normalization ports `_normalize_ytdlp_search_entries` fully:
+exact-URL dedupe, junk titles (title equal to the URL or the
+entry id) repaired with Python's friendly per-host fallbacks,
+the owner label (name / @handle, with the UC-prefix suppression
+and the YouTube handle-from-URL rule), play counts (view_count
+then play_count, non-negative only), the detail line
+(`Kind | owner | H:MM:SS`), and the display site label taken
+from the result URL's host. Not ported: Python's quick-title
+network prefetch for junk titles (one page fetch per result
+inside normalization) — the friendly fallback covers the same
+rows offline. Merging ports the dialog's rule as
+`videosearch::merge_result`: an existing row is replaced in
+place — keeping its arrival slot — only when the new row's
+quality tuple (real title, has a subscribe target, play count)
+is strictly greater; the app previously dropped every later
+duplicate first-wins. Duration and owner are also carried as
+result fields for the dialog columns, as before; the detail
+string itself is Python's.
+
+**G09 — one provider-aware subscribe action.** `spawn_subscribe`
+in app/main.rs is now the single subscribe path for Add Feed,
+Feed Search directory results, Video Search and Detect Feeds on
+Page: with a hosted provider active it calls the provider's
+`add_feed` (a server-side subscribe; the ProviderAction drain
+reloads the cache from the DB and runs the post-sync side
+effects, so directory subscriptions persist remotely), and
+locally it runs the worker subscribe path. Feed Search
+previously subscribed locally even when a hosted provider was
+active.
+
+**G18 — Add Feed hints and category suggestion.** Add Feed is
+Python's AddFeedDialog shape: URL and category in one dialog
+(the combo lists the existing categories plus Uncategorized,
+preselects YouTube when present, and accepts a typed new path),
+with the asynchronous compatibility hint — YouTube hosts are
+recognized immediately ("OK: Recognized as YouTube source", and
+the YouTube category is auto-selected), other URLs are checked
+on a worker after a 500 ms debounce ("Checking
+compatibility..." → "OK: Supported by yt-dlp") without ever
+blocking the dialog. Deviation: the support check is the offline
+port `ytdlp_supported_offline` (scheme/host allowlist plus
+media/article path heuristics) because the CLI bridge cannot
+consult yt-dlp's extractor URL regexes in-process as Python
+does; a non-allowlisted URL on an unrecognized host reports
+unsupported where Python's regex pass might match one. Hosted
+adds show the same dialog; the provider `add_feed` trait takes
+no category, so the chosen category applies to local adds only
+(pre-existing trait shape). Accessibility pass before the UI
+edits: new controls were appended, never inserted (the two new
+Video Search buttons follow the existing row; dialogs use
+labelled controls with accessible names only and no
+instructional descriptions; initial focus lands on the primary
+field; results keep arriving through the worker + RefreshMsg
+drain, so no dialog blocks on the network).
+
+Adjacent finds left for reconciliation: Python's
+`_merge_records_into_jar` prunes YouTube `ST-` per-page state
+tokens on jar rewrite (Task 25's find — untouched here); Python's
+refresh has an HTTP-level retry layer (`_response_looks_blocked`)
+that Task 24 also noted and this task did not add; the port's
+Add Feed category combo shows identity paths where Python shows
+display names over identities (the port's established picker
+convention); the vBulletin forum-id regex lacks Python's
+case-insensitive flag (paths are case-sensitive in practice).
+
+**Task 26 gate (2026-11-04):** worker gate on branch
+audit8/task26-discovery: fmt clean, clippy clean (workspace
+--all-targets and core x86_64-pc-windows-gnu, -D warnings),
+825 passed / 0 failed (baseline 803; +22 regression tests
+across videosearch unit tests, discovery_slice,
+feedsearch_parity and source_depth_parity), `cargo build -p
+blindrss` OK. Two VM replacements interrupted gate runs
+mid-flight; deps were restored via the azure-only apt sidestep
+and every gate was re-run to completion afterwards. Owner
+screen-reader acceptance of the Video Search subscribe
+buttons, Detect Feeds on Page and the Add Feed hints joins
+the standing acceptance list.

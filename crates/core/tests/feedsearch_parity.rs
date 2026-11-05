@@ -238,3 +238,57 @@ fn piefed_user_results_and_keyless_newsapis_fail_safely() {
         blindrss_core::feedsearch::search(SearchProvider::NewsApis, "science", 10).unwrap_err();
     assert!(error.contains("Configure"));
 }
+
+// ---------------------------------------------------------------------------
+// Audit 8 Task 26 — Awesome RSS cache + tolerant OPML (F17)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn malformed_opml_recovers_through_the_tolerant_tokenizer() {
+    use blindrss_core::feedsearch::parse_catalogue;
+    // Unescaped & in the URL makes this not-well-formed
+    // XML; Python's parser falls back to a tolerant outline
+    // scan and so does the port.
+    let rows = parse_catalogue(
+        r#"<opml version="2.0"><body><outline text="Tech"><outline text="Amp Feed" xmlUrl="https://example.com/feed?a=1&b=2"/></outline></body></opml>"#,
+        "Canada",
+    )
+    .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].url, "https://example.com/feed?a=1&b=2");
+    assert!(rows[0].description.contains("Canada Tech"));
+}
+
+#[test]
+fn awesome_catalogue_cache_serves_searches_offline() {
+    use blindrss_core::feedsearch::search_awesome_rss;
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "blindrss-awesome-{}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+        COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    // Python's cache shape: {title, detail, url, category,
+    // country} — a fresh cache means NO download happens.
+    let cache = std::path::PathBuf::from(&dir).join("awesome_rss_catalogue.json");
+    std::fs::write(
+        &cache,
+        r#"[{"title": "Rust Blog", "detail": "", "url": "https://blog.rust-lang.org/feed.xml", "category": "Tech / Languages", "country": "United States"}, {"title": "Cooking Daily", "detail": "Recipes", "url": "https://cooking.example/feed", "category": "Food", "country": "Canada"}]"#,
+    )
+    .unwrap();
+    let hits = search_awesome_rss("rust", Some(&dir));
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].title, "Rust Blog");
+    // Empty detail falls back to the category, like Python.
+    assert_eq!(hits[0].description, "Tech / Languages");
+    // Category and country are searchable too.
+    let hits = search_awesome_rss("canada", Some(&dir));
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].title, "Cooking Daily");
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -593,9 +593,16 @@ fn dedupe_items(items: Vec<SourceItem>) -> Vec<SourceItem> {
 /// Run yt-dlp for a single info document (`-J --flat-playlist`):
 /// the listing title plus its flat entries in one JSON value
 /// (Python's yt_dlp-library `extract_flat="in_playlist"` shape).
-fn ytdlp_info_document(url: &str, max_items: usize, timeout_s: u64) -> Result<Value, String> {
+/// `extra_args` carries one attempt's cookie arguments
+/// (Audit 8 F14).
+fn ytdlp_info_document_attempt(
+    url: &str,
+    max_items: usize,
+    timeout_s: u64,
+    extra_args: &[String],
+) -> Result<Value, String> {
     let exe = crate::media::find_ytdlp().ok_or("yt-dlp not found")?;
-    let args: Vec<String> = vec![
+    let mut args: Vec<String> = vec![
         "--ignore-config".into(),
         "-J".into(),
         "--flat-playlist".into(),
@@ -603,8 +610,9 @@ fn ytdlp_info_document(url: &str, max_items: usize, timeout_s: u64) -> Result<Va
         "--no-warnings".into(),
         "--playlist-end".into(),
         max_items.to_string(),
-        url.to_string(),
     ];
+    args.extend(extra_args.iter().cloned());
+    args.push(url.to_string());
     // F20: owned subprocess via the shared runner (kill + reap
     // on timeout), same as `ytdlp_flat_listing`.
     let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
@@ -627,20 +635,37 @@ fn ytdlp_info_document(url: &str, max_items: usize, timeout_s: u64) -> Result<Va
 }
 
 fn fetch_odysee(url: &str, max_items: usize) -> Result<(String, Vec<SourceItem>), String> {
-    let info = ytdlp_info_document(url, max_items, 60)?;
-    // Python `_extract_listing_from_info`: the feed title is the
-    // listing's own title from the info document.
-    let title = json_str(&info, &["title"]).unwrap_or_else(|| "Odysee".to_string());
-    let entries = info
-        .get("entries")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-    let items: Vec<SourceItem> = entries
-        .iter()
-        .filter_map(|e| flat_entry_item(e, "odysee"))
-        .collect();
-    Ok((title, dedupe_items(items)))
+    // Python `fetch_listing_items` (Audit 8 F14): the
+    // anonymous attempt first; when it fails, one retry per
+    // configured browser cookie source, in order. yt-dlp
+    // reads the browser cookies itself — no cookie value is
+    // logged or stored here.
+    let mut attempts: Vec<Vec<String>> = vec![Vec::new()];
+    for source in crate::ytdlp_recovery::cookie_sources() {
+        attempts.push(vec!["--cookies-from-browser".to_string(), source]);
+    }
+    let mut last_err = String::new();
+    for extra in &attempts {
+        match ytdlp_info_document_attempt(url, max_items, 60, extra) {
+            Ok(info) => {
+                // Python `_extract_listing_from_info`: the feed title is the
+                // listing's own title from the info document.
+                let title = json_str(&info, &["title"]).unwrap_or_else(|| "Odysee".to_string());
+                let entries = info
+                    .get("entries")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                let items: Vec<SourceItem> = entries
+                    .iter()
+                    .filter_map(|e| flat_entry_item(e, "odysee"))
+                    .collect();
+                return Ok((title, dedupe_items(items)));
+            }
+            Err(e) => last_err = e,
+        }
+    }
+    Err(last_err)
 }
 
 fn fetch_youtube_search(
@@ -1115,6 +1140,49 @@ fn find_time_datetime(fragment: &str) -> Option<String> {
     None
 }
 
+/// Fetch a page's text plus its final (post-redirect) URL
+/// (Python `_fetch_text`'s pair).
+fn fetch_text_final(url: &str) -> Result<(String, String), String> {
+    let mut resp = crate::http::agent()
+        .get(url)
+        .call()
+        .map_err(|e| format!("fetch failed: {e}"))?;
+    use ureq::ResponseExt as _;
+    let final_url = resp.get_uri().to_string();
+    let bytes = resp
+        .body_mut()
+        .read_to_vec()
+        .map_err(|e| format!("read failed: {e}"))?;
+    Ok((String::from_utf8_lossy(&bytes).to_string(), final_url))
+}
+
+/// Python rumble `_looks_like_login_page`: a redirect to a
+/// login route, or a sign-in document.
+pub fn rumble_looks_like_login_page(html: &str, final_url: &str) -> bool {
+    let fu = final_url.to_lowercase();
+    if fu.contains("/login") || fu.contains("/signin") {
+        return true;
+    }
+    let low = html.to_lowercase();
+    if low.contains("<title>sign in") || low.contains("<title>login") {
+        return true;
+    }
+    low.contains("name=\"password\"") && (low.contains("sign in") || low.contains("log in"))
+}
+
+/// The managed-jar Cookie header for `url`, when the app
+/// has one (Audit 8 F14's authorized retry source): only
+/// cookies the user already imported or the app harvested
+/// under the Task 25 consent model are ever sent — no live
+/// browser read happens here.
+fn managed_cookie_header(url: &str) -> String {
+    let cfg = crate::source_feeds::config();
+    let Some(path) = cfg.source_path() else {
+        return String::new();
+    };
+    crate::cookies::site_headers_for(path, url).0
+}
+
 fn fetch_rumble(url: &str, max_pages: usize) -> Result<(String, Vec<SourceItem>), String> {
     let mut items = Vec::new();
     let mut title = String::new();
@@ -1126,7 +1194,28 @@ fn fetch_rumble(url: &str, max_pages: usize) -> Result<(String, Vec<SourceItem>)
         } else {
             format!("{url}?page={page}")
         };
-        let html = fetch_text(&page_url)?;
+        let html = if page == 1 {
+            let (html, final_url) = fetch_text_final(&page_url)?;
+            // Python `fetch_listing_items` (Audit 8 F14): a
+            // login page means the anonymous fetch hit the
+            // sign-in wall — retry once with the configured
+            // cookies, when the app holds any for Rumble.
+            if rumble_looks_like_login_page(&html, &final_url) {
+                let header = managed_cookie_header(&page_url);
+                if !header.is_empty() {
+                    match crate::extract::fetch_page_bytes(&page_url, &header) {
+                        Ok((bytes, _)) => String::from_utf8_lossy(&bytes).to_string(),
+                        Err(_) => html,
+                    }
+                } else {
+                    html
+                }
+            } else {
+                html
+            }
+        } else {
+            fetch_text(&page_url)?
+        };
         if title.is_empty() {
             title = html_title(&html).unwrap_or_default();
         }

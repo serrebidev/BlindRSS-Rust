@@ -1254,20 +1254,195 @@ pub fn show_article_columns(frame: &Frame, config_path: &Path) {
     dialog.destroy();
 }
 
+/// Add Feed (Python's AddFeedDialog, Audit 8 G18): a URL
+/// field with a live compatibility hint and a category
+/// combo. The hint updates as the user types (500 ms
+/// debounce, worker thread for the heavier check — the
+/// dialog never blocks): YouTube URLs are recognized
+/// instantly and auto-select an existing YouTube category;
+/// other URLs get Python's "OK: Supported by yt-dlp" when
+/// the offline support check passes. `categories` are
+/// identity paths with "" first (Uncategorized, displayed
+/// as such). Returns (url, category identity — a typed
+/// combo value is a new category path).
+pub fn show_add_feed(
+    frame: &Frame,
+    categories: &[String],
+    initial_url: &str,
+) -> Option<(String, String)> {
+    let dialog = Dialog::builder(frame, "Add Feed").build();
+    bind_f1(frame, &dialog, "AddFeedDialog");
+    let sizer = BoxSizer::builder(Orientation::Vertical).build();
+    let url_ctrl = name_row(&dialog, &sizer, "Feed or Media URL:", initial_url);
+    url_ctrl.set_name("Feed or Media URL");
+    let hint = StaticText::builder(&dialog).with_label("").build();
+    sizer.add(&hint, 0, SizerFlag::All, 4);
+    let cat_label = StaticText::builder(&dialog)
+        .with_label(&crate::tr("Category:"))
+        .build();
+    sizer.add(&cat_label, 0, SizerFlag::All, 4);
+    let cat_ctrl = ComboBox::builder(&dialog).build();
+    cat_ctrl.set_name("Category");
+    for (i, cat) in categories.iter().enumerate() {
+        cat_ctrl.append(if i == 0 { "Uncategorized" } else { cat });
+    }
+    // Python preselects an existing YouTube category.
+    let yt_pos = categories.iter().position(|c| c == "YouTube").unwrap_or(0);
+    cat_ctrl.set_selection(yt_pos as u32);
+    sizer.add(&cat_ctrl, 0, SizerFlag::Expand | SizerFlag::All, 4);
+    ok_cancel(&dialog, &sizer);
+
+    // Async hint machinery: text changes record a
+    // debounced evaluation; heavy checks run on a worker
+    // and land through the same timer drain.
+    let pending: Rc<RefCell<Option<(String, std::time::Instant)>>> = Rc::new(RefCell::new(None));
+    let evaluated: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
+    let (tx, rx) = std::sync::mpsc::channel::<(String, bool)>();
+    let rx = Rc::new(rx);
+    {
+        let pending = pending.clone();
+        url_ctrl.on_text_updated(move |_| {
+            *pending.borrow_mut() = Some((
+                url_ctrl.get_value().trim().to_string(),
+                std::time::Instant::now() + std::time::Duration::from_millis(500),
+            ));
+        });
+    }
+    let timer = Timer::new(&dialog);
+    {
+        let pending = pending.clone();
+        let evaluated = evaluated.clone();
+        // Precomputed: the tick closure is 'static and
+        // cannot borrow the categories slice.
+        let youtube_pos = categories.iter().position(|c| c == "YouTube");
+        timer.on_tick(move |_| {
+            while let Ok((url, supported)) = rx.try_recv() {
+                if url_ctrl.get_value().trim() == url {
+                    let text = if supported {
+                        crate::tr("OK: Supported by yt-dlp")
+                    } else {
+                        String::new()
+                    };
+                    hint.set_label(&text);
+                }
+            }
+            let due = pending
+                .borrow()
+                .as_ref()
+                .is_some_and(|(_, when)| std::time::Instant::now() >= *when);
+            if !due {
+                return;
+            }
+            let (url, _) = pending.borrow_mut().take().unwrap();
+            if url == *evaluated.borrow() {
+                return;
+            }
+            *evaluated.borrow_mut() = url.clone();
+            if url.is_empty() {
+                hint.set_label("");
+                return;
+            }
+            let lower = url.to_lowercase();
+            if lower.contains("youtube.com") || lower.contains("youtu.be") {
+                hint.set_label(&crate::tr("OK: Recognized as YouTube source"));
+                if let Some(pos) = youtube_pos {
+                    cat_ctrl.set_selection(pos as u32);
+                }
+                return;
+            }
+            hint.set_label(&crate::tr("Checking compatibility..."));
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let supported = blindrss_core::discovery::ytdlp_supported_offline(&url);
+                let _ = tx.send((url, supported));
+            });
+        });
+    }
+    timer.start(100, false);
+    if !initial_url.trim().is_empty() {
+        *pending.borrow_mut() = Some((initial_url.trim().to_string(), std::time::Instant::now()));
+    }
+    dialog.set_sizer(sizer, true);
+    dialog.set_size(Size::new(520, 300));
+    url_ctrl.set_focus();
+    let accepted = dialog.show_modal() == 5100;
+    timer.stop();
+    let result = if accepted {
+        let url = url_ctrl.get_value().trim().to_string();
+        let text = cat_ctrl.get_value().trim().to_string();
+        let category = if text.is_empty() || text == "Uncategorized" {
+            String::new()
+        } else {
+            text
+        };
+        Some((url, category))
+    } else {
+        None
+    };
+    dialog.destroy();
+    result
+}
+
+/// Detected Feeds picker (Python's choice dialog in
+/// `_present_detected_page_feeds`): rows read
+/// "title (url)", or the bare URL when the detection
+/// left the title empty.
+pub fn show_detected_feed_choice(
+    frame: &Frame,
+    feeds: &[blindrss_core::discovery::DetectedFeed],
+) -> Option<String> {
+    let dialog = Dialog::builder(frame, "Detected Feeds").build();
+    bind_f1(frame, &dialog, "DetectFeedsDialog");
+    let sizer = BoxSizer::builder(Orientation::Vertical).build();
+    let label = StaticText::builder(&dialog)
+        .with_label(&crate::tr("Select a feed to subscribe to:"))
+        .build();
+    sizer.add(&label, 0, SizerFlag::All, 4);
+    let list = ListBox::builder(&dialog).build();
+    list.set_name("Detected feeds");
+    for feed in feeds {
+        if feed.title.trim().is_empty() {
+            list.append(&feed.url);
+        } else {
+            list.append(&format!("{} ({})", feed.title, feed.url));
+        }
+    }
+    if !feeds.is_empty() {
+        list.set_selection(0, true);
+    }
+    sizer.add(&list, 1, SizerFlag::Expand | SizerFlag::All, 4);
+    ok_cancel(&dialog, &sizer);
+    dialog.set_sizer(sizer, true);
+    dialog.set_size(Size::new(560, 380));
+    let picked = if dialog.show_modal() == 5100 {
+        list.get_selection()
+            .and_then(|sel| feeds.get(sel as usize).map(|f| f.url.clone()))
+    } else {
+        None
+    };
+    dialog.destroy();
+    picked
+}
+
 /// Video Search (Python's YtdlpGlobalSearchDialog): search
 /// videos across yt-dlp sites, then Play / Subscribe / Copy
-/// URL a result. Returns ("play" | "subscribe", result) for
-/// the caller to act on; Copy URL is handled in place.
+/// URL a result. Returns ("play" | "subscribe_best" |
+/// "subscribe_native" | "subscribe_source", result) for
+/// the caller to act on (Audit 8 F05: subscribing acts on
+/// the result's retained native/source target, never the
+/// bare video URL); Copy URL is handled in place.
 /// Per-site searches run on their own threads (Python caps
 /// concurrency at 8; the site list itself is the cap here)
-/// and stream into the list through a timer drain, deduped
-/// by canonical key. Load More widens the per-site limit by
-/// 80 and re-runs, matching Python's step.
+/// and stream into the list through a timer drain, merged
+/// by canonical key with Python's quality rule (a better
+/// later duplicate replaces the stored copy). Load More
+/// widens the per-site limit by 80 and re-runs, matching
+/// Python's step.
 pub fn show_video_search(
     frame: &Frame,
     config_path: &Path,
 ) -> Option<(&'static str, blindrss_core::videosearch::VideoResult)> {
-    use blindrss_core::videosearch::{VideoResult, canonical_key, search_site, searchable_sites};
+    use blindrss_core::videosearch::{VideoResult, merge_result, search_site, searchable_sites};
     let cfg = Config::load(config_path).unwrap_or_default();
     let sites = searchable_sites(cfg.get_bool("enable_adult_search", false));
     let dialog = Dialog::builder(frame, "Video Search").build();
@@ -1279,8 +1454,8 @@ pub fn show_video_search(
         .with_label(&crate::tr("Search Sites:"))
         .build();
     opt_row.add(&scope_label, 0, SizerFlag::All, 4);
-    let mut scope_items: Vec<&str> = vec!["All sites"];
-    scope_items.extend(sites.iter().map(|s| s.label));
+    let mut scope_items: Vec<String> = vec!["All sites".to_string()];
+    scope_items.extend(sites.iter().map(|s| s.label.clone()));
     let scope_choice = Choice::builder(&dialog).build();
     for item in &scope_items {
         scope_choice.append(item);
@@ -1323,6 +1498,11 @@ pub fn show_video_search(
     let sub_btn = mk("Subscribe");
     let copy_btn = mk("Copy URL");
     let close_btn = mk("Close");
+    // Python's Subscribe (native) / Subscribe (source)
+    // actions (Audit 8 F05), appended after the existing
+    // buttons so no existing control moves.
+    let sub_native_btn = mk("Subscribe (Native Feed)");
+    let sub_source_btn = mk("Subscribe (Source)");
     sizer.add_sizer(&row, 0, SizerFlag::Expand | SizerFlag::All, 2);
 
     let results: Rc<RefCell<Vec<VideoResult>>> = Rc::new(RefCell::new(Vec::new()));
@@ -1450,7 +1630,15 @@ pub fn show_video_search(
     }
     {
         let pick = pick.clone();
-        sub_btn.on_click(move |_| pick("subscribe"));
+        sub_btn.on_click(move |_| pick("subscribe_best"));
+    }
+    {
+        let pick = pick.clone();
+        sub_native_btn.on_click(move |_| pick("subscribe_native"));
+    }
+    {
+        let pick = pick.clone();
+        sub_source_btn.on_click(move |_| pick("subscribe_source"));
     }
     {
         let pick = pick.clone();
@@ -1486,17 +1674,9 @@ pub fn show_video_search(
                 changed = true;
                 completed.set(completed.get() + 1);
                 if let Ok(found) = result {
-                    let mut have: std::collections::HashSet<String> = results
-                        .borrow()
-                        .iter()
-                        .map(|r| canonical_key(&r.url))
-                        .collect();
                     let mut all = results.borrow_mut();
                     for r in found {
-                        let key = canonical_key(&r.url);
-                        if !key.is_empty() && have.insert(key) {
-                            all.push(r);
-                        }
+                        merge_result(&mut all, r);
                     }
                 }
             }

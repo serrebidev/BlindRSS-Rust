@@ -155,6 +155,36 @@ fn subscribe_on_worker(url: &str, category: Option<&str>) -> Result<Feed, String
     )
 }
 
+/// The ONE provider-aware subscribe action (Audit 8 G09 +
+/// F05): Add Feed, Feed Search, Video Search and Detect
+/// Feeds on Page all subscribe through here. A hosted
+/// provider subscribes on the server (its result lands as
+/// a ProviderAction, whose drain reloads the cache from
+/// the DB and runs the post-sync side effects, so the
+/// subscription persists remotely); the local provider
+/// resolves and stores on a worker through
+/// `subscribe_on_worker`.
+fn spawn_subscribe(tx: &std::sync::mpsc::Sender<RefreshMsg>, url: &str, category: Option<String>) {
+    let url = url.to_string();
+    let tx = tx.clone();
+    let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+    if blindrss_core::provider::active_name(&cfg) != "local" {
+        std::thread::spawn(move || {
+            let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+            let provider = blindrss_core::provider::get_provider(&cfg, db_path());
+            let _ = tx.send(RefreshMsg::ProviderAction(provider.add_feed(&url)));
+        });
+        return;
+    }
+    std::thread::spawn(move || {
+        // "" is the Uncategorized identity; the stored
+        // form is no category (NULL), as before.
+        let category = category.filter(|c| !c.trim().is_empty());
+        let result = subscribe_on_worker(&url, category.as_deref());
+        let _ = tx.send(RefreshMsg::Added(url, result, category));
+    });
+}
+
 /// The retention boundary ingestion must not insert past (Python
 /// issue #106): the `YYYY-MM-DD` cutoff for the configured
 /// `article_retention`, or None when retention is unlimited.
@@ -1779,6 +1809,15 @@ enum RefreshMsg {
     /// A finished active-provider action (hosted refresh,
     /// subscribe, unsubscribe): a human summary or an error.
     ProviderAction(Result<String, String>),
+    /// Detect Feeds on Page finished (Audit 8 F10): the
+    /// detected feeds, or the page-fetch error (challenge
+    /// errors carry the Import Site Cookies guidance).
+    DetectedPageFeeds(
+        Result<
+            Vec<blindrss_core::discovery::DetectedFeed>,
+            blindrss_core::discovery::PageFetchError,
+        >,
+    ),
     /// A finished article translation: the request identity
     /// it was started under (article, generation, variant —
     /// Audit 8 O08) plus the result.
@@ -1877,6 +1916,7 @@ const M_QUEUE_NEXT: i32 = 2201;
 const M_QUEUE_PREV: i32 = 2202;
 const M_FEED_SEARCH: i32 = 2203;
 const M_TRANSLATE: i32 = 2204;
+const M_DETECT_PAGE: i32 = 2207;
 const M_FILTER_ALL: i32 = 2170;
 const M_FILTER_UNREAD: i32 = 2171;
 const M_FILTER_READ: i32 = 2172;
@@ -1953,7 +1993,8 @@ fn shortcut_menu_id(command: &str) -> Option<i32> {
         "feeds.import_opml" => M_IMPORT_OPML,
         "feeds.import_youtube_takeout" => M_TAKEOUT,
         "feeds.export_opml" => M_EXPORT_OPML,
-        "feeds.find_podcast" | "feeds.detect_page" => M_FEED_SEARCH,
+        "feeds.find_podcast" => M_FEED_SEARCH,
+        "feeds.detect_page" => M_DETECT_PAGE,
         "feeds.podcast_archive" => M_PODCAST_ARCHIVE,
         "feeds.video_search" => M_VIDEO_SEARCH,
         "media.open_url" => M_OPEN_MEDIA,
@@ -4159,6 +4200,11 @@ fn main() {
                     ));
                 }
             });
+            // Video Search site registry (Audit 8 F06):
+            // enumerate the installed yt-dlp's extractors in
+            // the background, like Python's startup preload,
+            // so the dialog never waits on it.
+            blindrss_core::videosearch::warm_search_sites();
         }
         let rx = Rc::new(RefCell::new(rx));
         let state_btn = state.clone();
@@ -6059,7 +6105,8 @@ fn main() {
 
         // Video Search (Tools): cross-site yt-dlp search dialog;
         // Play resolves through the normal playback path,
-        // Subscribe runs the result URL through feed discovery.
+        // Subscribe acts on the result's retained native/source
+        // target through the provider-aware subscribe action.
         let frame_vs = frame;
         let state_vs = state.clone();
         let tx_vs = tx.clone();
@@ -6117,14 +6164,25 @@ fn main() {
                             }
                         });
                     }
-                    Some(("subscribe", result)) => {
-                        let url = result.url.clone();
-                        frame_vs.set_status_text(&format!("Adding {url}..."), 0);
-                        let tx = tx_vs.clone();
-                        std::thread::spawn(move || {
-                            let result = subscribe_on_worker(&url, None);
-                            let _ = tx.send(RefreshMsg::Added(url, result, None));
-                        });
+                    Some((action, result)) => {
+                        // Subscribe best / native / source
+                        // (Audit 8 F05): act on the result's
+                        // retained target — the native feed
+                        // when there is one, else the source
+                        // channel page — never the bare video
+                        // URL, and through the one
+                        // provider-aware subscribe action.
+                        let target = match action {
+                            "subscribe_native" => result.native_feed_url.clone(),
+                            "subscribe_source" => result.source_subscribe_url.clone(),
+                            _ => result.best_subscribe_url().unwrap_or("").to_string(),
+                        };
+                        if target.is_empty() {
+                            frame_vs.set_status_text("That result has no subscription target", 0);
+                            return;
+                        }
+                        frame_vs.set_status_text(&format!("Adding {target}..."), 0);
+                        spawn_subscribe(&tx_vs, &target, None);
                     }
                     _ => {}
                 },
@@ -6379,10 +6437,43 @@ fn main() {
                 }
             }
             frame_fs.set_status_text(&format!("Adding {url}..."), 0);
-            let tx = tx_fs.clone();
+            // The one provider-aware subscribe action
+            // (Audit 8 G09): a hosted provider subscribes
+            // on the server, not just locally.
+            spawn_subscribe(&tx_fs, &url, None);
+        });
+
+        // Detect Feeds on Page (Feeds menu, Audit 8 F10):
+        // Python's dedicated page detection — its own
+        // handler, not the directory search it used to
+        // alias. The scan runs on a worker; the drain
+        // presents results (none -> message, one -> Add
+        // Feed prefilled, many -> picker).
+        let state_dp = state.clone();
+        let frame_dp = frame;
+        let tree_dp = tree;
+        let list_dp = list;
+        let tx_dp = tx.clone();
+        let act_detect_page: Rc<dyn Fn()> = Rc::new(move || {
+            let Some(url) = prompt_text(
+                &frame_dp,
+                "Enter the address of a webpage to scan for feeds:",
+                "Detect Feeds on Page",
+                "",
+            ) else {
+                restore_focus(&state_dp.borrow(), &tree_dp, &list_dp);
+                return;
+            };
+            restore_focus(&state_dp.borrow(), &tree_dp, &list_dp);
+            let url = url.trim().to_string();
+            if url.is_empty() {
+                return;
+            }
+            frame_dp.set_status_text(&format!("Detecting feeds on {url}..."), 0);
+            let tx = tx_dp.clone();
             std::thread::spawn(move || {
-                let result = subscribe_on_worker(&url, None);
-                let _ = tx.send(RefreshMsg::Added(url, result, None));
+                let result = blindrss_core::discovery::detect_page_feeds(&url);
+                let _ = tx.send(RefreshMsg::DetectedPageFeeds(result));
             });
         });
 
@@ -7101,16 +7192,29 @@ fn main() {
         let list_add = list;
         let tx_add = tx.clone();
         let act_add: Rc<dyn Fn()> = Rc::new(move || {
-            let dlg = TextEntryDialog::builder(&frame_add, "Feed URL:", "Add Feed").build();
-            let rc = dlg.show_modal();
-            restore_focus(&state_add.borrow(), &tree_add, &list_add);
-            if rc != ID_OK {
-                return;
-            }
-            let Some(url) = dlg.get_value().filter(|v| !v.trim().is_empty()) else {
+            // Python's AddFeedDialog (Audit 8 G18): URL +
+            // category in one dialog, with the live
+            // compatibility hint. "" is the Uncategorized
+            // identity, first in the list.
+            let categories: Vec<String> = {
+                let st = state_add.borrow();
+                let mut v = vec![String::new()];
+                if let Some(db) = st.db.as_ref()
+                    && let Ok(cats) = db.categories()
+                {
+                    v.extend(cats.into_iter().map(|c| c.title));
+                }
+                v
+            };
+            let Some((url, category)) = dialogs::show_add_feed(&frame_add, &categories, "") else {
+                restore_focus(&state_add.borrow(), &tree_add, &list_add);
                 return;
             };
+            restore_focus(&state_add.borrow(), &tree_add, &list_add);
             let url = url.trim().to_string();
+            if url.is_empty() {
+                return;
+            }
             {
                 let st = state_add.borrow();
                 if st.feeds.iter().any(|f| f.url == url) {
@@ -7119,52 +7223,9 @@ fn main() {
                 }
             }
             frame_add.set_status_text(&format!("Adding {url}..."), 0);
-            let tx = tx_add.clone();
-            {
-                let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
-                if blindrss_core::provider::active_name(&cfg) != "local" {
-                    // Hosted backend: subscribe on the server,
-                    // then pull it into the cache.
-                    std::thread::spawn(move || {
-                        let cfg =
-                            blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
-                        let provider = blindrss_core::provider::get_provider(&cfg, db_path());
-                        let _ = tx.send(RefreshMsg::ProviderAction(provider.add_feed(&url)));
-                    });
-                    return;
-                }
-            }
-            // Local: pick the category (picker with inline
-            // creation; the tree's current category is
-            // preselected). Cancelling the picker cancels the add.
-            let picked_category = {
-                let st = state_add.borrow();
-                let current = selected_category(&st).unwrap_or_default();
-                match st.db.as_ref() {
-                    Some(db) => dialogs::show_category_picker(
-                        &frame_add,
-                        db,
-                        &current,
-                        "Choose Category",
-                        "Category for the new feed:",
-                    ),
-                    None => Some(String::new()),
-                }
-            };
-            restore_focus(&state_add.borrow(), &tree_add, &list_add);
-            let Some(picked_category) = picked_category else {
-                frame_add.set_status_text("Add cancelled", 0);
-                return;
-            };
-            std::thread::spawn(move || {
-                // One worker subscribe path: discovery chain
-                // (social transforms, listing sources, direct
-                // feed, HTML alternates), row insert and the
-                // first store all happen on this thread.
-                let category = Some(picked_category.as_str()).filter(|c| !c.trim().is_empty());
-                let result = subscribe_on_worker(&url, category);
-                let _ = tx.send(RefreshMsg::Added(url, result, Some(picked_category)));
-            });
+            // The one provider-aware subscribe action
+            // (Audit 8 G09).
+            spawn_subscribe(&tx_add, &url, Some(category));
         });
         {
             let a = act_add.clone();
@@ -8509,7 +8570,7 @@ fn main() {
         let feeds_menu = Menu::builder()
             .append_item(M_ADD_FEED, "&Add Feed", "Add a new RSS feed")
             .append_item(
-                M_FEED_SEARCH,
+                M_DETECT_PAGE,
                 "Detect Feeds on &Page...",
                 "Find feeds on a web page",
             )
@@ -8880,6 +8941,7 @@ fn main() {
             (M_QUEUE_NEXT, act_queue_next.clone()),
             (M_QUEUE_PREV, act_queue_prev.clone()),
             (M_FEED_SEARCH, act_feed_search.clone()),
+            (M_DETECT_PAGE, act_detect_page.clone()),
             (M_TRANSLATE, act_translate.clone()),
             (M_COPY_TEXT, act_copy_text.clone()),
             (M_OPEN_BROWSER, act_open_browser.clone()),
@@ -9858,6 +9920,92 @@ fn main() {
                                 refresh_side_effects(&tray, &[], false);
                             }
                             Err(e) => frame_tick.set_status_text(&format!("Provider: {e}"), 0),
+                        }
+                    }
+                    Ok(RefreshMsg::DetectedPageFeeds(result)) => {
+                        // Python's `_present_detected_page_feeds`
+                        // (Audit 8 F10): none -> message, one ->
+                        // Add Feed prefilled with it, many -> a
+                        // picker feeding the same Add Feed flow.
+                        match result {
+                            Ok(feeds) if feeds.is_empty() => {
+                                let md = MessageDialog::builder(
+                                    &frame_tick,
+                                    "No feeds detected on this page.",
+                                    "Detect Feeds on Page",
+                                )
+                                .build();
+                                md.show_modal();
+                            }
+                            Ok(feeds) => {
+                                let chosen = if feeds.len() == 1 {
+                                    Some(feeds[0].url.clone())
+                                } else {
+                                    dialogs::show_detected_feed_choice(&frame_tick, &feeds)
+                                };
+                                if let Some(url) = chosen {
+                                    let categories: Vec<String> = {
+                                        let st = state_tick.borrow();
+                                        let mut v = vec![String::new()];
+                                        if let Some(db) = st.db.as_ref()
+                                            && let Ok(cats) = db.categories()
+                                        {
+                                            v.extend(cats.into_iter().map(|c| c.title));
+                                        }
+                                        v
+                                    };
+                                    if let Some((url, category)) = dialogs::show_add_feed(
+                                        &frame_tick,
+                                        &categories,
+                                        &url,
+                                    ) {
+                                        let url = url.trim().to_string();
+                                        if !url.is_empty() {
+                                            let duplicate = {
+                                                let st = state_tick.borrow();
+                                                st.feeds.iter().any(|f| f.url == url)
+                                            };
+                                            if duplicate {
+                                                frame_tick.set_status_text(
+                                                    "That feed is already subscribed",
+                                                    0,
+                                                );
+                                            } else {
+                                                frame_tick.set_status_text(
+                                                    &format!("Adding {url}..."),
+                                                    0,
+                                                );
+                                                spawn_subscribe(
+                                                    &tx_tick,
+                                                    &url,
+                                                    Some(category),
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                // Python's two messages: the
+                                // challenge guidance (Import Site
+                                // Cookies) or the generic failure.
+                                let message = if e.is_challenge {
+                                    "BlindRSS could not complete this site's browser verification page automatically.\n\nYou can still open the site in your web browser, export its cookies with a cookies.txt extension, then use Tools > Import Site Cookies."
+                                } else {
+                                    "Unable to retrieve the page."
+                                };
+                                let md = MessageDialog::builder(
+                                    &frame_tick,
+                                    message,
+                                    "Detect Feeds on Page",
+                                )
+                                .build();
+                                md.show_modal();
+                                frame_tick.set_status_text(
+                                    &format!("Detect Feeds on Page: {}", e.message),
+                                    0,
+                                );
+                            }
                         }
                     }
                     Ok(RefreshMsg::ProviderDone(name, result)) => {
