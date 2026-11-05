@@ -6498,3 +6498,10 @@ the 4 new i18n_slice tests) and `cargo build -p blindrss`
 closed. Mid-gate the VM was replaced and apt packages
 vanished; restored via the azure-only sidestep in
 ~/TOOLS.md and the gate re-run from the clippy leg.
+
+**Task 31 integration gate (2026-11-05):** cherry-picked
+clean onto main. Merged gate: fmt clean, clippy clean
+(workspace and core windows-gnu), 940 passed / 0 failed,
+build OK. All 31 Audit 8 tasks are now integrated; the
+Wave 4 release (v0.1.58) and the closing reconciliation
+follow.
