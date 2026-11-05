@@ -3374,6 +3374,15 @@ fn render_refill_rows(state: &mut State, list: &ListCtrl, loaded: Vec<Article>) 
 /// fall back to English (Python's gettext behaviour).
 static I18N: std::sync::OnceLock<blindrss_core::i18n::Catalog> = std::sync::OnceLock::new();
 
+/// Set in main() when the version-reset cleanup of downloaded
+/// translation overrides fails: the stale override tree is
+/// then off-limits for this run and tr() reads bundled
+/// catalogs only (fail closed, Python core/i18n.py's
+/// override_locale_dir answering "" when prepare raises;
+/// Audit 8 O16).
+static OVERRIDES_STANDDOWN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Bundled locale roots, best first (the exe's locale/ in
 /// releases, the repo's locale/ in dev).
 pub fn locale_roots() -> Vec<std::path::PathBuf> {
@@ -3388,10 +3397,15 @@ pub fn tr(text: &str) -> String {
     let catalog = I18N.get_or_init(|| {
         let lang = ui_language();
         // Downloaded translation updates shadow the bundled
-        // catalogs (translation_updates.override_root).
-        let mut roots = vec![blindrss_core::translation_updates::override_root(
-            &data_dir(),
-        )];
+        // catalogs (translation_updates.override_root) —
+        // unless the version-reset cleanup failed this run,
+        // in which case the stale tree stands down (O16).
+        let mut roots: Vec<std::path::PathBuf> = Vec::new();
+        if !OVERRIDES_STANDDOWN.load(std::sync::atomic::Ordering::Relaxed) {
+            roots.push(blindrss_core::translation_updates::override_root(
+                &data_dir(),
+            ));
+        }
         roots.extend(locale_roots());
         for root in roots {
             let cat = blindrss_core::i18n::Catalog::load(&root, &lang);
@@ -3501,8 +3515,14 @@ fn run_watcher_once(tx: &std::sync::mpsc::Sender<RefreshMsg>) {
                     }
                 }
             }
-            let result =
-                tu::check_and_update(&dir, &locale_roots(), &langs, &tu::HttpFetch, now_s as i64);
+            let result = tu::check_and_update(
+                &dir,
+                &locale_roots(),
+                &langs,
+                &tu::HttpFetch,
+                now_s as i64,
+                false,
+            );
             if result.changed() {
                 notes.push(format!(
                     "Translation updates installed for {}; they apply on next launch",
@@ -3563,12 +3583,19 @@ fn main() {
         config_path().display()
     ));
     // Translation overrides from a previous version stand down
-    // before the catalog loads (translation_updates).
-    blindrss_core::translation_updates::prepare_overrides_for_app_version(
+    // before the catalog loads (translation_updates). If the
+    // reset cleanup fails, the new version stays unrecorded
+    // (the reset retries next launch) and this run fails
+    // closed to the bundled catalogs (Audit 8 O16).
+    if blindrss_core::translation_updates::prepare_overrides_for_app_version(
         &data_dir(),
         &locale_roots(),
         env!("CARGO_PKG_VERSION"),
-    );
+    ) == blindrss_core::translation_updates::PrepareOutcome::CleanupFailed
+    {
+        OVERRIDES_STANDDOWN.store(true, std::sync::atomic::Ordering::Relaxed);
+        log_line("Translation override reset failed; using bundled catalogs this run");
+    }
     // Single instance: hand activation to the running copy
     // and exit when one answers.
     if blindrss_core::single_instance::signal_existing() {

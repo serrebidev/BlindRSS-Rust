@@ -35,6 +35,15 @@ pub fn override_root(data_dir: &Path) -> PathBuf {
     data_dir.join("locale")
 }
 
+/// Where one language's downloaded override catalog lives
+/// (Python `catalog_path`).
+pub fn catalog_path(data_dir: &Path, language: &str) -> PathBuf {
+    override_root(data_dir)
+        .join(language)
+        .join("LC_MESSAGES")
+        .join("blindrss.po")
+}
+
 fn state_path(data_dir: &Path) -> PathBuf {
     data_dir.join(STATE_FILENAME)
 }
@@ -68,17 +77,39 @@ pub fn overrides_available(data_dir: &Path, bundled_roots: &[PathBuf]) -> bool {
     true
 }
 
+/// Outcome of [`prepare_overrides_for_app_version`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrepareOutcome {
+    /// The recorded version already matches (or there is
+    /// nothing to prepare): the override tree may be used
+    /// as-is.
+    Current,
+    /// A version transition was handled: stale overrides were
+    /// removed and the new version recorded.
+    Reset,
+    /// Removing the stale override tree failed. The new
+    /// version was NOT recorded, so the reset retries on the
+    /// next launch, and the caller must fail closed to the
+    /// bundled catalogs for this run — Python raises out of
+    /// the cleanup, and `core/i18n.py`'s
+    /// `override_locale_dir` answers "" (bundled only) when
+    /// prepare raises. Recording the version anyway would
+    /// strand the stale override permanently: state claims
+    /// the reset happened while old catalogs still shadow
+    /// the bundled ones.
+    CleanupFailed,
+}
+
 /// Make bundled catalogs authoritative after a version change:
 /// drop downloaded overrides + etags once per app version.
-/// Returns true when a transition was handled.
 pub fn prepare_overrides_for_app_version(
     data_dir: &Path,
     bundled_roots: &[PathBuf],
     app_version: &str,
-) -> bool {
+) -> PrepareOutcome {
     let current = app_version.trim();
     if current.is_empty() || !overrides_available(data_dir, bundled_roots) {
-        return false;
+        return PrepareOutcome::Current;
     }
     let mut state = load_state(data_dir);
     let recorded = state
@@ -88,11 +119,15 @@ pub fn prepare_overrides_for_app_version(
         .trim()
         .to_string();
     if recorded == current {
-        return false;
+        return PrepareOutcome::Current;
     }
     let root = override_root(data_dir);
-    if root.exists() {
-        let _ = std::fs::remove_dir_all(&root);
+    if root.exists() && std::fs::remove_dir_all(&root).is_err() {
+        // Fail closed: no state write at all, so the recorded
+        // version, etags and last_check all survive for the
+        // retry, exactly as Python leaves them when rmtree
+        // raises before save_state.
+        return PrepareOutcome::CleanupFailed;
     }
     state.insert("app_version".to_string(), serde_json::json!(current));
     if let Some(obj) = state.get_mut("etags") {
@@ -100,7 +135,7 @@ pub fn prepare_overrides_for_app_version(
     }
     state.remove("last_check");
     save_state(data_dir, &state);
-    true
+    PrepareOutcome::Reset
 }
 
 /// Languages that already have a downloaded override catalog.
@@ -219,11 +254,11 @@ fn install_catalog(data_dir: &Path, language: &str, po_text: &str) -> bool {
     if catalog.len() < MIN_SANE_MESSAGES {
         return false;
     }
-    let dir = override_root(data_dir).join(language).join("LC_MESSAGES");
-    if std::fs::create_dir_all(&dir).is_err() {
+    let dest = catalog_path(data_dir, language);
+    let dir = dest.parent().expect("catalog path has a parent");
+    if std::fs::create_dir_all(dir).is_err() {
         return false;
     }
-    let dest = dir.join("blindrss.po");
     let tmp = dir.join(".blindrss.po.tmp");
     if std::fs::write(&tmp, po_text).is_err() {
         return false;
@@ -232,13 +267,18 @@ fn install_catalog(data_dir: &Path, language: &str, po_text: &str) -> bool {
 }
 
 /// Fetch and install newer catalogs for `languages`. Never errors
-/// out: transport problems land in UpdateResult.error.
+/// out: transport problems land in UpdateResult.error. With
+/// `force`, stored validators are ignored and every catalog is
+/// fetched unconditionally (Python's Settings "Check for
+/// Updates" path); the scheduled checks pass `force: false` and
+/// stay conditional.
 pub fn check_and_update(
     data_dir: &Path,
     bundled_roots: &[PathBuf],
     languages: &[String],
     fetcher: &dyn CatalogFetch,
     now: i64,
+    force: bool,
 ) -> UpdateResult {
     let mut result = UpdateResult::default();
     if !overrides_available(data_dir, bundled_roots) {
@@ -270,7 +310,20 @@ pub fn check_and_update(
         .unwrap_or_default();
     for lang in &wanted {
         result.checked += 1;
-        let etag = etags.get(lang).cloned().unwrap_or_default();
+        // Python: a forced check sends no validator at all.
+        let mut etag = if force {
+            String::new()
+        } else {
+            etags.get(lang).cloned().unwrap_or_default()
+        };
+        // An override recorded in state but missing on disk
+        // must be re-fetched even when the ETag says
+        // "unchanged": sending the stale validator would let
+        // a 304 confirm a file that does not exist and strand
+        // the language with no catalog at all.
+        if !etag.is_empty() && !catalog_path(data_dir, lang).is_file() {
+            etag.clear();
+        }
         let url = CATALOG_URL_TEMPLATE.replace("{lang}", lang);
         match fetcher.fetch(&url, &etag) {
             FetchOutcome::Updated {

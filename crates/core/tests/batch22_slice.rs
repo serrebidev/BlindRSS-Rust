@@ -155,7 +155,7 @@ fn translation_updates_round_trip() {
     responses.insert("de".to_string(), tu::FetchOutcome::Unchanged);
     let fetch = FakeFetch { responses };
     let langs = vec!["fr".to_string(), "de".to_string(), "en".to_string()];
-    let result = tu::check_and_update(&dir, &bundled, &langs, &fetch, 1_700_000_000);
+    let result = tu::check_and_update(&dir, &bundled, &langs, &fetch, 1_700_000_000, false);
     assert_eq!(result.updated, vec!["fr".to_string()]);
     assert_eq!(result.checked, 2);
     assert_eq!(tu::installed_languages(&dir), vec!["fr".to_string()]);
@@ -173,22 +173,24 @@ fn translation_updates_round_trip() {
         },
     );
     let fetch = FakeFetch { responses };
-    let result = tu::check_and_update(&dir, &bundled, &langs[..1], &fetch, 1_700_000_100);
+    let result = tu::check_and_update(&dir, &bundled, &langs[..1], &fetch, 1_700_000_100, false);
     assert!(result.updated.is_empty());
 
     // Version transition wipes overrides once.
-    assert!(tu::prepare_overrides_for_app_version(
-        &dir, &bundled, "0.1.22"
-    ));
+    assert_eq!(
+        tu::prepare_overrides_for_app_version(&dir, &bundled, "0.1.22"),
+        tu::PrepareOutcome::Reset
+    );
     assert!(tu::installed_languages(&dir).is_empty());
-    assert!(!tu::prepare_overrides_for_app_version(
-        &dir, &bundled, "0.1.22"
-    ));
+    assert_eq!(
+        tu::prepare_overrides_for_app_version(&dir, &bundled, "0.1.22"),
+        tu::PrepareOutcome::Current
+    );
 
     // Stand-down when the override root IS a bundled root.
     let dir2 = scratch("tu2");
     let same = vec![tu::override_root(&dir2)];
-    let result = tu::check_and_update(&dir2, &same, &langs, &fetch, 1);
+    let result = tu::check_and_update(&dir2, &same, &langs, &fetch, 1, false);
     assert_eq!(result.checked, 0);
 }
 

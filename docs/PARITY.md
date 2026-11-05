@@ -6393,3 +6393,108 @@ of the string instead of staying literal.
 onto the CI-fix tree; PARITY append conflict resolved by
 union. Merged gate: fmt clean, clippy clean (workspace
 and core windows-gnu), 936 passed / 0 failed, build OK.
+
+## Audit 8 Task 31 resolution — translation override lifecycle (O16) (2026-11-05)
+
+O16's three defects were all in
+`crates/core/src/translation_updates.rs`, each a place where
+the port recorded or trusted state Python treats as
+unproven. All three were reproduced red before the fix
+(a temporary repro file, since deleted: the version-reset
+repro showed prepare reporting the transition handled with
+the new version recorded despite a failed removal, and the
+ETag repro showed the stale validator going out for a
+catalog that was not on disk).
+
+**Fail closed on version-reset cleanup.**
+`prepare_overrides_for_app_version` ignored the result of
+`remove_dir_all` and recorded the new app version
+unconditionally, so a failed cleanup stranded the stale
+override tree permanently: state claimed the reset had
+happened while old catalogs kept shadowing the bundled
+ones. The function now returns `PrepareOutcome`
+(`Current` / `Reset` / `CleanupFailed`); on a removal
+error it writes NO state at all — recorded version, ETags
+and last_check all survive, exactly as Python leaves them
+when `shutil.rmtree` raises before `save_state` — so the
+reset retries on the next launch. The app side completes
+the fail-closed shape Python gets from `core/i18n.py`:
+when prepare reports `CleanupFailed`, main() sets
+`OVERRIDES_STANDDOWN` and `tr()` builds its root list
+without the override tree for that run, so bundled
+catalogs are authoritative (Python's
+`override_locale_dir` answers "" when prepare raises).
+There is no process-level "prepared" memo like Python's
+`_prepared_app_version`; the recorded-version check makes
+repeat calls cheap no-ops, and prepare is called once per
+launch, so the retry semantics match.
+
+**Absent catalog clears its ETag.** `check_and_update`
+sent the stored ETag even when the language's catalog file
+was missing from disk, so a server 304 could "confirm" a
+file that does not exist and strand the language with no
+catalog. A `catalog_path` helper (Python's function of the
+same name; `install_catalog` now uses it too) lets the
+check drop the validator whenever the file is absent, so
+the re-fetch is unconditional and a 304 cannot strand the
+client — Python's exact mechanism, applied per language
+before the fetch.
+
+**Forced checks.** `check_and_update` takes `force: bool`;
+forced checks send no validator for any language (Python
+`check_and_update(..., force=True)`). The Settings "Check
+for Updates" button is the forced path — Python's
+`on_check_translations_now` passes `force=True` — and the
+startup/scheduled check in main() passes `force: false`
+and stays conditional, as do the frequency settings.
+
+**Tests.** New `crates/core/tests/i18n_slice.rs` (4 tests):
+failed cleanup records nothing and the retry resets once
+the obstruction clears (removal failure is induced
+deterministically by parking a regular file at the
+override root, which `remove_dir_all` refuses on every
+platform); absent catalog → the recording fetcher sees an
+empty validator, the catalog is re-installed, and the
+follow-up check with the file present sends the new stored
+validator and stays conditional; forced check bypasses the
+validator while the unforced check against the same state
+does not; and bundled fallback plus same-version override
+precedence — a downloaded catalog shadows the bundled
+string, a version Reset removes it leaving the bundled
+catalog intact, and a failed reset leaves the bundled tree
+untouched. `batch22_slice`'s round-trip test was updated
+to the new signatures (force argument, `PrepareOutcome`
+comparisons); its damaged-catalog sanity refusal and
+path-to-bundled stand-down assertions are unchanged and
+still pass.
+
+**Accessibility pass (before the Settings change):** this
+task adds, moves and renames no controls. The only
+Settings change is the argument the existing "Check for
+Updates" button passes to core; its name, position and tab
+order are unchanged, and its result text in the adjacent
+status label is unchanged. The main-window change is
+invisible unless a reset cleanup fails, in which case the
+app simply speaks the bundled language for one run.
+
+**Deviations.** None from Python's lifecycle semantics.
+Two pre-existing port shapes were deliberately left alone
+as outside O16: the reset replaces the `etags` object with
+an empty one where Python pops the key (readers treat them
+identically), and the Settings manual check gathers its
+language list from the locale roots with the UI language
+first where Python uses the picker selection plus
+`installed_languages()` (a language-selection difference,
+not a validator-lifecycle one).
+
+**Task 31 gate:** the worker gate on branch
+audit8/task31-i18n ran fmt (last, clean), clippy
+(workspace --all-targets and core x86_64-pc-windows-gnu,
+both -D warnings clean), the full workspace test suite
+(940 passed / 0 failed: baseline 936 on main a56f8bf plus
+the 4 new i18n_slice tests) and `cargo build -p blindrss`
+(OK). One clippy catch in this task's own new test code
+(&PathBuf where &Path belongs) was fixed before the gate
+closed. Mid-gate the VM was replaced and apt packages
+vanished; restored via the azure-only sidestep in
+~/TOOLS.md and the gate re-run from the clippy leg.

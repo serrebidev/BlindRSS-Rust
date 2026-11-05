@@ -611,12 +611,19 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs())
                     .unwrap_or(0) as i64;
+                // The manual check is Python's forced check
+                // (gui/dialogs.py on_check_translations_now):
+                // validators are bypassed so a stale or
+                // stranded catalog state always re-fetches;
+                // only the scheduled checks stay conditional
+                // (Audit 8 O16).
                 let result = blindrss_core::translation_updates::check_and_update(
                     &crate::data_dir(),
                     &crate::locale_roots(),
                     &langs,
                     &blindrss_core::translation_updates::HttpFetch,
                     now,
+                    true,
                 );
                 let _ = cfg;
                 let note = if result.changed() {
