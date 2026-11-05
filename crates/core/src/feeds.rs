@@ -17,15 +17,31 @@ fn request(agent: ureq::Agent, url: &str) -> ureq::RequestBuilder<ureq::typestat
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone();
+    // Python's shared attachment rule (Audit 8 B05): cookies go
+    // out together with the User-Agent they were issued to — the
+    // host-pinned UA when one applies, the global UA only beside
+    // clearance — and the client hints follow that same identity.
+    // URLs with no applicable UA keep the app default untouched.
+    let mut identity: Option<String> = None;
     if let Some(path) = path {
-        let jar = crate::cookies::load_jar_beside(&path);
-        let cookie = crate::cookies::cookie_header_for(&jar, url);
+        let (cookie, ua) = crate::cookies::site_headers_for(&path, url);
         if !cookie.is_empty() {
             request = request.header("Cookie", cookie);
         }
+        identity = ua;
     }
-    for (key, value) in crate::user_agents::client_hints(&crate::http::user_agent()) {
-        request = request.header(key, value);
+    match &identity {
+        Some(ua) => {
+            request = request.header("User-Agent", ua.clone());
+            for (key, value) in crate::user_agents::client_hints(ua) {
+                request = request.header(key, value);
+            }
+        }
+        None => {
+            for (key, value) in crate::user_agents::client_hints(&crate::http::user_agent()) {
+                request = request.header(key, value);
+            }
+        }
     }
     request
 }

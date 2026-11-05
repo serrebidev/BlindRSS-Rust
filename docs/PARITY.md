@@ -4801,3 +4801,182 @@ build OK. Wave 3 is code-complete.
 ureq 3.5.1, ureq-proto 0.7.1; 24 packages already latest).
 Release-tree gate re-run on the updated tree: fmt clean,
 clippy clean both legs, 771 passed / 0 failed, build OK.
+
+## Audit 8 Task 25 resolution — consented cookie identity/import correctness (B03, B04, B05, B06, B07, B08, B12, B17) (2026-11-04)
+
+Regression-first: the four jar reproductions (oversize first
+cookie, sibling path leakage, duplicate names, leading-dot
+domains) were added to `cookies_slice.rs` and failed against
+the shipped code before any fix. New suite
+`audit8_task25_slice.rs` (11 tests) covers the rest against
+synthetic fixture profiles; no live browser or real cookie
+value is involved anywhere.
+
+**B03 (Firefox imports).** New core module `firefox.rs` ports
+Python's Firefox-family reading: per-OS roots for Firefox,
+LibreWolf, Waterfox, Floorp, Zen, Pale Moon and Thunderbird
+(including the Flatpak and Snap Linux layouts), both profile
+layouts (`<root>/<profile>` and `<root>/Profiles/<profile>`),
+dedupe by profile directory, newest DB first. Reads copy
+`cookies.sqlite` plus its WAL sidecars into a unique
+per-operation temp directory before querying `moz_cookies`.
+`profile_user_agent` derives the profile's UA from
+`compatibility.ini` exactly as Python does. The watcher
+(`cookies_import::auto_import_browser_profiles`, now factored
+over explicit profile lists for tests) runs the Firefox pass
+under the SAME consent model as Chromium: the automatic pass
+takes clearance-shaped cookies only — across all changed
+profiles the longest-lived candidate per (domain, path, name)
+wins and its profile's UA is pinned to the cookie's host — and
+full session records move only in the consented full mode,
+which uses the separate `site_cookies_full_profile_mtimes`
+marker map, as Python does. A failed read never advances a
+marker. The Import Site Cookies dialog gained an "Import from
+Firefox..." action (single profile imports directly; several
+get a chooser), so the Firefox support the Settings consent
+text has always advertised is now real on both paths.
+
+**B04 (YouTube sessions reach yt-dlp).**
+`cookies_import::merge_youtube_cookies` ports Python's
+`merge_youtube_cookies`: permitted YouTube/Google records from
+a consented full import also land in the managed
+`youtube_cookies.txt` beside the data dir. The managed file is
+rewritten from YouTube/Google records only (anything else in
+it is dropped, as Python drops it), carries the managed-jar
+header, and the `ytdlp_cookies_file` setting is pointed at it
+only when unset or already pointing there — a file the user
+configured is never repointed. Wired into the watcher's full
+mode (both browser families) and into both explicit dialog
+imports. Nothing merges on the automatic clearance pass; the
+consent boundary is unchanged.
+
+**B05 (clearance identity).** `cookies.rs` now carries the
+identity half of Python's `site_cookies.py`: the global UA
+sidecar (`site_cookies_ua.txt`, removed when cleared) and the
+per-host UA map (`site_cookies_ua_hosts.json`) with
+longest-suffix host matching. `user_agent_for` follows Python:
+the host-pinned UA applies when the jar actually sends cookies
+for the URL; the global UA applies only beside clearance;
+anything else keeps the caller's default identity.
+`forget_clearance_for` removes ONLY the clearance cookies
+matching the URL's host (jar rewritten via temp file + rename)
+plus the host UAs pinned for matching domains — ordinary
+session cookies are never touched. Targeted recovery is
+ported with Python's shape and 20-second per-key rate limits:
+`refresh_groups_io_cookies` / `refresh_reddit_cookies`
+(host-gated, best-login-profile-wins-whole scoring, only that
+site's cookies merged, UA pinned to `groups.io` / `reddit.com`)
+and `refresh_clearance_from_browsers` (marker-free re-harvest,
+returns whether the URL's cookies changed). The feed fetcher
+(`feeds.rs::request`) now sends cookies together with
+`user_agent_for`'s UA and that identity's client hints.
+`browser.rs::save_cookies` now routes through
+`cookies::record_browser_session`: a solved challenge stores
+ONLY its clearance-shaped cookies for the request host
+(previously every cookie the browser returned was merged —
+a consent gap against Python), session cookies get Python's
+one-hour expiry, and the UA the browser ran with is pinned to
+the request host. The #[ignore]d live browser test's fixture
+cookie was renamed `clearance` -> `cf_clearance` to match the
+corrected semantics.
+
+**B06 (budget).** `cookie_header_for` is now Python's
+pipeline: `cookies_for` (insertion-ordered name->value map —
+a later duplicate replaces the value, keeps the first
+position) then `_trim_cookies_to_budget`: when the rendered
+header would exceed the 8,000-byte budget, selection prefers
+clearance cookies first, then smaller entries, SKIPPING an
+entry that does not fit instead of stopping at it; kept
+cookies render in their original relative order. The old
+walker stopped at the first oversize cookie and dropped every
+cookie after it, clearance included.
+
+**B07 (path matching).** A stored cookie path matches the
+request path exactly or at a slash boundary (`/private` and
+`/private/child` match, `/private-other` does not), with
+Python's trailing-slash handling; root/empty paths still match
+everywhere. Jar parsing now also treats a leading dot in the
+stored domain as include-subdomains on its own (Python
+`_parse_jar`), whatever the flag column says.
+
+**B08 (manual import + UA editing).** The dialog appends
+Python's section after the shipped controls (append-only; the
+existing tab order is untouched; the two text fields carry the
+accessible names "Cookies file path" and "Browser
+User-Agent"): a cookies-file field with Browse, the Browser
+User-Agent field prefilled with the stored global UA (else
+the app's current UA), and an "Import File / Save User-Agent"
+action with Python's OK semantics — an empty file field saves
+the UA alone; an invalid file is an error and NOTHING is
+saved, jar or UA. Core side: `validate_site_jar_file` (any
+domains; Python's messages) and `merge_jar_file` in
+`cookies_import.rs`. This is also the working fallback for
+cookies no direct reader can decrypt (see B17).
+
+**B12 (temp directories).** `chromium::read_cookie_db` uses a
+unique per-operation directory
+(`blindrss-chromium-cookies-<pid>-<uuid>`), replacing the
+PID-only directory whose cleanup let one in-process reader
+delete another's copy mid-read; the Firefox reader uses the
+same discipline. The database copy itself now retries up to
+three times with 150 ms pauses (Python `_copy_with_retries`),
+the non-privileged way to read a live profile whose browser
+holds the file only briefly. A regression test runs two
+same-process reads of distinct fixture DBs concurrently and
+asserts no temp directories are left behind.
+
+**B17 (v20 honesty) — where the line fell, exactly.**
+Everything in Python's recovery that needs NO privilege is
+now ported: the copy-with-retries read of a locked database
+(above) and the exported-jar fallback (B08, now solid). The
+part that remains unported is only the privileged master-key
+resolution — Python's elevated helper path (SYSTEM-level key
+access / CNG / snapshot of locked files) that v20 app-bound
+cookies require. No privileged or elevated helper was built
+in this task, per the plan's reservation of that for a
+separate design and security review with explicit consent.
+To keep the gap honest rather than silent, `ReadOutcome` now
+counts v20-prefixed rows separately (`skipped_v20`), and the
+Import dialog's result names them: the message states how
+many cookies use Chrome's app-bound (v20) encryption, that
+they cannot be read directly, and that the file import below
+is the way in. The batch9c round-trip test's skip accounting
+was updated to the split count.
+
+**Deviations, stated plainly.** (1) Python's Firefox-button
+dialog import does not merge YouTube records into yt-dlp's
+jar (only its watcher full harvest and Chromium import do);
+the Rust dialog's Firefox import DOES merge them, as its
+Chromium import does — a deliberate superset confined to
+explicit, user-initiated full imports. (2) Python's clearance
+watcher is Firefox-only; Rust's pre-existing Chromium
+clearance pass (shipped v0.1.22) is retained unchanged, and
+UA pinning is applied where Python pins (Firefox clearance
+pass; both families' consented full imports; dialog imports).
+(3) The Settings consent label keeps Python's exact wording;
+the honest v20 diagnostic lives in the Import dialog's result
+text rather than in a divergent settings label. (4) Python's
+`cookies_for` ignores the secure flag; the Rust jar's
+pre-existing secure-over-http filtering is kept (not a Task
+25 finding). (5) The recovery functions are ported and tested
+in core, but their call sites inside Python's extraction
+fallback chain (`article_extractor` retry / `groups_io`) are
+NOT rewired here: `extract.rs` belongs to Task 24's file set,
+and its reachable-transport work is where the retry wiring
+lands. (6) Python's Chromium fallback UA uses its CHROMIUM_MAJOR
+constant; the Rust fallback uses `user_agents`' own detected/
+preset identity for the family, since this tree's presets are
+the identity source of truth here (Operational Mandate 1).
+
+**Adjacent finds (not fixed, out of scope).** Python's
+`_merge_records_into_jar` also prunes YouTube `ST-` per-page
+state tokens from the site jar on rewrite (issue #101
+hygiene); `chromium::merge_into_jar` does not. Not among Task
+25's findings; left for the reconciliation pass.
+
+**Task 25 gate (2026-11-04):** fmt clean, clippy clean
+(workspace `--all-targets` and core `x86_64-pc-windows-gnu`,
+`-D warnings`), 786 passed / 0 failed (771 baseline + 15 new:
+4 jar regressions, 11 in `audit8_task25_slice`), build OK.
+Owner screen-reader acceptance of the appended dialog section
+joins the standing acceptance list.

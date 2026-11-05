@@ -64,7 +64,7 @@ fn installed_browser_fetches_javascript_page_and_harvests_own_cookie() {
                 "Actual story. ".repeat(40)
             );
             let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/html\r\nSet-Cookie: clearance=fixture; Path=/\r\nConnection: close\r\n\r\n{body}",
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/html\r\nSet-Cookie: cf_clearance=fixture; Path=/\r\nConnection: close\r\n\r\n{body}",
                 body.len()
             );
             let _ = stream.write_all(response.as_bytes());
@@ -80,7 +80,7 @@ fn installed_browser_fetches_javascript_page_and_harvests_own_cookie() {
     assert!(
         std::fs::read_to_string(directory.join("site_cookies.txt"))
             .unwrap()
-            .contains("clearance\tfixture")
+            .contains("cf_clearance\tfixture")
     );
     blindrss_core::browser::shutdown();
     std::fs::remove_dir_all(directory).unwrap();

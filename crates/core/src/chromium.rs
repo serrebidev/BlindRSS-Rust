@@ -256,6 +256,23 @@ pub fn list_profiles() -> Vec<ChromiumProfile> {
     found
 }
 
+/// The User-Agent cookies from this profile were issued to
+/// (Python `chromium_profile_user_agent`): the detected installed
+/// browser of the profile's family at its real version, so a
+/// harvested clearance can be pinned to the identity that earned
+/// it.
+pub fn chromium_profile_user_agent(profile: &ChromiumProfile) -> String {
+    let label = profile.browser.to_ascii_lowercase();
+    let family = if label.contains("edge") {
+        "edge"
+    } else if label.contains("brave") {
+        "brave"
+    } else {
+        "chrome"
+    };
+    crate::user_agents::installed_family_ua(family)
+}
+
 /// The Keychain/keyring account name for a browser label
 /// (Python's _browser_key_for_label).
 pub fn browser_key_for_label(label: &str) -> &'static str {
@@ -532,6 +549,32 @@ impl JarRecord {
 pub struct ReadOutcome {
     pub records: Vec<JarRecord>,
     pub skipped: usize,
+    /// Rows skipped because they use Chromium's v20 app-bound
+    /// encryption (Audit 8 B17): readable only through the
+    /// privileged component Python uses, which this port does not
+    /// ship — counted separately so callers can say so honestly
+    /// instead of folding them into generic failures.
+    pub skipped_v20: usize,
+}
+
+/// Copy a possibly locked browser database, retrying a few times
+/// (Python `_copy_with_retries`): a running browser holds the file
+/// only briefly, so a short retry is the non-privileged way to
+/// read a live profile. No elevation is involved.
+pub(crate) fn copy_with_retries(src: &Path, dst: &Path) -> Result<(), String> {
+    let mut last_err = String::new();
+    for attempt in 0..3 {
+        match std::fs::copy(src, dst) {
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                last_err = e.to_string();
+                if attempt < 2 {
+                    std::thread::sleep(std::time::Duration::from_millis(150));
+                }
+            }
+        }
+    }
+    Err(last_err)
 }
 
 /// Read + decrypt one profile's cookie DB (Python's read_cookie_db).
@@ -539,8 +582,15 @@ pub fn read_cookie_db(db_path: &Path, key: Option<&V10Key>) -> Result<ReadOutcom
     if !db_path.is_file() {
         return Err("cookies database not found".to_string());
     }
-    let tmp_dir = std::env::temp_dir().join(format!("blindrss-chromium-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&tmp_dir);
+    // Python uses a unique `mkdtemp` directory per operation
+    // (Audit 8 B12): a PID-only directory is shared by every
+    // concurrent import in this process, and one reader's cleanup
+    // deletes another reader's copy mid-read.
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "blindrss-chromium-cookies-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    ));
     std::fs::create_dir_all(&tmp_dir).map_err(|e| e.to_string())?;
     let result = read_cookie_db_inner(db_path, key, &tmp_dir);
     let _ = std::fs::remove_dir_all(&tmp_dir);
@@ -553,7 +603,7 @@ fn read_cookie_db_inner(
     tmp_dir: &Path,
 ) -> Result<ReadOutcome, String> {
     let dst = tmp_dir.join("Cookies");
-    std::fs::copy(db_path, &dst).map_err(|e| e.to_string())?;
+    copy_with_retries(db_path, &dst)?;
     for suffix in ["-wal", "-shm"] {
         let side = PathBuf::from(format!("{}{suffix}", db_path.display()));
         if side.is_file() {
@@ -590,6 +640,7 @@ fn read_cookie_db_inner(
         .map_err(|e| e.to_string())?;
     let mut records = Vec::new();
     let mut skipped = 0usize;
+    let mut skipped_v20 = 0usize;
     for row in rows {
         let (host, path, secure, http_only, expires_utc, name, value, encrypted) =
             row.map_err(|e| e.to_string())?;
@@ -603,7 +654,11 @@ fn read_cookie_db_inner(
             match decrypt_cookie_value(&encrypted, key, strip_hash) {
                 Some(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
                 None => {
-                    skipped += 1;
+                    if encrypted.starts_with(b"v20") {
+                        skipped_v20 += 1;
+                    } else {
+                        skipped += 1;
+                    }
                     continue;
                 }
             }
@@ -628,7 +683,11 @@ fn read_cookie_db_inner(
             value,
         });
     }
-    Ok(ReadOutcome { records, skipped })
+    Ok(ReadOutcome {
+        records,
+        skipped,
+        skipped_v20,
+    })
 }
 
 /// Import one profile: load its key, read its DB.
@@ -642,6 +701,7 @@ pub fn read_profile_cookies(profile: &ChromiumProfile) -> ReadOutcome {
         Err(_) => ReadOutcome {
             records: Vec::new(),
             skipped: 0,
+            skipped_v20: 0,
         },
     }
 }

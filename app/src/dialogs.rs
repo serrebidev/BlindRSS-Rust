@@ -3045,7 +3045,14 @@ pub fn show_cast_picker(
 /// #79): pick Chromium-family profiles; their decrypted v10
 /// cookies merge into site_cookies.txt beside the config, so
 /// challenge-protected sites can be read. v20 app-bound rows are
-/// counted as skipped (no elevation machinery in the Rust app).
+/// counted separately and named in the result (no elevation
+/// machinery in the Rust app — Audit 8 B17); the appended file
+/// import below is their working path. Firefox-family profiles
+/// import directly (B03), and the browser User-Agent can be
+/// edited on its own (B08). Accessibility: the Python-shaped
+/// controls are APPENDED after the shipped Chromium controls, so
+/// the existing tab order is unchanged; the new text fields carry
+/// accessible names only.
 pub fn show_import_cookies(frame: &Frame, config_path: &Path) {
     use blindrss_core::chromium;
     let dialog = Dialog::builder(frame, "Import Site Cookies").build();
@@ -3087,10 +3094,54 @@ pub fn show_import_cookies(frame: &Frame, config_path: &Path) {
         .build();
     row.add(&close_btn, 0, SizerFlag::All, 4);
     sizer.add_sizer(&row, 0, SizerFlag::All, 2);
+    // Python's dialog also carries an exported-file import and
+    // the browser User-Agent field (Audit 8 B08), appended after
+    // the shipped controls so their tab order is unchanged. The
+    // file import is the working path for cookies no direct
+    // reader can decrypt (Chrome v20 app-bound, B17), and for
+    // browsers with no direct reader at all.
+    let file_label = StaticText::builder(&dialog)
+        .with_label(&crate::tr("Cookies file:"))
+        .build();
+    sizer.add(&file_label, 0, SizerFlag::All, 4);
+    let file_row = BoxSizer::builder(Orientation::Horizontal).build();
+    let file_ctrl = TextCtrl::builder(&dialog).build();
+    file_ctrl.set_name("Cookies file path");
+    let browse_btn = Button::builder(&dialog)
+        .with_label(&crate::tr("Browse..."))
+        .build();
+    file_row.add(&file_ctrl, 1, SizerFlag::Expand | SizerFlag::All, 4);
+    file_row.add(&browse_btn, 0, SizerFlag::All, 4);
+    sizer.add_sizer(&file_row, 0, SizerFlag::Expand | SizerFlag::All, 2);
+    let ua_label = StaticText::builder(&dialog)
+        .with_label(&crate::tr("Browser User-Agent (recommended):"))
+        .build();
+    sizer.add(&ua_label, 0, SizerFlag::All, 4);
+    let ua_ctrl = TextCtrl::builder(&dialog).build();
+    ua_ctrl.set_name("Browser User-Agent");
+    let stored_ua = blindrss_core::cookies::get_global_user_agent(config_path);
+    let initial_ua = if stored_ua.is_empty() {
+        blindrss_core::http::user_agent()
+    } else {
+        stored_ua
+    };
+    ua_ctrl.set_value(&initial_ua);
+    sizer.add(&ua_ctrl, 0, SizerFlag::Expand | SizerFlag::All, 4);
+    let file_btn_row = BoxSizer::builder(Orientation::Horizontal).build();
+    let firefox_btn = Button::builder(&dialog)
+        .with_label(&crate::tr("Import from Firefox..."))
+        .build();
+    let file_import_btn = Button::builder(&dialog)
+        .with_label(&crate::tr("Import File / Save User-Agent"))
+        .build();
+    file_btn_row.add(&firefox_btn, 0, SizerFlag::All, 4);
+    file_btn_row.add(&file_import_btn, 0, SizerFlag::All, 4);
+    sizer.add_sizer(&file_btn_row, 0, SizerFlag::All, 2);
     dialog.set_sizer(sizer, true);
-    dialog.set_size(Size::new(620, 440));
+    dialog.set_size(Size::new(620, 680));
 
     let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let tx_file = tx.clone();
     let profiles = Rc::new(profiles);
     {
         let profiles = profiles.clone();
@@ -3108,6 +3159,7 @@ pub fn show_import_cookies(frame: &Frame, config_path: &Path) {
             }
             status.set_label("Importing...");
             let tx = tx.clone();
+            let cfg_thread = cfg_path.clone();
             let jar_path = cfg_path
                 .parent()
                 .map(|d| d.join("site_cookies.txt"))
@@ -3115,9 +3167,28 @@ pub fn show_import_cookies(frame: &Frame, config_path: &Path) {
             std::thread::spawn(move || {
                 let mut records = Vec::new();
                 let mut skipped = 0usize;
+                let mut skipped_v20 = 0usize;
                 for p in &chosen {
                     let outcome = chromium::read_profile_cookies(p);
                     skipped += outcome.skipped;
+                    skipped_v20 += outcome.skipped_v20;
+                    // Pin this profile's clearance hosts to the
+                    // UA its cookies were issued to (B05).
+                    let ua = chromium::chromium_profile_user_agent(p);
+                    if !ua.is_empty() {
+                        for record in &outcome.records {
+                            if blindrss_core::cookies::is_clearance_cookie_name(&record.name) {
+                                let host = record.host.trim().trim_start_matches('.');
+                                if !host.is_empty() {
+                                    blindrss_core::cookies::set_host_user_agent(
+                                        &cfg_thread,
+                                        host,
+                                        &ua,
+                                    );
+                                }
+                            }
+                        }
+                    }
                     records.extend(outcome.records);
                 }
                 let existing = std::fs::read_to_string(&jar_path).unwrap_or_default();
@@ -3127,13 +3198,37 @@ pub fn show_import_cookies(frame: &Frame, config_path: &Path) {
                     .unwrap_or(0);
                 let merged = chromium::merge_into_jar(&existing, &records, now);
                 let imported = records.len();
-                let msg = match std::fs::write(&jar_path, merged) {
-                    Ok(()) => format!(
-                        "Imported {imported} cookies from {} profiles; {skipped} skipped (could not be decrypted).",
-                        chosen.len()
-                    ),
+                let mut msg = match std::fs::write(&jar_path, merged) {
+                    Ok(()) => {
+                        let mut text = format!(
+                            "Imported {imported} cookies from {} profiles; {skipped} skipped (could not be decrypted).",
+                            chosen.len()
+                        );
+                        // This is an explicit full import, so
+                        // YouTube sessions also land in yt-dlp's
+                        // cookie file (B04).
+                        let mut cfg = Config::load(&cfg_thread).unwrap_or_default();
+                        if let Some(data_dir) = cfg_thread.parent() {
+                            let yt = blindrss_core::cookies_import::merge_youtube_cookies(
+                                &mut cfg,
+                                data_dir,
+                                &records,
+                                now,
+                            );
+                            if yt > 0 && cfg.save(&cfg_thread).is_ok() {
+                                text +=
+                                    &format!(" {yt} YouTube cookies also saved for yt-dlp.");
+                            }
+                        }
+                        text
+                    }
                     Err(e) => format!("Could not write the cookie jar: {e}"),
                 };
+                if skipped_v20 > 0 {
+                    msg += &format!(
+                        " {skipped_v20} cookies use Chrome's app-bound (v20) encryption and cannot be read directly; export a cookies.txt from that browser and use the file import below."
+                    );
+                }
                 let _ = tx.send(msg);
             });
         });
@@ -3142,6 +3237,139 @@ pub fn show_import_cookies(frame: &Frame, config_path: &Path) {
         let d = dialog;
         close_btn.on_click(move |_| {
             d.end_modal(5100);
+        });
+    }
+    {
+        let frame_browse = *frame;
+        browse_btn.on_click(move |_| {
+            let dlg = FileDialog::builder(&frame_browse)
+                .with_message("Select a cookies.txt export")
+                .with_wildcard("Cookie files (*.txt)|*.txt")
+                .with_style(FileDialogStyle::Open)
+                .build();
+            if dlg.show_modal() == 5100
+                && let Some(path) = dlg.get_path()
+            {
+                file_ctrl.set_value(&path);
+            }
+        });
+    }
+    {
+        let cfg_path = config_path.to_path_buf();
+        let tx = tx_file.clone();
+        file_import_btn.on_click(move |_| {
+            let src = file_ctrl.get_value();
+            let ua = ua_ctrl.get_value();
+            status.set_label("Importing...");
+            let tx = tx.clone();
+            let cfg_path = cfg_path.clone();
+            let jar_path = cfg_path
+                .parent()
+                .map(|d| d.join("site_cookies.txt"))
+                .unwrap_or_default();
+            std::thread::spawn(move || {
+                // Python's OK semantics: an empty file field
+                // saves the User-Agent alone; an invalid file is
+                // an error and NOTHING is saved.
+                let msg = if src.trim().is_empty() {
+                    blindrss_core::cookies::set_global_user_agent(&cfg_path, &ua);
+                    "Saved the browser User-Agent.".to_string()
+                } else {
+                    match blindrss_core::cookies_import::merge_jar_file(
+                        &jar_path,
+                        std::path::Path::new(&src),
+                    ) {
+                        Ok(n) => {
+                            blindrss_core::cookies::set_global_user_agent(&cfg_path, &ua);
+                            format!(
+                                "Imported {n} cookies from the file and saved the browser User-Agent."
+                            )
+                        }
+                        Err(e) => {
+                            format!("Import failed: {e} Nothing was changed.")
+                        }
+                    }
+                };
+                let _ = tx.send(msg);
+            });
+        });
+    }
+    {
+        let cfg_path = config_path.to_path_buf();
+        let frame_ff = *frame;
+        firefox_btn.on_click(move |_| {
+            let profiles = blindrss_core::firefox::list_profiles();
+            if profiles.is_empty() {
+                let md = MessageDialog::builder(
+                    &frame_ff,
+                    "No Firefox-family browser profiles were found. Firefox, LibreWolf, Waterfox, Floorp and Zen are read directly; for Chrome, Edge or Brave, export a cookies.txt from the browser and use the file import instead.",
+                    "Import Site Cookies",
+                )
+                .with_style(MessageDialogStyle::OK | MessageDialogStyle::IconInformation)
+                .build();
+                md.show_modal();
+                md.destroy();
+                return;
+            }
+            let pick = if profiles.len() == 1 {
+                Some(0)
+            } else {
+                pick_firefox_profile(&frame_ff, &profiles)
+            };
+            let Some(idx) = pick else { return };
+            let profile = &profiles[idx];
+            let jar_path = cfg_path
+                .parent()
+                .map(|d| d.join("site_cookies.txt"))
+                .unwrap_or_default();
+            match blindrss_core::firefox::read_profile_cookies(profile) {
+                Ok(records) => {
+                    let existing = std::fs::read_to_string(&jar_path).unwrap_or_default();
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0);
+                    let count = records.len();
+                    let merged = chromium::merge_into_jar(&existing, &records, now);
+                    match std::fs::write(&jar_path, merged) {
+                        Ok(()) => {
+                            // Python's dialog flow: the profile's
+                            // UA becomes the stored browser UA.
+                            let ua =
+                                blindrss_core::firefox::profile_user_agent(&profile.profile_dir);
+                            if !ua.is_empty() {
+                                blindrss_core::cookies::set_global_user_agent(&cfg_path, &ua);
+                                ua_ctrl.set_value(&ua);
+                            }
+                            // An explicit full import, so YouTube
+                            // records also land in yt-dlp's jar
+                            // (B04, as with the Chromium import).
+                            let mut extra = String::new();
+                            let mut cfg = Config::load(&cfg_path).unwrap_or_default();
+                            if let Some(data_dir) = cfg_path.parent() {
+                                let yt = blindrss_core::cookies_import::merge_youtube_cookies(
+                                    &mut cfg,
+                                    data_dir,
+                                    &records,
+                                    now,
+                                );
+                                if yt > 0 && cfg.save(&cfg_path).is_ok() {
+                                    extra =
+                                        format!(" {yt} YouTube cookies also saved for yt-dlp.");
+                                }
+                            }
+                            status.set_label(&format!(
+                                "Imported {count} cookies from {} — {}.{extra}",
+                                profile.browser, profile.profile
+                            ));
+                        }
+                        Err(e) => {
+                            status.set_label(&format!("Could not write the cookie jar: {e}"))
+                        }
+                    }
+                }
+                Err(e) => status.set_label(&format!("Could not read that profile: {e}")),
+            }
         });
     }
     let timer = Box::leak(Box::new(Timer::new(&dialog)));
@@ -3153,6 +3381,37 @@ pub fn show_import_cookies(frame: &Frame, config_path: &Path) {
     });
     dialog.show_modal();
     dialog.destroy();
+}
+
+/// Pick one Firefox-family profile when several exist (Python's
+/// SingleChoiceDialog step in the Import Site Cookies flow).
+fn pick_firefox_profile(
+    frame: &Frame,
+    profiles: &[blindrss_core::firefox::FirefoxProfile],
+) -> Option<usize> {
+    let dialog = Dialog::builder(frame, "Import from Firefox").build();
+    let sizer = BoxSizer::builder(Orientation::Vertical).build();
+    let label = StaticText::builder(&dialog)
+        .with_label(&crate::tr("Choose the Firefox profile to import from:"))
+        .build();
+    sizer.add(&label, 0, SizerFlag::All, 4);
+    let list = ListBox::builder(&dialog).build();
+    list.set_name("Firefox profile");
+    for p in profiles {
+        list.append(&format!("{} — {}", p.browser, p.profile));
+    }
+    list.set_selection(0, true);
+    sizer.add(&list, 1, SizerFlag::Expand | SizerFlag::All, 4);
+    ok_cancel(&dialog, &sizer);
+    dialog.set_sizer(sizer, true);
+    dialog.set_size(Size::new(520, 360));
+    let result = if dialog.show_modal() == 5100 {
+        list.get_selection().map(|s| s as usize)
+    } else {
+        None
+    };
+    dialog.destroy();
+    result
 }
 
 /// The Equalizer dialog (Python's EqualizerDialog): enable

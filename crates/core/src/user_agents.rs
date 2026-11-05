@@ -142,6 +142,27 @@ fn installed() -> &'static [InstalledBrowser] {
     BROWSERS.get_or_init(detect_installed)
 }
 
+/// The User-Agent of an installed browser family ("chrome",
+/// "edge", "brave") at its detected version, for pinning beside
+/// cookies harvested from that family's profiles (Python's
+/// `installed:<family>` resolution in `chromium_profile_user_agent`).
+/// Brave has no preset of its own and resolves through Chrome's,
+/// as in Python. Falls back to the platform preset when the
+/// family is not detected.
+pub fn installed_family_ua(family: &str) -> String {
+    if let Some(browser) = installed().iter().find(|b| b.key == family) {
+        return build_ua(browser.engine, platform(), browser.major);
+    }
+    if family == "edge"
+        && let Some(ua) = preset_ua(&format!("edge_{}", platform()))
+    {
+        return ua.to_string();
+    }
+    preset_ua(&auto_preset_key())
+        .unwrap_or_else(|| preset_ua(FALLBACK_PRESET).unwrap())
+        .to_string()
+}
+
 /// Stable config keys and labels for detected browsers in Settings.
 pub fn installed_choices() -> Vec<(String, String)> {
     installed()

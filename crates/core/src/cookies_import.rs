@@ -363,33 +363,142 @@ fn permitted_profile_records(config: &Config, records: Vec<JarRecord>, now: i64)
     records
         .into_iter()
         .filter(|record| {
-            let name = record.name.trim().to_ascii_lowercase();
-            let harvestable = [
-                "cf_clearance",
-                "__cf_bm",
-                "datadome",
-                "reese84",
-                "incap_ses",
-                "visid_incap",
-                "_px3",
-                "_pxvid",
-                "bm_sz",
-                "ak_bmsc",
-            ]
-            .iter()
-            .any(|prefix| name.starts_with(prefix));
-            (full || (clearance && harvestable))
+            (full || (clearance && crate::cookies::is_clearance_cookie_name(&record.name)))
                 && !record.value.is_empty()
                 && (record.expires == 0 || record.expires >= now)
         })
         .collect()
 }
 
-/// Re-read Chromium profiles whose cookie DB changed since the
-/// last pass and merge their cookies into the site jar. Returns
+/// (ok, message) for a manually chosen SITE cookie export
+/// (Python `validate_jar_file`): any domains are fine here —
+/// unlike the YouTube-specific `validate_cookie_file`, this gates
+/// the Import Site Cookies dialog's file field (Audit 8 B08).
+pub fn validate_site_jar_file(path: &Path) -> (bool, String) {
+    if !path.is_file() {
+        return (false, "File not found.".to_string());
+    }
+    let Some(text) = read_jar_text(path) else {
+        return (
+            false,
+            "Could not read the file (too large or unreadable).".to_string(),
+        );
+    };
+    if !is_netscape_cookie_jar(&text) {
+        return (
+            false,
+            "This does not look like a Netscape cookies.txt export.".to_string(),
+        );
+    }
+    (true, "Looks like a valid cookie export.".to_string())
+}
+
+/// Merge a manually chosen export file into the site jar
+/// (Python `import_jar`). Validation happens before anything is
+/// read or written, so an invalid file leaves the existing jar
+/// byte-identical. Returns the number of records merged.
+pub fn merge_jar_file(jar_path: &Path, src_path: &Path) -> Result<usize, String> {
+    let (ok, message) = validate_site_jar_file(src_path);
+    if !ok {
+        return Err(message);
+    }
+    let text = read_jar_text(src_path)
+        .ok_or_else(|| "Could not read the file (too large or unreadable).".to_string())?;
+    let records = parse_netscape_records(&text);
+    if records.is_empty() {
+        return Err("This does not look like a Netscape cookies.txt export.".to_string());
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let existing = std::fs::read_to_string(jar_path).unwrap_or_default();
+    let merged = merge_into_jar(&existing, &records, now);
+    std::fs::write(jar_path, merged).map_err(|e| e.to_string())?;
+    Ok(records.len())
+}
+
+fn is_youtube_record(record: &JarRecord) -> bool {
+    let host = record.host.trim().trim_start_matches('.').to_lowercase();
+    YOUTUBE_DOMAINS
+        .iter()
+        .any(|d| host == *d || host.ends_with(&format!(".{d}")))
+}
+
+/// Merge permitted YouTube/Google browser records into yt-dlp's
+/// managed cookie file (Python `merge_youtube_cookies`, Audit 8
+/// B04). The managed file is rewritten from YouTube/Google
+/// records only — anything else that landed in it is dropped —
+/// and the `ytdlp_cookies_file` setting is pointed at it only
+/// when it is unset or already points there; a file the user
+/// configured themselves is never repointed. Config is updated in
+/// place (caller saves). Returns the number of records merged.
+pub fn merge_youtube_cookies(
+    config: &mut Config,
+    data_dir: &Path,
+    records: &[JarRecord],
+    now: i64,
+) -> usize {
+    let yt: Vec<JarRecord> = records
+        .iter()
+        .filter(|r| is_youtube_record(r))
+        .cloned()
+        .collect();
+    if yt.is_empty() {
+        return 0;
+    }
+    let dest = data_dir.join(IMPORTED_COOKIE_FILENAME);
+    let existing = std::fs::read_to_string(&dest).unwrap_or_default();
+    let filtered: Vec<&str> = existing
+        .lines()
+        .filter(|line| {
+            parse_netscape_records(line)
+                .first()
+                .is_some_and(is_youtube_record)
+        })
+        .collect();
+    let mut base = String::from(
+        "# Netscape HTTP Cookie File\n# Harvested from installed browsers by BlindRSS\n",
+    );
+    if !filtered.is_empty() {
+        base.push_str(&filtered.join("\n"));
+        base.push('\n');
+    }
+    let merged = merge_into_jar(&base, &yt, now);
+    if std::fs::write(&dest, merged).is_err() {
+        return 0;
+    }
+    let dest_str = dest.to_string_lossy().to_string();
+    let current = config.get_str("ytdlp_cookies_file", "").to_string();
+    if current.is_empty() || current == dest_str {
+        config.set_path("ytdlp_cookies_file", serde_json::json!(dest_str));
+    }
+    yt.len()
+}
+
+/// Re-read browser profiles whose cookie DB changed since the
+/// last pass and merge their permitted cookies into the site jar:
+/// Chromium profiles (keyed by cookie DB path) and Firefox-family
+/// profiles (keyed by profile directory, Audit 8 B03). Returns
 /// the number of cookies stored (Python's
 /// site_cookies.auto_import_browser_profiles).
 pub fn auto_import_browser_profiles(config: &mut Config, jar_path: &Path, now: i64) -> usize {
+    let chromium_profiles = crate::chromium::list_profiles();
+    let firefox_profiles = crate::firefox::list_profiles();
+    auto_import_browser_profiles_with(config, jar_path, now, &chromium_profiles, &firefox_profiles)
+}
+
+/// The profile pass over explicit profile lists, so tests can run
+/// it against fixture profiles. Consent shape (unchanged): the
+/// automatic pass stores clearance-shaped cookies only; full
+/// session records move only in the consented full mode.
+pub fn auto_import_browser_profiles_with(
+    config: &mut Config,
+    jar_path: &Path,
+    now: i64,
+    chromium_profiles: &[crate::chromium::ChromiumProfile],
+    firefox_profiles: &[crate::firefox::FirefoxProfile],
+) -> usize {
     let Some(full) = profile_import_mode(config, now) else {
         return 0;
     };
@@ -404,10 +513,34 @@ pub fn auto_import_browser_profiles(config: &mut Config, jar_path: &Path, now: i
         .and_then(|v| v.as_object())
         .cloned()
         .unwrap_or_default();
-    let profiles = crate::chromium::list_profiles();
     let mut stored = 0usize;
     let mut changed = false;
-    for profile in &profiles {
+    let mut youtube_records: Vec<JarRecord> = Vec::new();
+    // The UA sidecars live beside the config, which is the same
+    // directory as the site jar; the identity helpers key off a
+    // path's parent, so the jar path addresses them.
+    let pin_host_uas = |records: &[JarRecord], ua: &str| {
+        if ua.is_empty() {
+            return;
+        }
+        for record in records {
+            if crate::cookies::is_clearance_cookie_name(&record.name) {
+                let host = record.host.trim().trim_start_matches('.');
+                if !host.is_empty() {
+                    crate::cookies::set_host_user_agent(jar_path, host, ua);
+                }
+            }
+        }
+    };
+    let merge_into_site_jar = |records: &[JarRecord]| -> bool {
+        if records.is_empty() {
+            return true;
+        }
+        let existing = std::fs::read_to_string(jar_path).unwrap_or_default();
+        let merged = merge_into_jar(&existing, records, now);
+        std::fs::write(jar_path, merged).is_ok()
+    };
+    for profile in chromium_profiles {
         let db_mtime = profile.mtime;
         let key = profile.cookie_db.to_string_lossy().to_string();
         let previous = seen.get(&key).and_then(|v| v.as_f64()).unwrap_or(0.0);
@@ -419,13 +552,103 @@ pub fn auto_import_browser_profiles(config: &mut Config, jar_path: &Path, now: i
             continue;
         }
         let records = permitted_profile_records(config, outcome.records, now);
-        let existing = std::fs::read_to_string(jar_path).unwrap_or_default();
+        if full {
+            // Python's consented Chromium harvest: YouTube
+            // sessions also land in yt-dlp's jar (B04), and
+            // clearance domains are pinned to the profile's UA.
+            youtube_records.extend(
+                records
+                    .iter()
+                    .filter(|r| is_youtube_record(r))
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            );
+            pin_host_uas(
+                &records,
+                &crate::chromium::chromium_profile_user_agent(profile),
+            );
+        }
         let count = records.len();
-        let merged = merge_into_jar(&existing, &records, now);
-        if std::fs::write(jar_path, merged).is_ok() {
+        if merge_into_site_jar(&records) {
             stored += count;
             seen.insert(key, serde_json::json!(db_mtime));
             changed = true;
+        }
+    }
+    if full {
+        for profile in firefox_profiles {
+            let key = profile.profile_dir.to_string_lossy().to_string();
+            let previous = seen.get(&key).and_then(|v| v.as_f64()).unwrap_or(0.0);
+            if profile.mtime <= previous {
+                continue;
+            }
+            let Ok(records) = crate::firefox::read_profile_cookies(profile) else {
+                continue;
+            };
+            seen.insert(key, serde_json::json!(profile.mtime));
+            changed = true;
+            let records = permitted_profile_records(config, records, now);
+            youtube_records.extend(
+                records
+                    .iter()
+                    .filter(|r| is_youtube_record(r))
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            );
+            let ua = crate::firefox::profile_user_agent(&profile.profile_dir);
+            if merge_into_site_jar(&records) {
+                stored += records.len();
+                pin_host_uas(&records, &ua);
+            }
+        }
+    } else {
+        // Python's clearance pass is Firefox-only: candidates
+        // from every changed profile compete per
+        // (domain, path, name) and the longest-lived wins, with
+        // its profile's UA pinned to the cookie's host.
+        let mut best: Vec<(JarRecord, String)> = Vec::new();
+        for profile in firefox_profiles {
+            let key = profile.profile_dir.to_string_lossy().to_string();
+            let previous = seen.get(&key).and_then(|v| v.as_f64()).unwrap_or(0.0);
+            if profile.mtime <= previous {
+                continue;
+            }
+            let Ok(records) = crate::firefox::read_profile_cookies(profile) else {
+                continue;
+            };
+            seen.insert(key, serde_json::json!(profile.mtime));
+            changed = true;
+            let ua = crate::firefox::profile_user_agent(&profile.profile_dir);
+            for record in permitted_profile_records(config, records, now) {
+                let rkey = (
+                    record.host.trim().trim_start_matches('.').to_lowercase(),
+                    record.name.clone(),
+                    record.path.clone(),
+                );
+                match best.iter_mut().find(|(existing, _)| {
+                    (
+                        existing.host.trim().trim_start_matches('.').to_lowercase(),
+                        existing.name.clone(),
+                        existing.path.clone(),
+                    ) == rkey
+                }) {
+                    Some(slot) => {
+                        if record.expires > slot.0.expires {
+                            *slot = (record, ua.clone());
+                        }
+                    }
+                    None => best.push((record, ua.clone())),
+                }
+            }
+        }
+        if !best.is_empty() {
+            let records: Vec<JarRecord> = best.iter().map(|(record, _)| record.clone()).collect();
+            if merge_into_site_jar(&records) {
+                stored += records.len();
+                for (record, ua) in &best {
+                    pin_host_uas(std::slice::from_ref(record), ua);
+                }
+            }
         }
     }
     if changed {
@@ -433,6 +656,11 @@ pub fn auto_import_browser_profiles(config: &mut Config, jar_path: &Path, now: i
     }
     if full {
         config.set_path("site_cookies_full_import_last_run", serde_json::json!(now));
+        if !youtube_records.is_empty()
+            && let Some(data_dir) = jar_path.parent()
+        {
+            merge_youtube_cookies(config, data_dir, &youtube_records, now);
+        }
     }
     stored
 }

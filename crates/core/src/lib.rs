@@ -31,6 +31,7 @@ pub mod equalizer;
 pub mod extract;
 pub mod feeds;
 pub mod feedsearch;
+pub mod firefox;
 pub mod forum_sources;
 pub mod help;
 pub mod help_topics;

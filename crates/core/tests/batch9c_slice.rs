@@ -124,7 +124,11 @@ fn chromium_v10_round_trip_and_jar_merge() {
     }
     let outcome = read_cookie_db(&db_path, Some(&V10Key::Gcm(key))).unwrap();
     assert_eq!(outcome.records.len(), 1);
-    assert_eq!(outcome.skipped, 1);
+    // Audit 8 Task 25 (B17): the v20 row is counted separately
+    // from generic decrypt failures so callers can report it
+    // honestly.
+    assert_eq!(outcome.skipped, 0);
+    assert_eq!(outcome.skipped_v20, 1);
     let rec = &outcome.records[0];
     assert_eq!(rec.value, "secret-value");
     assert_eq!(rec.expires, 1_900_000_000);

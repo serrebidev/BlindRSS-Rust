@@ -204,7 +204,7 @@ impl Cdp {
     }
 }
 
-fn save_cookies(root: &Path, cookies: &Value) -> Result<(), String> {
+fn save_cookies(root: &Path, url: &str, cookies: &Value) -> Result<(), String> {
     let records: Vec<_> = cookies
         .as_array()
         .into_iter()
@@ -226,16 +226,24 @@ fn save_cookies(root: &Path, cookies: &Value) -> Result<(), String> {
     if records.is_empty() {
         return Ok(());
     }
-    let path = root.join("site_cookies.txt");
-    let existing = std::fs::read_to_string(&path).unwrap_or_default();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64;
-    let merged = crate::chromium::merge_into_jar(&existing, &records, now);
-    let temporary = root.join(format!(".browser-cookies-{}", uuid::Uuid::new_v4()));
-    std::fs::write(&temporary, merged).map_err(|_| "Could not stage browser cookies")?;
-    std::fs::rename(&temporary, &path).map_err(|_| "Could not save browser cookies".to_owned())
+    // Python `record_browser_session` (Audit 8 B05): a solved
+    // challenge stores ONLY its clearance cookies — never the
+    // whole session the browser happened to hold — and pins the
+    // UA this browser ran with to the request host. `root` is the
+    // data directory; the sidecar helpers key off the config
+    // file's parent, which is this same directory.
+    crate::cookies::record_browser_session(
+        &root.join("config.json"),
+        url,
+        &records,
+        &crate::http::user_agent(),
+        now,
+    );
+    Ok(())
 }
 
 /// Blocking worker-only operation; never starts or reads a personal profile.
@@ -362,7 +370,7 @@ pub fn fetch_page(
         {
             let final_url = page["url"].as_str().unwrap_or(url).to_owned();
             let cookies = cdp.call("Network.getCookies", json!({"urls":[final_url]}))?;
-            save_cookies(&root, &cookies["cookies"])?;
+            save_cookies(&root, &final_url, &cookies["cookies"])?;
             return Ok(BrowserPageResponse {
                 html: html.to_owned(),
                 url: final_url,
