@@ -164,7 +164,7 @@ const NESTED_OPML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 fn opml_import_builds_full_category_paths() {
     let path = scratch("blindrss_batch1_opml.db");
     let db = Db::open_or_create(&path).unwrap();
-    let n = blindrss_core::opml::import_opml(&db, NESTED_OPML).unwrap();
+    let n = blindrss_core::opml::import_opml(&db, NESTED_OPML.as_bytes()).unwrap();
     assert_eq!(n, 2);
     let feeds = db.feeds().unwrap();
     let nested = feeds.iter().find(|f| f.title == "Example").unwrap();
@@ -183,7 +183,8 @@ fn opml_import_builds_full_category_paths() {
 fn opml_import_under_prefixes_and_export_nests() {
     let path = scratch("blindrss_batch1_opml2.db");
     let db = Db::open_or_create(&path).unwrap();
-    let n = blindrss_core::opml::import_opml_under(&db, NESTED_OPML, Some("Imports")).unwrap();
+    let n = blindrss_core::opml::import_opml_under(&db, NESTED_OPML.as_bytes(), Some("Imports"))
+        .unwrap();
     assert_eq!(n, 2);
     let feeds = db.feeds().unwrap();
     let nested = feeds.iter().find(|f| f.title == "Example").unwrap();
@@ -195,7 +196,7 @@ fn opml_import_under_prefixes_and_export_nests() {
     let xml = blindrss_core::opml::export_opml_feeds(&feeds).unwrap();
     let path2 = scratch("blindrss_batch1_opml3.db");
     let db2 = Db::open_or_create(&path2).unwrap();
-    blindrss_core::opml::import_opml(&db2, &xml).unwrap();
+    blindrss_core::opml::import_opml(&db2, xml.as_bytes()).unwrap();
     let feeds2 = db2.feeds().unwrap();
     let nested2 = feeds2.iter().find(|f| f.title == "Example").unwrap();
     assert_eq!(nested2.category.as_deref(), Some("Imports / News / Tech"));

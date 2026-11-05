@@ -261,6 +261,7 @@ fn episode_with(
             media_url: media.map(str::to_string),
             media_type: None,
             tags: Vec::new(),
+            duration: None,
         },
         source_feed_url: String::new(),
         snapshot_timestamp: String::new(),
@@ -841,4 +842,107 @@ fn simultaneous_claims_admit_one_worker() {
     assert_eq!(claimed, 1);
     drop(db);
     std::fs::remove_file(path).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Audit 8 Task 27 (F16): parsed episode duration flows into
+// archive identity. Undated episodes whose GUID, page and
+// media URLs all changed between snapshots still reconcile
+// through Python's title-duration key — the branch that was
+// inert while the feed parser dropped itunes:duration.
+// ---------------------------------------------------------------------------
+
+fn undated_document(guid: &str, page: &str, media: &str, duration: &str) -> Vec<u8> {
+    format!(
+        "<rss version='2.0' xmlns:itunes='http://www.itunes.com/dtds/podcast-1.0.dtd'><channel><title>Show</title>\
+         <item><guid>{guid}</guid><title>Episode One</title><link>{page}</link>\
+         <enclosure url='{media}' type='audio/mpeg' length='100'/>\
+         <itunes:duration>{duration}</itunes:duration></item></channel></rss>"
+    )
+    .into_bytes()
+}
+
+#[test]
+fn undated_url_changed_episode_matches_by_title_duration() {
+    let current = archive::parse_document(
+        &undated_document(
+            "guid-new",
+            "https://new.example/episodes/one",
+            "https://cdn2.example/audio/ep1.mp3",
+            "1:02:03",
+        ),
+        "https://example.com/rss",
+        "",
+    )
+    .unwrap();
+    let old = archive::parse_document(
+        &undated_document(
+            "guid-old",
+            "https://old.example/episodes/one",
+            "https://cdn1.example/audio/ep1.mp3",
+            " 1:02:03 ",
+        ),
+        "https://example.com/rss",
+        "20250101",
+    )
+    .unwrap();
+    // The key embeds the RAW duration text (feedparser's
+    // value), whitespace-trimmed — not normalized seconds.
+    assert!(
+        current.episodes[0]
+            .identity_keys
+            .contains("title-duration:episode one|1:02:03"),
+        "{:?}",
+        current.episodes[0].identity_keys
+    );
+    let episodes = archive::deduplicate_episodes(current.episodes.into_iter().chain(old.episodes));
+    assert_eq!(episodes.len(), 1);
+    assert_eq!(episodes[0].entry.id, "guid-new");
+}
+
+#[test]
+fn undated_episode_with_different_duration_stays_separate() {
+    let current = archive::parse_document(
+        &undated_document(
+            "guid-a",
+            "https://a.example/one",
+            "https://cdn.example/a.mp3",
+            "1:02:03",
+        ),
+        "https://example.com/rss",
+        "",
+    )
+    .unwrap();
+    let other = archive::parse_document(
+        &undated_document(
+            "guid-b",
+            "https://b.example/one",
+            "https://cdn.example/b.mp3",
+            "58:10",
+        ),
+        "https://example.com/rss",
+        "20250101",
+    )
+    .unwrap();
+    let episodes =
+        archive::deduplicate_episodes(current.episodes.into_iter().chain(other.episodes));
+    assert_eq!(episodes.len(), 2);
+}
+
+#[test]
+fn parsed_entry_duration_is_the_raw_document_text() {
+    let feed = blindrss_core::feeds::parse_feed(&undated_document(
+        "g1",
+        "https://p.example/one",
+        "https://cdn.example/a.mp3",
+        "62:03",
+    ))
+    .unwrap();
+    assert_eq!(feed.entries[0].duration.as_deref(), Some("62:03"));
+    // No duration element anywhere: None, not a fabricated value.
+    let plain = blindrss_core::feeds::parse_feed(
+        b"<rss version='2.0'><channel><title>S</title><item><guid>g</guid><title>T</title></item></channel></rss>",
+    )
+    .unwrap();
+    assert_eq!(plain.entries[0].duration, None);
 }

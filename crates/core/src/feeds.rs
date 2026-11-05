@@ -346,6 +346,12 @@ pub struct ParsedEntry {
     pub media_url: Option<String>,
     pub media_type: Option<String>,
     pub tags: Vec<String>,
+    /// The episode's duration as the feed document states it
+    /// (the raw `itunes:duration` text — Python's feedparser
+    /// value, kept un-normalized because archive identity keys
+    /// embed it verbatim; Audit 8 Task 27, F16). None when the
+    /// document carries no usable duration.
+    pub duration: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -434,19 +440,189 @@ fn entry_from(e: &Entry) -> ParsedEntry {
                 .map(|c| c.term.clone())
                 .collect::<Vec<_>>(),
         ),
+        // feed-rs parses itunes:duration into a Duration,
+        // losing the document's raw text; the raw scan in
+        // parse_feed overwrites this fallback (formatted total
+        // seconds) whenever it can see the element itself.
+        duration: media_duration_fallback(e),
     }
+}
+
+/// feed-rs's parsed duration (the media object's, else the
+/// first media content's) as a total-seconds string — the
+/// fallback for documents whose duration element the raw scan
+/// could not pair with its entry.
+fn media_duration_fallback(e: &Entry) -> Option<String> {
+    let duration = e.media.iter().find_map(|m| {
+        m.duration
+            .or_else(|| m.content.iter().find_map(|c| c.duration))
+    })?;
+    let secs = duration.as_secs();
+    let millis = duration.subsec_millis();
+    if millis == 0 {
+        Some(secs.to_string())
+    } else {
+        Some(
+            format!("{secs}.{:03}", millis)
+                .trim_end_matches('0')
+                .to_string(),
+        )
+    }
+}
+
+/// Raw per-entry `itunes:duration` texts, in document order
+/// (feedparser's `itunes_duration`: the element text exactly
+/// as written, whitespace-trimmed — NOT normalized to seconds,
+/// because Python's archive identity keys embed it verbatim
+/// and the episode keys must hash identically in both apps).
+/// The scan pairs durations with entries by order; entries
+/// whose element it cannot see keep their index as None and
+/// fall back to feed-rs's parsed value.
+fn raw_entry_durations(bytes: &[u8]) -> Vec<Option<String>> {
+    use quick_xml::events::Event;
+    const ITUNES_NS: &str = "http://www.itunes.com/dtds/podcast-1.0.dtd";
+    let text = String::from_utf8_lossy(bytes);
+    let mut reader = quick_xml::Reader::from_str(&text);
+    reader.config_mut().check_end_names = false;
+    let mut durations: Vec<Option<String>> = Vec::new();
+    // Element stack: (local name, xmlns declarations added).
+    let mut stack: Vec<(String, Vec<(String, String)>)> = Vec::new();
+    let mut scopes: Vec<(String, String)> = Vec::new();
+    let mut in_entry = false;
+    let mut capturing = false;
+    let mut captured = String::new();
+    let mut buf = Vec::new();
+    let lookup_ns = |scopes: &[(String, String)], prefix: &str| -> Option<String> {
+        scopes
+            .iter()
+            .rev()
+            .find(|(p, _)| p == prefix)
+            .map(|(_, uri)| uri.clone())
+    };
+    loop {
+        let event = reader.read_event_into(&mut buf);
+        let is_empty = matches!(event, Ok(Event::Empty(_)));
+        match event {
+            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
+                let qname = e.name().as_ref().to_string();
+                let (prefix, local) = match qname.split_once(':') {
+                    Some((p, l)) => (p.to_string(), l.to_lowercase()),
+                    None => (String::new(), qname.to_lowercase()),
+                };
+                let mut decls: Vec<(String, String)> = Vec::new();
+                for a in e.attributes().filter_map(|a| a.ok()) {
+                    let key = a.key.as_ref().to_string();
+                    if let Some(p) = key.strip_prefix("xmlns:") {
+                        decls.push((
+                            p.to_string(),
+                            a.normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                                .unwrap_or_default()
+                                .into_owned(),
+                        ));
+                    } else if key == "xmlns" {
+                        decls.push((
+                            String::new(),
+                            a.normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                                .unwrap_or_default()
+                                .into_owned(),
+                        ));
+                    }
+                }
+                for d in &decls {
+                    scopes.push(d.clone());
+                }
+                if local == "item" || local == "entry" {
+                    if !in_entry {
+                        durations.push(None);
+                        if !is_empty {
+                            in_entry = true;
+                        }
+                    }
+                } else if in_entry
+                    && local == "duration"
+                    && durations.last().is_some_and(|d| d.is_none())
+                    && !capturing
+                    && !is_empty
+                {
+                    let ns_ok = prefix == "itunes"
+                        || prefix.is_empty()
+                        || lookup_ns(&scopes, &prefix).as_deref() == Some(ITUNES_NS);
+                    if ns_ok {
+                        capturing = true;
+                        captured.clear();
+                    }
+                }
+                if is_empty {
+                    for _ in &decls {
+                        scopes.pop();
+                    }
+                } else {
+                    stack.push((local, decls));
+                }
+            }
+            Ok(Event::End(e)) => {
+                let qname = e.name().as_ref().to_string();
+                let local = qname
+                    .split_once(':')
+                    .map(|(_, l)| l.to_lowercase())
+                    .unwrap_or_else(|| qname.to_lowercase());
+                if capturing && local == "duration" {
+                    capturing = false;
+                    if let Some(slot) = durations.last_mut() {
+                        let value = captured.trim().to_string();
+                        if !value.is_empty() {
+                            *slot = Some(value);
+                        }
+                    }
+                }
+                if (local == "item" || local == "entry") && in_entry {
+                    in_entry = false;
+                    capturing = false;
+                }
+                if let Some(pos) = stack.iter().rposition(|(name, _)| *name == local) {
+                    let removed: Vec<_> = stack.drain(pos..).collect();
+                    for (_, decls) in &removed {
+                        for _ in decls {
+                            scopes.pop();
+                        }
+                    }
+                }
+            }
+            Ok(Event::Text(e)) => {
+                if capturing {
+                    captured.push_str(
+                        &quick_xml::escape::unescape(&e.xml10_content()).unwrap_or_default(),
+                    );
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+    durations
 }
 
 /// Parse a feed document (RSS, Atom, or JSON Feed) from raw bytes.
 pub fn parse_feed(bytes: &[u8]) -> Result<ParsedFeed, String> {
     let feed = parser::parse(std::io::Cursor::new(bytes)).map_err(|e| format!("{e:?}"))?;
+    let mut entries: Vec<ParsedEntry> = feed.entries.iter().map(entry_from).collect();
+    // The raw itunes:duration text (feedparser's value) wins
+    // over feed-rs's parsed Duration wherever the scan could
+    // pair it with its entry (Audit 8 Task 27, F16).
+    for (entry, raw) in entries.iter_mut().zip(raw_entry_durations(bytes)) {
+        if raw.is_some() {
+            entry.duration = raw;
+        }
+    }
     Ok(ParsedFeed {
         title: feed
             .title
             .as_ref()
             .map(|t| t.content.clone())
             .unwrap_or_default(),
-        entries: feed.entries.iter().map(entry_from).collect(),
+        entries,
     })
 }
 

@@ -351,7 +351,7 @@ fn default_download_dir() -> PathBuf {
 
 /// The download root (Python `_download_dir_for_article`'s
 /// root): the configured `download_path`, else the default.
-fn download_root(cfg: &blindrss_core::config::Config) -> PathBuf {
+pub(crate) fn download_root(cfg: &blindrss_core::config::Config) -> PathBuf {
     let configured = cfg.get_str("download_path", "");
     if configured.trim().is_empty() {
         default_download_dir()
@@ -362,7 +362,7 @@ fn download_root(cfg: &blindrss_core::config::Config) -> PathBuf {
 
 /// The configured download retention in seconds (None =
 /// unlimited), via core's stable-identifier policy.
-fn download_retention_seconds(cfg: &blindrss_core::config::Config) -> Option<i64> {
+pub(crate) fn download_retention_seconds(cfg: &blindrss_core::config::Config) -> Option<i64> {
     blindrss_core::retention::retention_days(cfg.get_str("download_retention", "unlimited"))
         .map(|days| days * 86_400)
 }
@@ -371,7 +371,10 @@ fn download_retention_seconds(cfg: &blindrss_core::config::Config) -> Option<i64
 /// `downloaded_media` index first, then the legacy scan of
 /// the download folders (Audit 8 Task 22, M19 — files Python
 /// or an older build wrote before the index tracked them).
-fn downloaded_path_for(cfg: &blindrss_core::config::Config, article: &Article) -> Option<PathBuf> {
+pub(crate) fn downloaded_path_for(
+    cfg: &blindrss_core::config::Config,
+    article: &Article,
+) -> Option<PathBuf> {
     blindrss_core::download::downloaded_media_path_or_legacy(cfg, article, &download_root(cfg))
 }
 
@@ -1839,6 +1842,23 @@ enum RefreshMsg {
     YtdlpUpdated(Result<std::path::PathBuf, String>),
     /// Automatic ffmpeg/ffprobe install finished (bin dir).
     FfmpegInstalled(Result<std::path::PathBuf, String>),
+    /// YouTube Takeout prepared on a worker (Audit 8 Task
+    /// 27, F11): the parsed import plus the active
+    /// provider's category names for the destination prompt.
+    TakeoutParsed(Result<(blindrss_core::takeout::TakeoutImport, Vec<String>), String>),
+    /// YouTube Takeout import finished on a worker: the
+    /// completion report (Python's `_post_import_youtube_
+    /// takeout` message figures) or the error text.
+    TakeoutImported(Result<TakeoutReport, String>),
+}
+
+/// The figures in Python's Takeout completion message.
+struct TakeoutReport {
+    new_feeds: usize,
+    subscriptions: usize,
+    history: usize,
+    owned: usize,
+    playlists: usize,
 }
 
 const ID_OK: i32 = 5100;
@@ -3042,6 +3062,33 @@ fn refill_inner(state: &mut State, list: &ListCtrl) {
             if !recs.is_empty() {
                 return finish_refill(state, list, merge_recommendations(loaded, recs));
             }
+        }
+    }
+    // Plain subscribed-feed view under a hosted provider:
+    // recovered archive episodes merge into the ordinary
+    // read (Python's `_merge_hosted_archive_articles`,
+    // Audit 8 Task 27, F02) — the same merge the provider
+    // layer performs, applied to the window's own cache so
+    // the rows the user sees carry them too. The merged
+    // view loads whole and runs the in-memory pipeline,
+    // like Python's provider returns; a feed with no
+    // stored episodes keeps the paged path below.
+    if let Some(feed_id) = filter
+        .filter(|f| *f != "favorites:all" && !f.starts_with("cat:") && !f.starts_with("smart:"))
+    {
+        let scope = blindrss_core::archive_store::scope_for_config(&cfg);
+        if !scope.is_empty()
+            && blindrss_core::archive_store::has_entries(&db_path(), &scope, feed_id)
+                .unwrap_or(false)
+            && let Ok(merged) = blindrss_core::archive_store::merge_articles(
+                &db_path(),
+                &scope,
+                feed_id,
+                db.articles_light(Some(feed_id), WHOLE_VIEW)
+                    .unwrap_or_default(),
+            )
+        {
+            return finish_refill(state, list, merged);
         }
     }
     // Every other view — All, feed, category (Python's
@@ -5674,23 +5721,20 @@ fn main() {
         }
 
         // Resolve media and its request headers on a worker.
+        // `play_article` is the parameterized core (Audit 8
+        // Task 27, F04): the archive manager's Play routes its
+        // own article through the same path via
+        // `activate_article` below.
         let state_pm = state.clone();
         let frame_pm = frame;
         let tx_pm = tx.clone();
-        let act_play: Rc<dyn Fn()> = Rc::new(move || {
-            let st = state_pm.borrow();
-            let Some(mut article) = st
-                .selected_article
-                .and_then(|i| st.articles.get(i))
-                .cloned()
-            else {
-                frame_pm.set_status_text("No article selected", 0);
-                return;
-            };
-            // Media detection scans the body for embedded
-            // media; list rows are light, so resolve it first.
-            ensure_content(st.db.as_ref(), &mut article);
-            drop(st);
+        let play_article: Rc<dyn Fn(Article)> = Rc::new(move |mut article: Article| {
+            {
+                let st = state_pm.borrow();
+                // Media detection scans the body for embedded
+                // media; list rows are light, so resolve it first.
+                ensure_content(st.db.as_ref(), &mut article);
+            }
             // The player session opens NOW, in its loading
             // state (Audit 8 M11): the resolution below runs on
             // the worker and is delivered under this
@@ -5742,6 +5786,24 @@ fn main() {
                 }
             });
         });
+        let act_play: Rc<dyn Fn()> = {
+            let state_pl = state.clone();
+            let frame_pl = frame;
+            let play_article = play_article.clone();
+            Rc::new(move || {
+                let st = state_pl.borrow();
+                let Some(article) = st
+                    .selected_article
+                    .and_then(|i| st.articles.get(i))
+                    .cloned()
+                else {
+                    frame_pl.set_status_text("No article selected", 0);
+                    return;
+                };
+                drop(st);
+                play_article(article);
+            })
+        };
         {
             let a = act_play.clone();
             play_btn.on_click(move |_| a());
@@ -5753,29 +5815,16 @@ fn main() {
         // article with playable media plays in the player;
         // anything else opens in the browser. The article is
         // marked read either way, as Python does.
+        // `activate_article` is the parameterized core (Audit
+        // 8 Task 27, F04): the podcast archive dialog's Play
+        // routes its picked episode through here, exactly
+        // like Python's archive `_on_play` calling the main
+        // window's `_open_article`.
         let state_act = state.clone();
         let frame_act = frame;
-        let list_act = list;
-        let act_play_for_act = act_play.clone();
-        let act_activate: Rc<dyn Fn()> = Rc::new(move || {
+        let play_for_act = play_article.clone();
+        let activate_article: Rc<dyn Fn(Article)> = Rc::new(move |mut article: Article| {
             let mut st = state_act.borrow_mut();
-            // The trailing placeholder row of a paged view:
-            // Enter loads the next page (Python's "Load more
-            // items (Enter)").
-            if st.selected_article == Some(st.articles.len())
-                && st.view_total > st.articles.len() as i64
-            {
-                load_more_articles(&mut st, &list_act);
-                return;
-            }
-            let Some(mut article) = st
-                .selected_article
-                .and_then(|i| st.articles.get(i))
-                .cloned()
-            else {
-                frame_act.set_status_text("No article selected", 0);
-                return;
-            };
             // The activation decision's last step detects media
             // in the body; list rows are light, so resolve it.
             ensure_content(st.db.as_ref(), &mut article);
@@ -5809,13 +5858,41 @@ fn main() {
                 propagate_read_state(&article, true);
             }
             if playable {
-                act_play_for_act();
+                play_for_act(article);
             } else if !article.url.is_empty() {
                 open_article_link(&frame_act, &article.url);
             } else {
                 frame_act.set_status_text("Article has no media or link", 0);
             }
         });
+        let act_activate: Rc<dyn Fn()> = {
+            let state_aa = state.clone();
+            let frame_aa = frame;
+            let list_aa = list;
+            let activate_article = activate_article.clone();
+            Rc::new(move || {
+                let mut st = state_aa.borrow_mut();
+                // The trailing placeholder row of a paged view:
+                // Enter loads the next page (Python's "Load more
+                // items (Enter)").
+                if st.selected_article == Some(st.articles.len())
+                    && st.view_total > st.articles.len() as i64
+                {
+                    load_more_articles(&mut st, &list_aa);
+                    return;
+                }
+                let Some(article) = st
+                    .selected_article
+                    .and_then(|i| st.articles.get(i))
+                    .cloned()
+                else {
+                    frame_aa.set_status_text("No article selected", 0);
+                    return;
+                };
+                drop(st);
+                activate_article(article);
+            })
+        };
         {
             let a = act_activate.clone();
             list.on_item_activated(move |_| a());
@@ -6243,11 +6320,18 @@ fn main() {
         let tree_pa = tree;
         let list_pa = list;
         let tx_pa = tx.clone();
+        let on_archive_play: Rc<dyn Fn(&Article)> = {
+            let activate = activate_article.clone();
+            Rc::new(move |article: &Article| activate(article.clone()))
+        };
         let act_podcast_archive: Rc<dyn Fn()> = Rc::new(move || {
+            // The dialog gets its own connection, opened
+            // outside any state borrow: its Play callback
+            // re-enters the activation path, which borrows
+            // state itself (Audit 8 Task 27, F04).
             let feed = {
-                let st = state_pa.borrow();
-                let Some(db) = st.db.as_ref() else { return };
-                dialogs::show_podcast_archive(&frame_pa, db)
+                let Ok(db) = Db::open(&db_path()) else { return };
+                dialogs::show_podcast_archive(&frame_pa, &db, on_archive_play.clone())
             };
             restore_focus(&state_pa.borrow(), &tree_pa, &list_pa);
             let Some(feed) = feed else { return };
@@ -6658,12 +6742,18 @@ fn main() {
             download_btn.on_click(move |_| a());
         }
 
-        // Import YouTube Takeout: pick the ZIP, subscribe every
-        // channel/playlist feed not already present.
+        // Import YouTube Takeout (Python's `on_import_
+        // youtube_takeout` flow, Audit 8 Task 27, F11/F03):
+        // pick the ZIP; a worker parses it and reads the
+        // active provider's categories; the drain prompts
+        // for source groups and a destination category; a
+        // second worker imports through the provider. The
+        // UI thread never parses or imports.
         let state_to = state.clone();
         let frame_to = frame;
         let tree_to = tree;
         let list_to = list;
+        let tx_to = tx.clone();
         let act_takeout: Rc<dyn Fn()> = Rc::new(move || {
             let dlg = FileDialog::builder(&frame_to)
                 .with_message("Select YouTube Takeout ZIP")
@@ -6676,46 +6766,21 @@ fn main() {
                 return;
             }
             let Some(path) = dlg.get_path() else { return };
-            let bytes = match std::fs::read(&path) {
-                Ok(b) => b,
-                Err(e) => {
-                    frame_to.set_status_text(&format!("Takeout read failed: {e}"), 0);
-                    return;
-                }
-            };
-            match blindrss_core::takeout::parse_takeout_zip(&bytes) {
-                Ok(feeds) => {
-                    let Some(feeds) = dialogs::select_takeout_feeds(&frame_to, &feeds) else {
-                        restore_focus(&state_to.borrow(), &tree_to, &list_to);
-                        return;
-                    };
-                    restore_focus(&state_to.borrow(), &tree_to, &list_to);
-                    let mut st = state_to.borrow_mut();
-                    let new_feeds: Vec<Feed> = {
-                        let existing: Vec<String> =
-                            st.feeds.iter().map(|x| x.url.clone()).collect();
-                        let mut acc = Vec::new();
-                        if let Some(db) = &st.db {
-                            for f in &feeds {
-                                if existing.contains(&f.url) {
-                                    continue;
-                                }
-                                if let Ok(feed) = db.add_feed(&f.url, &f.title, Some("YouTube")) {
-                                    acc.push(feed);
-                                }
-                            }
-                        }
-                        acc
-                    };
-                    let added = new_feeds.len();
-                    st.feeds.extend(new_feeds);
-                    rebuild_tree(&mut st, &tree_to);
-                    refill_articles(&mut st, &list_to);
-                    frame_to
-                        .set_status_text(&format!("Takeout: {added} new subscription(s) added"), 0);
-                }
-                Err(e) => frame_to.set_status_text(&format!("Takeout: {e}"), 0),
-            }
+            frame_to.set_status_text("Reading YouTube Takeout...", 0);
+            let tx = tx_to.clone();
+            std::thread::spawn(move || {
+                let result = (|| {
+                    let bytes = std::fs::read(&path)
+                        .map_err(|e| format!("Could not read Takeout file: {e}"))?;
+                    let import = blindrss_core::takeout::parse_takeout_zip(&bytes)?;
+                    let cfg =
+                        blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+                    let provider = blindrss_core::provider::get_provider(&cfg, db_path());
+                    let categories = provider.categories().unwrap_or_default();
+                    Ok((import, categories))
+                })();
+                let _ = tx.send(RefreshMsg::TakeoutParsed(result));
+            });
         });
 
         // Rescan Archive: live document + newest Wayback snapshot
@@ -7292,9 +7357,15 @@ fn main() {
             remove_btn.on_click(move |_| a());
         }
 
-        // OPML import/export.
+        // OPML import/export. Import routes through the
+        // ACTIVE provider on a worker (Audit 8 Task 27,
+        // F03): under a hosted provider the subscriptions
+        // land on the server, not just in the local cache;
+        // the result lands as a ProviderAction, whose drain
+        // reloads the tree and list.
         let state_imp = state.clone();
         let frame_imp = frame;
+        let tx_imp = tx.clone();
         let act_import: Rc<dyn Fn()> = Rc::new(move || {
             let dlg = FileDialog::builder(&frame_imp)
                 .with_message("Import OPML")
@@ -7307,24 +7378,15 @@ fn main() {
                 return;
             }
             let Some(path) = dlg.get_path() else { return };
-            let text = match std::fs::read_to_string(&path) {
-                Ok(t) => t,
-                Err(e) => {
-                    frame_imp.set_status_text(&format!("Could not read file: {e}"), 0);
-                    return;
-                }
-            };
-            let mut st = state_imp.borrow_mut();
-            let Some(db) = st.db.as_ref() else { return };
-            match blindrss_core::opml::import_opml(db, &text) {
-                Ok(n) => {
-                    st.feeds = db.feeds().unwrap_or_default();
-                    rebuild_tree(&mut st, &tree);
-                    refill_articles(&mut st, &list);
-                    frame_imp.set_status_text(&format!("Imported {n} feeds"), 0);
-                }
-                Err(e) => frame_imp.set_status_text(&format!("Import failed: {e}"), 0),
-            }
+            frame_imp.set_status_text("Importing OPML...", 0);
+            let tx = tx_imp.clone();
+            std::thread::spawn(move || {
+                let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+                let provider = blindrss_core::provider::get_provider(&cfg, db_path());
+                let _ = tx.send(RefreshMsg::ProviderAction(
+                    provider.import_opml(std::path::Path::new(&path), None),
+                ));
+            });
         });
         {
             let a = act_import.clone();
@@ -7976,10 +8038,14 @@ fn main() {
             })
         };
 
-        // Import OPML Here / Export Category OPML.
+        // Import OPML Here / Export Category OPML. "Here"
+        // imports through the active provider too, with the
+        // selected tree category as the target (Audit 8
+        // Task 27, F03).
         let act_import_here: Rc<dyn Fn()> = {
             let state_ih = state.clone();
             let frame_ih = frame;
+            let tx_ih = tx.clone();
             Rc::new(move || {
                 let Some(path) = selected_category(&state_ih.borrow()) else {
                     frame_ih.set_status_text("Select a category in the tree first", 0);
@@ -7996,24 +8062,16 @@ fn main() {
                     return;
                 }
                 let Some(file) = dlg.get_path() else { return };
-                let text = match std::fs::read_to_string(&file) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        frame_ih.set_status_text(&format!("Could not read file: {e}"), 0);
-                        return;
-                    }
-                };
-                let mut st = state_ih.borrow_mut();
-                let Some(db) = st.db.as_ref() else { return };
-                match blindrss_core::opml::import_opml_under(db, &text, Some(&path)) {
-                    Ok(n) => {
-                        st.feeds = db.feeds().unwrap_or_default();
-                        rebuild_tree(&mut st, &tree);
-                        refill_articles(&mut st, &list);
-                        frame_ih.set_status_text(&format!("Imported {n} feeds into {path}"), 0);
-                    }
-                    Err(e) => frame_ih.set_status_text(&format!("Import failed: {e}"), 0),
-                }
+                frame_ih.set_status_text("Importing OPML...", 0);
+                let tx = tx_ih.clone();
+                std::thread::spawn(move || {
+                    let cfg =
+                        blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+                    let provider = blindrss_core::provider::get_provider(&cfg, db_path());
+                    let _ = tx.send(RefreshMsg::ProviderAction(
+                        provider.import_opml(std::path::Path::new(&file), Some(&path)),
+                    ));
+                });
             })
         };
         let act_export_category: Rc<dyn Fn()> = {
@@ -9921,6 +9979,179 @@ fn main() {
                             }
                             Err(e) => frame_tick.set_status_text(&format!("Provider: {e}"), 0),
                         }
+                    }
+                    Ok(RefreshMsg::TakeoutParsed(result)) => {
+                        // Python's `_show_youtube_takeout_options`:
+                        // source groups, then the destination
+                        // category, then the import worker.
+                        match result {
+                            Err(e) => {
+                                let md = MessageDialog::builder(
+                                    &frame_tick,
+                                    &e,
+                                    "Import YouTube Takeout",
+                                )
+                                .with_style(
+                                    MessageDialogStyle::OK | MessageDialogStyle::IconError,
+                                )
+                                .build();
+                                md.show_modal();
+                            }
+                            Ok((import, categories)) => {
+                                if let Some(sources) =
+                                    dialogs::select_takeout_sources(&frame_tick, &import)
+                                {
+                                    if sources.is_empty() {
+                                        let md = MessageDialog::builder(
+                                            &frame_tick,
+                                            "Select at least one item type to import.",
+                                            "Import YouTube Takeout",
+                                        )
+                                        .with_style(
+                                            MessageDialogStyle::OK
+                                                | MessageDialogStyle::IconInformation,
+                                        )
+                                        .build();
+                                        md.show_modal();
+                                    } else {
+                                        let source_refs: Vec<&str> =
+                                            sources.iter().map(|s| s.as_str()).collect();
+                                        let selected = import.selected(&source_refs);
+                                        if selected.feeds.is_empty() {
+                                            let md = MessageDialog::builder(
+                                                &frame_tick,
+                                                "No subscribable items were selected.",
+                                                "Import YouTube Takeout",
+                                            )
+                                            .with_style(
+                                                MessageDialogStyle::OK
+                                                    | MessageDialogStyle::IconInformation,
+                                            )
+                                            .build();
+                                            md.show_modal();
+                                        } else if let Some(category) =
+                                            dialogs::choose_takeout_category(
+                                                &frame_tick,
+                                                &categories,
+                                            )
+                                        {
+                                            frame_tick.set_status_text(
+                                                "Importing YouTube Takeout...",
+                                                0,
+                                            );
+                                            let tx = tx_tick.clone();
+                                            std::thread::spawn(move || {
+                                                let result = (|| -> Result<TakeoutReport, String> {
+                                                    let cfg = blindrss_core::config::Config::load(
+                                                        &config_path(),
+                                                    )
+                                                    .unwrap_or_default();
+                                                    let provider =
+                                                        blindrss_core::provider::get_provider(
+                                                            &cfg,
+                                                            db_path(),
+                                                        );
+                                                    let before: std::collections::HashSet<
+                                                        String,
+                                                    > = provider
+                                                        .feeds()?
+                                                        .iter()
+                                                        .map(|f| f.id.clone())
+                                                        .collect();
+                                                    let temp = std::env::temp_dir().join(format!(
+                                                        "blindrss-takeout-{}-{}.opml",
+                                                        std::process::id(),
+                                                        std::time::SystemTime::now()
+                                                            .duration_since(
+                                                                std::time::UNIX_EPOCH
+                                                            )
+                                                            .map(|d| d.as_nanos())
+                                                            .unwrap_or(0)
+                                                    ));
+                                                    std::fs::write(&temp, selected.to_opml())
+                                                        .map_err(|e| {
+                                                            format!(
+                                                                "Could not write temporary OPML: {e}"
+                                                            )
+                                                        })?;
+                                                    let imported = provider
+                                                        .import_opml(&temp, Some(&category));
+                                                    let _ = std::fs::remove_file(&temp);
+                                                    imported?;
+                                                    let after = provider.feeds()?;
+                                                    let new_feeds = after
+                                                        .iter()
+                                                        .filter(|f| !before.contains(&f.id))
+                                                        .count();
+                                                    Ok(TakeoutReport {
+                                                        new_feeds,
+                                                        subscriptions: selected.subscriptions,
+                                                        history: selected.history_channels,
+                                                        owned: selected.owner_channels,
+                                                        playlists: selected.playlists,
+                                                    })
+                                                })();
+                                                let _ =
+                                                    tx.send(RefreshMsg::TakeoutImported(result));
+                                            });
+                                        }
+                                    }
+                                }
+                                restore_focus(&state_tick.borrow(), &tree, &list);
+                            }
+                        }
+                    }
+                    Ok(RefreshMsg::TakeoutImported(result)) => {
+                        // Python's `_post_import_youtube_takeout`:
+                        // refresh the tree, then the completion
+                        // (or error) message.
+                        {
+                            let mut st = state_tick.borrow_mut();
+                            st.feeds = st
+                                .db
+                                .as_ref()
+                                .and_then(|db| db.feeds().ok())
+                                .unwrap_or_default();
+                            rebuild_tree(&mut st, &tree);
+                            refill_articles(&mut st, &list);
+                        }
+                        match result {
+                            Ok(report) => {
+                                let text = format!(
+                                    "YouTube Takeout import complete.\n\nNew subscriptions: {}\nSubscription channels: {}\nWatch-history channels: {}\nOwned channels: {}\nPlaylists: {}\n\nThe imported feeds will update during normal background refreshes.",
+                                    report.new_feeds,
+                                    report.subscriptions,
+                                    report.history,
+                                    report.owned,
+                                    report.playlists
+                                );
+                                frame_tick
+                                    .set_status_text("YouTube Takeout import complete.", 0);
+                                let md = MessageDialog::builder(
+                                    &frame_tick,
+                                    &text,
+                                    "Import YouTube Takeout",
+                                )
+                                .with_style(
+                                    MessageDialogStyle::OK | MessageDialogStyle::IconInformation,
+                                )
+                                .build();
+                                md.show_modal();
+                            }
+                            Err(e) => {
+                                let md = MessageDialog::builder(
+                                    &frame_tick,
+                                    &e,
+                                    "Import YouTube Takeout",
+                                )
+                                .with_style(
+                                    MessageDialogStyle::OK | MessageDialogStyle::IconError,
+                                )
+                                .build();
+                                md.show_modal();
+                            }
+                        }
+                        restore_focus(&state_tick.borrow(), &tree, &list);
                     }
                     Ok(RefreshMsg::DetectedPageFeeds(result)) => {
                         // Python's `_present_detected_page_feeds`

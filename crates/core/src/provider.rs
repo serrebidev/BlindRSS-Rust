@@ -44,6 +44,18 @@ pub trait Provider {
     fn set_favorite(&self, article: &Article, favorite: bool) -> Result<(), String>;
     /// Subscribe a feed URL. Returns a human summary.
     fn add_feed(&self, url: &str) -> Result<String, String>;
+    /// Import an OPML file through this provider (Python
+    /// `providers/base.py::import_opml` and its overrides):
+    /// the local provider imports into its database directly;
+    /// hosted providers subscribe on the server (Miniflux
+    /// through its bulk endpoint, with the per-feed fallback)
+    /// and pull the result into the cache. A target category
+    /// files every imported feed under it. Returns a human
+    /// summary; Err when nothing could be imported.
+    fn import_opml(&self, path: &Path, target_category: Option<&str>) -> Result<String, String>;
+    /// The provider's category inventory (Python
+    /// `get_categories`).
+    fn categories(&self) -> Result<Vec<String>, String>;
     /// Unsubscribe/remove a feed (cache + server when hosted).
     fn remove_feed(&self, feed: &Feed) -> Result<(), String>;
     /// Edit subscription metadata, committing the cache only after remote success.
@@ -138,6 +150,21 @@ impl Provider for LocalProvider {
         let db = self.db()?;
         let feed = crate::refresh::subscribe_url(&db, url, None, &self.delete_behavior, None)?;
         Ok(format!("Added {}", feed.title))
+    }
+    fn import_opml(&self, path: &Path, target_category: Option<&str>) -> Result<String, String> {
+        let bytes = std::fs::read(path).map_err(|e| format!("Could not read OPML file: {e}"))?;
+        let db = self.db()?;
+        let added = crate::opml::import_opml_under(&db, &bytes, target_category)?;
+        Ok(format!("Imported {added} new feed(s)"))
+    }
+    fn categories(&self) -> Result<Vec<String>, String> {
+        Ok(self
+            .db()?
+            .categories()
+            .map_err(|e| format!("{e}"))?
+            .into_iter()
+            .map(|c| c.title)
+            .collect())
     }
     fn remove_feed(&self, feed: &Feed) -> Result<(), String> {
         self.db()?.remove_feed(&feed.id).map_err(|e| format!("{e}"))
@@ -332,6 +359,42 @@ impl HostedProvider {
         }
         Ok(MinifluxClient::new(&url, &key).with_refresh_config(&self.cfg))
     }
+    /// Python `providers/miniflux.py::import_opml`: prepare
+    /// the document strictly (a malformed file fails the
+    /// import), wrap it in the target category's folder, and
+    /// POST it to the bulk endpoint; on HTTP 404/405 fall
+    /// back to the base per-feed import.
+    fn import_opml_miniflux(&self, path: &Path, target: Option<&str>) -> Result<String, String> {
+        let bytes = std::fs::read(path).map_err(|e| format!("Could not read OPML file: {e}"))?;
+        let text =
+            String::from_utf8(bytes).map_err(|_| "OPML file is not valid UTF-8".to_string())?;
+        let document = crate::opml::bulk_import_document(&text, target)?;
+        let client = self.miniflux()?;
+        match client.opml_import_result(&document) {
+            Ok(()) => {
+                let summary = self.refresh()?;
+                Ok(format!("Imported OPML into Miniflux ({summary})"))
+            }
+            Err(crate::providers::OpmlImportError::Http(404))
+            | Err(crate::providers::OpmlImportError::Http(405)) => {
+                let triples = crate::opml::parse_opml(text.as_bytes())?;
+                let mut count = 0;
+                for (_title, url, category) in &triples {
+                    let cat = target.unwrap_or(category.as_str());
+                    if client.create_feed_remote_in(url, Some(cat)).is_ok() {
+                        count += 1;
+                    }
+                }
+                if count == 0 {
+                    return Err("No subscriptions could be imported".to_string());
+                }
+                let summary = self.refresh()?;
+                Ok(format!("Imported {count} subscription(s) ({summary})"))
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
     fn refresh_miniflux(
         &self,
         force: bool,
@@ -385,6 +448,20 @@ impl Provider for HostedProvider {
     fn articles(&self, feed_id: Option<&str>, limit: usize) -> Result<Vec<Article>, String> {
         let db = self.db()?;
         let mut articles = db.articles(feed_id, limit).map_err(|e| format!("{e}"))?;
+        // Recovered archive episodes merge into ordinary feed
+        // reads (Python's hosted mixin,
+        // `_merge_hosted_archive_articles`); the merge owns
+        // the virtual-view exclusions (all/category/unread/
+        // favorites views stay unmerged, `read:` resolves to
+        // the real feed). Audit 8 Task 27, F02.
+        if let Some(view) = feed_id {
+            articles = crate::archive_store::merge_articles(
+                &self.db_path,
+                &crate::archive_store::scope_for_config(&self.cfg),
+                view,
+                articles,
+            )?;
+        }
         // Hosted NPR attach: program feeds carry no enclosure, so
         // resolve the audio client-side (cached in the Db).
         crate::sources::attach_hosted_npr_media(&db, self.name, &mut articles);
@@ -447,6 +524,56 @@ impl Provider for HostedProvider {
         // Pull the new subscription into the cache right away.
         let summary = self.refresh()?;
         Ok(format!("Subscribed on {} ({summary})", self.name))
+    }
+    fn import_opml(&self, path: &Path, target_category: Option<&str>) -> Result<String, String> {
+        let target = target_category.map(str::trim).filter(|t| !t.is_empty());
+        match self.kind {
+            HostedKind::Miniflux => self.import_opml_miniflux(path, target),
+            HostedKind::GReader(_) => {
+                // Python's base implementation: parse the
+                // triples and add_feed each one with the
+                // target category or its OPML category.
+                let bytes =
+                    std::fs::read(path).map_err(|e| format!("Could not read OPML file: {e}"))?;
+                let triples = crate::opml::parse_opml(&bytes)?;
+                let client = self.greader()?;
+                let mut count = 0;
+                for (_title, url, category) in &triples {
+                    let cat = target.unwrap_or(category.as_str());
+                    if client.subscribe_remote_in(url, Some(cat)).is_ok() {
+                        count += 1;
+                    }
+                }
+                if count == 0 {
+                    return Err("No subscriptions could be imported".to_string());
+                }
+                let summary = self.refresh()?;
+                Ok(format!("Imported {count} subscription(s) ({summary})"))
+            }
+        }
+    }
+    fn categories(&self) -> Result<Vec<String>, String> {
+        match self.kind {
+            HostedKind::Miniflux => Ok(self
+                .miniflux()?
+                .categories_remote()?
+                .into_iter()
+                .map(|(_, title)| title)
+                .collect()),
+            HostedKind::GReader(_) => {
+                // The GReader family's inventory is the set of
+                // labels its subscriptions carry.
+                let subs = self.greader()?.subscriptions()?;
+                let mut cats: Vec<String> = subs
+                    .iter()
+                    .filter_map(|s| s.category.clone())
+                    .filter(|c| !c.trim().is_empty())
+                    .collect();
+                cats.sort();
+                cats.dedup();
+                Ok(cats)
+            }
+        }
     }
     fn remove_feed(&self, feed: &Feed) -> Result<(), String> {
         match self.kind {

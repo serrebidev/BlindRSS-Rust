@@ -655,6 +655,22 @@ pub fn entries(path: &Path, scope: &str, feed_id: &str) -> Result<Vec<Article>, 
         .map_err(|e| e.to_string())
 }
 
+/// Whether any recovered episodes are stored for (scope,
+/// feed) — the cheap existence check behind the main window's
+/// merged feed view (Audit 8 Task 27, F02), so ordinary views
+/// never pay for a merge that cannot add rows.
+pub fn has_entries(path: &Path, scope: &str, feed_id: &str) -> Result<bool, String> {
+    let connection = open(path)?;
+    let count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM hosted_podcast_archive_entries WHERE provider_scope=?1 AND feed_id=?2",
+            params![scope, feed_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(count > 0)
+}
+
 pub fn merge_articles(
     path: &Path,
     scope: &str,

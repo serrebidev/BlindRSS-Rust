@@ -146,6 +146,7 @@ fn entry(
         media_url: None,
         media_type: None,
         tags: Vec::new(),
+        duration: None,
     }
 }
 

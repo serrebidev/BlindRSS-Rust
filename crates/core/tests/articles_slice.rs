@@ -61,6 +61,7 @@ fn delete_tombstone_restore_cycle() {
             media_url: None,
             media_type: None,
             tags: Vec::new(),
+            duration: None,
         }],
     };
     assert_eq!(

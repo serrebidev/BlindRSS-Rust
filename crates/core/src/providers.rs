@@ -651,12 +651,38 @@ impl GReaderClient {
         self.subscription_edit(&format!("feed/{feed_url}"), "subscribe")
     }
 
+    /// Subscribe into a category, Python's GReader-family
+    /// `add_feed(url, category)` shape: the same
+    /// subscription/edit request, with the category carried in
+    /// the form's `t` field (sent empty when no category), as
+    /// Python sends it (Audit 8 Task 27, F03).
+    pub fn subscribe_remote_in(
+        &self,
+        feed_url: &str,
+        category: Option<&str>,
+    ) -> Result<(), String> {
+        self.subscription_edit_with(
+            &format!("feed/{feed_url}"),
+            "subscribe",
+            &[("t", category.unwrap_or(""))],
+        )
+    }
+
     /// Unsubscribe a stream ("feed/<url>" or a stream id).
     pub fn unsubscribe_remote(&self, stream_id: &str) -> Result<(), String> {
         self.subscription_edit(stream_id, "unsubscribe")
     }
 
     fn subscription_edit(&self, stream: &str, action: &str) -> Result<(), String> {
+        self.subscription_edit_with(stream, action, &[])
+    }
+
+    fn subscription_edit_with(
+        &self,
+        stream: &str,
+        action: &str,
+        extra: &[(&str, &str)],
+    ) -> Result<(), String> {
         let mut token_resp = self
             .with_app_headers(crate::http::agent().get(&format!("{}/token", self.api_base)))
             .header("Authorization", &self.auth_header()?)
@@ -666,11 +692,14 @@ impl GReaderClient {
             .body_mut()
             .read_to_string()
             .map_err(|e| format!("token read failed: {e}"))?;
+        let mut form: Vec<(&str, &str)> = vec![("s", stream), ("ac", action)];
+        form.extend_from_slice(extra);
+        form.push(("T", edit_token.trim()));
         self.with_app_headers(
             crate::http::agent().post(&format!("{}/subscription/edit", self.api_base)),
         )
         .header("Authorization", &self.auth_header()?)
-        .send_form([("s", stream), ("ac", action), ("T", edit_token.trim())])
+        .send_form(form)
         .map_err(|e| format!("subscription edit failed: {e}"))?;
         Ok(())
     }
@@ -963,6 +992,25 @@ fn chrono_rfc3339(secs: i64) -> String {
 // Miniflux
 // ---------------------------------------------------------------------------
 
+/// Why a Miniflux bulk OPML import failed: the HTTP status
+/// when the server answered (Python checks for 404/405 to
+/// decide the per-feed compatibility fallback), or a
+/// transport-level message.
+#[derive(Debug, Clone, PartialEq)]
+pub enum OpmlImportError {
+    Http(u16),
+    Other(String),
+}
+
+impl std::fmt::Display for OpmlImportError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OpmlImportError::Http(code) => write!(f, "OPML import failed: HTTP {code}"),
+            OpmlImportError::Other(message) => write!(f, "{message}"),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct MinifluxClient {
     /// Base URL without trailing /v1.
@@ -994,6 +1042,8 @@ pub struct MfFeed {
     title: String,
     #[serde(default)]
     feed_url: String,
+    #[serde(default)]
+    site_url: String,
     #[serde(default)]
     category: Option<MfCategory>,
     #[serde(default)]
@@ -1432,6 +1482,23 @@ impl MinifluxClient {
         Ok(())
     }
 
+    /// `opml_import` with the HTTP status preserved: Python's
+    /// Miniflux import falls back to per-feed adds when the
+    /// bulk endpoint answers 404/405, so the caller needs the
+    /// code, not just a message (Audit 8 Task 27, F03).
+    pub fn opml_import_result(&self, opml_xml: &str) -> Result<(), OpmlImportError> {
+        crate::http::agent()
+            .post(&format!("{}/v1/import", self.base_url))
+            .header("X-Auth-Token", &self.api_key)
+            .header("Content-Type", "application/xml; charset=utf-8")
+            .send(opml_xml)
+            .map_err(|e| match e {
+                ureq::Error::StatusCode(code) => OpmlImportError::Http(code),
+                other => OpmlImportError::Other(format!("OPML import failed: {other}")),
+            })?;
+        Ok(())
+    }
+
     /// Fetch an entry's full content from the server
     /// (GET /v1/entries/{id}/fetch-content): Miniflux's own
     /// scraper result, the provider side of full-text
@@ -1455,6 +1522,61 @@ impl MinifluxClient {
             .header("Content-Type", "application/json")
             .send(body.to_string())
             .map_err(|e| format!("create feed failed: {e}"))?;
+        let text = resp
+            .body_mut()
+            .read_to_string()
+            .map_err(|e| format!("read failed: {e}"))?;
+        let value: serde_json::Value =
+            serde_json::from_str(&text).map_err(|e| format!("bad JSON: {e}"))?;
+        value
+            .get("feed_id")
+            .and_then(|v| v.as_i64())
+            .ok_or_else(|| "no feed_id in create response".to_string())
+    }
+
+    /// Create a feed filed under a category (Python's Miniflux
+    /// `add_feed(url, category)`): the category is matched
+    /// case-insensitively against the server inventory and
+    /// created when missing; with no category the account's
+    /// first category is used, as Miniflux requires one.
+    /// An HTTP 400 for an already-subscribed URL counts as
+    /// success with the existing feed's id, as in Python.
+    pub fn create_feed_remote_in(
+        &self,
+        feed_url: &str,
+        category: Option<&str>,
+    ) -> Result<i64, String> {
+        let cats = self.categories_remote()?;
+        if cats.is_empty() {
+            return Err("Miniflux account has no categories".to_string());
+        }
+        let category_id = match category.map(str::trim).filter(|c| !c.is_empty()) {
+            None => cats[0].0,
+            Some(title) => match cats.iter().find(|(_, t)| t.eq_ignore_ascii_case(title)) {
+                Some((id, _)) => *id,
+                None => self.create_category_remote(title)?,
+            },
+        };
+        let body = serde_json::json!({"feed_url": feed_url, "category_id": category_id});
+        let mut resp = match crate::http::agent()
+            .post(&format!("{}/v1/feeds", self.base_url))
+            .header("X-Auth-Token", &self.api_key)
+            .header("Content-Type", "application/json")
+            .send(body.to_string())
+        {
+            Ok(resp) => resp,
+            Err(ureq::Error::StatusCode(400)) => {
+                // Already subscribed (Python treats the 400
+                // as success): answer with the existing id.
+                let feeds = self.feeds()?;
+                return feeds
+                    .iter()
+                    .find(|f| f.feed_url == feed_url || f.site_url == feed_url)
+                    .map(|f| f.id)
+                    .ok_or_else(|| "create feed failed: HTTP 400".to_string());
+            }
+            Err(e) => return Err(format!("create feed failed: {e}")),
+        };
         let text = resp
             .body_mut()
             .read_to_string()

@@ -61,6 +61,7 @@ fn parsed(entries: Vec<(&str, &str)>) -> ParsedFeed {
                 media_url: None,
                 media_type: None,
                 tags: Vec::new(),
+                duration: None,
             })
             .collect(),
     }

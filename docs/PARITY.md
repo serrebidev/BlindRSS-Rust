@@ -5539,3 +5539,196 @@ windows-gnu), 826 passed / 0 failed, build OK. One
 transient single-test failure in the first gate attempt
 under peak three-way build contention did not reproduce
 in two subsequent full runs; CI is the arbiter.
+
+## Audit 8 Task 27 resolution — imported subscriptions and complete archive integration (F02, F03, F04, F11, F12, F13, F15, F16) (2026-11-05)
+
+**F02 — recovered hosted episodes merge into ordinary reads.**
+`archive_store::merge_articles` (the port of the hosted
+mixin's `_merge_hosted_archive_articles`, with its virtual-
+view exclusions: empty scope, `all`, `category:`, `unread:`,
+`favorites:`/`fav:`/`starred:` views stay unmerged, `read:`
+resolves to the real feed) is now called from
+`HostedProvider::articles` for plain feed views and from the
+main window's `refill_inner`: a plain subscribed-feed view
+under a hosted provider whose (scope, feed) has stored
+episodes (new cheap `archive_store::has_entries` check)
+loads whole, merges, and runs the in-memory pipeline, like
+Python's provider returns; every other view keeps the paged
+path. Live/archive dedupe rides Python's identity keys, so
+an episode the live feed also carries appears once, as the
+live row.
+
+**F03 — OPML/Takeout import routes through the active
+provider.** The `Provider` trait gains `import_opml(path,
+target)` and `categories()`. Local: the ported local
+importer (F13) against the on-disk database. Miniflux: the
+document is validated as strictly well-formed XML, its body
+children are wrapped in one folder outline named by the
+target category when one is given, and the document is
+POSTed to `/v1/import` as `application/xml`; HTTP 404/405
+falls back to the base per-feed import (category matched
+case-insensitively or created, HTTP 400 for an already-
+subscribed URL counts as success, as Python's Miniflux
+`add_feed` rules). GReader family: the base per-feed import
+over `parse_opml` triples, subscribing with the category in
+the `subscription/edit` form's `t` field — Python's exact
+carrier, quirks included. All three app handlers (Import
+OPML, Import OPML Here with the tree category as target,
+YouTube Takeout) run the import on a worker and land the
+result as a `ProviderAction`, whose drain reloads the tree
+and list; fixture tests assert the remote requests and that
+a following sync retains the subscriptions with their
+categories.
+
+**F04 — archive Play is normal activation.** The archive
+dialog takes a playback callback from the main window;
+`act_play`/`act_activate` were split into parameterized
+`play_article`/`activate_article` cores (the list actions
+keep their selection and placeholder-row behavior), and
+the dialog's Play button and Enter both route the picked
+episode (selection, else first visible row — Python's pick)
+through `activate_article`. Downloaded and recovered
+episodes play in the player; the article-window opening is
+gone from the Play path. The dialog now receives its own
+`Db` connection opened outside the state borrow, since the
+callback re-enters the activation path.
+
+**F11 — Takeout keeps (source, URL) provenance end to
+end.** `takeout.rs` is rewritten on Python's model:
+`TakeoutImport` carries the feeds plus the four source
+counts; dedupe is per (source, URL), so one URL keeps one
+entry per source it appeared in; `selected(sources)`
+tallies counts over the kept feeds BEFORE URL
+deduplication while the feeds themselves are URL-unique,
+first occurrence winning; member matching uses Python's
+exact paths under the "YouTube and YouTube Music" section
+and its exact DictReader field names (subscriptions/owner
+read only the Channel ID column); the error strings are
+Python's. The app flow mirrors `mainframe`: a worker
+parses the ZIP and reads the provider's categories, the
+drain prompts for source groups and the destination
+category (Uncategorized first when unlisted, deduped), a
+second worker snapshots feed ids, writes the selected
+import as temporary OPML, imports through the provider,
+and counts the new subscriptions; the completion message
+is Python's, verbatim figures included.
+
+**F12 — Takeout checklist native checkbox state.**
+Python's dialog uses a native report list with real
+checkbox state because wx.CheckListBox exposes none
+(nvaccess/nvda#7325). wxDragon's ListCtrl has no checkbox
+binding at all (no EnableCheckBoxes in its FFI surface),
+so the port uses the one wxDragon control with native
+checkbox state — a TreeListCtrl in Checkbox style with
+flat root items, one column, the source-group labels with
+counts, all checked initially, first item selected, focus
+on the list, named "YouTube Takeout items to import" as in
+Python. Deviation, stated plainly: the control's role is a
+tree, not a list. NVDA checked-state announcement and
+Space toggling are the owner's manual acceptance item;
+they are recorded, not claimed.
+
+**F13 — OPML compatibility.** `opml.rs`'s import half is
+rewritten on Python's local importer: the decode chain is
+strict UTF-8, then BOM-stripped UTF-8, then latin-1 —
+Python's cp1252 step is unreachable behind latin-1, and
+the port mirrors the chain exactly (a cp1252-encoded file
+decodes as latin-1, smart-quote bytes becoming the same
+control characters Python produces; the regression test
+asserts that faithful result). Parsing is tolerant in
+BeautifulSoup's shape: a streaming tokenizer that never
+requires balanced tags (an end tag closes everything
+opened inside it, EOF closes the rest), attributes read
+case-insensitively, outline titles from `text` then
+`title`, feed titles falling back to "Unknown Feed",
+`title_is_custom` set exactly when an imported title was
+present, feed-outline children filed under the SAME
+category, folder outlines appending their title to the
+category path (split on " / ", leaves sanitized, category
+rows ensured), and feed URLs resolved OFFLINE through
+Python's `_resolve_feed_url(allow_network=False)` chain
+with dedupe against both the original and resolved URL.
+A missing `<body>` is the failure, as in Python; a file
+with a body and zero new feeds still imports successfully.
+`parse_opml` (the utils triples) backs the base provider
+import. For Miniflux's bulk import the document is
+spliced, not re-serialized: same document, different bytes
+than ElementTree's — stated as a deviation of form, not
+of content.
+
+**F15 — busy-close covers every native route.** The
+archive dialog's close logic is one shared handler used
+by the Close button and by a `CLOSE_WINDOW` binding that
+vetoes the native close (title-bar X, Alt+F4, Escape) and
+re-drives it through the same path: busy → Python's
+"Stop the active work and close this window when it is
+safe?" confirmation, Yes sets both cancel flags and
+`close_when_idle` (the existing drain completes the close
+when the work finishes), No stays open; idle → the same
+end-modal code the Close button always produced.
+
+**F16 — duration flows into archive identity.**
+`ParsedEntry` gains `duration`: feed-rs loses the raw
+`itunes:duration` text (it parses to a `Duration`), and
+feedparser's `itunes_duration` — the value Python's
+episode keys embed — is the raw element text, whitespace-
+trimmed, NOT normalized to seconds ("1:02:03" and "3723"
+are different keys). `parse_feed` therefore overlays a
+raw-text scan (quick-xml; entry boundaries plus xmlns
+scope tracking; the element counts when its prefix is
+`itunes`, empty, or resolves to the iTunes DTD URI) over
+feed-rs's parsed value, which remains the fallback.
+`archive::entry_identity_keys` now receives the duration,
+activating the title-duration branch that sat inert under
+Gap 6; `article_identity_keys` still passes none, exactly
+like Python's `_podcast_article_identity_keys`. Regression
+tests: an undated episode whose GUID, page and media URLs
+all changed still merges by `title-duration:<title>|<raw
+duration>` (whitespace variant included), and a different
+duration keeps the episodes apart.
+
+**Task 22 deviation resolved.** The archive dialog's
+downloads now route through the standard feed-folder path
+with its folder override, like Python's archive worker:
+the shared `download_root`, core `download_dir_for` with
+the feed title as override ("Podcast Archive" when the
+feed has no title), the legacy-aware `downloaded_path_for`
+for both the worker's already-downloaded check and the
+list's Downloaded column, and `apply_download_retention`
+after each successful download.
+
+Pre-existing tests adapted to the corrected shapes:
+`media2_slice` and `parity_core_audit` read the new
+`TakeoutImport` (one media2 fixture header was corrected
+to the real Takeout spelling "Channel title" — Python's
+DictReader lookup is exact-case, and the old fixture's
+"Channel Title" only ever passed against the old, more
+tolerant parser); `manage_slice` and `batch1_slice` pass
+bytes to the OPML import API.
+
+Adjacent finds left for reconciliation: the offline OPML
+resolver inherits `sources::google_group_subscription_
+url`'s gap — Python's `normalize_google_groups_url` also
+accepts the legacy `#!forum` link form, the port handles
+the email and `/g/name` forms only; the GReader family's
+`add_feed` (and therefore its OPML import) does not do
+Python's per-feed network discovery before subscribing —
+a pre-existing gap, inherited, not widened; `Db::ensure_
+category_path` does not UPDATE parent_id on existing rows
+where Python's local-import ensure does — kept per this
+repo's ensure-helper rule (INSERT OR IGNORE + re-read).
+
+**Task 27 gate (2026-11-05):** worker gate on branch
+audit8/task27-imports: fmt clean (run last), clippy clean
+(workspace --all-targets and core x86_64-pc-windows-gnu,
+-D warnings, both re-run after fmt), 851 passed / 0 failed
+(baseline 825; +26 regression tests across opml_parity 11,
+takeout_parity 7, audit8_task27_slice 5, archive_parity +3),
+`cargo build -p blindrss` OK. One VM replacement mid-gate
+wiped the apt build deps; they were restored via the
+azure-only apt sidestep (shared with the parallel worker)
+and every gate was re-run to completion afterwards. Owner
+screen-reader acceptance items added by this task: the
+Takeout source-selection list's checked-state announcement
+and Space behavior under NVDA (F12), and archive Play
+focus behavior after activation from the dialog (F04).

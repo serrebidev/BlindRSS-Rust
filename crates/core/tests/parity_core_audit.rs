@@ -117,7 +117,7 @@ fn takeout_owner_channels_and_bom_headers() {
         "Takeout/YouTube and YouTube Music/channels/channel.csv",
         "\u{feff}Channel ID,Channel title (Original)\nUCabcdefghijk,My channel\n",
     );
-    let feeds = parse_takeout_zip(&bytes).unwrap();
+    let feeds = parse_takeout_zip(&bytes).unwrap().feeds;
     assert_eq!(feeds.len(), 1);
     assert_eq!(feeds[0].title, "My channel");
     assert_eq!(feeds[0].source, "owner");
@@ -139,7 +139,7 @@ fn takeout_history_reads_unicode_titles_and_rejects_other_hosts() {
         "Takeout/YouTube and YouTube Music/history/watch-history.html",
         "ééééééééééééééééééééé<a href='https://www.youtube.com/channel/UCabcdefghijk'>Café &amp; News</a><a href='https://other.example/channel/UCnotyoutube1'>Wrong</a>",
     );
-    let feeds = parse_takeout_zip(&bytes).unwrap();
+    let feeds = parse_takeout_zip(&bytes).unwrap().feeds;
     assert_eq!(feeds.len(), 1);
     assert_eq!(feeds[0].title, "Café & News");
 }

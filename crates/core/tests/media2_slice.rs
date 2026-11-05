@@ -30,12 +30,14 @@ fn takeout_subscriptions_csv() {
         )
         .unwrap();
         zw.write_all(
-            b"Channel ID,Channel URL,Channel Title\nUCabcdefghij123456,https://www.youtube.com/channel/UCabcdefghij123456,\"Some, Channel\"\nUCzzzzzzzzzz999999,https://www.youtube.com/channel/UCzzzzzzzzzz999999,Other\n",
+            b"Channel ID,Channel URL,Channel title\nUCabcdefghij123456,https://www.youtube.com/channel/UCabcdefghij123456,\"Some, Channel\"\nUCzzzzzzzzzz999999,https://www.youtube.com/channel/UCzzzzzzzzzz999999,Other\n",
         )
         .unwrap();
         zw.finish().unwrap();
     }
-    let feeds = blindrss_core::takeout::parse_takeout_zip(&buf).unwrap();
+    let feeds = blindrss_core::takeout::parse_takeout_zip(&buf)
+        .unwrap()
+        .feeds;
     assert_eq!(feeds.len(), 2);
     assert_eq!(
         feeds[0].url,

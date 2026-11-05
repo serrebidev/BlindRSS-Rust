@@ -365,9 +365,11 @@ pub fn canonical_url(value: &str, media: bool) -> String {
 /// real publication day exists, else `title-duration` — Python's
 /// fallback for undated episodes. Keys whose value part is empty
 /// are dropped, as in Python. `duration` is Python's
-/// itunes:duration; the Rust feed parser does not retain it yet,
-/// so callers pass None and the duration branch stays inert until
-/// the parser carries it.
+/// itunes:duration (the raw element text; the feed parser
+/// carries it on `ParsedEntry::duration` since Audit 8 Task 27,
+/// which activated this branch for scan-side episodes; article
+/// identity keys pass None because Python's article-side keys
+/// carry no duration either).
 pub fn episode_identity_keys(
     id: &str,
     page: &str,
@@ -439,7 +441,7 @@ fn entry_identity_keys(entry: &ParsedEntry) -> HashSet<String> {
         entry.media_url.as_deref(),
         &entry.title,
         entry.date.as_deref(),
-        None,
+        entry.duration.as_deref(),
     )
 }
 

@@ -39,6 +39,7 @@ fn entry(id: &str, title: &str, url: &str) -> ParsedEntry {
         media_url: None,
         media_type: None,
         tags: Vec::new(),
+        duration: None,
     }
 }
 

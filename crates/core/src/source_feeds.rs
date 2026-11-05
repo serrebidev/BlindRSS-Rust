@@ -213,6 +213,7 @@ fn entry(v: &Value, fallback_author: &str) -> Option<ParsedEntry> {
         media_url: Some(address),
         media_type: None,
         tags: Vec::new(),
+        duration: None,
     })
 }
 

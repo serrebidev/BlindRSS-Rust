@@ -1558,6 +1558,7 @@ pub fn items_to_entries(items: Vec<SourceItem>) -> Vec<ParsedEntry> {
             media_url: it.media_url,
             media_type: it.media_type,
             tags: Vec::new(),
+            duration: None,
         })
         .collect()
 }

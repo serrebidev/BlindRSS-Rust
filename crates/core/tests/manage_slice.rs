@@ -51,10 +51,10 @@ fn opml_roundtrip_with_categories() {
 </outline>
 <outline type="rss" text="Solo" title="Solo" xmlUrl="https://example.com/solo.xml"/>
 </body></opml>"#;
-    let added = import_opml(&db, xml).unwrap();
+    let added = import_opml(&db, xml.as_bytes()).unwrap();
     assert_eq!(added, 3);
     // Importing again adds nothing (URL dedupe).
-    assert_eq!(import_opml(&db, xml).unwrap(), 0);
+    assert_eq!(import_opml(&db, xml.as_bytes()).unwrap(), 0);
     let feeds = db.feeds().unwrap();
     let bbc = feeds.iter().find(|f| f.title == "BBC News").unwrap();
     assert_eq!(bbc.category.as_deref(), Some("Tech"));
@@ -63,7 +63,7 @@ fn opml_roundtrip_with_categories() {
     assert!(out.contains("Tech"));
     // Export -> fresh DB import keeps the same URLs.
     let (db2, path2) = scratch_db("opml2");
-    assert_eq!(import_opml(&db2, &out).unwrap(), 3);
+    assert_eq!(import_opml(&db2, out.as_bytes()).unwrap(), 3);
     std::fs::remove_file(&path).ok();
     std::fs::remove_file(&path2).ok();
 }

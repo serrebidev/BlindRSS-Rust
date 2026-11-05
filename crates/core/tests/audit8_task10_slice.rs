@@ -71,6 +71,7 @@ fn store_twin(db: &Db, video_id: &str) {
             media_url: None,
             media_type: None,
             tags: Vec::new(),
+            duration: None,
         }],
     };
     // add_feed returns the existing feed on a second call, so

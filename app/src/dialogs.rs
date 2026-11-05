@@ -1858,7 +1858,16 @@ enum PodcastArchiveMsg {
 /// active store's own database file. The dialog does its own
 /// work on workers and always returns None; the main window's
 /// separate Rescan Archive action keeps the old one-shot flow.
-pub fn show_podcast_archive(frame: &Frame, db: &Db) -> Option<blindrss_core::Feed> {
+/// Play (button and Enter) goes through `on_play`, the main
+/// window's normal article activation, so downloaded and
+/// recovered episodes play in the player exactly like list
+/// articles (Python's `_on_play` -> host `_open_article`;
+/// Audit 8 Task 27, F04).
+pub fn show_podcast_archive(
+    frame: &Frame,
+    db: &Db,
+    on_play: Rc<dyn Fn(&blindrss_core::Article)>,
+) -> Option<blindrss_core::Feed> {
     use blindrss_core::archive_store::ArchiveSettings;
     use std::sync::atomic::{AtomicBool, Ordering};
     let db_path = crate::db_path();
@@ -2012,8 +2021,7 @@ pub fn show_podcast_archive(frame: &Frame, db: &Db) -> Option<blindrss_core::Fee
                     1,
                     article.date.as_deref().unwrap_or(""),
                 );
-                let downloaded =
-                    blindrss_core::download::downloaded_media_path(&cfg, article).is_some();
+                let downloaded = crate::downloaded_path_for(&cfg, article).is_some();
                 episodes.set_item_text_by_column(
                     index as i64,
                     2,
@@ -2200,22 +2208,24 @@ pub fn show_podcast_archive(frame: &Frame, db: &Db) -> Option<blindrss_core::Fee
             let config_path = config_path.clone();
             std::thread::spawn(move || {
                 let cfg = Config::load(&config_path).unwrap_or_default();
-                let base = {
-                    let dir = cfg.get_str("download_path", "");
-                    if dir.is_empty() {
-                        crate::home_dir().join("Downloads").join("BlindRSS")
-                    } else {
-                        std::path::PathBuf::from(dir)
-                    }
+                // The standard feed-folder path, like Python's
+                // archive worker (its `_downloaded_media_path_
+                // for_article` chain): the shared download root
+                // plus the feed-title folder override (Audit 8
+                // Task 27, resolving Task 22's deviation).
+                let root = crate::download_root(&cfg);
+                let folder_override = if feed_title.is_empty() {
+                    "Podcast Archive"
+                } else {
+                    &feed_title
                 };
-                let folder = base.join(blindrss_core::download::sanitize_filename(
-                    if feed_title.is_empty() {
-                        "Podcast Archive"
-                    } else {
-                        &feed_title
-                    },
-                ));
+                let folder = blindrss_core::download::download_dir_for(
+                    &root,
+                    Some(&feed_title),
+                    Some(folder_override),
+                );
                 let _ = std::fs::create_dir_all(&folder);
+                let retention_secs = crate::download_retention_seconds(&cfg);
                 let format = cfg.get_str("download_format", "video_best").to_string();
                 let total = articles.len();
                 let (mut downloaded, mut skipped, mut failed) = (0usize, 0usize, 0usize);
@@ -2232,7 +2242,7 @@ pub fn show_podcast_archive(frame: &Frame, db: &Db) -> Option<blindrss_core::Fee
                             &article.title
                         }
                     )));
-                    if blindrss_core::download::downloaded_media_path(&cfg, article).is_some() {
+                    if crate::downloaded_path_for(&cfg, article).is_some() {
                         skipped += 1;
                         continue;
                     }
@@ -2247,6 +2257,10 @@ pub fn show_podcast_archive(frame: &Frame, db: &Db) -> Option<blindrss_core::Fee
                             {
                                 let _ = cfg.save(&config_path);
                             }
+                            blindrss_core::download::apply_download_retention(
+                                &folder,
+                                retention_secs,
+                            );
                             downloaded += 1;
                         }
                         Err(_) => failed += 1,
@@ -2281,18 +2295,7 @@ pub fn show_podcast_archive(frame: &Frame, db: &Db) -> Option<blindrss_core::Fee
                 picked.push(first);
             }
             if let Some(article) = picked.into_iter().next() {
-                let body = article
-                    .content
-                    .as_deref()
-                    .filter(|text| !text.trim().is_empty())
-                    .or(article.description.as_deref())
-                    .unwrap_or("");
-                let body = blindrss_core::extract::html_to_text_opts(body, false);
-                let body = match article.media_url.as_deref() {
-                    Some(media) if !media.is_empty() => format!("{body}\n\nMedia: {media}"),
-                    _ => body,
-                };
-                crate::article_window::open(&article.title, &body, Some(&article.url));
+                on_play(&article);
             }
         })
     };
@@ -2482,7 +2485,15 @@ pub fn show_podcast_archive(frame: &Frame, db: &Db) -> Option<blindrss_core::Fee
             });
         });
     }
-    {
+    // The ONE busy-close handler (Python's `_on_close`,
+    // EVT_CLOSE): every close route — the Close button,
+    // Escape, Alt+F4, the title-bar button — funnels through
+    // it, so a scan or download in flight always gets the
+    // stop-and-close-when-safe confirmation (Audit 8 Task
+    // 27, F15). Native closes are vetoed and re-driven
+    // through end_modal so the modal result matches the
+    // Close button's.
+    let request_close: Rc<dyn Fn()> = {
         let scan_running = scan_running.clone();
         let download_running = download_running.clone();
         let close_when_idle = close_when_idle.clone();
@@ -2490,7 +2501,7 @@ pub fn show_podcast_archive(frame: &Frame, db: &Db) -> Option<blindrss_core::Fee
         let download_cancel = download_cancel.clone();
         let frame2 = *frame;
         let d = dialog;
-        close_btn.on_click(move |_| {
+        Rc::new(move || {
             if scan_running.get() || download_running.get() {
                 let md = MessageDialog::builder(
                     &frame2,
@@ -2511,8 +2522,16 @@ pub fn show_podcast_archive(frame: &Frame, db: &Db) -> Option<blindrss_core::Fee
                 return;
             }
             d.end_modal(5101);
-        });
+        })
+    };
+    {
+        let request_close = request_close.clone();
+        close_btn.on_click(move |_| request_close());
     }
+    dialog.bind_internal(EventType::CLOSE_WINDOW, move |ev| {
+        ev.veto();
+        request_close();
+    });
 
     fill_feeds(None);
 
@@ -2823,38 +2842,128 @@ pub fn show_queue(
     played.filter(|i| *i < entries.borrow().len())
 }
 
+/// One Takeout source group's dialog label (Python
+/// `mainframe._show_youtube_takeout_options`).
+fn takeout_group_label(source: &str, count: usize) -> String {
+    match source {
+        "subscriptions" => format!("Subscribed channels ({count})"),
+        "history" => format!("Channels from watch history ({count})"),
+        "owner" => format!("Owned channels ({count})"),
+        "playlists" => format!("Playlists ({count})"),
+        _ => format!("{source} ({count})"),
+    }
+}
+
 /// Takeout import selection (Python's
-/// TakeoutImportSelectionDialog): a check list of the feeds
-/// found in the Takeout ZIP; everything starts checked and
-/// only the checked feeds import.
-pub fn select_takeout_feeds(
+/// TakeoutImportSelectionDialog): the source groups found in
+/// the Takeout ZIP, each with its count, all checked at
+/// first; the checked groups import. Python moved this
+/// dialog off wx.CheckListBox — an owner-drawn list whose
+/// checkboxes expose no checkable state to MSAA/UIA
+/// (nvaccess/nvda#7325) — onto a native report list with
+/// real checkbox state. wxDragon's ListCtrl has no checkbox
+/// binding, so this uses the one wxDragon control with
+/// native checkbox state, a TreeListCtrl in Checkbox style
+/// with flat root items (Audit 8 Task 27, F12; the control
+/// role differs from Python's list — NVDA checked-state and
+/// Space acceptance is the owner's manual item, recorded
+/// in PARITY.md). Returns the chosen source keys, or None
+/// on cancel.
+pub fn select_takeout_sources(
     frame: &Frame,
-    feeds: &[blindrss_core::takeout::TakeoutFeed],
-) -> Option<Vec<blindrss_core::takeout::TakeoutFeed>> {
+    import: &blindrss_core::takeout::TakeoutImport,
+) -> Option<Vec<String>> {
+    use wxdragon::widgets::treelistctrl::{
+        CheckboxState, TreeListCtrl, TreeListCtrlStyle, TreeListItem,
+    };
     let dialog = Dialog::builder(frame, "Import YouTube Takeout").build();
+    bind_f1(frame, &dialog, "TakeoutImportSelectionDialog");
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let label = StaticText::builder(&dialog)
-        .with_label(&crate::tr("Choose the subscriptions to import:"))
+        .with_label(&crate::tr(
+            "Select what to import from this YouTube Takeout file. Press Space to check or uncheck an item:",
+        ))
         .build();
     sizer.add(&label, 0, SizerFlag::All, 4);
-    let list = CheckListBox::builder(&dialog).build();
-    for (i, f) in feeds.iter().enumerate() {
-        list.append(&format!("{} ({})", f.title, f.source));
-        list.check(i as u32, true);
+    let list = TreeListCtrl::builder(&dialog)
+        .with_style(TreeListCtrlStyle::Default | TreeListCtrlStyle::Checkbox)
+        .build();
+    list.set_name("YouTube Takeout items to import");
+    list.append_column("", 480, ListColumnFormat::Left);
+    let root = list.get_root_item();
+    let mut items: Vec<(String, TreeListItem)> = Vec::new();
+    for source in import.groups() {
+        let text = takeout_group_label(source, import.count(source));
+        if let Some(item) = list.append_item(&root, &text) {
+            list.check_item(&item, CheckboxState::Checked);
+            if items.is_empty() {
+                list.select_item(&item);
+            }
+            items.push((source.to_string(), item));
+        }
     }
     sizer.add(&list, 1, SizerFlag::Expand | SizerFlag::All, 4);
     ok_cancel(&dialog, &sizer);
     dialog.set_sizer(sizer, true);
-    dialog.set_size(Size::new(620, 480));
+    dialog.set_size(Size::new(520, 300));
+    list.set_focus();
     let result = if dialog.show_modal() == 5100 {
         Some(
-            feeds
+            items
                 .iter()
-                .enumerate()
-                .filter(|(i, _)| list.is_checked(*i as u32))
-                .map(|(_, f)| f.clone())
+                .filter(|(_, item)| list.is_checked(item))
+                .map(|(source, _)| source.clone())
                 .collect(),
         )
+    } else {
+        None
+    };
+    dialog.destroy();
+    result
+}
+
+/// Takeout destination category (Python's category step in
+/// `_show_youtube_takeout_options`): a single choice over
+/// the active provider's categories, with the Uncategorized
+/// sentinel first when the provider does not list it,
+/// duplicates removed. Returns the chosen category name, or
+/// None on cancel.
+pub fn choose_takeout_category(frame: &Frame, categories: &[String]) -> Option<String> {
+    let mut choices: Vec<String> = Vec::new();
+    if !categories
+        .iter()
+        .any(|c| c == blindrss_core::opml::UNCATEGORIZED)
+    {
+        choices.push(blindrss_core::opml::UNCATEGORIZED.to_string());
+    }
+    for c in categories {
+        if !choices.contains(c) {
+            choices.push(c.clone());
+        }
+    }
+    let dialog = Dialog::builder(frame, "Import YouTube Takeout").build();
+    bind_f1(frame, &dialog, "TakeoutCategoryDialog");
+    let sizer = BoxSizer::builder(Orientation::Vertical).build();
+    let label = StaticText::builder(&dialog)
+        .with_label(&crate::tr("Choose the destination category:"))
+        .build();
+    sizer.add(&label, 0, SizerFlag::All, 4);
+    let list = ListBox::builder(&dialog).build();
+    list.set_name("Destination category");
+    for c in &choices {
+        list.append(c);
+    }
+    if !choices.is_empty() {
+        list.set_selection(0, true);
+    }
+    sizer.add(&list, 1, SizerFlag::Expand | SizerFlag::All, 4);
+    ok_cancel(&dialog, &sizer);
+    dialog.set_sizer(sizer, true);
+    dialog.set_size(Size::new(520, 300));
+    list.set_focus();
+    let result = if dialog.show_modal() == 5100 {
+        list.get_selection()
+            .and_then(|i| choices.get(i as usize).cloned())
     } else {
         None
     };
