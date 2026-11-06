@@ -272,6 +272,7 @@ pub fn edit_smart_folder(
     rule0: &Value,
 ) -> Option<(String, Value)> {
     let dialog = Dialog::builder(frame, title).build();
+    dialog.set_escape_id(5101);
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let name_ctrl = name_row(&dialog, &sizer, "Folder name:", name0);
     let block = CondBlock::build(&dialog, &sizer, rule0);
@@ -324,6 +325,7 @@ pub fn edit_filter_rule(
         ),
     };
     let dialog = Dialog::builder(frame, "Filter Rule").build();
+    dialog.set_escape_id(5101);
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let name_ctrl = name_row(&dialog, &sizer, "Rule name:", &name0);
     let block = CondBlock::build(&dialog, &sizer, &rule0);
@@ -480,6 +482,7 @@ fn bind_f1_impl(
 
 pub fn show_filter_rules(frame: &Frame, db: &Db) {
     let dialog = Dialog::builder(frame, "Filter Rules").build();
+    dialog.set_escape_id(5101);
     bind_f1(frame, &dialog, "FilterRulesDialog");
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let list = ListCtrl::builder(&dialog)
@@ -673,6 +676,7 @@ pub fn show_category_picker(
     prompt: &str,
 ) -> Option<String> {
     let dialog = Dialog::builder(frame, title).build();
+    dialog.set_escape_id(5101);
     bind_f1(frame, &dialog, "ChooseCategoryDialog");
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let label = StaticText::builder(&dialog).with_label(prompt).build();
@@ -793,6 +797,7 @@ fn category_leaf_parent(path: &str) -> (String, Option<String>) {
 /// moves the whole subtree, which covers both edits).
 pub fn show_category_properties(frame: &Frame, db: &Db, category_path: &str) -> Option<String> {
     let dialog = Dialog::builder(frame, "Category Properties").build();
+    dialog.set_escape_id(5101);
     bind_f1(frame, &dialog, "CategoryPropertiesDialog");
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let (leaf, current_parent) = category_leaf_parent(category_path);
@@ -848,6 +853,7 @@ pub fn show_feed_properties(frame: &Frame, db: &Db, feed: &blindrss_core::Feed) 
     use blindrss_core::feed_settings as fs;
     let settings0 = db.feed_settings(&feed.id).unwrap_or(Value::Null);
     let dialog = Dialog::builder(frame, "Feed Properties").build();
+    dialog.set_escape_id(5101);
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     // Python's dialog is a notebook: General + List Headers.
     // The existing General controls keep their order; the
@@ -1193,6 +1199,7 @@ pub fn show_feed_properties(frame: &Frame, db: &Db, feed: &blindrss_core::Feed) 
 /// About BlindRSS (Python's AboutDialog content).
 pub fn show_about(frame: &Frame) {
     let dialog = Dialog::builder(frame, "About BlindRSS").build();
+    dialog.set_escape_id(5101);
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let lines = [
         format!("BlindRSS {}", env!("CARGO_PKG_VERSION")),
@@ -1231,6 +1238,7 @@ pub fn show_open_article_dialog(
     rich_default: bool,
 ) -> Option<(String, bool)> {
     let dialog = Dialog::builder(frame, "Open Article").build();
+    dialog.set_escape_id(5101);
     bind_f1(frame, &dialog, "OpenArticleDialog");
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let intro = StaticText::builder(&dialog)
@@ -1287,6 +1295,7 @@ pub fn show_article_history(frame: &Frame, db: &Db, article: &blindrss_core::Art
     }
     let total = versions.len();
     let dialog = Dialog::builder(frame, "Article History").build();
+    dialog.set_escape_id(5101);
     bind_f1(frame, &dialog, "ArticleHistoryDialog");
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let heading = StaticText::builder(&dialog)
@@ -1554,6 +1563,7 @@ pub fn show_article_columns(frame: &Frame, config_path: &Path) {
     use blindrss_core::article_columns::{layout_from_config, layout_to_json};
     let cfg = Config::load(config_path).unwrap_or_default();
     let dialog = Dialog::builder(frame, "Article Columns").build();
+    dialog.set_escape_id(5101);
     bind_f1(frame, &dialog, "list-headers");
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let editor = ColumnEditor::build(&dialog, &sizer, layout_from_config(&cfg), true);
@@ -1606,6 +1616,7 @@ pub fn show_add_feed(
     initial_url: &str,
 ) -> Option<(String, String)> {
     let dialog = Dialog::builder(frame, "Add Feed").build();
+    dialog.set_escape_id(5101);
     bind_f1(frame, &dialog, "AddFeedDialog");
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let url_ctrl = name_row(&dialog, &sizer, "Feed or Media URL:", initial_url);
@@ -1727,6 +1738,7 @@ pub fn show_detected_feed_choice(
     feeds: &[blindrss_core::discovery::DetectedFeed],
 ) -> Option<String> {
     let dialog = Dialog::builder(frame, "Detected Feeds").build();
+    dialog.set_escape_id(5101);
     bind_f1(frame, &dialog, "DetectFeedsDialog");
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let label = StaticText::builder(&dialog)
@@ -1781,6 +1793,7 @@ pub fn show_video_search(
     let cfg = Config::load(config_path).unwrap_or_default();
     let sites = searchable_sites(cfg.get_bool("enable_adult_search", false));
     let dialog = Dialog::builder(frame, "Video Search").build();
+    dialog.set_escape_id(5101);
     bind_f1(frame, &dialog, "YtdlpGlobalSearchDialog");
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let query_ctrl = name_row(&dialog, &sizer, "Search:", "");
@@ -2091,6 +2104,7 @@ pub fn show_persistent_searches(frame: &Frame, config_path: &Path) -> Option<Str
         .unwrap_or_default();
     let searches = Rc::new(RefCell::new(normalize_saved_searches(&stored)));
     let dialog = Dialog::builder(frame, "Configure Persistent Search").build();
+    dialog.set_escape_id(5101);
     bind_f1(frame, &dialog, "PersistentSearchDialog");
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let list_label = StaticText::builder(&dialog)
@@ -2284,6 +2298,7 @@ pub(crate) fn feed_error_detail(e: &blindrss_core::db::FeedError) -> String {
 pub fn show_feed_errors(frame: &Frame) -> bool {
     let changed = Rc::new(RefCell::new(false));
     let dialog = Dialog::builder(frame, "Feeds with Errors").build();
+    dialog.set_escape_id(5101);
     bind_f1(frame, &dialog, "FeedErrorsDialog");
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let heading = StaticText::builder(&dialog).with_label("").build();
@@ -2587,6 +2602,7 @@ pub fn show_podcast_archive(
     }
 
     let dialog = Dialog::builder(frame, "Podcast Archive").build();
+    dialog.set_escape_id(5101);
     bind_f1(frame, &dialog, "PodcastArchiveDialog");
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let feed_row = BoxSizer::builder(Orientation::Horizontal).build();
@@ -3406,6 +3422,7 @@ pub fn show_queue(
 ) -> Option<usize> {
     let entries = Rc::new(RefCell::new(load_queue(config_path)));
     let dialog = Dialog::builder(frame, "Play Queue").build();
+    dialog.set_escape_id(5101);
     bind_f1(frame, &dialog, "play-queue");
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let list = ListBox::builder(&dialog).build();
@@ -3576,6 +3593,7 @@ pub fn select_takeout_sources(
         CheckboxState, TreeListCtrl, TreeListCtrlStyle, TreeListItem,
     };
     let dialog = Dialog::builder(frame, "Import YouTube Takeout").build();
+    dialog.set_escape_id(5101);
     bind_f1(frame, &dialog, "TakeoutImportSelectionDialog");
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let label = StaticText::builder(&dialog)
@@ -3641,6 +3659,7 @@ pub fn choose_takeout_category(frame: &Frame, categories: &[String]) -> Option<S
         }
     }
     let dialog = Dialog::builder(frame, "Import YouTube Takeout").build();
+    dialog.set_escape_id(5101);
     bind_f1(frame, &dialog, "TakeoutCategoryDialog");
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let label = StaticText::builder(&dialog)
@@ -3676,6 +3695,7 @@ pub fn choose_takeout_category(frame: &Frame, categories: &[String]) -> Option<S
 /// and subscribes the chosen one.
 pub fn show_feed_search(frame: &Frame) -> Option<String> {
     let dialog = Dialog::builder(frame, "Find Feeds").build();
+    dialog.set_escape_id(5101);
     bind_f1(frame, &dialog, "FeedSearchDialog");
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let url_ctrl = name_row(&dialog, &sizer, "Search terms or site/feed URL:", "");
@@ -3849,6 +3869,7 @@ pub fn show_exclude_feeds(frame: &impl WxWidget, config_path: &Path) {
         })
         .unwrap_or_default();
     let dialog = Dialog::builder(frame, "Exclude Feeds from Notifications").build();
+    dialog.set_escape_id(5101);
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let label = StaticText::builder(&dialog)
         .with_label(&crate::tr("Checked feeds will not send notifications:"))
@@ -3895,6 +3916,7 @@ pub fn show_youtube_signin(frame: &impl WxWidget, config_path: &Path) {
     };
     let secret = cfg.get_str("youtube_account_client_secret", "").to_string();
     let dialog = Dialog::builder(frame, "Connect YouTube Account").build();
+    dialog.set_escape_id(5101);
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let status = StaticText::builder(&dialog)
         .with_label(&crate::tr("Contacting Google..."))
@@ -4007,6 +4029,7 @@ pub fn show_cast_picker(
     devices: &[blindrss_core::cast::CastDevice],
 ) -> Option<blindrss_core::cast::CastDevice> {
     let dialog = Dialog::builder(frame, "Cast to Device").build();
+    dialog.set_escape_id(5101);
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let list = ListBox::builder(&dialog).build();
     for d in devices {
@@ -4044,6 +4067,7 @@ pub fn show_cast_picker(
 pub fn show_import_cookies(frame: &Frame, config_path: &Path) {
     use blindrss_core::chromium;
     let dialog = Dialog::builder(frame, "Import Site Cookies").build();
+    dialog.set_escape_id(5101);
     bind_f1(frame, &dialog, "site-cookies");
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let label = StaticText::builder(&dialog)
@@ -4378,6 +4402,7 @@ fn pick_firefox_profile(
     profiles: &[blindrss_core::firefox::FirefoxProfile],
 ) -> Option<usize> {
     let dialog = Dialog::builder(frame, "Import from Firefox").build();
+    dialog.set_escape_id(5101);
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let label = StaticText::builder(&dialog)
         .with_label(&crate::tr("Choose the Firefox profile to import from:"))
@@ -4415,6 +4440,7 @@ pub fn show_equalizer(frame: &Frame, config_path: &Path) {
         cfg.raw().get("equalizer_user_presets"),
     )));
     let dialog = Dialog::builder(frame, "Equalizer").build();
+    dialog.set_escape_id(5101);
     bind_f1(frame, &dialog, "EqualizerDialog");
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let enabled_cb = CheckBox::builder(&dialog)
@@ -4668,6 +4694,7 @@ pub fn show_equalizer(frame: &Frame, config_path: &Path) {
 pub fn show_add_shortcuts(frame: &Frame) {
     use blindrss_core::windows_shortcuts::{self, ShortcutSelection};
     let dialog = Dialog::builder(frame, &crate::tr("Add BlindRSS Shortcuts")).build();
+    dialog.set_escape_id(5101);
     bind_f1(frame, &dialog, "AddShortcutsDialog");
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let intro = StaticText::builder(&dialog)

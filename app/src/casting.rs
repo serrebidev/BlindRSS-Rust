@@ -541,6 +541,18 @@ pub fn open_queue(device: CastDevice, items: Vec<CastQueueItem>) {
     volume.set_value(100);
     layout.add(&volume, 0, SizerFlag::Expand | SizerFlag::All, 4);
     frame.set_sizer(layout, true);
+    // Escape closes the cast window (the article window and
+    // player patterns; a modeless frame gets no Esc for
+    // free). It goes through the same close path as the
+    // window's close button, which stops the cast.
+    frame.bind_internal(EventType::CHAR_HOOK, move |event| {
+        if event.get_key_code().unwrap_or(0) == 27 {
+            frame.close(false);
+            event.skip(false);
+        } else {
+            event.skip(true);
+        }
+    });
     let (commands, rx) = mpsc::channel();
     let (updates, results) = mpsc::channel::<Result<String, String>>();
     let worker_device = device.clone();

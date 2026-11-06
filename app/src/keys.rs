@@ -72,6 +72,7 @@ fn refresh_list(list: &ListCtrl, working: &HashMap<String, String>) {
 /// help filter while a capture dialog is up).
 fn capture_shortcut(parent: &Dialog, command_label: &str) -> Option<String> {
     let dialog = Dialog::builder(parent, "Press Shortcut").build();
+    dialog.set_escape_id(5101);
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let prompt = StaticText::builder(&dialog)
         .with_label(&format!(
@@ -143,6 +144,7 @@ pub fn show_shortcuts(frame: &Frame, config_path: &Path) {
     let rows: Rc<Vec<Row>> = Rc::new(rows());
 
     let dialog = Dialog::builder(frame, "Keyboard Shortcuts").build();
+    dialog.set_escape_id(5101);
     crate::dialogs::bind_f1(frame, &dialog, "KeyboardShortcutsDialog");
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let info = StaticText::builder(&dialog)

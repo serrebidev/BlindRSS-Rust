@@ -6646,3 +6646,19 @@ at root, Linux signature VALID with tamper rejected.
 on the code side; owner screen-reader/platform/hardware
 acceptance remains the owner's separate record, and the
 classic-branch swap awaits the owner's explicit word.
+
+**Accessibility fix (2026-11-06, Brandon's report): v0.1.62.**
+Escape did not close the app's custom dialogs. Root
+cause: every custom dialog wires its OK/Cancel buttons by
+hand — plain buttons whose clicks call
+end_modal(5100/5101) — and never sets an escape id, so wx
+never learns which code Escape should end with; Python's
+dialogs get Esc from wx's standard handling. Fix: all 33
+custom dialogs now call set_escape_id(5101) right after
+building. The cast queue window (a modeless frame) also
+gained the CHAR_HOOK Escape binding the article, player
+and help windows already had (verified present, matching
+Python). Two source-scan regression tests
+(every_custom_dialog_sets_an_escape_id,
+modeless_windows_bind_escape_to_close) keep any future
+dialog or window from silently losing Escape again.

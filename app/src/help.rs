@@ -60,6 +60,7 @@ pub fn show_help_topic(frame: &Frame, locale: &str, topic_id: Option<&str>) {
     };
 
     let dialog = Dialog::builder(frame, "BlindRSS Help").build();
+    dialog.set_escape_id(5101);
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     if doc.is_fallback() {
         let notice = StaticText::builder(&dialog)

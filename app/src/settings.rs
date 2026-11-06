@@ -345,6 +345,7 @@ fn inoreader_listener_connect(
     open_url(&url);
     // Drain on a dialog timer like the other async flows.
     let dialog2 = Dialog::builder(frame, "Inoreader Sign-in").build();
+    dialog2.set_escape_id(5101);
     let sizer2 = BoxSizer::builder(Orientation::Vertical).build();
     let label = StaticText::builder(&dialog2)
         .with_label(&crate::tr("Waiting for the browser sign-in to complete..."))
@@ -420,6 +421,7 @@ fn inoreader_listener_connect(
 pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> {
     let cfg = Config::load(config_path).unwrap_or_default();
     let dialog = Dialog::builder(frame, "BlindRSS Settings").build();
+    dialog.set_escape_id(5101);
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let notebook = Notebook::builder(&dialog).build();
     sizer.add(&notebook, 1, SizerFlag::Expand | SizerFlag::All, 4);

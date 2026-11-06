@@ -4970,6 +4970,7 @@ fn main() {
                 return;
             }
             let dlg = Dialog::builder(&frame_deleted, "Deleted Articles").build();
+            dlg.set_escape_id(5101);
             dlg.set_size(Size::new(820, 480));
             let search_label = StaticText::builder(&dlg).with_label("Search:").build();
             let search_box = TextCtrl::builder(&dlg).build();
@@ -11312,6 +11313,60 @@ mod ui_parity_tests {
         assert!(auto_fulltext_on_select(false, false, true, false));
         assert!(auto_fulltext_on_select(false, false, false, true));
         assert!(!auto_fulltext_on_select(false, false, false, false));
+    }
+
+    #[test]
+    fn every_custom_dialog_sets_an_escape_id() {
+        // Accessibility (Brandon, 2026-11-06): Escape must
+        // close every dialog. A custom Dialog ends its modal
+        // loop on Esc only when it has an escape id — the
+        // hand-wired OK/Cancel buttons use wx's standard
+        // codes (5100/5101) through click handlers, which wx
+        // never learns from, so without set_escape_id(5101)
+        // Escape was dead in every custom dialog. This scan
+        // keeps any future dialog honest: every custom
+        // Dialog builder site in the app crate must set the
+        // escape id right after building.
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut checked = 0;
+        for entry in std::fs::read_dir(&src_dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            let lines: Vec<&str> = text.lines().collect();
+            for (i, line) in lines.iter().enumerate() {
+                if line.contains("= Dialog::builder") {
+                    checked += 1;
+                    let window: String = lines[i..(i + 6).min(lines.len())].join("\n");
+                    assert!(
+                        window.contains("set_escape_id(5101)"),
+                        "{}:{}: custom dialog without an escape id: {}",
+                        path.display(),
+                        i + 1,
+                        line.trim()
+                    );
+                }
+            }
+        }
+        assert!(checked >= 30, "scan found only {checked} dialogs");
+    }
+
+    #[test]
+    fn modeless_windows_bind_escape_to_close() {
+        // The modeless windows (article, player, help, cast)
+        // get no Esc from wx either: each binds CHAR_HOOK and
+        // closes on key 27, matching Python. Guard the four
+        // bindings against silent removal.
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        for file in ["article_window.rs", "player.rs", "help.rs", "casting.rs"] {
+            let text = std::fs::read_to_string(src_dir.join(file)).unwrap();
+            assert!(
+                text.contains("CHAR_HOOK") && text.contains("27"),
+                "{file}: Escape-to-close binding missing"
+            );
+        }
     }
 
     #[test]
