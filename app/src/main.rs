@@ -1,3 +1,9 @@
+// No console window beside the app on Windows release builds;
+// debug builds keep the console for development output (and
+// the --blindrss-runtime-self-test diagnostics). Same line
+// as BlindRadio and Blind Designer.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 //! BlindRSS (Rust) — main window over the existing Python database.
 //! Slice 2: Refresh All (worker-thread fetch, main-thread store),
 //! feed filtering via the tree, mark-read on open.

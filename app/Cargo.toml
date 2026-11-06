@@ -1,6 +1,6 @@
 [package]
 name = "blindrss"
-version = "0.1.60"
+version = "0.1.61"
 edition.workspace = true
 license.workspace = true
 
@@ -8,7 +8,16 @@ license.workspace = true
 blindrss-core = { path = "../crates/core" }
 serde_json = "1"
 libloading = "0.8.9"
-wxdragon = { version = "0.9.24", features = ["media-ctrl", "richtext", "stc", "webview"] }
+# default-features = false for exactly one reason: wxdragon's
+# defaults include wx-asserts, which builds wxWidgets with
+# its internal consistency checks live — every failed check
+# becomes a modal "debugging check" dialog for the end user,
+# even in release builds (the class removed in
+# Accessible-IPTV-Client-Rust v0.4.19, validation 0095
+# there). Release wx builds compile those checks out, as
+# wxPython ships. Every other default is re-enabled
+# explicitly below, so the ONLY build change is the asserts.
+wxdragon = { version = "0.9.24", default-features = false, features = ["media-ctrl", "richtext", "stc", "webview", "wx-printing", "wx-tiff", "wx-jpeg", "wx-tango-icons", "wx-extra-image-formats", "wx-regex", "appindicator"] }
 ship-shape = "0.5.0"
 rcgen = "0.13"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
