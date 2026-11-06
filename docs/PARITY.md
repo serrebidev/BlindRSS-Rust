@@ -6635,3 +6635,14 @@ baseline (2a7eeb3), shipped as Python v2.5.9 (#148, #150,
 Reconciliation tree state: 942 tests, all gates green.
 The classic-branch swap remains the final step, on the
 owner's explicit word only.
+
+**Final Audit 8 release (2026-11-05): v0.1.60** —
+reconciliation fixes (ST- pruning, #151 debounce) with
+the lock sync in the same commit; CI fully green;
+Release run 42144380037 success (3 Package + Publish);
+verified Latest, exactly 7 fixed-name assets, contents
+at root, Linux signature VALID with tamper rejected.
+942 tests. Audit 8's plan completion criteria are met
+on the code side; owner screen-reader/platform/hardware
+acceptance remains the owner's separate record, and the
+classic-branch swap awaits the owner's explicit word.
