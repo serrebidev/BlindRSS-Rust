@@ -706,17 +706,39 @@ pub fn read_profile_cookies(profile: &ChromiumProfile) -> ReadOutcome {
     }
 }
 
+/// Python `_is_ignorable_record` (site_cookies.py, issue
+/// #101): YouTube `ST-<random>` cookies are per-page state
+/// tokens — every one has a unique name, so they are never
+/// replaced on merge and simply pile up; they carry no login
+/// or clearance state and were the bulk of the oversized
+/// Cookie header that made YouTube answer 413. They never
+/// enter the jar, and a rewrite prunes ones an earlier
+/// version already wrote.
+fn is_ignorable_record(domain: &str, name: &str) -> bool {
+    if !name.starts_with("ST-") {
+        return false;
+    }
+    let domain = domain.trim_start_matches('.').to_lowercase();
+    domain == "youtube.com" || domain.ends_with(".youtube.com")
+}
+
 /// Merge imported records into existing jar text: an imported
 /// cookie replaces an existing line with the same
 /// (domain, name, path); everything else is kept verbatim.
 pub fn merge_into_jar(existing: &str, records: &[JarRecord], now: i64) -> String {
-    let new_keys: std::collections::HashSet<(String, String, String)> =
-        records.iter().map(|r| r.key()).collect();
+    let new_keys: std::collections::HashSet<(String, String, String)> = records
+        .iter()
+        .filter(|r| !is_ignorable_record(&r.host, &r.name))
+        .map(|r| r.key())
+        .collect();
     let mut out: Vec<String> = Vec::new();
     for line in existing.lines() {
         let trimmed = line.trim_end_matches('\r');
         let parsed = parse_jar_line(trimmed);
         match parsed {
+            Some(rec) if is_ignorable_record(&rec.host, &rec.name) => {
+                /* pruned on rewrite (Python) */
+            }
             Some(rec) if new_keys.contains(&rec.key()) => { /* replaced below */ }
             _ => {
                 if !trimmed.is_empty() {
@@ -726,6 +748,9 @@ pub fn merge_into_jar(existing: &str, records: &[JarRecord], now: i64) -> String
         }
     }
     for rec in records {
+        if is_ignorable_record(&rec.host, &rec.name) {
+            continue;
+        }
         if rec.expires != 0 && rec.expires < now {
             continue;
         }

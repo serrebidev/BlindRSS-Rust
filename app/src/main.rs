@@ -1710,17 +1710,36 @@ fn auto_fulltext_on_select(
     translation_ready || platform_macos || forum_thread || youtube_video
 }
 
-/// Queue the automatic full-text load for the drain timer:
-/// immediate when forced (reader focus), debounced 350 ms
-/// otherwise (Python `_fulltext_debounce_ms`), and tied to
-/// the current reader generation so a selection change
-/// cancels it.
-fn schedule_auto_fulltext(st: &mut State, force: bool) {
-    let delay = if force {
-        std::time::Duration::ZERO
+/// The selection-settle delay before an automatic full-text
+/// load (Python `_fulltext_debounce_ms_for`, v2.5.9 #151):
+/// a YouTube row launches the yt-dlp CLI — on Windows the
+/// packaged binary unpacks itself to %TEMP% on every run
+/// (~3 s and ~4 CPU-seconds before it fetches anything), so
+/// a Windows YouTube selection must settle for 3000 ms;
+/// every other case uses the generic 350 ms. macOS is
+/// excluded from the long delay (VoiceOver never focuses
+/// the reader, so selection is the only trigger there).
+fn auto_fulltext_delay_ms(force: bool, windows: bool, youtube_video: bool) -> u64 {
+    if force {
+        0
+    } else if windows && youtube_video {
+        3000
     } else {
-        std::time::Duration::from_millis(350)
-    };
+        350
+    }
+}
+
+/// Queue the automatic full-text load for the drain timer:
+/// immediate when forced (reader focus), debounced
+/// otherwise (Python `_fulltext_debounce_ms_for`), and tied
+/// to the current reader generation so a selection change
+/// cancels it.
+fn schedule_auto_fulltext(st: &mut State, force: bool, youtube_video: bool) {
+    let delay = std::time::Duration::from_millis(auto_fulltext_delay_ms(
+        force,
+        cfg!(target_os = "windows"),
+        youtube_video,
+    ));
     st.auto_load = Some((st.reader_generation, std::time::Instant::now() + delay));
 }
 
@@ -4229,13 +4248,14 @@ fn main() {
             // Task 11): Task 12's mark-on-select block was
             // dropped at integration — marking belongs to
             // reader focus and activation.
+            let youtube_video = blindrss_core::ytfull::is_youtube_video_url(&a.url);
             if auto_fulltext_on_select(
                 blindrss_core::translate::settings_from_config(&cfg).is_some(),
                 cfg!(target_os = "macos"),
                 blindrss_core::forum_sources::is_forum_thread_host(&a.url),
-                blindrss_core::ytfull::is_youtube_video_url(&a.url),
+                youtube_video,
             ) {
-                schedule_auto_fulltext(&mut st, false);
+                schedule_auto_fulltext(&mut st, false, youtube_video);
             }
         });
 
@@ -9714,7 +9734,7 @@ fn main() {
                 ev.skip(true);
                 let mut st = state_focus.borrow_mut();
                 if st.selected_article.is_some() {
-                    schedule_auto_fulltext(&mut st, true);
+                    schedule_auto_fulltext(&mut st, true, false);
                 }
             });
         }
@@ -11286,6 +11306,22 @@ mod ui_parity_tests {
         assert!(auto_fulltext_on_select(false, false, true, false));
         assert!(auto_fulltext_on_select(false, false, false, true));
         assert!(!auto_fulltext_on_select(false, false, false, false));
+    }
+
+    #[test]
+    fn auto_fulltext_delay_matches_python_v259_youtube_rule() {
+        // Python v2.5.9 #151 (`_fulltext_debounce_ms_for`):
+        // forced loads are immediate; a Windows YouTube
+        // selection settles 3000 ms (the packaged yt-dlp
+        // one-file unpack cost); everything else — including
+        // macOS YouTube, where selection is the only trigger —
+        // keeps the generic 350 ms.
+        assert_eq!(auto_fulltext_delay_ms(true, true, true), 0);
+        assert_eq!(auto_fulltext_delay_ms(true, false, false), 0);
+        assert_eq!(auto_fulltext_delay_ms(false, true, true), 3000);
+        assert_eq!(auto_fulltext_delay_ms(false, true, false), 350);
+        assert_eq!(auto_fulltext_delay_ms(false, false, true), 350);
+        assert_eq!(auto_fulltext_delay_ms(false, false, false), 350);
     }
 
     #[test]

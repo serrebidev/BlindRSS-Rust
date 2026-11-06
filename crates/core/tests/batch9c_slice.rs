@@ -147,6 +147,46 @@ fn chromium_v10_round_trip_and_jar_merge() {
 }
 
 #[test]
+fn merge_into_jar_prunes_youtube_st_tokens() {
+    use blindrss_core::chromium::*;
+    // Python `_is_ignorable_record` (issue #101): ST-* records
+    // on youtube.com domains are pruned from the existing jar
+    // on rewrite and never merged in; ST-* on other domains
+    // and ordinary YouTube cookies pass through.
+    let existing = ".youtube.com\tTRUE\t/\tTRUE\t0\tST-abc123\tpollution\n\
+                    .youtube.com\tTRUE\t/\tTRUE\t0\tSID\tkeep-me\n\
+                    .example.com\tTRUE\t/\tFALSE\t0\tST-other\tkept\n";
+    let incoming = vec![
+        JarRecord {
+            host: ".youtube.com".into(),
+            http_only: false,
+            include_subdomains: true,
+            path: "/".into(),
+            secure: true,
+            expires: 0,
+            name: "ST-newtoken".into(),
+            value: "pollution2".into(),
+        },
+        JarRecord {
+            host: ".youtube.com".into(),
+            http_only: false,
+            include_subdomains: true,
+            path: "/".into(),
+            secure: true,
+            expires: 0,
+            name: "HSID".into(),
+            value: "fresh".into(),
+        },
+    ];
+    let merged = merge_into_jar(existing, &incoming, 1_800_000_000);
+    assert!(!merged.contains("ST-abc123"), "merged jar: {merged}");
+    assert!(!merged.contains("ST-newtoken"), "merged jar: {merged}");
+    assert!(merged.contains("keep-me"), "merged jar: {merged}");
+    assert!(merged.contains("ST-other"), "merged jar: {merged}");
+    assert!(merged.contains("fresh"), "merged jar: {merged}");
+}
+
+#[test]
 fn chromium_decrypt_rejects_garbage() {
     use blindrss_core::chromium::*;
     assert!(decrypt_cookie_value(b"v10short", Some(&V10Key::Gcm([0u8; 32])), true).is_none());

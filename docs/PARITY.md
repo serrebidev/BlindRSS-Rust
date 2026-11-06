@@ -6553,3 +6553,85 @@ green, Release run 42132756400 success (3 Package +
 Publish), exactly 7 fixed-name assets, contents at
 archive root, Linux signature VALID with tamper
 rejected. Combined Wave 4 tree state: 940 tests.
+
+## 10. Audit 8 reconciliation (2026-11-05, post Wave 4)
+
+Every Audit 8 finding ID (160) carries a resolution or a
+recorded deviation in the sections above; a mechanical
+cross-check confirms all 162 ID tokens in the audit doc
+are addressed in this file. Final state of the items that
+are not plain "fixed":
+
+- B16 (TLS impersonation transport): PENDING, research
+  complete and cited in the Task 24 resolution. Both
+  credible transports are unusable today (wreq releases
+  yanked / pre-release only, impit only as patched forks,
+  both async-only against the blocking core). The stage
+  stays wired behind `extract.rs::impersonated_fetch`;
+  targets are fingerprint profile keys, never UA strings.
+  Python refresh's `_response_looks_blocked` escalation
+  (Task 24 adjacent find) is this same item: it is the
+  trigger INTO impersonation, and with the transport
+  pending the Rust refresh escalates blocked responses to
+  the browser stage via B01's ported qualification, which
+  covers the same challenge/WAF shapes. Both land or stay
+  pending together.
+- B17: the privileged Chromium v20 master-key resolution
+  (SYSTEM/CNG/UAC helper, VSS) is deliberately not built
+  — the plan reserved it for a separate design/review.
+  Everything non-privileged is ported; v20 rows are
+  counted and named in the dialog with the file-import
+  route.
+- Task 20 deviation: local MP4/M4A/M4B embedded chapters
+  are not ported (no MP4 chapter-atom reader exists in
+  the tree; Python uses mutagen). ID3, Podcasting 2.0 and
+  YouTube chapters are ported.
+- O17 (update download cancellation/retry): superseded —
+  the hand-rolled updater it cited was deleted by Task 6;
+  updates are ship-shape's, whose behavior owns this now.
+- Task 23's Deno packaging and Task 30's B14 bundle-app
+  workflow step: recorded proposals awaiting the owner's
+  workflow decision; the code-side pieces shipped.
+- `close_to_tray` default: owner-disposition item,
+  untouched per the Task 29 scope note.
+- Remaining per-task deviations (wxDragon limits, relay
+  shapes, probe byte windows, and the rest) stand as
+  recorded in their resolutions.
+
+Two adjacent finds were closed during reconciliation:
+the YouTube `ST-` token pruning (Task 25's open find)
+is now ported in `chromium::merge_into_jar` with
+Python's exact rule (skip on merge, prune on rewrite,
+youtube.com domains only) plus a regression test; and
+the Python re-comparison below produced one port.
+
+### Python source re-comparison, v2.5.8 -> v2.5.9
+
+Python moved three fix commits after the Audit 8
+baseline (2a7eeb3), shipped as Python v2.5.9 (#148, #150,
+#151 via #149/#150/#151):
+
+- #148 (NVDA re-reading the focused row when chapters
+  arrive): ALREADY PORTED — Task 20's live poll defers
+  the focused row's title rewrite until the selection
+  moves, exactly Python's fix; recorded in the Task 20
+  resolution.
+- #150 (cancelled YouTube loads leaving ~30 MB folders
+  in %TEMP%): NOT APPLICABLE — the folders are the
+  Python app's own PyInstaller one-file unpack dirs, left
+  when its worker children outlived a cancel. The Rust
+  binary has no unpack folder, creates no temp dirs in
+  ytfull, and its yt-dlp runs are owned subprocesses
+  (Task 23) killed on cancel.
+- #151 (yt-dlp launched for every YouTube row paused
+  on): PORTED in this reconciliation. Python's
+  `_fulltext_debounce_ms_for` gives Windows YouTube
+  selections a 3000 ms settle delay (the packaged
+  yt-dlp's per-run unpack cost); macOS and all other
+  cases keep 350 ms; reader focus stays immediate.
+  Rust: `auto_fulltext_delay_ms` behind
+  `schedule_auto_fulltext`, regression-tested.
+
+Reconciliation tree state: 942 tests, all gates green.
+The classic-branch swap remains the final step, on the
+owner's explicit word only.
