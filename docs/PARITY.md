@@ -6536,3 +6536,20 @@ and found its own stale plant. Production code matches
 Python exactly; the test now computes the expected path
 by Python's platform rule. The earlier B13 cfg fix is
 confirmed by this run's clean Windows clippy.
+
+**Wave 4 release (2026-11-05): v0.1.59.** The first
+Wave 4 tag, v0.1.58 (86549b0), FAILED its Release run at
+the Validate step on both Unix legs: the version-bump
+commit carried app/Cargo.toml only, and the release
+build's --locked rejected the stale Cargo.lock member
+version (CI does not use --locked and passed). The tag
+is burned with no release, per the standing
+never-reuse rule. Lesson, now part of the release flow:
+after any version bump, run `cargo update -p blindrss`
+so the lock sync lands in the SAME commit, and include a
+`cargo check --locked` in the release gate. v0.1.59
+(9294956: bump + lock sync) shipped verified: CI fully
+green, Release run 42132756400 success (3 Package +
+Publish), exactly 7 fixed-name assets, contents at
+archive root, Linux signature VALID with tamper
+rejected. Combined Wave 4 tree state: 940 tests.
