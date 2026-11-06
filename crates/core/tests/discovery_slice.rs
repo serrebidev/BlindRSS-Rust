@@ -281,7 +281,19 @@ fn loopback_server(routes: std::collections::HashMap<String, LoopbackRoute>) -> 
                     .get(&path)
                     .cloned()
                     .unwrap_or((404, Vec::new(), "not found".to_string()));
-            let mut response = format!("HTTP/1.1 {status} X\r\nContent-Length: {}\r\n", body.len());
+            // Connection: close is load-bearing (every other
+            // test server in the tree sends it): the server
+            // answers one request per connection and drops
+            // the socket, and without the header ureq pools
+            // the connection and can write the next request
+            // (e.g. a redirect follow) into the closing
+            // socket — macOS CI failed exactly there with
+            // reset / peer-disconnected, twice on 2026-11-06
+            // after passing earlier the same day.
+            let mut response = format!(
+                "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n",
+                body.len()
+            );
             for (name, value) in headers {
                 response.push_str(&format!("{name}: {value}\r\n"));
             }
