@@ -6662,3 +6662,11 @@ Python). Two source-scan regression tests
 (every_custom_dialog_sets_an_escape_id,
 modeless_windows_bind_escape_to_close) keep any future
 dialog or window from silently losing Escape again.
+
+**v0.1.62 VERIFIED (2026-11-06):** Latest, exactly 7
+fixed-name assets, contents at root, Linux signature
+VALID with tamper rejected; 944 tests; CI fully green
+on c445db3 (the tag tree also carries the discovery
+test-server Connection: close fix described in that
+commit). Brandon's NVDA pass on Escape across dialogs
+is the acceptance step.
