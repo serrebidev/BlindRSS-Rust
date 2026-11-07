@@ -6984,3 +6984,16 @@ edit. Shipped as v0.1.64.
 B16 status unchanged by this batch (wiring still the next
 step; the spike's local proof stands). Owner-decision
 items unchanged.
+
+**v0.1.64 VERIFIED** (2026-11-06): release commit
+`6c9522f`, CI run 42337290468 fully green (all three jobs
+read directly), Release run 42338640517 success (3 Package
++ Publish). API verification: draft=false,
+`/releases/latest` = v0.1.64, exactly 7 assets with the
+fixed ship-shape names. Linux tarball contents sit at the
+archive root; signature verified VALID with the committed
+public key and the tamper control (flipped byte) rejected.
+Local gate on the release tree: 969 tests passed, 0 failed
+(956 + 13 new: core date/collapse/detect-media/menu-label
+unit tests and 7 app source-scan guards). Acceptance of
+the ten fixes is Brandon's NVDA pass on v0.1.64.
