@@ -20,6 +20,7 @@ pub mod castupnp;
 pub mod castwire;
 pub mod chapters;
 pub mod chromium;
+pub mod chromium_v20;
 pub mod config;
 pub mod cookies;
 pub mod cookies_import;

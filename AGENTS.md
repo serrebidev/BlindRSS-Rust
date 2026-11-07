@@ -238,8 +238,11 @@ Python `core/casting.py`, in that order.
   and browser cookie import, mirroring the Python consent model:
   automatic import copies only clearance-shaped cookies; full-jar
   import happens only through the explicit user action. Chromium v20
-  app-bound cookies need the privileged component and remain a
-  documented non-port in PARITY.md.
+  app-bound cookies resolve through `chromium_v20.rs` (B17, landed
+  v0.1.66): pure-crypto key derivation, the Windows privileged helper
+  (SYSTEM impersonation, CNG flag-3 unwrap, a silent scheduled task
+  after one registration prompt, runas fallbacks) and VSS staging for
+  locked cookie databases.
 - `browser.rs` / `captcha.rs`: the warm-CDP Chromium fallback
   (Audit 8 Task 24), wired into refresh (`feeds.rs`), discovery
   and extraction (`extract.rs`) behind the
@@ -251,10 +254,10 @@ Python `core/casting.py`, in that order.
   challenge params, callback delivery, and zero requests when
   the solver is disabled, keyless or unconfigured. Solver keys,
   challenge params and tokens are never logged. Extraction's
-  TLS-impersonation stage is a seam in `extract.rs` pending a
-  supportable transport (B16, see PARITY.md) — certificate
-  validation is never weakened and wire UAs come only from
-  `user_agents`/`http`.
+  TLS-impersonation stage runs over wreq/BoringSSL through
+  `impersonate.rs` (B16, landed v0.1.65), in the extractor cascade
+  and as refresh's per-feed stage — certificate validation is never
+  weakened and wire UAs come only from `user_agents`/`http`.
 - `rules.rs`: the Filter Rules pipeline port (ordered rules, pure
   evaluation, one DB-writing apply step; the abstract "delete" action
   resolves through the delete behaviour exactly as in `db.rs` above).

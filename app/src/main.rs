@@ -3750,6 +3750,32 @@ fn main() {
         }
         std::process::exit(1);
     }
+    // Chromium v20 helper processes (B17; Python main.py's
+    // dispatch of the same flags): an elevated copy of
+    // this binary deriving App-Bound master keys, staging
+    // locked cookie databases through VSS, or serving the
+    // silent scheduled task. All exit before the GUI.
+    {
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        if args
+            .iter()
+            .any(|a| a == blindrss_core::chromium_v20::KEY_HELPER_FLAG)
+        {
+            std::process::exit(blindrss_core::chromium_v20::run_key_helper_cli(&args));
+        }
+        if args
+            .iter()
+            .any(|a| a == blindrss_core::chromium_v20::VSS_HELPER_FLAG)
+        {
+            std::process::exit(blindrss_core::chromium_v20::run_vss_copy_cli(&args));
+        }
+        if args
+            .iter()
+            .any(|a| a == blindrss_core::chromium_v20::ELEVATED_HELPER_FLAG)
+        {
+            std::process::exit(blindrss_core::chromium_v20::run_elevated_helper_cli());
+        }
+    }
     // Panics land in blindrss.log in the data dir instead of dying
     // silently (a screen reader user gets no console to read).
     std::panic::set_hook(Box::new(|info| {

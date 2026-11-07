@@ -540,14 +540,86 @@ pub fn auto_import_browser_profiles_with(
         let merged = merge_into_jar(&existing, records, now);
         std::fs::write(jar_path, merged).is_ok()
     };
-    for profile in chromium_profiles {
+    // B17 (Python import_chromium_cookies): resolve every
+    // candidate profile's v20 master key in ONE batched
+    // elevation before the loop, and stage locked cookie
+    // databases through the same elevation's VSS copy.
+    // Candidates are the profiles that pass the mtime
+    // gate below; fixture profiles carry no app-bound
+    // key, so tests never elevate.
+    let data_dir = jar_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_default();
+    let candidate = |profile: &crate::chromium::ChromiumProfile| -> bool {
+        let key = profile.cookie_db.to_string_lossy().to_string();
+        let previous = seen.get(&key).and_then(|v| v.as_f64()).unwrap_or(0.0);
+        profile.mtime > previous
+    };
+    let mut app_bound_map: Vec<(String, String)> = Vec::new();
+    for profile in chromium_profiles.iter().filter(|p| candidate(p)) {
+        let b64 = crate::chromium_v20::app_bound_key_b64(&profile.local_state);
+        if !b64.is_empty() {
+            app_bound_map.push((crate::chromium_v20::v20_fingerprint(&b64), b64));
+        }
+    }
+    let v20_resolution = crate::chromium_v20::resolve_master_keys(&app_bound_map, &data_dir, true);
+    let v20_key_for = |profile: &crate::chromium::ChromiumProfile| -> Option<&[u8; 32]> {
+        let b64 = crate::chromium_v20::app_bound_key_b64(&profile.local_state);
+        if b64.is_empty() {
+            None
+        } else {
+            v20_resolution
+                .keys
+                .get(&crate::chromium_v20::v20_fingerprint(&b64))
+        }
+    };
+    // Mutated only by the Windows VSS stage below.
+    #[allow(unused_mut)]
+    let mut staged_dbs: std::collections::HashMap<usize, PathBuf> =
+        std::collections::HashMap::new();
+    let mut staging_dir: Option<PathBuf> = None;
+    #[cfg(target_os = "windows")]
+    {
+        let locked: Vec<PathBuf> = chromium_profiles
+            .iter()
+            .filter(|p| candidate(p))
+            .filter(|p| crate::chromium_v20::is_locked_file(&p.cookie_db))
+            .map(|p| p.cookie_db.clone())
+            .collect();
+        if !locked.is_empty()
+            && let Ok((map, dir)) = crate::chromium_v20::run_elevated_vss_copy(&locked)
+        {
+            // `map` indexes into `locked`, whose order
+            // follows the profile list; translate back
+            // to profile indices.
+            let locked_indices: Vec<usize> = chromium_profiles
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| candidate(p))
+                .filter(|(_, p)| crate::chromium_v20::is_locked_file(&p.cookie_db))
+                .map(|(i, _)| i)
+                .collect();
+            for (locked_pos, staged_path) in map {
+                if let Some(profile_index) = locked_indices.get(locked_pos) {
+                    staged_dbs.insert(*profile_index, staged_path);
+                }
+            }
+            staging_dir = dir;
+        }
+    }
+    for (index, profile) in chromium_profiles.iter().enumerate() {
         let db_mtime = profile.mtime;
         let key = profile.cookie_db.to_string_lossy().to_string();
         let previous = seen.get(&key).and_then(|v| v.as_f64()).unwrap_or(0.0);
         if db_mtime <= previous {
             continue;
         }
-        let outcome = crate::chromium::read_profile_cookies(profile);
+        let outcome = crate::chromium::read_profile_cookies_resolved(
+            profile,
+            v20_key_for(profile),
+            staged_dbs.get(&index).map(|p| p.as_path()),
+        );
         if outcome.records.is_empty() {
             continue;
         }
@@ -574,6 +646,11 @@ pub fn auto_import_browser_profiles_with(
             seen.insert(key, serde_json::json!(db_mtime));
             changed = true;
         }
+    }
+    // The staged VSS copies are consumed; remove the
+    // staging directory (Python's caller contract).
+    if let Some(dir) = staging_dir.take() {
+        let _ = std::fs::remove_dir_all(&dir);
     }
     if full {
         for profile in firefox_profiles {

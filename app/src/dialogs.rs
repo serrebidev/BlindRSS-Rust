@@ -4180,8 +4180,18 @@ pub fn show_import_cookies(frame: &Frame, config_path: &Path) {
                 let mut records = Vec::new();
                 let mut skipped = 0usize;
                 let mut skipped_v20 = 0usize;
-                for p in &chosen {
-                    let outcome = chromium::read_profile_cookies(p);
+                // B17: one batched elevation resolves the
+                // chosen profiles' v20 keys and stages any
+                // locked databases (Python's import flow).
+                let data_dir = cfg_thread.parent().map(|d| d.to_path_buf()).unwrap_or_default();
+                let chosen_refs: Vec<&chromium::ChromiumProfile> = chosen.iter().collect();
+                let prep = blindrss_core::chromium_v20::prepare_v20_reads(&chosen_refs, &data_dir);
+                for (index, p) in chosen.iter().enumerate() {
+                    let outcome = chromium::read_profile_cookies_resolved(
+                        p,
+                        prep.key_for(p),
+                        prep.staged.get(&index).map(|s| s.as_path()),
+                    );
                     skipped += outcome.skipped;
                     skipped_v20 += outcome.skipped_v20;
                     // Pin this profile's clearance hosts to the
@@ -4203,6 +4213,7 @@ pub fn show_import_cookies(frame: &Frame, config_path: &Path) {
                     }
                     records.extend(outcome.records);
                 }
+                prep.cleanup();
                 let existing = std::fs::read_to_string(&jar_path).unwrap_or_default();
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -4238,7 +4249,7 @@ pub fn show_import_cookies(frame: &Frame, config_path: &Path) {
                 };
                 if skipped_v20 > 0 {
                     msg += &format!(
-                        " {skipped_v20} cookies use Chrome's app-bound (v20) encryption and cannot be read directly; export a cookies.txt from that browser and use the file import below."
+                        " {skipped_v20} cookies use Chrome's app-bound (v20) encryption and could not be read this time (their key elevation was cancelled or failed); try the import again and accept the Windows prompt, or export a cookies.txt from that browser and use the file import below."
                     );
                 }
                 let _ = tx.send(msg);

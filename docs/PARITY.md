@@ -6577,11 +6577,11 @@ are not plain "fixed":
   covers the same challenge/WAF shapes. Both land or stay
   pending together.
 - B17: the privileged Chromium v20 master-key resolution
-  (SYSTEM/CNG/UAC helper, VSS) is deliberately not built
-  — the plan reserved it for a separate design/review.
-  Everything non-privileged is ported; v20 rows are
-  counted and named in the dialog with the file-import
-  route.
+  (SYSTEM/CNG/UAC helper, VSS) — LANDED v0.1.66; see the
+  "## B17 landed" section at the end of this file. The
+  earlier "deliberately not built" disposition is
+  superseded by Brandon's 2026-11-06 finish-everything
+  order.
 - Task 20 deviation: local MP4/M4A/M4B embedded chapters
   are not ported (no MP4 chapter-atom reader exists in
   the tree; Python uses mutagen). ID3, Podcasting 2.0 and
@@ -7151,3 +7151,68 @@ and `refresh_never_mode_skips_the_impersonation_stage`
 (exactly one request reaches the server), plus
 `impersonated_fetch_bytes_returns_the_raw_body`.
 
+
+## B17 landed — privileged Chromium v20 helper (2026-11-06, shipped v0.1.66)
+
+Brandon's 2026-11-06 order ("Finish everything d16 d17, all the d's
+that are left") lifted the design-review reservation on B17. The
+full Python `core/chromium_cookies.py` design is ported in
+`crates/core/src/chromium_v20.rs`, wired into both import paths
+(`cookies_import.rs` automatic import and the explicit Import
+button in `app/src/dialogs.rs`), with the helper entry points
+dispatched early in `app/src/main.rs` before the GUI starts.
+
+What landed, against the Python spec:
+
+- Pure crypto, platform-free: the app-bound key blob parser
+  (`[u32 path_len][path][u32 content_len][content]`), all four
+  derivation shapes — raw 32-byte key (flag 0), flag 1 AES-256-GCM
+  with the static Chrome 127–132 key, flag 2 ChaCha20-Poly1305
+  with the static Chrome 133+ key, flag 3 domain-joined (CNG
+  decrypt of the wrapped AES key as SYSTEM, XOR with the static
+  key, AES-GCM unwrap) — and v20 cookie decryption with the
+  DB-version ≥24 SHA-256(domain) prefix strip. Decryption runs on
+  ring; the derivation is covered by `crates/core/tests/
+  chromium_v20.rs` (14 tests), including Python's real Chrome 130
+  flag-1 test vector end-to-end (blob → derived key) and
+  flag-2/flag-3 roundtrips sealed with the fixture crates.
+- Key cache at Python's location and shape:
+  `<data_dir>/chromium_v20_keys.json` maps sha256(b64) to the key
+  re-encrypted under user DPAPI with Python's entropy string;
+  writes are atomic (temp + rename). Resolution is cache-first
+  and batches every missing browser key into ONE elevation.
+- Windows elevation, Python's transport order: the silent
+  scheduled task (`BlindRSS Elevated Helper <sha256(exe)[:10]>`,
+  RunLevel Highest, registered once through a runas PowerShell
+  script that also unregisters stale sibling tasks) is tried
+  first; a response-file `error` is a hard failure with no
+  fallback (Python parity); a transport failure falls back to
+  the runas key helper; cancellation (error 1223) propagates as
+  cancelled and never falls back. The elevated body impersonates
+  SYSTEM (SeDebugPrivilege, candidate-process token search,
+  S-1-5-18 SID check), performs the double-DPAPI unwrap, and runs
+  the flag-3 CNG decrypt under that token.
+- VSS staging for locked cookie databases: the elevated helper
+  creates ClientAccessible shadow copies through WMI COM
+  (SWbemLocator, driven through a hand-rolled IDispatch layer —
+  deliberately not PowerShell, as in Python), copies the database
+  plus -wal/-shm, grants Users full control with icacls, and
+  deletes each shadow copy. Both import paths stage every locked
+  candidate profile in one elevation and read from the staged
+  copies; the staging directory is removed after the import.
+- The `skipped_v20` outcome now means the key could not be
+  resolved this time (elevation cancelled or failed); the import
+  dialog says so and points at retrying with the prompt accepted,
+  or the cookies.txt route.
+
+Shape notes (recorded, not gaps): the Rust helper is always the
+shipped-binary shape — Python's dev form (interpreter + script
+path) has no analogue and none is needed. Task staleness is
+checked by the current executable path appearing in the task's
+query XML, matching Python's comparison. The WMI/COM and
+elevation paths are compile-proven here (windows-gnu clippy zero
+with -D warnings; the Windows MSVC CI leg is the build arbiter)
+and unit-proven only in their pure parts; first-run acceptance —
+import from a real v20 Chrome profile on Brandon's machine, one
+registration prompt, silent task runs after — is Brandon's
+hands-on pass, as with every Windows-only surface in this port.

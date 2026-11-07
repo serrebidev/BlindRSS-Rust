@@ -1,15 +1,16 @@
-//! Chromium cookie import (port of Python core/chromium_cookies.py,
-//! the v10 half). Lists installed Chromium-family profiles, loads
+//! Chromium cookie import (port of Python core/chromium_cookies.py).
+//! Lists installed Chromium-family profiles, loads
 //! each profile's v10 key (Windows: DPAPI-unwrap of the Local State
 //! key, then AES-256-GCM; macOS: Keychain password + PBKDF2 into
 //! AES-128-CBC; Linux: the "peanuts" pre-keyring default), and reads
 //! decrypted cookies out of a temp copy of the profile's SQLite DB.
 //!
-//! NOT ported: the v20 app-bound path. Python resolves it through
-//! SYSTEM impersonation, a CNG machine key and a UAC-elevated helper
-//! process; the Rust app ships no elevation machinery, so v20 rows
-//! are counted as skipped instead of decrypted. v10 remains the
-//! default cookie scheme for non-domain-joined installs.
+//! The v20 App-Bound path is ported in `chromium_v20.rs` (B17):
+//! master keys resolve from the DPAPI-protected cache or one
+//! batched elevation (silent scheduled task, runas fallback),
+//! and locked databases are staged through the same elevation's
+//! Volume Shadow Copy stage. Rows whose key cannot be resolved
+//! are counted as skipped_v20 instead of decrypted.
 
 use crate::cookies::Cookie;
 use std::path::{Path, PathBuf};
@@ -367,7 +368,86 @@ fn load_v10_key_windows(local_state: &Path) -> Option<V10Key> {
 }
 
 #[cfg(target_os = "windows")]
-fn dpapi_unprotect(blob: &[u8]) -> Option<Vec<u8>> {
+pub(crate) fn dpapi_protect(blob: &[u8], description: &str) -> Option<Vec<u8>> {
+    use std::ffi::c_void;
+    use std::sync::OnceLock;
+
+    #[repr(C)]
+    struct DataBlob {
+        size: u32,
+        data: *mut u8,
+    }
+    type CryptProtectData = unsafe extern "system" fn(
+        *const DataBlob,
+        *const u16,
+        *const DataBlob,
+        *const c_void,
+        *const c_void,
+        u32,
+        *mut DataBlob,
+    ) -> i32;
+    type LocalFree = unsafe extern "system" fn(*mut c_void) -> *mut c_void;
+
+    unsafe extern "system" {
+        fn LoadLibraryW(name: *const u16) -> usize;
+        fn GetProcAddress(module: usize, name: *const u8) -> usize;
+    }
+    fn proc<T>(module: usize, name: &str) -> Option<T> {
+        let mut buf = name.as_bytes().to_vec();
+        buf.push(0);
+        let addr = unsafe { GetProcAddress(module, buf.as_ptr()) };
+        if addr == 0 {
+            None
+        } else {
+            Some(unsafe { std::mem::transmute_copy(&addr) })
+        }
+    }
+    static CRYPT32: OnceLock<usize> = OnceLock::new();
+    static KERNEL32: OnceLock<usize> = OnceLock::new();
+    let wide = |s: &str| -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() };
+    let crypt = *CRYPT32.get_or_init(|| unsafe { LoadLibraryW(wide("crypt32.dll").as_ptr()) });
+    let kern = *KERNEL32.get_or_init(|| unsafe { LoadLibraryW(wide("kernel32.dll").as_ptr()) });
+    if crypt == 0 || kern == 0 {
+        return None;
+    }
+    let protect: CryptProtectData = proc(crypt, "CryptProtectData")?;
+    let local_free: LocalFree = proc(kern, "LocalFree")?;
+    let input = DataBlob {
+        size: blob.len() as u32,
+        data: blob.as_ptr() as *mut u8,
+    };
+    let mut output = DataBlob {
+        size: 0,
+        data: std::ptr::null_mut(),
+    };
+    let desc = wide(description);
+    let ok = unsafe {
+        protect(
+            &input,
+            if description.is_empty() {
+                std::ptr::null()
+            } else {
+                desc.as_ptr()
+            },
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+            &mut output,
+        )
+    };
+    if ok == 0 || output.data.is_null() {
+        return None;
+    }
+    let out = unsafe { std::slice::from_raw_parts(output.data, output.size as usize).to_vec() };
+    unsafe {
+        local_free(output.data as *mut c_void);
+    }
+    Some(out)
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn dpapi_unprotect(blob: &[u8]) -> Option<Vec<u8>> {
     use std::ffi::c_void;
     use std::sync::OnceLock;
 
@@ -441,11 +521,27 @@ fn dpapi_unprotect(blob: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// Decrypt one Chromium encrypted_value (Python's
-/// decrypt_cookie_value for the v10 scheme). v20 returns None —
-/// counted as skipped by callers.
+/// decrypt_cookie_value for the v10 scheme). v20 returns
+/// None here — use `decrypt_cookie_value_with_v20` with a
+/// resolved master key (B17, chromium_v20.rs).
 pub fn decrypt_cookie_value(
     encrypted: &[u8],
     key: Option<&V10Key>,
+    strip_domain_hash: bool,
+) -> Option<Vec<u8>> {
+    decrypt_cookie_value_with_v20(encrypted, key, None, strip_domain_hash)
+}
+
+/// Python's full `decrypt_cookie_value`: v10 rows use
+/// the profile key, v20 rows the App-Bound master key
+/// (AES-256-GCM in both cases once the v10 key is the
+/// GCM kind). Returns None when the value cannot be
+/// decrypted (unknown prefix, missing key, bad tag), so
+/// callers skip the row rather than crash.
+pub fn decrypt_cookie_value_with_v20(
+    encrypted: &[u8],
+    key: Option<&V10Key>,
+    v20_key: Option<&[u8; 32]>,
     strip_domain_hash: bool,
 ) -> Option<Vec<u8>> {
     if encrypted.is_empty() {
@@ -453,7 +549,15 @@ pub fn decrypt_cookie_value(
     }
     let prefix = &encrypted[..3.min(encrypted.len())];
     if prefix == b"v20" {
-        return None;
+        let key = v20_key?;
+        if encrypted.len() < 3 + 12 + 16 + 1 {
+            return None;
+        }
+        let plain = decrypt_gcm(key, &encrypted[3..15], &encrypted[15..])?;
+        if strip_domain_hash && plain.len() > DOMAIN_HASH_LEN {
+            return Some(plain[DOMAIN_HASH_LEN..].to_vec());
+        }
+        return Some(plain);
     }
     if prefix != b"v10" {
         return None;
@@ -550,10 +654,11 @@ pub struct ReadOutcome {
     pub records: Vec<JarRecord>,
     pub skipped: usize,
     /// Rows skipped because they use Chromium's v20 app-bound
-    /// encryption (Audit 8 B17): readable only through the
-    /// privileged component Python uses, which this port does not
-    /// ship — counted separately so callers can say so honestly
-    /// instead of folding them into generic failures.
+    /// encryption and no master key resolved for the profile
+    /// (B17: cache miss plus a failed or cancelled elevation,
+    /// or a non-Windows platform) — counted separately so
+    /// callers can say so honestly instead of folding them
+    /// into generic failures.
     pub skipped_v20: usize,
 }
 
@@ -579,6 +684,17 @@ pub(crate) fn copy_with_retries(src: &Path, dst: &Path) -> Result<(), String> {
 
 /// Read + decrypt one profile's cookie DB (Python's read_cookie_db).
 pub fn read_cookie_db(db_path: &Path, key: Option<&V10Key>) -> Result<ReadOutcome, String> {
+    read_cookie_db_with_v20(db_path, key, None)
+}
+
+/// As `read_cookie_db`, with the profile's resolved v20
+/// App-Bound master key (B17) so app-bound rows decrypt
+/// instead of counting as skipped.
+pub fn read_cookie_db_with_v20(
+    db_path: &Path,
+    key: Option<&V10Key>,
+    v20_key: Option<&[u8; 32]>,
+) -> Result<ReadOutcome, String> {
     if !db_path.is_file() {
         return Err("cookies database not found".to_string());
     }
@@ -592,7 +708,7 @@ pub fn read_cookie_db(db_path: &Path, key: Option<&V10Key>) -> Result<ReadOutcom
         uuid::Uuid::new_v4().simple()
     ));
     std::fs::create_dir_all(&tmp_dir).map_err(|e| e.to_string())?;
-    let result = read_cookie_db_inner(db_path, key, &tmp_dir);
+    let result = read_cookie_db_inner(db_path, key, v20_key, &tmp_dir);
     let _ = std::fs::remove_dir_all(&tmp_dir);
     result
 }
@@ -600,6 +716,7 @@ pub fn read_cookie_db(db_path: &Path, key: Option<&V10Key>) -> Result<ReadOutcom
 fn read_cookie_db_inner(
     db_path: &Path,
     key: Option<&V10Key>,
+    v20_key: Option<&[u8; 32]>,
     tmp_dir: &Path,
 ) -> Result<ReadOutcome, String> {
     let dst = tmp_dir.join("Cookies");
@@ -651,7 +768,7 @@ fn read_cookie_db_inner(
         let value = if !value.is_empty() && encrypted.is_empty() {
             value
         } else {
-            match decrypt_cookie_value(&encrypted, key, strip_hash) {
+            match decrypt_cookie_value_with_v20(&encrypted, key, v20_key, strip_hash) {
                 Some(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
                 None => {
                     if encrypted.starts_with(b"v20") {
@@ -692,11 +809,23 @@ fn read_cookie_db_inner(
 
 /// Import one profile: load its key, read its DB.
 pub fn read_profile_cookies(profile: &ChromiumProfile) -> ReadOutcome {
+    read_profile_cookies_resolved(profile, None, None)
+}
+
+/// As `read_profile_cookies`, with the profile's resolved
+/// v20 master key (B17) and an optional staged database
+/// path (the VSS copy of a locked DB).
+pub fn read_profile_cookies_resolved(
+    profile: &ChromiumProfile,
+    v20_key: Option<&[u8; 32]>,
+    db_override: Option<&Path>,
+) -> ReadOutcome {
     let key = load_v10_key(
         &profile.local_state,
         browser_key_for_label(&profile.browser),
     );
-    match read_cookie_db(&profile.cookie_db, key.as_ref()) {
+    let db_path = db_override.unwrap_or(&profile.cookie_db);
+    match read_cookie_db_with_v20(db_path, key.as_ref(), v20_key) {
         Ok(outcome) => outcome,
         Err(_) => ReadOutcome {
             records: Vec::new(),

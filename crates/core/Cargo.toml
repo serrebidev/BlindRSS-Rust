@@ -41,3 +41,8 @@ tokio = { version = "1", features = ["rt", "net", "time"] }
 [dev-dependencies]
 rusqlite = { version = "0.40", features = ["bundled"] }
 ring = "0.17"
+# B17 test fixtures: seal the Python ground-truth vectors
+# the production AEAD code must open (production decrypts
+# via ring only).
+aes-gcm = "0.10"
+chacha20poly1305 = "0.10"
