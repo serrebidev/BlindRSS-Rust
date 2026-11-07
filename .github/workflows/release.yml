@@ -238,6 +238,9 @@ jobs:
     needs: package
     runs-on: ubuntu-latest
     steps:
+      # CHANGELOG.md at the tag supplies the release notes.
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
@@ -255,6 +258,36 @@ jobs:
       - name: Checksums
         run: cd artifacts && sha256sum *.zip *.tar.gz *.dmg *.minisig > SHA256SUMS
 
+      # The release body is the tag's section of CHANGELOG.md
+      # (BlindRadio's rule). A missing section fails the
+      # publish instead of shipping GitHub's auto-generated
+      # compare link as the notes.
+      - name: Extract release notes from CHANGELOG.md
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          python3 - "$TAG" <<'PY'
+          import os, sys
+          version = sys.argv[1].lstrip("v")
+          head = f"## {version}"
+          notes, inside = [], False
+          for line in open("CHANGELOG.md").read().splitlines():
+              if line.startswith("## "):
+                  inside = line.strip() == head
+                  if inside:
+                      continue
+                  if notes:
+                      break
+              if inside:
+                  notes.append(line)
+          notes = "\n".join(notes).strip()
+          if not notes:
+              sys.exit(f"no {head} section in CHANGELOG.md")
+          with open(os.path.join(os.environ["RUNNER_TEMP"], "notes.md"), "w") as f:
+              f.write(notes + "\n")
+          PY
+
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
@@ -264,4 +297,4 @@ jobs:
             artifacts/*.dmg
             artifacts/*.minisig
             artifacts/SHA256SUMS
-          generate_release_notes: true
+          body_path: ${{ runner.temp }}/notes.md

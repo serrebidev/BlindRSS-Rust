@@ -7502,3 +7502,35 @@ while a resume seek is pending; the port's seek verifier
 is a separate bounded machine designed around
 observation ticks, and it inherits the 280 ms cadence
 whenever Skip Silence is on. Not adopted.
+
+## Release notes + Detect Audio row refresh (2026-11-07, Brandon's order)
+
+Brandon, updating 0.1.66 → 0.1.67: the updater showed only "Full
+Changelog: https://github.com/serrebidev/BlindRSS-Rust/compare/v0.1.66...v0.1.67"
+— the Publish job used softprops/action-gh-release with
+`generate_release_notes: true`, so GitHub's auto-generated compare text
+was the whole body, and ship-shape's update dialog displays that body.
+BlindRadio's mechanism is ported: a `CHANGELOG.md` at the repo root
+holds one human-readable `## X.Y.Z` section per release (backfilled
+0.1.55–0.1.68 individually, 0.1.0–0.1.54 combined); the Publish job now
+checks out the tag, extracts that tag's section with the same Python
+loop BlindRadio's workflow uses, fails the publish when the section is
+missing, and passes the text as the release `body_path`. The published
+v0.1.64–v0.1.67 release bodies were replaced with their CHANGELOG
+sections the same day, so the updater shows real notes immediately.
+
+Detect Audio focus bug (Brandon, same report): on a successful
+detection the completion handler called `refill_articles`, which
+rebuilds every row and drops the list's selection and focus, leaving
+the user on the first article of the folder to hunt for the article
+manually. Python's `on_detect_audio` never refills: it persists the
+media, invalidates the media-column label, and refreshes only that
+article's row (`_refresh_article_in_list`). The handler now matches:
+after the in-memory row update it rewrites only that row's Media cell
+in place (`set_item_text_by_column` at `state.media_column`, label
+from `row_annotations.media_for`, which computes from the article
+itself). Guard test `detect_audio_updates_the_row_in_place`: the
+AudioDetected handler window must not contain `refill_articles` and
+must contain the in-place cell write. Deviation note: under a
+"no media" media filter the row now stays visible until the next
+refill, exactly as Python's in-place refresh leaves it.

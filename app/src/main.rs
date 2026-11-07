@@ -11255,7 +11255,22 @@ fn main() {
                                     row.media_url = Some(media_url);
                                     row.media_type = media_type;
                                 }
-                                refill_articles(&mut st, &list);
+                                // Python refreshes just this row
+                                // (_refresh_article_in_list). A full
+                                // refill rebuilds every row, drops
+                                // the list's selection and focus,
+                                // and leaves the user back on the
+                                // first article of the folder,
+                                // hunting for the article the audio
+                                // was just attached to.
+                                if let Some(idx) =
+                                    st.articles.iter().position(|a| a.id == article_id)
+                                    && let Some(mcol) = st.media_column
+                                {
+                                    let media =
+                                        st.row_annotations.media_for(&st.articles[idx]);
+                                    list.set_item_text_by_column(idx as i64, mcol as i32, &media);
+                                }
                                 frame_tick.set_status_text("Audio detected and added", 0);
                                 announce("general", "Audio detected and added");
                             }
@@ -11835,6 +11850,31 @@ mod ui_parity_tests {
         assert!(
             window.contains("focus_first_row_if_unvisited(list)"),
             "render_refill_rows no longer focuses the first row"
+        );
+    }
+
+    #[test]
+    fn detect_audio_updates_the_row_in_place() {
+        // Brandon's report (2026-11-07): when Detect Audio
+        // attached audio, the completion handler refilled the
+        // whole list, which dropped the selection and focus
+        // back to the first article of the folder. Python
+        // refreshes only the article's own row
+        // (_refresh_article_in_list) — the port must update
+        // the row's Media cell in place and never refill here.
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let main = std::fs::read_to_string(src_dir.join("main.rs")).unwrap();
+        let start = main
+            .find("Ok(RefreshMsg::AudioDetected(article_id, found))")
+            .expect("AudioDetected handler missing");
+        let window = &main[start..(start + 3000).min(main.len())];
+        assert!(
+            !window.contains("refill_articles"),
+            "AudioDetected handler refills the list again"
+        );
+        assert!(
+            window.contains("set_item_text_by_column"),
+            "AudioDetected handler no longer updates the row in place"
         );
     }
 
