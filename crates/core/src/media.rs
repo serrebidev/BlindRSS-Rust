@@ -713,6 +713,68 @@ pub fn resolve_for_play(
     Err("Article has no playable media".to_string())
 }
 
+/// The MIME type Python's `detect_media` assigns from a yt-dlp
+/// `ext` value.
+fn ytdlp_ext_media_type(ext: &str) -> &'static str {
+    match ext {
+        "mp3" => "audio/mpeg",
+        "m4a" => "audio/mp4",
+        "flac" => "audio/flac",
+        "mp4" => "video/mp4",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Manual audio detection for one article (Python
+/// `core/discovery.py::detect_media`, the pipeline behind the
+/// Detect Audio command): publisher-specific routes first —
+/// Sky podcast pages, then NPR's embed-player route — then
+/// yt-dlp's `--dump-json` with the configured cookie source.
+/// Feed entries for these publishers ship no enclosure, so this
+/// is the only path that finds their audio. Runs on a worker
+/// thread: it performs network requests and runs yt-dlp.
+pub fn detect_media(
+    url: &str,
+    title: &str,
+    content_hint: Option<&str>,
+) -> Option<(String, Option<String>)> {
+    if url.is_empty() {
+        return None;
+    }
+    if let Some((u, t)) = crate::sources::sky_podcast_audio(url, title, content_hint.unwrap_or(""))
+    {
+        return Some((u, Some(t)));
+    }
+    if crate::sources::is_npr_url(url)
+        && let Some((u, t)) = crate::sources::npr_audio(url)
+    {
+        return Some((u, Some(t)));
+    }
+    let exe = find_ytdlp()?;
+    let mut args: Vec<String> = vec!["--dump-json".into(), "--no-playlist".into()];
+    if let Some(source) = crate::ytdlp_recovery::cookie_sources().into_iter().next() {
+        args.push("--cookies-from-browser".into());
+        args.push(source);
+    }
+    args.push(url.to_string());
+    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let run =
+        crate::dependency::run_tool(&exe, &arg_refs, std::time::Duration::from_secs(20)).ok()?;
+    if !run.success {
+        return None;
+    }
+    let data: serde_json::Value = serde_json::from_str(&run.stdout).ok()?;
+    let media_url = data.get("url").and_then(|v| v.as_str())?;
+    if media_url.is_empty() {
+        return None;
+    }
+    let ext = data.get("ext").and_then(|v| v.as_str()).unwrap_or("");
+    Some((
+        media_url.to_string(),
+        Some(ytdlp_ext_media_type(ext).to_string()),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -721,6 +783,19 @@ mod tests {
     // live here covered the removed pure `resolve_ytdlp` helper.
     // Precedence is now `dependency::find_tool`'s and is covered
     // in crates/core/tests/dependency_parity.rs (Audit 8 Task 23).
+
+    #[test]
+    fn detect_media_ytdlp_ext_types_match_python() {
+        assert_eq!(super::ytdlp_ext_media_type("mp3"), "audio/mpeg");
+        assert_eq!(super::ytdlp_ext_media_type("m4a"), "audio/mp4");
+        assert_eq!(super::ytdlp_ext_media_type("flac"), "audio/flac");
+        assert_eq!(super::ytdlp_ext_media_type("mp4"), "video/mp4");
+        assert_eq!(
+            super::ytdlp_ext_media_type("webm"),
+            "application/octet-stream"
+        );
+        assert_eq!(super::ytdlp_ext_media_type(""), "application/octet-stream");
+    }
 
     #[test]
     fn hls_and_dash_enclosures_are_playable() {

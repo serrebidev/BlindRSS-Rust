@@ -6804,3 +6804,183 @@ fixed ship-shape names. Linux tarball contents sit at the
 archive root; signature verified VALID with the committed
 public key and the tamper control (flipped byte) rejected.
 Local gate on the release tree: 956 tests passed, 0 failed.
+
+## User reports batch (2026-11-06, Brandon's hands-on reports against v0.1.63)
+
+Brandon filed ten reports from his own NVDA use and ordered
+the whole batch brainstormed, fixed, committed and released
+("I want everything brainstorm fix and commit and release").
+Method per his stop-and-think directive: Python is the spec;
+every root cause below was read from both sources before any
+edit. Shipped as v0.1.64.
+
+1. **Ctrl+Up/Down did nothing in the article text area.**
+   Python's `on_content_key_down` never special-cases the
+   keys; its readers are all TE_RICH2 (mainframe.py:6032,
+   article_window.py:67, help_viewer.py:123), so the native
+   RichEdit paragraph movement is the behavior. The port
+   built plain MultiLine|ReadOnly controls at all three
+   sites. Fix: `TextCtrlStyle::Rich2` added at the main
+   reader, the article window reader and the help reader.
+   Guarded by `readers_use_rich2_so_ctrl_arrows_move_by_paragraph`.
+
+2. **No author/date/publisher header; title ran straight
+   into the body.** Python's selection pane composes
+   title + "Date:" (humanized) + "Author:" + "Link:" + a
+   40-dash rule + blank line, and its full-text render
+   composes "Title:" + "Author:" + blank line over the
+   whitespace-normalized body (article_extractor.py
+   `_render`). There is NO "Source:" line in either Python
+   composition — none was invented. The port composed
+   `"{title}\n\n{body}"` everywhere. Fix: core ports of
+   `humanize_article_date` (utils.py:1501) and
+   `collapse_blank_lines` (see 3), app helpers
+   `selection_reader_text` / `fulltext_reader_text`, applied
+   at every reader fill site (selection, cached full text,
+   translation result, extractor result, YouTube full text,
+   article-window load completion). The article VERSIONS
+   dialog composition was left unchanged (not a reported
+   surface). Deviation: the local UTC offset used for the
+   absolute Date line is today's offset, not the offset in
+   effect on the article's own date; across a DST boundary
+   the rendered absolute time can be off by one hour.
+
+3. **Blank lines between paragraphs.** Python's
+   `collapse_blank_lines` (utils.py:549 — "A screen reader
+   stops on every one of those blank lines") drops empty
+   lines at its render points. The port never collapsed.
+   Fix: exact core port in postprocess.rs, applied inside
+   both composition helpers, matching Python's application
+   points.
+
+4. **Focus trapped on the Add Feed button after Alt+Tab;
+   Tab/Shift+Tab could not leave; restart only.** Mechanism
+   NOT proven from source: the frame CHAR_HOOK passes Tab
+   through, and no code path was found that swallows it.
+   Structural divergence fixed: Python has no button row at
+   all (Add Feed is menu-only); the port's ~23 buttons and
+   the search box were direct children of the frame, and a
+   wxFrame is not a tab-navigation container the way a
+   wxPanel is. The buttons and search controls now live on
+   a dedicated `btn_panel` (same controls, order, labels,
+   position). Whether this cures the trap on Brandon's
+   machine is decided by his retest, not by this record.
+
+5. **Menu shortcuts not announced.** Proven: Python routes
+   registry items through `_append_shortcut_menu_item`,
+   whose label is the binding rendered as TEXT —
+   `"Add Feed (Ctrl+N)"` — deliberately not a `\t`
+   accelerator (dispatch is the global char hook; a native
+   accelerator would double-fire), re-rendered by
+   `_refresh_shortcut_menu_labels` after binding edits.
+   The port had the binding and the dispatch but never the
+   label rendering. Fix: core `shortcuts::menu_item_label`
+   + app `refresh_shortcut_menu_labels`, a post-build pass
+   over `shortcut_menu_id` mappings via
+   `MenuBar::find_item`; base labels captured once in
+   `State.menu_label_bases`; called after the menu bar is
+   set and again when the shortcuts dialog closes.
+   Simplification vs Python: mnemonic re-derivation is
+   skipped — base labels are never regenerated, so the
+   captured base keeps its original mnemonic.
+
+6. **PowerShell window flashed on failed refresh, landing
+   in NVDA's speech history.** Proven chain:
+   `refresh_side_effects` → `play_sound_file` spawned
+   `powershell` (SoundPlayer script) with no
+   CREATE_NO_WINDOW; the app is windows_subsystem, so the
+   console app flashed a console window and stole focus.
+   Python plays in-process (`wx.adv.Sound`), and every
+   Python PowerShell spawn carries CREATE_NO_WINDOW with
+   the comment that a console window "can take focus from
+   a screen reader". Fix: `play_sound_file` now plays
+   in-process via wxdragon `Sound` on all platforms (the
+   afplay/paplay branches are gone too), and
+   CREATE_NO_WINDOW was added at the three remaining spawn
+   sites that lacked it: core `windows_shortcuts.rs`
+   run_powershell, app settings.rs test-notification
+   balloon, core `dependency.rs` spawn_tool (yt-dlp /
+   ffmpeg / ffprobe launches).
+
+7. **Uncategorized sat right after Favorites.** Proven:
+   the port appended it before the sorted categories.
+   Python treats it as an ordinary member of the sorted
+   category set (no pin); Brandon directed the literal
+   reading — bottom of the tree. Fix: the Uncategorized
+   node is appended last, after categories,
+   Recommendations and Smart Folders; its unread label and
+   feed filing are unchanged. Adjacent observations NOT
+   acted on: the port has no "All Articles" / "Deleted
+   Articles" root nodes (Python has both; All Articles is
+   exposed via the View filter).
+
+8. **Tabbing into a folder's list: first article not
+   selected/read; NVDA said only "Articles list".** Proven:
+   Python has an exact function for this exact symptom,
+   `_focus_first_row_if_unvisited` (mainframe.py:10843,
+   "With no focused row, Tab into the list made NVDA say
+   only 'list'"). It FOCUSES row 0 (never selects —
+   selecting loads the article), and skips when a selection
+   is remembered, the list is empty, a row is already
+   selected, or the list itself has focus (double-read).
+   The port's `render_refill_rows` set no focused item and
+   the list had no focus handling. Fix: the port
+   `focus_first_row_if_unvisited`, called at the end of
+   every refill. One deliberate guard difference: the
+   `selected_article_id` check is covered by the widget
+   selection check (restores set widget selection; a stale
+   remembered index from a previous view must not block
+   the placeholder in a new view).
+
+9. **NPR feeds arrive with no audio (Morning Edition, All
+   Things Considered; feeds.npr.org/3/rss.xml carries zero
+   enclosures — detection must come from the article
+   side).** Two findings. (a) The refresh-time attach:
+   story-id extraction, embed-player URL, the ondemand MP3
+   regex and unescaping were all verified correct against
+   the live embed page, and the compiled path fails in
+   this sandbox only at TLS (`UnknownIssuer` — the egress
+   proxy re-signs certificates; the same artifact as the
+   B16 spike's first failure). Its behavior on Brandon's
+   machine is unproven either way; no refresh-path change
+   was made on unverifiable evidence. (b) PROVEN
+   divergence, the manual path Brandon named: the Detect
+   Audio command fetched the article page and ran only the
+   in-page scan — no NPR embed-player step, which cannot
+   work (the story page is TollBit-gated; the MP3 lives in
+   the embed player). Fix: core `media::detect_media`
+   ports Python's `discovery.detect_media` order — Sky,
+   then NPR embed player, then yt-dlp `--dump-json` with
+   the first cookie source — and the command's worker now
+   calls it. Simplification: Python's optional
+   cookie-profile argument is not reproduced
+   (`cookie_sources()` returns plain source names).
+   Untouched: `resolve_for_play` also lacks an NPR embed
+   step, but Python's player path was not proven to call
+   detect_media, so no change was made there.
+
+10. **During playback, Ctrl+Left/Right (seek) and
+    Ctrl+Up/Down (volume) did nothing.** Proven: Python's
+    main frame routes these in its key handler
+    (mainframe.py ~3010): Ctrl-only arrows, skipped when a
+    text control or the rich view has focus, seek only
+    when media is loaded, volume whenever a player window
+    exists — deliberately NOT menu accelerators ("causes
+    double-seeks"). The player window's own handler exists
+    in the port, but the main frame's hook had no media
+    block at all. Fix: the block added to the main frame
+    CHAR_HOOK using core `media_arrow_action` with the
+    macOS-Alt variant off (Python's main-frame block
+    requires Ctrl; Alt lives in the player window),
+    routing to the one player session through
+    `player::dispatch_command`
+    (player.rewind/forward/volume_up/volume_down), with
+    the seek guard read from `player::progress_snapshot`.
+    Simplification: Python's hold-to-repeat gate tames
+    Windows key-repeat randomness; the port relies on
+    wx autorepeat re-firing CHAR_HOOK, one step per event,
+    like the player window's existing handler.
+
+B16 status unchanged by this batch (wiring still the next
+step; the spike's local proof stands). Owner-decision
+items unchanged.

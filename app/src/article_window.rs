@@ -7,7 +7,15 @@ use wxdragon::prelude::*;
 use wxdragon::widgets::webview::{WebView, WebViewBackend};
 
 pub fn open(title: &str, body: &str, url: Option<&str>) {
-    open_impl(title, body, url, None, false, false);
+    open_impl(title, body, url, None, false, false, "");
+}
+
+/// Open for a stored article whose author is known (the main
+/// window's Open Article / deleted-article paths): the author
+/// feeds the full-text render header, as Python's
+/// `render_full_article(fallback_author=...)` does.
+pub fn open_article(title: &str, body: &str, url: Option<&str>, author: &str) {
+    open_impl(title, body, url, None, false, false, author);
 }
 
 /// Open Article from URL (Python `gui/article_window.py`,
@@ -18,7 +26,15 @@ pub fn open(title: &str, body: &str, url: Option<&str>) {
 /// readable failure text in the reader instead of leaving it
 /// on "Loading article...".
 pub fn open_url(url: &str, rich: bool) {
-    open_impl(url, "Loading article...", Some(url), Some(rich), true, true);
+    open_impl(
+        url,
+        "Loading article...",
+        Some(url),
+        Some(rich),
+        true,
+        true,
+        "",
+    );
 }
 
 /// Python `core/open_article.py` `_reason_from`: one
@@ -133,6 +149,7 @@ fn open_impl(
     start_rich: Option<bool>,
     start_load: bool,
     translate_plain: bool,
+    author: &str,
 ) {
     let frame = Frame::builder()
         .with_title(&format!("BlindRSS - {title}"))
@@ -144,7 +161,7 @@ fn open_impl(
         .build();
     layout.add(&rich, 0, SizerFlag::All, 4);
     let reader = TextCtrl::builder(&frame)
-        .with_style(TextCtrlStyle::MultiLine | TextCtrlStyle::ReadOnly)
+        .with_style(TextCtrlStyle::MultiLine | TextCtrlStyle::ReadOnly | TextCtrlStyle::Rich2)
         .build();
     crate::msaa_names::set_name(&reader, &crate::tr("Article text"));
     reader.set_value(body);
@@ -370,6 +387,8 @@ fn open_impl(
     let timer = Box::leak(Box::new(Timer::new(&frame)));
     let source = url;
     let current_text_tick = current_text.clone();
+    let title_tick = title.to_string();
+    let author_tick = author.to_string();
     timer.on_tick(move |_| {
         while let Ok((token, html, result)) = rx.try_recv() {
             if token != generation.get() || html != rich.is_checked() {
@@ -393,7 +412,19 @@ fn open_impl(
                 }
                 Ok((page_title, text)) => {
                     *current_text_tick.borrow_mut() = text.clone();
-                    reader.set_value(&text);
+                    // The plain result is a full-text render:
+                    // it carries Python's Title:/Author: header
+                    // (render_full_article), not the bare body.
+                    let display_title = if page_title.is_empty() {
+                        title_tick.as_str()
+                    } else {
+                        page_title.as_str()
+                    };
+                    reader.set_value(&crate::fulltext_reader_text(
+                        display_title,
+                        &author_tick,
+                        &text,
+                    ));
                     if !page_title.is_empty() {
                         frame.set_title(&format!("BlindRSS - {page_title}"));
                     }

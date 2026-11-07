@@ -211,10 +211,14 @@ impl SettingsPage {
 fn test_notify() {
     #[cfg(target_os = "windows")]
     {
+        use std::os::windows::process::CommandExt as _;
         let script = "$n = New-Object System.Windows.Forms.NotifyIcon; $n.Icon = [System.Drawing.SystemIcons]::Information; $n.Visible = $true; $n.ShowBalloonTip(4000, 'BlindRSS', 'Test notification', [System.Windows.Forms.ToolTipIcon]::Info)";
-        let _ = std::process::Command::new("powershell")
-            .args(["-NoProfile", "-Command", script])
-            .spawn();
+        let mut cmd = std::process::Command::new("powershell");
+        cmd.args(["-NoProfile", "-Command", script]);
+        // CREATE_NO_WINDOW: never flash a console from a
+        // windowed app (it steals screen-reader focus).
+        cmd.creation_flags(0x0800_0000);
+        let _ = cmd.spawn();
     }
     #[cfg(target_os = "macos")]
     {

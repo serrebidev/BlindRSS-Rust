@@ -505,6 +505,19 @@ pub fn help_key_action(accel: &str, accel_map: &HashMap<String, String>) -> Help
     }
 }
 
+/// The label a menu item carries for a registry command
+/// (Python `_shortcut_menu_label`): the base label plus the
+/// binding rendered as a "(Ctrl+N)" text suffix, or the base
+/// label alone when the command is unbound. Deliberately NOT a
+/// native `\t` accelerator: registry shortcuts dispatch from the
+/// global char hook, and a native accelerator would double-fire.
+pub fn menu_item_label(base_label: &str, binding: Option<&str>) -> String {
+    match binding {
+        Some(accel) if !accel.is_empty() => format!("{base_label} ({accel})"),
+        _ => base_label.to_string(),
+    }
+}
+
 /// Commands that must not fire while an editable text field has
 /// focus (Python `_SHORTCUT_TEXT_GUARDED`): the transport keys
 /// and the Ctrl+digit filter shortcuts, which have always
@@ -557,4 +570,19 @@ pub fn fixed_key_rows() -> &'static [(&'static str, &'static str)] {
             "Cut / Copy / Paste / Select All in text fields",
         ),
     ]
+}
+
+#[cfg(test)]
+mod menu_label_tests {
+    use super::menu_item_label;
+
+    #[test]
+    fn menu_label_appends_binding_as_text_suffix() {
+        assert_eq!(
+            menu_item_label("&Add Feed", Some("Ctrl+N")),
+            "&Add Feed (Ctrl+N)"
+        );
+        assert_eq!(menu_item_label("&Add Feed", None), "&Add Feed");
+        assert_eq!(menu_item_label("&Add Feed", Some("")), "&Add Feed");
+    }
 }

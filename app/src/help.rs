@@ -100,7 +100,7 @@ pub fn show_help_topic(frame: &Frame, locale: &str, topic_id: Option<&str>) {
         list.append(&format!("{}{}", indent, crate::tr(title)));
     }
     let reader = TextCtrl::builder(&dialog)
-        .with_style(TextCtrlStyle::MultiLine | TextCtrlStyle::ReadOnly)
+        .with_style(TextCtrlStyle::MultiLine | TextCtrlStyle::ReadOnly | TextCtrlStyle::Rich2)
         .build();
     crate::msaa_names::set_name(&reader, &crate::tr("User guide text"));
     if rendered.text.is_empty() {

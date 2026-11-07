@@ -1066,38 +1066,118 @@ fn apply_http_config() {
     }
 }
 
-/// Play a sound file with the platform's command-line player
-/// (no audio dependency in the tree): PowerShell SoundPlayer
-/// on Windows, afplay on macOS, paplay/aplay on Linux.
+/// Play a sound file in-process (Python `_play_sound`:
+/// `wx.adv.Sound(path).Play(wx.adv.SOUND_ASYNC)`). The previous
+/// implementation spawned PowerShell on Windows to run
+/// SoundPlayer; powershell.exe is a console application and the
+/// app has no console, so every failure sound flashed a console
+/// window and stole focus — NVDA announced the powershell.exe
+/// window and kept it in its speech history.
 fn play_sound_file(path: &std::path::Path) {
     if !path.exists() {
         return;
     }
     let p = path.to_string_lossy().to_string();
-    #[cfg(target_os = "windows")]
-    {
-        let script = format!(
-            "(New-Object System.Media.SoundPlayer '{}').PlaySync()",
-            p.replace('\'', "''")
-        );
-        let _ = std::process::Command::new("powershell")
-            .args(["-NoProfile", "-Command", &script])
-            .spawn();
+    let sound = wxdragon::prelude::Sound::new(&p, false);
+    if sound.is_ok() {
+        sound.play(wxdragon::prelude::SoundFlags::Async);
     }
-    #[cfg(target_os = "macos")]
-    {
-        let _ = std::process::Command::new("afplay").arg(&p).spawn();
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        if std::process::Command::new("paplay")
-            .arg(&p)
-            .spawn()
-            .is_err()
-        {
-            let _ = std::process::Command::new("aplay").arg(&p).spawn();
-        }
-    }
+}
+
+/// Current unix time in seconds (0 when the clock is unusable).
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// The local UTC offset in seconds right now. Neither std nor
+/// the wxdragon surface used here exposes it, so it is derived
+/// by comparing the wall-clock fields wx reports for this
+/// instant against the unix clock. Python formats article dates
+/// with the offset in effect at the article's own date; across
+/// a DST boundary this value can differ by an hour (recorded in
+/// PARITY).
+fn local_utc_offset_secs() -> i64 {
+    let now = wxdragon::prelude::DateTime::now();
+    // Days from civil (Hinnant), matching core's conversion.
+    let (y, m, d) = (
+        i64::from(now.year()),
+        i64::from(now.month()),
+        i64::from(now.day()),
+    );
+    let yy = if m <= 2 { y - 1 } else { y };
+    let era = yy.div_euclid(400);
+    let yoe = yy - era * 400;
+    let mp = if m > 2 { m - 3 } else { m + 9 };
+    let days =
+        era * 146_097 + (yoe * 365 + yoe / 4 - yoe / 100 + (153 * mp + 2) / 5 + d - 1) - 719_468;
+    let pseudo = days * 86_400
+        + i64::from(now.hour()) * 3600
+        + i64::from(now.minute()) * 60
+        + i64::from(now.second());
+    let offset = pseudo - now_unix();
+    // Round to the nearest minute; real offsets are whole
+    // minutes and the two clocks are read a breath apart.
+    (offset / 60).clamp(-14 * 60, 14 * 60) * 60
+}
+
+/// The plain reader text for a selected article (Python
+/// `_update_content_view`'s plain path): the title, a
+/// Date/Author/Link header with the humanized date, a rule of
+/// 40 dashes, a blank line, then the feed body with blank lines
+/// collapsed (Python's `_reader_body` runs the body through
+/// `_strip_html`, which applies `collapse_blank_lines`).
+fn selection_reader_text(a: &blindrss_core::db::Article, body_text: &str) -> String {
+    let human = blindrss_core::postprocess::humanize_article_date(
+        a.date.as_deref().unwrap_or(""),
+        now_unix(),
+        local_utc_offset_secs(),
+    );
+    format!(
+        "{}\n{} {}\n{} {}\n{} {}\n{}\n\n{}",
+        a.title,
+        tr("Date:"),
+        human,
+        tr("Author:"),
+        a.author.as_deref().unwrap_or(""),
+        tr("Link:"),
+        a.url,
+        "-".repeat(40),
+        blindrss_core::postprocess::collapse_blank_lines(body_text),
+    )
+}
+
+/// The reader text for a full-text render (Python
+/// `render_full_article`'s `_render`): "Title:"/"Author:" lines
+/// with "(unknown)" fallbacks, a blank line, and the body with
+/// blank lines collapsed, whitespace-normalized, one trailing
+/// newline.
+pub(crate) fn fulltext_reader_text(title: &str, author: &str, body: &str) -> String {
+    let unknown = tr("(unknown)");
+    let title = title.trim();
+    let author = author.trim();
+    let composed = format!(
+        "{} {}\n{} {}\n\n{}",
+        tr("Title:"),
+        if title.is_empty() {
+            unknown.as_str()
+        } else {
+            title
+        },
+        tr("Author:"),
+        if author.is_empty() {
+            unknown.as_str()
+        } else {
+            author
+        },
+        blindrss_core::postprocess::collapse_blank_lines(body),
+    );
+    format!(
+        "{}\n",
+        blindrss_core::postprocess::normalize_whitespace(&composed)
+    )
 }
 
 /// Resolve a configured sound path ("sounds/refresh_complete.
@@ -1523,7 +1603,7 @@ fn rerender_current_article(
         .or_else(|| a.description.clone())
         .unwrap_or_else(|| "(no stored text)".to_string());
     let body = blindrss_core::extract::html_to_text_opts(&raw_body, keep_alt);
-    reader.set_value(&format!("{}\n\n{}", a.title, body));
+    reader.set_value(&selection_reader_text(&a, &body));
     if cfg.get_bool("full_text_rich_view", false)
         && let Some(wv) = rich_view.as_ref()
     {
@@ -1863,6 +1943,10 @@ struct State {
     /// runs it once for the node the user lands on instead of
     /// refilling for every node arrowed past.
     refill_pending: bool,
+    /// Base labels of registry-backed menu items, captured at
+    /// menu build so shortcut suffixes can be re-rendered when
+    /// bindings change (Python `_refresh_shortcut_menu_labels`).
+    menu_label_bases: std::collections::HashMap<i32, String>,
     /// Per-feed new articles for the running refresh
     /// (sounds/notifications at AllDone consume them): the
     /// notification-eligible articles themselves, so
@@ -2229,6 +2313,42 @@ fn shortcut_menu_id(command: &str) -> Option<i32> {
     })
 }
 
+/// Render the registry bindings into the main window's menu
+/// labels (Python `_refresh_shortcut_menu_labels`): each
+/// registry-backed item's label gains its live binding as a
+/// "(Ctrl+N)" text suffix, so screen readers announce the
+/// shortcut. The base label is captured on first sight and
+/// kept in `state.menu_label_bases`, so re-renders after a
+/// binding edit start from the clean label. Called once after
+/// the menu bar is built and again whenever the shortcuts
+/// dialog closes (Python re-renders on the same occasions).
+fn refresh_shortcut_menu_labels(frame: &Frame, state: &mut State) {
+    let Some(menubar) = frame.get_menu_bar() else {
+        return;
+    };
+    let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+    let bindings =
+        blindrss_core::shortcuts::effective(&blindrss_core::shortcuts::overrides_from_config(&cfg));
+    for command in blindrss_core::shortcuts::commands() {
+        let Some(id) = shortcut_menu_id(&command.id) else {
+            continue;
+        };
+        let Some(item) = menubar.find_item(id) else {
+            continue;
+        };
+        let base = state
+            .menu_label_bases
+            .entry(id)
+            .or_insert_with(|| item.get_label())
+            .clone();
+        let label = blindrss_core::shortcuts::menu_item_label(
+            &base,
+            bindings.get(&command.id).map(|s| s.as_str()),
+        );
+        item.set_label(&label);
+    }
+}
+
 fn selected_article_indices(list: &ListCtrl, state: &State) -> Vec<usize> {
     let mut indices = Vec::new();
     let mut index = list.get_first_selected_item();
@@ -2523,27 +2643,28 @@ fn rebuild_tree(state: &mut State, tree: &TreeCtrl) {
     tree.append_item_with_data(&root, "Favorites", "favorites:all".to_string(), None, None);
     // Uncategorized is a real node (Python's local provider):
     // feeds with no category — or carrying the sentinel — group
-    // under it, and selecting it lists only their articles.
+    // under it, and selecting it lists only their articles. The
+    // node itself is appended LAST, after every category and the
+    // Smart Folders root (owner's direction: it belongs at the
+    // bottom of the tree, not pinned under Favorites); only its
+    // label is computed here.
     let uncat_feeds: Vec<&Feed> = feeds
         .iter()
         .filter(|f| is_uncategorized_cat(f.category.as_deref()))
         .collect();
-    if !uncat_feeds.is_empty() {
+    let uncat_label: Option<String> = if uncat_feeds.is_empty() {
+        None
+    } else {
         let unread: i64 = uncat_feeds
             .iter()
             .map(|f| counts.get(&f.id).copied().unwrap_or(0))
             .sum();
-        let label = if unread > 0 {
+        Some(if unread > 0 {
             format!("Uncategorized ({unread})")
         } else {
             "Uncategorized".to_string()
-        };
-        if let Some(item) =
-            tree.append_item_with_data(&root, &label, "cat:Uncategorized".to_string(), None, None)
-        {
-            cat_items.insert("Uncategorized".to_string(), item);
-        }
-    }
+        })
+    };
     for path in &paths {
         let mut cur = String::new();
         for seg in path
@@ -2586,36 +2707,6 @@ fn rebuild_tree(state: &mut State, tree: &TreeCtrl) {
             }
         }
     }
-    for f in &feeds {
-        let label = feed_label(&counts, f);
-        let parent = if is_uncategorized_cat(f.category.as_deref()) {
-            cat_items
-                .get("Uncategorized")
-                .cloned()
-                .unwrap_or_else(|| root.clone())
-        } else {
-            f.category
-                .as_ref()
-                .and_then(|c| cat_items.get(c))
-                .cloned()
-                .unwrap_or_else(|| root.clone())
-        };
-        tree.append_item_with_data(&parent, &label, f.id.clone(), None, None);
-    }
-    // Expansion (Python issue #33): the user's explicit choices
-    // survive rebuilds; the configured default covers the rest.
-    for (path, item) in &cat_items {
-        let expanded = if state.collapsed_cats.contains(path) {
-            false
-        } else if state.expanded_cats.contains(path) {
-            true
-        } else {
-            expand_cats
-        };
-        if expanded {
-            tree.expand(item);
-        }
-    }
     // YouTube Recommendations virtual feed (the account
     // provider wrapper injects it whenever signed in AND a
     // recommendations snapshot exists — Python's _has_snapshot).
@@ -2646,6 +2737,45 @@ fn rebuild_tree(state: &mut State, tree: &TreeCtrl) {
         };
         for (id, name, _rule, _pos) in &folders {
             tree.append_item_with_data(&sf_root, name, format!("smart:{id}"), None, None);
+        }
+    }
+    // Uncategorized goes at the very bottom of the tree (see
+    // the label computation above), then the feeds are filed
+    // under their category nodes.
+    if let Some(label) = &uncat_label
+        && let Some(item) =
+            tree.append_item_with_data(&root, label, "cat:Uncategorized".to_string(), None, None)
+    {
+        cat_items.insert("Uncategorized".to_string(), item);
+    }
+    for f in &feeds {
+        let label = feed_label(&counts, f);
+        let parent = if is_uncategorized_cat(f.category.as_deref()) {
+            cat_items
+                .get("Uncategorized")
+                .cloned()
+                .unwrap_or_else(|| root.clone())
+        } else {
+            f.category
+                .as_ref()
+                .and_then(|c| cat_items.get(c))
+                .cloned()
+                .unwrap_or_else(|| root.clone())
+        };
+        tree.append_item_with_data(&parent, &label, f.id.clone(), None, None);
+    }
+    // Expansion (Python issue #33): the user's explicit choices
+    // survive rebuilds; the configured default covers the rest.
+    for (path, item) in &cat_items {
+        let expanded = if state.collapsed_cats.contains(path) {
+            false
+        } else if state.expanded_cats.contains(path) {
+            true
+        } else {
+            expand_cats
+        };
+        if expanded {
+            tree.expand(item);
         }
     }
     tree.expand(&root);
@@ -3389,6 +3519,41 @@ fn render_refill_rows(state: &mut State, list: &ListCtrl, loaded: Vec<Article>) 
         let at = state.articles.len() as i64;
         list.insert_item(at, &tr("Load more items (Enter)"), None);
     }
+    focus_first_row_if_unvisited(list);
+}
+
+/// Python `_focus_first_row_if_unvisited`: keep row 0 the
+/// list's focused row until a row is selected. With no focused
+/// row, Tab into the list makes NVDA say only "Articles list";
+/// with row 0 focused (NOT selected — selecting would load the
+/// article), the listview announces the row itself on entry.
+/// Set only while the list does NOT have keyboard focus (after
+/// a render): setting it from a focus handler fires a second
+/// item-focus event and NVDA reads the row twice. Skipped while
+/// a selection exists or a selected article is remembered (the
+/// restore path owns the focused row then). The placeholder
+/// focus is not a selection: command plumbing keys off
+/// `selected_article`, which only real selection events set —
+/// Python's `_user_focused_row` distinction.
+fn focus_first_row_if_unvisited(list: &ListCtrl) {
+    if list.get_item_count() <= 0 || list.get_first_selected_item() >= 0 {
+        return;
+    }
+    if list.has_focus() {
+        return;
+    }
+    let focused = list.get_next_item(
+        -1,
+        wxdragon::prelude::ListNextItemFlag::All,
+        wxdragon::prelude::ListItemState::Focused,
+    );
+    if focused != 0 {
+        list.set_item_state(
+            0,
+            wxdragon::prelude::ListItemState::Focused,
+            wxdragon::prelude::ListItemState::Focused,
+        );
+    }
 }
 
 /// UI language: config `language` ("auto"/missing = OS locale),
@@ -3808,43 +3973,74 @@ fn main() {
         }
         let tray = Rc::new(tray);
 
-        let add_btn = Button::builder(&frame).with_label("Add Feed...").build();
-        let remove_btn = Button::builder(&frame).with_label("Remove Feed").build();
-        let import_btn = Button::builder(&frame).with_label("Import OPML...").build();
-        let export_btn = Button::builder(&frame).with_label("Export OPML...").build();
-        let delete_btn = Button::builder(&frame).with_label("Delete Article").build();
-        let fav_btn = Button::builder(&frame)
+        // The button rows and search box live on their own
+        // panel, not directly on the frame: a wxPanel is the
+        // tab-navigation container, and buttons parented
+        // straight to the frame could trap keyboard focus
+        // (Tab/Shift+Tab stopped leaving the Add Feed button
+        // after Alt+Tab; only a restart recovered it). Same
+        // controls, same order, same labels — only the parent
+        // changes.
+        let btn_panel = Panel::builder(&frame).build();
+        let add_btn = Button::builder(&btn_panel)
+            .with_label("Add Feed...")
+            .build();
+        let remove_btn = Button::builder(&btn_panel)
+            .with_label("Remove Feed")
+            .build();
+        let import_btn = Button::builder(&btn_panel)
+            .with_label("Import OPML...")
+            .build();
+        let export_btn = Button::builder(&btn_panel)
+            .with_label("Export OPML...")
+            .build();
+        let delete_btn = Button::builder(&btn_panel)
+            .with_label("Delete Article")
+            .build();
+        let fav_btn = Button::builder(&btn_panel)
             .with_label("Toggle Favorite")
             .build();
-        let markall_btn = Button::builder(&frame).with_label("Mark All Read").build();
-        let deleted_btn = Button::builder(&frame).with_label("Deleted...").build();
-        let search_box = TextCtrl::builder(&frame)
+        let markall_btn = Button::builder(&btn_panel)
+            .with_label("Mark All Read")
+            .build();
+        let deleted_btn = Button::builder(&btn_panel).with_label("Deleted...").build();
+        let search_box = TextCtrl::builder(&btn_panel)
             .with_style(TextCtrlStyle::ProcessEnter)
             .build();
         msaa_names::set_name(&search_box, &tr("Search"));
-        let search_btn = Button::builder(&frame).with_label("Search").build();
-        let fulltext_btn = Button::builder(&frame).with_label("Read Full Text").build();
-        let toggle_read_btn = Button::builder(&frame).with_label("Toggle Read").build();
-        let edit_feed_btn = Button::builder(&frame).with_label("Edit Feed").build();
-        let rename_cat_btn = Button::builder(&frame)
+        let search_btn = Button::builder(&btn_panel).with_label("Search").build();
+        let fulltext_btn = Button::builder(&btn_panel)
+            .with_label("Read Full Text")
+            .build();
+        let toggle_read_btn = Button::builder(&btn_panel)
+            .with_label("Toggle Read")
+            .build();
+        let edit_feed_btn = Button::builder(&btn_panel).with_label("Edit Feed").build();
+        let rename_cat_btn = Button::builder(&btn_panel)
             .with_label("Rename Category")
             .build();
-        let set_cat_btn = Button::builder(&frame)
+        let set_cat_btn = Button::builder(&btn_panel)
             .with_label("Set Feed Category")
             .build();
-        let play_btn = Button::builder(&frame).with_label("Play Media").build();
-        let new_sf_btn = Button::builder(&frame)
+        let play_btn = Button::builder(&btn_panel).with_label("Play Media").build();
+        let new_sf_btn = Button::builder(&btn_panel)
             .with_label("New Smart Folder")
             .build();
-        let del_sf_btn = Button::builder(&frame)
+        let del_sf_btn = Button::builder(&btn_panel)
             .with_label("Delete Smart Folder")
             .build();
-        let download_btn = Button::builder(&frame).with_label("Download").build();
-        let cast_btn = Button::builder(&frame).with_label("Cast").build();
-        let settings_btn = Button::builder(&frame).with_label("Settings...").build();
-        let refresh_btn = Button::builder(&frame).with_label(&refresh_label).build();
-        let help_btn = Button::builder(&frame).with_label("Help").build();
-        let keys_btn = Button::builder(&frame).with_label("Shortcuts...").build();
+        let download_btn = Button::builder(&btn_panel).with_label("Download").build();
+        let cast_btn = Button::builder(&btn_panel).with_label("Cast").build();
+        let settings_btn = Button::builder(&btn_panel)
+            .with_label("Settings...")
+            .build();
+        let refresh_btn = Button::builder(&btn_panel)
+            .with_label(&refresh_label)
+            .build();
+        let help_btn = Button::builder(&btn_panel).with_label("Help").build();
+        let keys_btn = Button::builder(&btn_panel)
+            .with_label("Shortcuts...")
+            .build();
 
         let (tx, rx): (Sender<RefreshMsg>, Receiver<RefreshMsg>) = channel();
         let splitter = SplitterWindow::builder(&frame).build();
@@ -3855,7 +4051,7 @@ fn main() {
             .with_style(ListCtrlStyle::Report)
             .build();
         let reader = TextCtrl::builder(&right)
-            .with_style(TextCtrlStyle::MultiLine | TextCtrlStyle::ReadOnly)
+            .with_style(TextCtrlStyle::MultiLine | TextCtrlStyle::ReadOnly | TextCtrlStyle::Rich2)
             .build();
         msaa_names::set_name(&list, &tr("Articles"));
         msaa_names::set_name(&reader, &tr("Article text"));
@@ -3939,7 +4135,6 @@ fn main() {
         btn_row.add(&settings_btn, 0, SizerFlag::All, 4);
         btn_row.add(&help_btn, 0, SizerFlag::All, 4);
         btn_row.add(&keys_btn, 0, SizerFlag::All, 4);
-        sizer.add_sizer(&btn_row, 0, SizerFlag::All, 0);
         let btn_row2 = BoxSizer::builder(Orientation::Horizontal).build();
         btn_row2.add(&delete_btn, 0, SizerFlag::All, 4);
         btn_row2.add(&fav_btn, 0, SizerFlag::All, 4);
@@ -3947,7 +4142,11 @@ fn main() {
         btn_row2.add(&deleted_btn, 0, SizerFlag::All, 4);
         btn_row2.add(&search_box, 1, SizerFlag::All, 4);
         btn_row2.add(&search_btn, 0, SizerFlag::All, 4);
-        sizer.add_sizer(&btn_row2, 0, SizerFlag::All, 0);
+        let panel_sizer = BoxSizer::builder(Orientation::Vertical).build();
+        panel_sizer.add_sizer(&btn_row, 0, SizerFlag::All, 0);
+        panel_sizer.add_sizer(&btn_row2, 0, SizerFlag::All, 0);
+        btn_panel.set_sizer(panel_sizer, true);
+        sizer.add(&btn_panel, 0, SizerFlag::Expand | SizerFlag::All, 0);
         sizer.add(&splitter, 1, SizerFlag::Expand | SizerFlag::All, 0);
         frame.set_sizer(sizer, true);
         {
@@ -3993,6 +4192,7 @@ fn main() {
             collapsed_cats: std::collections::HashSet::new(),
             cols_sig: String::new(),
             refill_pending: false,
+            menu_label_bases: std::collections::HashMap::new(),
             reader_cache: blindrss_core::reader_cache::ReaderCache::default(),
             reader_generation: 0,
             pending_fulltext: None,
@@ -4197,7 +4397,7 @@ fn main() {
                 show_image_alt_for(&cfg, st.db.as_ref(), &a.feed_id)
             };
             let body = blindrss_core::extract::html_to_text_opts(&body, keep_alt);
-            reader.set_value(&format!("{}\n\n{}", a.title, body));
+            reader.set_value(&selection_reader_text(&a, &body));
             // Rich reader (opt-in, full_text_rich_view): the WebView
             // shows the cleaned feed body now; the full rich article
             // replaces it when the worker returns (RichHtml in the
@@ -5187,7 +5387,12 @@ fn main() {
                         .filter(|c| !c.trim().is_empty())
                         .or_else(|| a.description.clone())
                         .unwrap_or_default();
-                    crate::article_window::open(&deleted_display_title(a), &body, Some(&a.url));
+                    crate::article_window::open_article(
+                        &deleted_display_title(a),
+                        &body,
+                        Some(&a.url),
+                        a.author.as_deref().unwrap_or(""),
+                    );
                 })
             };
             {
@@ -5461,7 +5666,11 @@ fn main() {
             {
                 st.reader_generation = st.reader_generation.wrapping_add(1);
                 st.pending_fulltext = None;
-                reader.set_value(&format!("{}\n\n{}", article.title, text));
+                reader.set_value(&fulltext_reader_text(
+                    &article.title,
+                    article.author.as_deref().unwrap_or(""),
+                    &text,
+                ));
                 frame_ft.set_status_text(&format!("Full text ({source}, cached)"), 0);
                 if cfg.get_bool("full_text_rich_view", false) && rich_view_ft.as_ref().is_some() {
                     spawn_rich_fetch(&tx_ft, &article);
@@ -6641,7 +6850,12 @@ fn main() {
             } else {
                 body
             };
-            article_window::open(&article.title, &body, Some(&article.url));
+            article_window::open_article(
+                &article.title,
+                &body,
+                Some(&article.url),
+                article.author.as_deref().unwrap_or(""),
+            );
         });
 
         // Podcast Archive (Tools): pick a podcast feed, rescan
@@ -7575,6 +7789,10 @@ fn main() {
         let act_keys: Rc<dyn Fn()> = Rc::new(move || {
             keys::show_shortcuts(&frame_keys, &config_path());
             *keymap_keys.borrow_mut() = build_keymap();
+            // Menu labels carry the bindings as text: re-render
+            // them against the edited keymap (Python's
+            // _refresh_shortcut_menu_labels on the same event).
+            refresh_shortcut_menu_labels(&frame_keys, &mut state_keys.borrow_mut());
             restore_focus(&state_keys.borrow(), &tree_keys, &list_keys);
         });
         {
@@ -8854,11 +9072,18 @@ fn main() {
                 frame_da.set_status_text("Scanning for audio...", 0);
                 let tx = tx_da.clone();
                 std::thread::spawn(move || {
-                    let found = blindrss_core::extract::fetch_html(&article.url)
-                        .ok()
-                        .and_then(|html| {
-                            blindrss_core::media::detect_media_in_page(&html, &article.url)
-                        });
+                    // Python's Detect Audio pipeline
+                    // (discovery.detect_media): Sky and NPR
+                    // publisher routes first, then yt-dlp. The
+                    // previous port scanned only the article
+                    // page's markup, which never finds NPR audio
+                    // — those feeds ship no enclosure and the
+                    // MP3 lives in NPR's embed player.
+                    let found = blindrss_core::media::detect_media(
+                        &article.url,
+                        &article.title,
+                        article.content.as_deref(),
+                    );
                     let _ = tx.send(RefreshMsg::AudioDetected(article.id.clone(), found));
                 });
             })
@@ -9242,6 +9467,9 @@ fn main() {
             .append(help_menu, "&Help")
             .build();
         frame.set_menu_bar(menu_bar);
+        // Render the shortcut suffixes into the menu labels
+        // (Python builds its items through the label helper).
+        refresh_shortcut_menu_labels(&frame, &mut state.borrow_mut());
         {
             let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
             if let Some(bar) = frame.get_menu_bar() {
@@ -9837,6 +10065,7 @@ fn main() {
             let f1_list = list.get_handle() as usize;
             let f1_reader = reader.get_handle() as usize;
             let f1_search = search_box.get_handle() as usize;
+            let f1_rich = rich_view.as_ref().as_ref().map(|w| w.get_handle() as usize);
             frame.bind_internal(EventType::CHAR_HOOK, move |ev| {
                 let code = ev.get_key_code().unwrap_or(0);
                 // One shared bridge forms the accelerator
@@ -9926,6 +10155,57 @@ fn main() {
                         ev.skip(true);
                     }
                     return;
+                }
+                // Media arrows (Python's main-frame key
+                // handler): Ctrl-only+Arrow drives the player
+                // from the main window — Up/Down volume,
+                // Left/Right seek — unless a text control or
+                // the rich view has focus, where the key
+                // belongs to the control (the reader's own
+                // Ctrl+Arrow behavior included). These keys
+                // are not registry bindings in either app:
+                // Python routes them in this handler, and the
+                // port's hook never did, so they did nothing.
+                // macOS Alt is NOT accepted here (Python's
+                // main-frame block requires ControlDown; the
+                // Alt variant lives in the player window's
+                // own handler).
+                if let Some(action) =
+                    blindrss_core::shortcuts::media_arrow_action(false, mods, code)
+                {
+                    let focused = ev
+                        .get_event_object()
+                        .map(|w| w.get_handle() as usize)
+                        .unwrap_or(0);
+                    let on_text = focused == f1_reader
+                        || focused == f1_search
+                        || f1_rich.is_some_and(|h| h == focused);
+                    if on_text {
+                        ev.skip(true);
+                        return;
+                    }
+                    let command = match action {
+                        "seek_back" => "player.rewind",
+                        "seek_forward" => "player.forward",
+                        "volume_up" => "player.volume_up",
+                        _ => "player.volume_down",
+                    };
+                    // Seek needs media loaded (Python's
+                    // has_media_loaded check); volume applies
+                    // whenever a player session exists.
+                    if matches!(action, "seek_back" | "seek_forward")
+                        && !player::progress_snapshot().has_media
+                    {
+                        ev.skip(true);
+                        return;
+                    }
+                    if player::dispatch_command(command) {
+                        ev.skip(false);
+                        return;
+                    }
+                    // No live player session: fall through to
+                    // the registry dispatch, as Python's
+                    // handler does when no player window exists.
                 }
                 // No accelerator (plain typing/navigation, or a
                 // key outside the bridge): leave it to the
@@ -10321,7 +10601,11 @@ fn main() {
                         if current && let Some(article) = selected {
                             match result {
                                 Ok(text) => {
-                                    reader.set_value(&format!("{}\n\n{}", article.title, text));
+                                    reader.set_value(&fulltext_reader_text(
+                                        &article.title,
+                                        article.author.as_deref().unwrap_or(""),
+                                        &text,
+                                    ));
                                     frame_tick.set_status_text("Article translated", 0);
                                     // The rich document is an
                                     // output too: refresh it so
@@ -10696,7 +10980,11 @@ fn main() {
                                     ..
                                 },
                             ) => {
-                                reader.set_value(&format!("{}\n\n{}", article.title, text));
+                                reader.set_value(&fulltext_reader_text(
+                                    &article.title,
+                                    article.author.as_deref().unwrap_or(""),
+                                    &text,
+                                ));
                                 frame_tick.set_status_text(&format!("Full text ({source})"), 0);
                             }
                             (_, blindrss_core::extract::ExtractOutcome::Gate { reason }) => {
@@ -10968,7 +11256,11 @@ fn main() {
                         let title = article.title.clone();
                         match result {
                             Ok(text) => {
-                                reader.set_value(&format!("{title}\n\n{text}"));
+                                reader.set_value(&fulltext_reader_text(
+                                    &title,
+                                    article.author.as_deref().unwrap_or(""),
+                                    &text,
+                                ));
                                 frame_tick.set_status_text("Full text (YouTube)", 0);
                             }
                             Err(e) => frame_tick.set_status_text(&format!("Full text: {e}"), 0),
@@ -11371,6 +11663,123 @@ mod ui_parity_tests {
     }
 
     #[test]
+    fn readers_use_rich2_so_ctrl_arrows_move_by_paragraph() {
+        // User reports batch 2026-11-06, issue 1: Ctrl+Up/Down
+        // did nothing in the article text. Python builds every
+        // reader as TE_RICH2 (mainframe, article window, help
+        // viewer); the native RichEdit paragraph movement IS
+        // the behavior. The port built plain multiline
+        // controls. Guard all three builders.
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        for file in ["main.rs", "article_window.rs", "help.rs"] {
+            let text = std::fs::read_to_string(src_dir.join(file)).unwrap();
+            assert!(
+                text.contains("TextCtrlStyle::Rich2"),
+                "{file}: reader lost its Rich2 style"
+            );
+        }
+    }
+
+    #[test]
+    fn sound_playback_never_spawns_a_console_process() {
+        // Issue 6: the refresh-error sound spawned powershell
+        // without CREATE_NO_WINDOW; the console window flashed
+        // and landed in NVDA's speech history. Playback is
+        // in-process now (Python's wx.adv.Sound parity), and
+        // the remaining Windows spawns carry the flag.
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let main = std::fs::read_to_string(src_dir.join("main.rs")).unwrap();
+        assert!(
+            !main.contains("Command::new(\"powershell\")"),
+            "main.rs spawns powershell again"
+        );
+        let settings = std::fs::read_to_string(src_dir.join("settings.rs")).unwrap();
+        assert!(settings.contains("creation_flags(0x0800_0000)"));
+        let core_dir = src_dir.join("../../crates/core/src");
+        for file in ["windows_shortcuts.rs", "dependency.rs"] {
+            let text = std::fs::read_to_string(core_dir.join(file)).unwrap();
+            assert!(
+                text.contains("creation_flags(0x0800_0000)"),
+                "{file}: Windows spawn lost CREATE_NO_WINDOW"
+            );
+        }
+    }
+
+    #[test]
+    fn tree_appends_uncategorized_after_smart_folders() {
+        // Issue 7: Uncategorized sat directly under Favorites;
+        // the owner wants it at the bottom of the tree.
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let main = std::fs::read_to_string(src_dir.join("main.rs")).unwrap();
+        let smart = main
+            .find("append_item_with_data(&root, \"Smart Folders\"")
+            .expect("Smart Folders root append missing");
+        let uncat = main
+            .find("append_item_with_data(&root, label, \"cat:Uncategorized\"")
+            .expect("Uncategorized append missing");
+        assert!(smart < uncat, "Uncategorized no longer at the bottom");
+    }
+
+    #[test]
+    fn refill_focuses_the_first_row() {
+        // Issue 8: after a refill the list had no focused
+        // item, so tabbing in made NVDA say only "Articles
+        // list". The port of Python's
+        // _focus_first_row_if_unvisited must stay wired into
+        // the refill path.
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let main = std::fs::read_to_string(src_dir.join("main.rs")).unwrap();
+        assert!(main.contains("fn focus_first_row_if_unvisited"));
+        let start = main.find("fn render_refill_rows").unwrap();
+        let window = &main[start..(start + 6000).min(main.len())];
+        assert!(
+            window.contains("focus_first_row_if_unvisited(list)"),
+            "render_refill_rows no longer focuses the first row"
+        );
+    }
+
+    #[test]
+    fn menu_shortcut_labels_are_rendered_and_refreshed() {
+        // Issue 5: menu items never carried their binding, so
+        // NVDA announced no shortcut. The render pass must
+        // exist and run both after the menu bar is built and
+        // after the shortcuts dialog rebuilds the keymap.
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let main = std::fs::read_to_string(src_dir.join("main.rs")).unwrap();
+        assert!(main.contains("fn refresh_shortcut_menu_labels"));
+        let calls = main.matches("refresh_shortcut_menu_labels(").count();
+        assert!(
+            calls >= 3,
+            "expected definition + 2 call sites, got {calls}"
+        );
+    }
+
+    #[test]
+    fn toolbar_buttons_live_on_their_own_panel() {
+        // Issue 4: buttons parented straight to the frame
+        // could trap keyboard focus. They live on a dedicated
+        // panel now; keep them there.
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let main = std::fs::read_to_string(src_dir.join("main.rs")).unwrap();
+        assert!(main.contains("let btn_panel = Panel::builder(&frame)"));
+        let on_panel = main.matches("Button::builder(&btn_panel)").count();
+        assert!(on_panel >= 20, "only {on_panel} buttons on the panel");
+    }
+
+    #[test]
+    fn main_frame_routes_ctrl_arrows_to_the_player() {
+        // Issue 9: during playback, Ctrl+Left/Right (seek)
+        // and Ctrl+Up/Down (volume) did nothing from the main
+        // window — Python routes them in its main-frame key
+        // handler; the port's hook never had the block.
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let main = std::fs::read_to_string(src_dir.join("main.rs")).unwrap();
+        assert!(main.contains("media_arrow_action(false, mods, code)"));
+        assert!(main.contains("\"player.rewind\""));
+        assert!(main.contains("\"player.volume_up\""));
+    }
+
+    #[test]
     fn auto_fulltext_delay_matches_python_v259_youtube_rule() {
         // Python v2.5.9 #151 (`_fulltext_debounce_ms_for`):
         // forced loads are immediate; a Windows YouTube
@@ -11568,6 +11977,7 @@ mod ui_parity_tests {
                 collapsed_cats: std::collections::HashSet::new(),
                 cols_sig: String::new(),
                 refill_pending: false,
+                menu_label_bases: std::collections::HashMap::new(),
                 refresh_new: Vec::new(),
                 refresh_failed: false,
                 pending_play: None,

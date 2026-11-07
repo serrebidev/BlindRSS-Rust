@@ -237,19 +237,24 @@ pub fn format_results(results: &[ShortcutOutcome]) -> (String, bool) {
 #[cfg(target_os = "windows")]
 fn run_powershell(script: &str, timeout_s: u64) -> (bool, String) {
     use std::io::Read;
+    use std::os::windows::process::CommandExt as _;
     let encoded = encode_powershell_command(script);
-    let spawned = std::process::Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-EncodedCommand",
-            &encoded,
-        ])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn();
+    let mut cmd = std::process::Command::new("powershell");
+    cmd.args([
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-EncodedCommand",
+        &encoded,
+    ])
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped());
+    // CREATE_NO_WINDOW: the app is windowed, so the child's
+    // console would flash and take focus from the screen reader
+    // (Python carries the same flag on every PowerShell spawn).
+    cmd.creation_flags(0x0800_0000);
+    let spawned = cmd.spawn();
     let mut child = match spawned {
         Ok(c) => c,
         Err(e) => return (false, e.to_string()),

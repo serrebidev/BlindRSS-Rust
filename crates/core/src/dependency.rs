@@ -220,12 +220,20 @@ fn spawn_tool(
     let started = std::time::Instant::now();
     let mut backoff = std::time::Duration::from_millis(10);
     loop {
-        let result = std::process::Command::new(exe)
-            .args(args)
+        let mut cmd = std::process::Command::new(exe);
+        cmd.args(args)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn();
+            .stderr(std::process::Stdio::piped());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt as _;
+            // CREATE_NO_WINDOW: yt-dlp/ffmpeg are console apps;
+            // from a windowed app their consoles would flash and
+            // take screen-reader focus on every call.
+            cmd.creation_flags(0x0800_0000);
+        }
+        let result = cmd.spawn();
         match result {
             Ok(child) => return Ok(child),
             Err(e) => {

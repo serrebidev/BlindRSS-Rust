@@ -1057,3 +1057,211 @@ pub fn postprocess_extracted_text(text: &str, url: &str, published: &str) -> Str
 
     normalize_whitespace(&t)
 }
+
+/// Python `utils.collapse_blank_lines`: one paragraph per line,
+/// no blank lines in between. Trafilatura output already reads
+/// that way; HTML-to-text conversion and the site strippers emit
+/// blank-line-separated paragraphs, and a screen reader stops on
+/// every blank line, so every reader-bound body is normalized to
+/// the one-line convention. Newlines unify first, lines that are
+/// empty after trimming are dropped, surviving lines are
+/// right-trimmed, and the whole result is trimmed.
+pub fn collapse_blank_lines(text: &str) -> String {
+    let text = text.replace("\r\n", "\n").replace('\r', "\n");
+    let lines: Vec<&str> = text
+        .split('\n')
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| line.trim_end())
+        .collect();
+    lines.join("\n").trim().to_string()
+}
+
+/// Days from civil date (Howard Hinnant's algorithm) — the
+/// inverse of the civil-from-days conversion the app uses to
+/// format timestamps.
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = if m > 2 { m - 3 } else { m + 9 };
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// Civil date/time from unix seconds (UTC), Hinnant's algorithm.
+fn civil_from_unix(secs: i64) -> (i64, u32, u32, u32, u32, u32) {
+    let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    let (h, mi, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (
+        if m <= 2 { y + 1 } else { y },
+        m as u32,
+        d as u32,
+        h as u32,
+        mi as u32,
+        s as u32,
+    )
+}
+
+/// Parse the date shapes the apps store (RFC 3339 / ISO 8601,
+/// `Z` or numeric offset, fractional seconds optional, a space
+/// may separate date and time, date-only means midnight UTC)
+/// into unix seconds. Python's `parse_datetime_utc` accepts more
+/// shapes (RFC 2822 feed dates); stored article dates in both
+/// apps' databases are normalized to this family at ingest.
+pub fn parse_stored_date_unix(text: &str) -> Option<i64> {
+    let text = text.trim();
+    let bytes = text.as_bytes();
+    if bytes.len() < 10 {
+        return None;
+    }
+    let num = |from: usize, len: usize| -> Option<i64> { text.get(from..from + len)?.parse().ok() };
+    let (year, month, day) = (num(0, 4)?, num(5, 2)?, num(8, 2)?);
+    if bytes.get(4) != Some(&b'-') || bytes.get(7) != Some(&b'-') {
+        return None;
+    }
+    let mut secs = days_from_civil(year, month, day) * 86_400;
+    if bytes.len() == 10 {
+        return Some(secs);
+    }
+    let (hour, min, sec) = (num(11, 2)?, num(14, 2)?, num(17, 2).unwrap_or(0));
+    secs += hour * 3600 + min * 60 + sec;
+    // Offset: 'Z'/'z' or ±HH:MM / ±HHMM after the seconds (and any
+    // fractional part). No offset means the value is already UTC
+    // (Python treats naive values as UTC in parse_datetime_utc).
+    let rest = &text[19.min(text.len())..];
+    let rest = rest.trim_start_matches(|c: char| c.is_ascii_digit() || c == '.');
+    if rest.is_empty() || rest.starts_with(['Z', 'z']) {
+        return Some(secs);
+    }
+    let sign = match rest.as_bytes().first() {
+        Some(b'+') => 1i64,
+        Some(b'-') => -1i64,
+        _ => return Some(secs),
+    };
+    let digits: String = rest[1..].chars().filter(|c| *c != ':').collect();
+    if digits.len() < 4 || !digits.chars().all(|c| c.is_ascii_digit()) {
+        return Some(secs);
+    }
+    let oh: i64 = digits[..2].parse().ok()?;
+    let om: i64 = digits[2..4].parse().ok()?;
+    Some(secs - sign * (oh * 3600 + om * 60))
+}
+
+/// Python `utils.humanize_article_date`: relative wording for
+/// the first 24 hours ("Just now", "N minutes ago", "N hours
+/// ago"), then the absolute local time `YYYY-MM-DD HH:MM`.
+/// Unparseable input yields "". `now_unix` and
+/// `local_offset_secs` are parameters so the rule is testable;
+/// the caller supplies the offset for the article date's own
+/// timezone (see the app-side note on how it is derived).
+pub fn humanize_article_date(date_str: &str, now_unix: i64, local_offset_secs: i64) -> String {
+    let Some(dt) = parse_stored_date_unix(date_str) else {
+        return String::new();
+    };
+    let delta = (now_unix - dt).max(0);
+    if delta <= 24 * 3600 {
+        if delta < 60 {
+            return "Just now".to_string();
+        }
+        let mins = delta / 60;
+        if mins < 60 {
+            return if mins == 1 {
+                "1 minute ago".to_string()
+            } else {
+                format!("{mins} minutes ago")
+            };
+        }
+        let hours = mins / 60;
+        return if hours == 1 {
+            "1 hour ago".to_string()
+        } else {
+            format!("{hours} hours ago")
+        };
+    }
+    let (y, mo, d, h, mi, _s) = civil_from_unix(dt + local_offset_secs);
+    format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}")
+}
+
+#[cfg(test)]
+mod reader_text_tests {
+    use super::{collapse_blank_lines, humanize_article_date, parse_stored_date_unix};
+
+    #[test]
+    fn collapse_drops_blank_lines_and_unifies_endings() {
+        let input = "First para.\r\n\r\nSecond para.  \n\n\nThird para.\rTail";
+        assert_eq!(
+            collapse_blank_lines(input),
+            "First para.\nSecond para.\nThird para.\nTail"
+        );
+    }
+
+    #[test]
+    fn collapse_keeps_indentation_and_content_lines() {
+        assert_eq!(
+            collapse_blank_lines("  indented\n\n\ttabbed"),
+            "indented\n\ttabbed"
+        );
+        assert_eq!(collapse_blank_lines(""), "");
+        assert_eq!(collapse_blank_lines("\n\n  \n"), "");
+    }
+
+    #[test]
+    fn parse_stored_dates() {
+        // 2026-10-30T10:00:00Z
+        assert_eq!(
+            parse_stored_date_unix("2026-10-30T10:00:00Z"),
+            Some(1_793_354_400)
+        );
+        assert_eq!(
+            parse_stored_date_unix("2026-10-30T10:00:00+01:00"),
+            Some(1_793_350_800)
+        );
+        assert_eq!(
+            parse_stored_date_unix("2026-10-30 10:00:00Z"),
+            Some(1_793_354_400)
+        );
+        assert_eq!(parse_stored_date_unix("2026-10-30"), Some(1_793_318_400));
+        assert_eq!(parse_stored_date_unix("not a date"), None);
+        assert_eq!(parse_stored_date_unix(""), None);
+    }
+
+    #[test]
+    fn humanize_relative_and_absolute() {
+        let t0 = 1_793_354_400; // 2026-10-30T10:00:00Z
+        let stamp = "2026-10-30T10:00:00Z";
+        assert_eq!(humanize_article_date(stamp, t0 + 30, 0), "Just now");
+        assert_eq!(humanize_article_date(stamp, t0 + 60, 0), "1 minute ago");
+        assert_eq!(
+            humanize_article_date(stamp, t0 + 5 * 60, 0),
+            "5 minutes ago"
+        );
+        assert_eq!(humanize_article_date(stamp, t0 + 3600, 0), "1 hour ago");
+        assert_eq!(
+            humanize_article_date(stamp, t0 + 3 * 3600, 0),
+            "3 hours ago"
+        );
+        // Exactly 24h is still relative in Python (delta <= 24h).
+        assert_eq!(
+            humanize_article_date(stamp, t0 + 24 * 3600, 0),
+            "24 hours ago"
+        );
+        // Past 24h: absolute local time (offset -8h here).
+        assert_eq!(
+            humanize_article_date(stamp, t0 + 25 * 3600, -8 * 3600),
+            "2026-10-30 02:00"
+        );
+        assert_eq!(humanize_article_date("garbage", t0, 0), "");
+        // Future dates clamp to zero delta, like Python.
+        assert_eq!(humanize_article_date(stamp, t0 - 500, 0), "Just now");
+    }
+}
