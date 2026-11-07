@@ -397,6 +397,352 @@ fn parse_clock(text: &str) -> Option<f64> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Watch-next chapters (Python `youtube_fulltext.extract_chapters`:
+// the watch-next InnerTube response is Python's FIRST chapter
+// source — one request instead of a 3-4 s yt-dlp run — with the
+// yt-dlp info dict as the fallback when the response cannot
+// settle the answer. Results memoize per video for 30 minutes
+// (Python `_chapter_memo`), including a settled empty list.
+
+const CHAPTER_MEMO_TTL_S: u64 = 30 * 60;
+
+type ChapterMemo =
+    std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, Vec<Chapter>)>>;
+
+fn chapter_memo() -> &'static ChapterMemo {
+    static MEMO: std::sync::OnceLock<ChapterMemo> = std::sync::OnceLock::new();
+    MEMO.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Python `_find_values`: every value stored under `key`,
+/// anywhere in the JSON tree, in document order.
+fn find_values<'a>(node: &'a Value, key: &str, out: &mut Vec<&'a Value>) {
+    match node {
+        Value::Object(map) => {
+            for (name, value) in map {
+                if name == key {
+                    out.push(value);
+                } else {
+                    find_values(value, key, out);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for value in items {
+                find_values(value, key, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Python `_runs_text`: simpleText, else the concatenation
+/// of run texts.
+fn runs_text(node: Option<&Value>) -> String {
+    let Some(node) = node.filter(|n| n.is_object()) else {
+        return String::new();
+    };
+    if let Some(simple) = node.get("simpleText") {
+        return simple.as_str().unwrap_or("").to_string();
+    }
+    node.get("runs")
+        .and_then(|r| r.as_array())
+        .map(|runs| {
+            runs.iter()
+                .filter(|r| r.is_object())
+                .map(|r| r.get("text").and_then(|t| t.as_str()).unwrap_or(""))
+                .collect::<String>()
+        })
+        .unwrap_or_default()
+}
+
+/// Python `_parse_clock` (the youtube_fulltext one): 1-3
+/// colon-separated integer parts.
+fn parse_clock_py(text: &str) -> Option<f64> {
+    let parts: Vec<&str> = text.trim().split(':').collect();
+    if parts.is_empty() || parts.len() > 3 {
+        return None;
+    }
+    let mut seconds = 0.0f64;
+    for part in parts {
+        seconds = seconds * 60.0 + part.parse::<i64>().ok()? as f64;
+    }
+    Some(seconds)
+}
+
+/// Python `_valid_chapters` (yt-dlp's helper): ordered
+/// starts, none past the duration when it is known.
+fn valid_chapters(pairs: Vec<(Option<f64>, String)>, duration: Option<f64>) -> Vec<(f64, String)> {
+    let mut out = Vec::new();
+    let mut last = 0.0f64;
+    for (start, title) in pairs {
+        let Some(start) = start else { continue };
+        if last <= start && duration.is_none_or(|d| start <= d) {
+            out.push((start, title));
+            last = start;
+        }
+    }
+    out
+}
+
+/// One InnerTube JSON call (Python `_innertube`, WEB
+/// client). Python clamps its timeout to 3..=15 s; the
+/// shared agent's configured timeout governs here.
+fn innertube(endpoint: &str, video_id: &str) -> Option<Value> {
+    let url = format!("https://www.youtube.com/youtubei/v1/{endpoint}?prettyPrint=false");
+    let body = serde_json::json!({
+        "context": {"client": {"clientName": "WEB", "clientVersion": "2.20251010.01.00", "hl": "en"}},
+        "videoId": video_id,
+    });
+    let mut response = crate::http::agent()
+        .post(&url)
+        .header("Origin", "https://www.youtube.com")
+        .header("Content-Type", "application/json")
+        .send(body.to_string())
+        .ok()?;
+    if response.status() != 200 {
+        return None;
+    }
+    let text = response.body_mut().read_to_string().ok()?;
+    let data: Value = serde_json::from_str(&text).ok()?;
+    data.is_object().then_some(data)
+}
+
+/// Python `_chapters_from_watch_next`, with the InnerTube
+/// fetch injected so fixtures can drive it. None means the
+/// responses could not settle the chapters — the caller
+/// falls back to the yt-dlp info dict. Some(empty) is a
+/// settled answer (the description has no timestamps).
+pub fn chapters_from_watch_next(
+    video_id: &str,
+    fetch: &dyn Fn(&str, &str) -> Option<Value>,
+) -> Option<Vec<Chapter>> {
+    let data = fetch("next", video_id)?;
+    data.get("contents")?;
+    let mut chapters: Vec<(f64, String)>;
+
+    // 1) Player-bar markers: chapteredPlayerBarRenderer
+    // lists, then the markersMap chapters keyed
+    // DESCRIPTION_CHAPTERS / AUTO_CHAPTERS / the rest.
+    let empty = Value::Null;
+    let overlays = data.get("playerOverlays").unwrap_or(&empty);
+    let mut lists = Vec::new();
+    find_values(overlays, "chapteredPlayerBarRenderer", &mut lists);
+    let mut by_key: Vec<(String, &Value)> = Vec::new();
+    let mut maps = Vec::new();
+    find_values(overlays, "markersMap", &mut maps);
+    for markers_map in maps {
+        let Some(entries) = markers_map.as_array() else {
+            continue;
+        };
+        for entry in entries {
+            let Some(entry) = entry.as_object() else {
+                continue;
+            };
+            let value = entry.get("value").unwrap_or(&empty);
+            let has = value
+                .get("chapters")
+                .and_then(|c| c.as_array())
+                .is_some_and(|c| !c.is_empty());
+            if has {
+                let key = entry
+                    .get("key")
+                    .and_then(|k| k.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if !by_key.iter().any(|(k, _)| *k == key) {
+                    by_key.push((key, value));
+                }
+            }
+        }
+    }
+    let mut candidates: Vec<&Value> = lists;
+    for wanted in ["DESCRIPTION_CHAPTERS", "AUTO_CHAPTERS"] {
+        if let Some((_, value)) = by_key.iter().find(|(k, _)| k == wanted) {
+            candidates.push(value);
+        }
+    }
+    for (_, value) in &by_key {
+        candidates.push(value);
+    }
+    let mut pairs: Vec<(Option<f64>, String)> = Vec::new();
+    for candidate in candidates {
+        if let Some(list) = candidate.get("chapters").and_then(|c| c.as_array()) {
+            for chapter in list {
+                let Some(renderer) = chapter.get("chapterRenderer").filter(|r| r.is_object())
+                else {
+                    continue;
+                };
+                // Python: int(value or 0) — a missing value
+                // means 0, an unparseable one drops the row.
+                let start = match renderer.get("timeRangeStartMillis") {
+                    None => Some(0.0),
+                    Some(v) => v
+                        .as_f64()
+                        .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
+                        .map(|ms| ms / 1000.0),
+                };
+                pairs.push((start, runs_text(renderer.get("title"))));
+            }
+        }
+        if !pairs.is_empty() {
+            break;
+        }
+    }
+    chapters = valid_chapters(pairs, None);
+
+    // 2) The "key moments" engagement panel.
+    if chapters.is_empty() {
+        let panels = data.get("engagementPanels").unwrap_or(&empty);
+        let mut renderers = Vec::new();
+        find_values(panels, "macroMarkersListRenderer", &mut renderers);
+        for renderer in renderers {
+            let contents = renderer.get("contents").cloned().unwrap_or(Value::Null);
+            let mut items = Vec::new();
+            find_values(&contents, "macroMarkersListItemRenderer", &mut items);
+            let pairs: Vec<(Option<f64>, String)> = items
+                .iter()
+                .map(|item| {
+                    (
+                        parse_clock_py(&runs_text(item.get("timeDescription"))),
+                        runs_text(item.get("title")),
+                    )
+                })
+                .collect();
+            chapters = valid_chapters(pairs, None);
+            if !chapters.is_empty() {
+                break;
+            }
+        }
+    }
+
+    // 3) Description timestamps, validated against the
+    // length from one extra `player` request.
+    if chapters.is_empty() {
+        const DUR: &str = r"(?:\d+:)?\d{1,2}:\d{2}";
+        let time_first_re = Regex::new(&format!(r"(?m)^\s*({DUR})\b\W*\s(.+?)\s*$")).unwrap();
+        let title_first_re = Regex::new(&format!(r"(?m)^\s*(.+?)\b\W*\s({DUR})\s*$")).unwrap();
+        let mut descriptions = Vec::new();
+        find_values(&data, "attributedDescription", &mut descriptions);
+        let text = descriptions
+            .iter()
+            .filter(|d| d.is_object())
+            .map(|d| d.get("content").and_then(|c| c.as_str()).unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let find_pairs = |re: &Regex, text: &str, clock_first: bool| -> Vec<(String, String)> {
+            re.captures_iter(text)
+                .map(|cap| {
+                    if clock_first {
+                        (cap[1].to_string(), cap[2].to_string())
+                    } else {
+                        (cap[2].to_string(), cap[1].to_string())
+                    }
+                })
+                .collect()
+        };
+        if find_pairs(&time_first_re, &text, true).is_empty()
+            && find_pairs(&title_first_re, &text, false).is_empty()
+        {
+            return Some(Vec::new());
+        }
+        let player = fetch("player", video_id);
+        let duration = player
+            .as_ref()
+            .and_then(|p| p.get("videoDetails"))
+            .and_then(|d| d.get("lengthSeconds"))
+            .and_then(|v| {
+                v.as_str()
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .or_else(|| v.as_f64())
+            })
+            .unwrap_or(0.0);
+        if duration == 0.0 {
+            return None;
+        }
+        let text = player
+            .as_ref()
+            .and_then(|p| p.get("videoDetails"))
+            .and_then(|d| d.get("shortDescription"))
+            .and_then(|s| s.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or(text);
+        for (re, clock_first) in [(&time_first_re, true), (&title_first_re, false)] {
+            let mut found: Vec<(Option<f64>, String)> = find_pairs(re, &text, clock_first)
+                .into_iter()
+                .map(|(clock, title)| (parse_clock_py(&clock), title))
+                .collect();
+            found.sort_by(|a, b| {
+                a.0.unwrap_or(0.0)
+                    .partial_cmp(&b.0.unwrap_or(0.0))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            chapters = valid_chapters(found, Some(duration));
+            if !chapters.is_empty() {
+                break;
+            }
+        }
+    }
+
+    if !chapters.is_empty() && chapters[0].0 > 0.0 {
+        // yt-dlp fills the gap before a late first chapter.
+        chapters.insert(0, (0.0, "<Untitled Chapter 1>".to_string()));
+    }
+    let base_url = format!("https://www.youtube.com/watch?v={video_id}");
+    Some(
+        chapters
+            .into_iter()
+            .map(|(start, title)| {
+                let title = title.trim().to_string();
+                Chapter {
+                    start: start.max(0.0),
+                    title: if title.is_empty() {
+                        "Chapter".to_string()
+                    } else {
+                        title
+                    },
+                    href: format!("{base_url}&t={}s", start.max(0.0) as i64),
+                }
+            })
+            .collect(),
+    )
+}
+
+/// Python `youtube_fulltext.extract_chapters`: watch-next
+/// first (memoized), the yt-dlp info dict as the fallback.
+/// (Python also checks its cancellation flag here; the
+/// Rust call sites guard with generations — the recorded
+/// Task 23 deviation, unchanged.)
+pub fn extract_chapters(url: &str) -> Vec<Chapter> {
+    let Some(video_id) = video_id_from_url(url) else {
+        return Vec::new();
+    };
+    if let Ok(memo) = chapter_memo().lock()
+        && let Some((when, chapters)) = memo.get(&video_id)
+        && when.elapsed().as_secs() < CHAPTER_MEMO_TTL_S
+    {
+        return chapters.clone();
+    }
+    let from_watch_next = std::panic::catch_unwind(|| {
+        chapters_from_watch_next(&video_id, &|endpoint, id| innertube(endpoint, id))
+    })
+    .ok()
+    .flatten();
+    if let Some(chapters) = from_watch_next {
+        if let Ok(mut memo) = chapter_memo().lock() {
+            memo.insert(video_id, (std::time::Instant::now(), chapters.clone()));
+        }
+        return chapters;
+    }
+    let info = crate::media::youtube_article_info(url).ok();
+    match info {
+        Some(info) => chapters_from_info(&info, url),
+        None => Vec::new(),
+    }
+}
+
 fn clean_subtitle_text(value: &str) -> String {
     static WS_RE: OnceLock<Regex> = OnceLock::new();
     let ws_re = WS_RE.get_or_init(|| Regex::new(r"\s+").unwrap());

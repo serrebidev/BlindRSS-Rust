@@ -24,6 +24,22 @@ pub struct CastDevice {
     /// AVTransport control URL, Roku base URL); empty when
     /// host+port are enough.
     pub endpoint: String,
+    /// Content types the receiver said it accepts (UPnP
+    /// ConnectionManager GetProtocolInfo sinks); empty when
+    /// it did not say, which callers must treat as unknown,
+    /// never as "nothing" (Caster's rule).
+    pub sinks: Vec<String>,
+}
+
+impl CastDevice {
+    /// Caster `Device.supports_video`: a published sink list
+    /// is believed outright; silence falls back to the kind.
+    pub fn supports_video(&self) -> bool {
+        if !self.sinks.is_empty() {
+            return self.sinks.iter().any(|m| m.starts_with("video/"));
+        }
+        matches!(self.kind.as_str(), "chromecast" | "dlna" | "roku" | "kodi")
+    }
 }
 
 impl CastDevice {
@@ -328,6 +344,7 @@ pub fn parse_ssdp_packet(text: &str) -> Option<CastDevice> {
         kind: "chromecast".to_string(),
         model: headers.get("x-model-name").cloned().unwrap_or_default(),
         endpoint: String::new(),
+        sinks: Vec::new(),
     })
 }
 
@@ -347,6 +364,7 @@ pub fn discover_chromecasts(timeout: Duration) -> Vec<CastDevice> {
         return Vec::new();
     }
     let deadline = std::time::Instant::now() + timeout;
+    let mut resends = SearchResends::new(timeout);
     let mut out: Vec<CastDevice> = Vec::new();
     let mut buf = [0u8; 4096];
     while std::time::Instant::now() < deadline {
@@ -359,7 +377,12 @@ pub fn discover_chromecasts(timeout: Duration) -> Vec<CastDevice> {
                     out.push(dev);
                 }
             }
-            Err(_) => continue,
+            Err(_) => {
+                if resends.due() {
+                    let _ = socket.send_to(search.as_bytes(), "239.255.255.250:1900");
+                }
+                continue;
+            }
         }
     }
     out
@@ -407,6 +430,10 @@ pub struct UpnpDescription {
     pub manufacturer: String,
     pub model: String,
     pub av_transport_url: String,
+    /// ConnectionManager control URL (GetProtocolInfo sinks
+    /// live behind it); empty for renderers that do not
+    /// publish the service.
+    pub connection_manager_url: String,
     pub rendering_control_url: String,
     /// ZoneGroupTopology control URL (Sonos group state lives
     /// behind it; empty for other renderers).
@@ -460,6 +487,9 @@ pub fn parse_upnp_description_full(xml: &str, location: &str) -> Option<UpnpDesc
             let resolved = resolve_control_url(&control, location);
             if block.contains("AVTransport") && desc.av_transport_url.is_empty() {
                 desc.av_transport_url = resolved;
+            } else if block.contains("ConnectionManager") && desc.connection_manager_url.is_empty()
+            {
+                desc.connection_manager_url = resolved;
             } else if block.contains("RenderingControl") && desc.rendering_control_url.is_empty() {
                 desc.rendering_control_url = resolved;
             } else if block.contains("ZoneGroupTopology") && desc.zone_group_topology_url.is_empty()
@@ -473,6 +503,104 @@ pub fn parse_upnp_description_full(xml: &str, location: &str) -> Option<UpnpDesc
         return None;
     }
     Some(desc)
+}
+
+/// Content types a renderer accepts, from its
+/// ConnectionManager's GetProtocolInfo (Caster
+/// `upnp_sink_mimes`). Empty means "it did not say" —
+/// unknown, not "nothing".
+pub fn upnp_sink_mimes(connection_manager_url: &str) -> Vec<String> {
+    if connection_manager_url.is_empty() {
+        return Vec::new();
+    }
+    let Ok(xml) = crate::castupnp::soap_call(
+        connection_manager_url,
+        "urn:schemas-upnp-org:service:ConnectionManager:1",
+        "GetProtocolInfo",
+        "",
+    ) else {
+        return Vec::new();
+    };
+    let Some(sink) = xml_tag(&xml, "Sink") else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = Vec::new();
+    for entry in sink.split(',') {
+        // protocol:network:contentFormat:additionalInfo
+        let parts: Vec<&str> = entry.trim().split(':').collect();
+        if parts.len() >= 3 && parts[2].contains('/') {
+            let mime = parts[2]
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_lowercase();
+            if !mime.is_empty() && !out.contains(&mime) {
+                out.push(mime);
+            }
+        }
+    }
+    out
+}
+
+/// Caster repeats each SSDP search across the window
+/// (SSDP_SEARCHES = 3, spaced timeout / (3 + 1) apart):
+/// SSDP is lossy UDP multicast — one lost reply is one
+/// device missing from the list, and a device that
+/// already answered just answers again and is deduped.
+pub(crate) const SSDP_SEARCHES: u32 = 3;
+
+pub(crate) struct SearchResends {
+    sent: u32,
+    next: std::time::Instant,
+    spacing: Duration,
+}
+
+impl SearchResends {
+    pub(crate) fn new(timeout: Duration) -> Self {
+        let spacing = timeout / (SSDP_SEARCHES + 1);
+        Self {
+            sent: 1, // the caller sends the first search itself
+            next: std::time::Instant::now() + spacing,
+            spacing,
+        }
+    }
+
+    /// True (at most SSDP_SEARCHES - 1 times) when the next
+    /// repeat is due.
+    pub(crate) fn due(&mut self) -> bool {
+        if self.sent < SSDP_SEARCHES && std::time::Instant::now() >= self.next {
+            self.sent += 1;
+            self.next += self.spacing;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Caster's cross-protocol discovery merge (`_discover_sync`):
+/// devices keyed by NAME, protocols applied in the caller's
+/// fixed order (chromecast, airplay, upnp/dlna, roku, kodi —
+/// Sonos is handled separately and wins outright). A later
+/// same-name device replaces the incumbent ONLY when it
+/// published sinks proving video and the incumbent cannot
+/// show video — a TV answering AirPlay (audio-only RAOP) and
+/// DLNA keeps its picture path; ties keep the earlier
+/// protocol. Replacement keeps the incumbent's position.
+pub fn merge_discovery_by_name(devices: Vec<CastDevice>) -> Vec<CastDevice> {
+    let mut out: Vec<CastDevice> = Vec::new();
+    for dev in devices {
+        match out.iter_mut().find(|d| d.name == dev.name) {
+            None => out.push(dev),
+            Some(existing) => {
+                if !dev.sinks.is_empty() && dev.supports_video() && !existing.supports_video() {
+                    *existing = dev;
+                }
+            }
+        }
+    }
+    out
 }
 
 /// One SSDP sweep for several search targets; returns raw
@@ -490,6 +618,7 @@ fn ssdp_sweep(targets: &[&str], timeout: Duration) -> Vec<(String, String)> {
         let _ = socket.send_to(search.as_bytes(), "239.255.255.250:1900");
     }
     let deadline = std::time::Instant::now() + timeout;
+    let mut resends = SearchResends::new(timeout);
     let mut out: Vec<(String, String)> = Vec::new();
     let mut buf = [0u8; 8192];
     while std::time::Instant::now() < deadline {
@@ -499,7 +628,17 @@ fn ssdp_sweep(targets: &[&str], timeout: Duration) -> Vec<(String, String)> {
                     out.push((text.to_string(), String::new()));
                 }
             }
-            Err(_) => continue,
+            Err(_) => {
+                if resends.due() {
+                    for st in targets {
+                        let search = format!(
+                            "M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\nMX: 2\r\nST: {st}\r\n\r\n"
+                        );
+                        let _ = socket.send_to(search.as_bytes(), "239.255.255.250:1900");
+                    }
+                }
+                continue;
+            }
         }
     }
     out
@@ -532,10 +671,16 @@ pub fn discover_all(timeout: Duration) -> Vec<CastDevice> {
     // Chromecasts: the SSDP DIAL sweep merged with the explicit
     // `_googlecast._tcp` mDNS browse (C02) — each finds devices
     // the other misses.
-    let mut out = merge_chromecast_discovery(
+    let chromecasts = merge_chromecast_discovery(
         discover_chromecasts(timeout),
         discover_chromecasts_mdns(timeout),
     );
+    // Per-protocol buckets, merged by name at the end in
+    // Caster's fixed order (chromecast, airplay, upnp, roku,
+    // kodi; Sonos last and winning outright).
+    let mut sonos: Vec<CastDevice> = Vec::new();
+    let mut dlna: Vec<CastDevice> = Vec::new();
+    let mut roku: Vec<CastDevice> = Vec::new();
     let hits = ssdp_sweep(
         &[
             "urn:schemas-upnp-org:device:MediaRenderer:1",
@@ -569,13 +714,14 @@ pub fn discover_all(timeout: Duration) -> Vec<CastDevice> {
             if let Some(xml) = http_get_text(location)
                 && let Some((name, control, model)) = parse_upnp_description(&xml, location)
             {
-                out.push(CastDevice {
+                sonos.push(CastDevice {
                     name,
                     host: host.clone(),
                     port: 1400,
                     kind: "sonos".to_string(),
                     model,
                     endpoint: control,
+                    sinks: Vec::new(),
                 });
             }
         } else if st.contains("MediaRenderer") {
@@ -588,16 +734,20 @@ pub fn discover_all(timeout: Duration) -> Vec<CastDevice> {
                 if looks_like_sonos(&desc.name, &desc.manufacturer) {
                     continue;
                 }
-                if !out.iter().any(|d| d.host == host) {
-                    out.push(CastDevice {
-                        name: desc.name,
-                        host: host.clone(),
-                        port: 0,
-                        kind: "dlna".to_string(),
-                        model: desc.model,
-                        endpoint: desc.av_transport_url,
-                    });
-                }
+                // The renderer's published sinks ride along:
+                // they are the merge's video proof and the
+                // honest capability record (Caster fetches
+                // them the same way, per renderer).
+                let sinks = upnp_sink_mimes(&desc.connection_manager_url);
+                dlna.push(CastDevice {
+                    name: desc.name,
+                    host: host.clone(),
+                    port: 0,
+                    kind: "dlna".to_string(),
+                    model: desc.model,
+                    endpoint: desc.av_transport_url,
+                    sinks,
+                });
             }
         } else if st == "roku:ecp" {
             // Caster tries the device-info name tags in order.
@@ -613,18 +763,26 @@ pub fn discover_all(timeout: Duration) -> Vec<CastDevice> {
                     .find_map(|tag| xml_tag(&xml, tag))
                 })
                 .unwrap_or_else(|| format!("Roku {host}"));
-            out.push(CastDevice {
+            roku.push(CastDevice {
                 name,
                 host: host.clone(),
                 port: 8060,
                 kind: "roku".to_string(),
                 model: String::new(),
                 endpoint: format!("http://{host}:8060"),
+                sinks: Vec::new(),
             });
         }
     }
-    out.extend(discover_kodi(timeout));
-    out.extend(discover_airplay(timeout));
+    // Caster's fixed merge order, keyed by name.
+    let mut merged: Vec<CastDevice> = Vec::new();
+    merged.extend(chromecasts);
+    merged.extend(discover_airplay(timeout));
+    merged.extend(dlna);
+    merged.extend(roku);
+    merged.extend(discover_kodi(timeout));
+    let mut out = merge_discovery_by_name(merged);
+    out.extend(sonos);
     // Sonos merges last and wins by name (C04): a generic entry
     // carrying a Sonos player's name is the same device seen
     // through a worse protocol, and is dropped.
@@ -693,6 +851,7 @@ pub fn discover_kodi(timeout: Duration) -> Vec<CastDevice> {
             kind: "kodi".to_string(),
             model: String::new(),
             endpoint: String::new(),
+            sinks: Vec::new(),
         });
     }
     out
@@ -1125,6 +1284,7 @@ pub fn chromecast_devices_from_records(records: &[MdnsServiceRecord]) -> Vec<Cas
                 .unwrap_or("Chromecast")
                 .to_string(),
             endpoint: String::new(),
+            sinks: Vec::new(),
         });
     }
     out
@@ -1211,6 +1371,7 @@ pub fn airplay_devices_from_records(records: &[MdnsServiceRecord]) -> Vec<CastDe
             kind: "airplay".to_string(),
             model: record.txt_get("am").unwrap_or("").to_string(),
             endpoint: String::new(),
+            sinks: Vec::new(),
         });
     }
     out

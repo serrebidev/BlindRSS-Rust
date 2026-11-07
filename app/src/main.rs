@@ -7198,6 +7198,7 @@ fn main() {
                                         kind: "kodi".to_string(),
                                         model: String::new(),
                                         endpoint: String::new(),
+                                        sinks: Vec::new(),
                                     });
                                 }
                             }

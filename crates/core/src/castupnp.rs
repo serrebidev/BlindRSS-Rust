@@ -52,7 +52,7 @@ fn soap_envelope(service_type: &str, action: &str, args: &str) -> String {
     )
 }
 
-fn soap_call(
+pub(crate) fn soap_call(
     control_url: &str,
     service_type: &str,
     action: &str,

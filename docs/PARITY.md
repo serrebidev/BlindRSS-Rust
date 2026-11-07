@@ -6670,3 +6670,127 @@ on c445db3 (the tag tree also carries the discovery
 test-server Connection: close fix described in that
 commit). Brandon's NVDA pass on Escape across dialogs
 is the acceptance step.
+
+## Audit 9 — missing-feature completion pass (2026-11-06, Brandon's order)
+
+A fresh sweep of every recorded non-port against current
+Python main (v2.5.9, unchanged since the reconciliation).
+Three real gaps were completed; several recorded "gaps"
+turned out to be stale records, corrected below; the rest
+are dispositioned with fresh evidence.
+
+**Completed.**
+
+1. **Local MP4/M4A/M4B embedded chapters** (was: Task 20
+   deviation). `chapters::mp4_chapters` walks the box tree
+   (moov/udta/trak/mdia/minf/stbl) for the `chpl` atom —
+   the Nero chapter list mutagen's `MP4.chapters` reads,
+   the only MP4 chapter source Python exposes — and parses
+   its entries (u64 100-ns starts, length-prefixed titles).
+   `embedded_media_chapters` mirrors Python's branch order
+   exactly (MP3/ID3 first, then the MP4 suffix/type set;
+   remote MP4 still not downloaded, Python's rule).
+   Tests: crates/core/tests/mp4_chapters.rs (4).
+2. **YouTube watch-next chapters + the chapter memo**
+   (was: Task 20 deviation (3) + Task 23 adjacent find (3)).
+   `ytfull::extract_chapters` now ports Python's
+   `youtube_fulltext.extract_chapters` in full: one
+   InnerTube `next` call, sources in Python's order
+   (player-bar markers incl. markersMap
+   DESCRIPTION/AUTO chapters, the key-moments panel, then
+   description timestamps validated against the `player`
+   call's lengthSeconds), `None` (unsettled) falling back
+   to the yt-dlp info dict while a settled empty list does
+   not, the "<Untitled Chapter 1>" gap fill, and the
+   30-minute per-video memo (successes only, empties
+   included). The chapters transport calls it instead of
+   going straight to the info dict. Python's cancellation
+   check stays unported per the Task 23 deviation (call
+   sites guard with generations). Tests:
+   crates/core/tests/watch_next_chapters.rs (5, fixture
+   InnerTube responses through the injected fetch).
+3. **Cast discovery: cross-protocol name merge, sinks,
+   repeated searches** (was: Task 28 adjacent finds).
+   `CastDevice` gains `sinks` (Caster's rule: published =
+   believed, empty = unknown); UPnP descriptions now also
+   resolve the ConnectionManager URL and discovery fetches
+   each renderer's GetProtocolInfo sinks
+   (`upnp_sink_mimes`, Caster's parse). `discover_all`
+   merges by NAME in Caster's fixed order (chromecast,
+   airplay, dlna, roku, kodi) via
+   `merge_discovery_by_name`: a later same-name device
+   replaces the incumbent only when its published sinks
+   prove video the incumbent cannot show; Sonos still
+   merges last and wins outright (the shipped C04 pass is
+   unchanged). Both SSDP sweeps now repeat each M-SEARCH
+   3 times across the window (Caster SSDP_SEARCHES,
+   spaced timeout/4), deduped downstream as before.
+   Tests: cast_depth merge/support rules (3 new).
+
+**Stale records corrected (already ported; not gaps).**
+
+- Forum HTML layouts (Invision/vBulletin/FluxBB/Drupal/
+  XenForo): ported in `forum_sources.rs` with its own
+  selector matcher and covered by source_depth_parity
+  tests. The stale claim survived in threads.rs's module
+  doc and §7-era notes; the doc now points at
+  forum_sources.
+- The range-cache proxy for ordinary playback: ported
+  by Task 22 (core/rangecache.rs + the player wiring,
+  probe retry, context and toggle reloads). §1's table
+  row predates it and is superseded by §9 as usual.
+- Sonos seed-based discovery: Caster-app surface only —
+  Python BlindRSS itself calls `sonos_discover` with
+  `seed_ips=[]` (core/casting.py). Nothing to port.
+- Settings surface items from the batch-9 era list
+  (interface-language picker, Debug mode): shipped by
+  Task 29 (S09/S18). `max_cached_views` remains an
+  Audit 7 "not a gap" (Python's control is inert there).
+
+**Still open, with verdicts.**
+
+- **B16 (TLS impersonation transport): research refreshed
+  2026-11-06.** The landscape moved: `wreq` (the rquest
+  rename) now has a stable 0.16.1 line in production use
+  elsewhere (fastcrw/crw PR #527, Sept 2026, verified
+  live against a JA3 wall with Chrome profiles;
+  independent test 2026-10-11: builds and 280+ tests pass
+  on Rust 1.99/Ubuntu with BoringSSL via btls + libclang —
+  this box's toolchain). The 6.0.0-rc line also continues
+  (rc.31, Aug 2026). impit remains git-patch-only for
+  Rust use. Remaining blocker is now only the shape: wreq
+  is async (tokio) and the core is blocking — the port
+  needs a bounded spike proving a per-call blocking
+  bridge + the BoringSSL build inside this workspace's
+  CI, then the stage wiring behind
+  `extract::impersonated_fetch`. That spike is the next
+  B16 step; it was not rushed into this release.
+- **B17 (privileged v20 helper): unchanged.** A new
+  elevated SYSTEM-impersonation binary is a security
+  surface of its own; it ships only with a design pass
+  and a Windows test pass, neither of which this audit
+  substitutes for. v20 rows remain counted-and-named
+  with the file-import route working.
+- **Caster HlsRelay internals** (piped TsSource reader,
+  replay dedupe, under-feed rotation, `_probe_codecs`
+  re-encode decisions): the recorded shape deviation
+  stands. This pass landed its prerequisite — per-device
+  published sinks now reach the cast layer — but the
+  relay stays the managed ffmpeg `-c copy` HLS route
+  until a receiver-driven transcode decision is designed
+  against it; physical receiver acceptance remains
+  Brandon's (RB Room unreachable from the sandbox).
+- **pytubefix phase / hidden-browser visitor-data
+  bootstrap** (Task 22 deviation): no Rust analogues
+  exist; the browser fallback (B01) covers the recovery
+  intent. Standing verdict.
+- Small recorded niceties left as-is: installed-browser
+  version detection for the "auto" UA preset, GSMArena's
+  battery-table sort, the diagnostic seek probes
+  (diagnostic-only in Python by design). None change
+  what a user can do; they are polish, listed here so
+  the record stays complete.
+- Owner-decision items unchanged from §10: Task 23's
+  Deno packaging and Task 30's B14 workflow integration
+  (both need Brandon's workflow OK), and the
+  `close_to_tray` default disposition.

@@ -6,7 +6,7 @@
 
 use blindrss_core::cast::{
     CastClock, CastDevice, CastQueue, CastQueueItem, CastStatus, QueueAdvance, format_hms,
-    parse_hms, protocol_label, supports_seek, supports_volume,
+    merge_discovery_by_name, parse_hms, protocol_label, supports_seek, supports_volume,
 };
 use blindrss_core::castupnp::{self, KodiAuth};
 use std::io::{Read, Write};
@@ -100,6 +100,7 @@ fn device(kind: &str, endpoint: String) -> CastDevice {
         kind: kind.into(),
         model: String::new(),
         endpoint,
+        sinks: Vec::new(),
     }
 }
 
@@ -703,6 +704,7 @@ fn sonos_play_and_stop_route_to_the_group_coordinator() {
         kind: "sonos".into(),
         model: String::new(),
         endpoint: "http://127.0.0.1:1400/member/AVTransport/Control".into(),
+        sinks: Vec::new(),
     };
     castupnp::play_upnp(&dev, "http://media.test/ep.mp3", "Ep", "audio/mpeg").unwrap();
     castupnp::stop_upnp(&dev).unwrap();
@@ -744,4 +746,67 @@ fn raop_handle_tracks_pause_volume_and_position() {
     assert_eq!(handle.volume(), 100);
     handle.request_stop();
     assert!(handle.stop.load(std::sync::atomic::Ordering::Relaxed));
+}
+
+// ---------------------------------------------------------------------------
+// Cross-protocol name merge (Caster `_discover_sync`): one box
+// answering two protocols under one name must appear once, and
+// the entry kept is the one that can do more.
+
+fn named(kind: &str, name: &str, sinks: &[&str]) -> CastDevice {
+    CastDevice {
+        name: name.into(),
+        host: format!("host-{name}-{kind}"),
+        port: 0,
+        kind: kind.into(),
+        model: String::new(),
+        endpoint: String::new(),
+        sinks: sinks.iter().map(|s| s.to_string()).collect(),
+    }
+}
+
+#[test]
+fn merge_keeps_the_video_capable_answer_for_a_tv_seen_twice() {
+    // AirPlay first (RAOP: audio only, no sinks -> not a video
+    // kind), then DLNA publishing video sinks: DLNA replaces,
+    // in the AirPlay entry's position.
+    let merged = merge_discovery_by_name(vec![
+        named("airplay", "Lounge TV", &[]),
+        named("kodi", "Study", &[]),
+        named("dlna", "Lounge TV", &["video/mp4", "audio/mpeg"]),
+    ]);
+    assert_eq!(merged.len(), 2);
+    assert_eq!(merged[0].name, "Lounge TV");
+    assert_eq!(merged[0].kind, "dlna");
+    assert_eq!(merged[1].name, "Study");
+}
+
+#[test]
+fn merge_keeps_first_answer_when_the_challenger_proves_nothing_more() {
+    // An amplifier: DLNA sinks are audio-only, so the later
+    // DLNA answer must NOT displace the AirPlay one (Caster:
+    // order decides every tie; AirPlay is the better path).
+    let merged = merge_discovery_by_name(vec![
+        named("airplay", "Amp", &[]),
+        named("dlna", "Amp", &["audio/mpeg"]),
+    ]);
+    assert_eq!(merged.len(), 1);
+    assert_eq!(merged[0].kind, "airplay");
+    // And a challenger with no published sinks never replaces,
+    // even a same-name entry that cannot show video either.
+    let merged2 = merge_discovery_by_name(vec![
+        named("airplay", "Amp", &[]),
+        named("dlna", "Amp", &[]),
+    ]);
+    assert_eq!(merged2.len(), 1);
+    assert_eq!(merged2[0].kind, "airplay");
+}
+
+#[test]
+fn supports_video_believes_sinks_then_falls_back_to_kind() {
+    assert!(named("dlna", "TV", &["video/mp4"]).supports_video());
+    assert!(!named("dlna", "Amp", &["audio/mpeg"]).supports_video());
+    assert!(named("dlna", "Silent renderer", &[]).supports_video());
+    assert!(!named("airplay", "Speaker", &[]).supports_video());
+    assert!(named("chromecast", "Cast TV", &[]).supports_video());
 }

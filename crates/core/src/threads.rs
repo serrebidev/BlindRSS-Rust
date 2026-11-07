@@ -20,9 +20,9 @@
 //!
 //! Detection fails closed: anything that does not confirm
 //! returns None and normal extraction runs. The HTML-selector
-//! forum configs (Invision, vBulletin, XenForo...) are not
-//! ported — the Rust extractor has no CSS-selector engine;
-//! see PARITY §7.
+//! forum layouts (Invision, vBulletin, XenForo...) live in
+//! `forum_sources.rs`, which carries its own small selector
+//! matcher; this module owns the API-shaped sources.
 
 use regex::Regex;
 use serde_json::Value;

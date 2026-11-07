@@ -81,16 +81,10 @@ impl ChapterTransport for HttpChapterTransport {
     }
 
     fn youtube_chapters(&self, url: &str) -> Vec<Chapter> {
-        // Python tries the watch-next endpoint first and falls
-        // back to the yt-dlp info dict; the Rust yt-dlp info
-        // path (`chapters_from_info`: the info's own chapter
-        // list, else the description timestamp grammar) is the
-        // same source the Rust YouTube article reader uses.
-        let info = crate::media::youtube_article_info(url).ok();
-        let Some(info) = info else {
-            return Vec::new();
-        };
-        crate::ytfull::chapters_from_info(&info, url)
+        // Python `youtube_fulltext.extract_chapters`: the
+        // watch-next endpoint first (memoized), the yt-dlp
+        // info dict as the fallback — ported in ytfull.
+        crate::ytfull::extract_chapters(url)
             .into_iter()
             .map(|c| Chapter {
                 start: c.start,
@@ -551,14 +545,96 @@ pub fn article_chapter_links(article_url: &str, chapters: &[Chapter]) -> Vec<Cha
     out
 }
 
+/// Chapters from an MP4/M4A/M4B file's `chpl` atom — the
+/// Nero chapter list mutagen's `MP4.chapters` reads (the
+/// only MP4 chapter source Python exposes; QuickTime
+/// chapter tracks are not read by mutagen either). Walks
+/// the box tree (moov and its container descendants) for
+/// `chpl`, then parses its entries: version/flags, a
+/// reserved u32 + u8, a u32 count, and per chapter a u64
+/// start in 100-ns units and a length-prefixed title —
+/// the layout ffmpeg's mov demuxer reads too.
+pub fn mp4_chapters(path: &str) -> Vec<Chapter> {
+    let Ok(data) = std::fs::read(path) else {
+        return Vec::new();
+    };
+    let Some(chpl) = find_box(&data, 0, data.len(), b"chpl") else {
+        return Vec::new();
+    };
+    parse_chpl(&data[chpl.0..chpl.1])
+}
+
+/// (content_start, content_end) of the first `target` box
+/// within data[start..end], descending into the container
+/// boxes MP4 chapters can live under.
+fn find_box(data: &[u8], start: usize, end: usize, target: &[u8; 4]) -> Option<(usize, usize)> {
+    const CONTAINERS: [&[u8; 4]; 6] = [b"moov", b"udta", b"trak", b"mdia", b"minf", b"stbl"];
+    let mut pos = start;
+    while pos + 8 <= end {
+        let size32 = u32::from_be_bytes(data[pos..pos + 4].try_into().ok()?) as usize;
+        let kind: &[u8; 4] = data[pos + 4..pos + 8].try_into().ok()?;
+        let (header, size) = match size32 {
+            1 if pos + 16 <= end => (
+                16,
+                u64::from_be_bytes(data[pos + 8..pos + 16].try_into().ok()?) as usize,
+            ),
+            0 => (8, end - pos),
+            _ => (8, size32),
+        };
+        if size < header || pos + size > end {
+            return None;
+        }
+        if kind == target {
+            return Some((pos + header, pos + size));
+        }
+        if CONTAINERS.contains(&kind)
+            && let Some(found) = find_box(data, pos + header, pos + size, target)
+        {
+            return Some(found);
+        }
+        pos += size;
+    }
+    None
+}
+
+fn parse_chpl(data: &[u8]) -> Vec<Chapter> {
+    // version/flags (4) + reserved u32 (4) + reserved u8 (1)
+    // + count u32 (4).
+    if data.len() < 13 {
+        return Vec::new();
+    }
+    let count = u32::from_be_bytes(data[9..13].try_into().unwrap()) as usize;
+    let mut pos = 13;
+    let mut out = Vec::new();
+    for _ in 0..count {
+        if pos + 9 > data.len() {
+            break;
+        }
+        let start_100ns = u64::from_be_bytes(data[pos..pos + 8].try_into().unwrap());
+        let title_len = data[pos + 8] as usize;
+        pos += 9;
+        if pos + title_len > data.len() {
+            break;
+        }
+        let title = String::from_utf8_lossy(&data[pos..pos + title_len]).into_owned();
+        pos += title_len;
+        out.push(Chapter {
+            start: start_100ns as f64 / 10_000_000.0,
+            title: Some(title),
+            href: None,
+        });
+    }
+    out
+}
+
 /// Python `_embedded_media_chapters`: embedded chapters from
 /// the media file. Local MP3s (and local files typed
-/// audio/mpeg) read their ID3 tag directly; remote files are
-/// only attempted for MP3 paths / MPEG types, through the same
-/// bounded prefix read — remote MP4 chapter atoms can live at
-/// the end of the file and are intentionally not downloaded.
-/// Local MP4/M4A/M4B chapters are the one Python source not
-/// ported: the Rust tree has no MP4 chapter-atom reader.
+/// audio/mpeg) read their ID3 tag directly; local
+/// MP4/M4A/M4B files read their `chpl` atom; remote files
+/// are only attempted for MP3 paths / MPEG types, through
+/// the same bounded prefix read — remote MP4 chapter atoms
+/// can live at the end of the file and are intentionally
+/// not downloaded (Python's rule, kept).
 pub fn embedded_media_chapters(media_url: &str, media_type: Option<&str>) -> Vec<Chapter> {
     let media_type = crate::media::canonical_media_type(media_type);
     let path_lower = url::Url::parse(media_url)
@@ -572,10 +648,15 @@ pub fn embedded_media_chapters(media_url: &str, media_type: Option<&str>) -> Vec
             .and_then(|e| e.to_str())
             .map(|e| format!(".{}", e.to_ascii_lowercase()))
             .unwrap_or_default();
-        if suffix != ".mp3" && media_type != "audio/mpeg" && media_type != "audio/mp3" {
-            return Vec::new();
+        if suffix == ".mp3" || media_type == "audio/mpeg" || media_type == "audio/mp3" {
+            return crate::extract::id3_chapters(media_url);
         }
-        return crate::extract::id3_chapters(media_url);
+        if [".m4a", ".m4b", ".mp4"].contains(&suffix.as_str())
+            || ["audio/mp4", "video/mp4", "audio/x-m4a"].contains(&media_type.as_str())
+        {
+            return mp4_chapters(local_path);
+        }
+        return Vec::new();
     }
     if !path_lower.ends_with(".mp3") && media_type != "audio/mpeg" && media_type != "audio/mp3" {
         return Vec::new();
