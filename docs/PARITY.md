@@ -7732,3 +7732,15 @@ by NAME: core_slice's fixture copies used fixed temp names,
 so a stale -wal resurrected the previous run's state into a
 fresh copy and mark_read_roundtrip flaked; fixture_copy now
 uses unique names and clears sidecars first.
+
+**v0.1.71 VERIFIED** (2026-11-07): tag on `f5e2ad6`; main CI
+42412907172 success (all three jobs, Windows included after
+the WAL-flip retry); Release run 42414336879 success (all
+three Package jobs + Publish). API verification: Latest =
+v0.1.71, draft = false, exactly 7 assets, body identical to
+the CHANGELOG.md 0.1.71 section. Signature verified locally:
+SIGNATURE VALID, tamper control rejected a flipped byte. 998
+tests on the ship tree. Ships the three fixes above: WAL
+connection setup (locked-database errors + refresh stalls),
+NPR audio resolved per session, and Settings' async minimal
+soundcard enumeration.
