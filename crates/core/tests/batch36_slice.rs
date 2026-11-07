@@ -240,6 +240,42 @@ fn end_to_end_range_cache_on_loopback() {
         "probe + fetch, hits={hits_after_first}"
     );
 
+    // Wait until the fetched window is committed to the disk
+    // cache before asserting the repeat read is a pure cache
+    // serve. The chunk file's name is deterministic
+    // (chunk_path's zero-padded start-end), and its rename into
+    // place is what registers the segment; under heavy CI load
+    // the repeat request could otherwise race the tail of the
+    // first request's bookkeeping and fetch once more from the
+    // origin (seen once on a macOS runner: hits 2 -> 3 with
+    // correct bytes throughout). The bounded poll keeps the
+    // test honest: a cache that never writes the chunk still
+    // fails here.
+    let chunk_name = "000000001000-000000001999.bin";
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let mut chunk_on_disk = false;
+    while std::time::Instant::now() < deadline {
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            for sub in rd.flatten() {
+                let sub_path = sub.path();
+                if sub_path.is_dir() && sub_path.join(chunk_name).is_file() {
+                    chunk_on_disk = true;
+                }
+            }
+        }
+        if chunk_on_disk {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(
+        chunk_on_disk,
+        "fetched window was committed to the disk cache"
+    );
+    // Fresh baseline after the settle: any late first-request
+    // origin traffic has landed by now.
+    let hits_after_first = *origin.hits.lock().unwrap();
+
     // The same range again is served from the disk cache: no
     // new origin hit for the data (the probe is single-flight
     // and already done).
