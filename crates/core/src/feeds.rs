@@ -60,6 +60,12 @@ pub struct FeedFetchOverrides {
     pub timeout_secs: Option<u64>,
     pub proxy: String,
     pub encoding: String,
+    /// Per-feed browser-impersonation policy (Python
+    /// feed_settings "impersonate": auto/always/never,
+    /// issue #29). "" reads as "auto" through
+    /// `feed_settings::normalize_impersonate` at the stage
+    /// gate, which is also the Default value's meaning.
+    pub impersonate: &'static str,
 }
 
 impl FeedFetchOverrides {
@@ -93,6 +99,7 @@ impl FeedFetchOverrides {
             encoding: crate::feed_settings::text_value(settings, "encoding")
                 .trim()
                 .to_string(),
+            impersonate: crate::feed_settings::impersonate_value(settings),
         }
     }
 
@@ -360,9 +367,27 @@ pub fn fetch_feed_document_cancellable(
     let cached = db
         .cached_feed(url)
         .map_err(|e| format!("feed cache: {e}"))?;
+    // Per-feed impersonation policy (issue #29, B16's
+    // refresh half): "always" tries the impersonated fetch
+    // first; "auto" keeps it as the reserved attempt when
+    // the plain fetch fails or answers with a block;
+    // "never" disables the stage. A recovered body follows
+    // the browser stage's contract (validators cleared,
+    // digest never recorded).
+    let impersonate_mode = crate::feed_settings::normalize_impersonate(overrides.impersonate);
+    if impersonate_mode == "always"
+        && let Some(recovered) = impersonate_recover_feed(db, url, overrides)
+    {
+        return recovered;
+    }
     let mut response = match fetch_response(url, force_full, &cached, overrides) {
         Ok(response) => response,
         Err(error) => {
+            if impersonate_mode != "never"
+                && let Some(recovered) = impersonate_recover_feed(db, url, overrides)
+            {
+                return recovered;
+            }
             if crate::browser::refresh_error_qualifies(&error)
                 && let Some(recovered) = browser_recover_feed(db, url, proxy, cancel)
             {
@@ -407,12 +432,23 @@ pub fn fetch_feed_document_cancellable(
         Ok(parsed) => parsed,
         Err(parse_error) => {
             let body_text = String::from_utf8_lossy(&body);
-            if crate::browser::refresh_response_qualifies(
+            let qualifies = crate::browser::refresh_response_qualifies(
                 status,
                 cf_mitigated.as_deref(),
                 &body_text,
-            ) && let Some(recovered) = browser_recover_feed(db, url, proxy, cancel)
+            );
+            // Python escalates the reserved attempt on
+            // `_response_looks_blocked`: a challenge shape,
+            // or a 200/403/429 HTML answer that is not a
+            // feed. The status half is checked here; the
+            // challenge half is the browser qualification.
+            if impersonate_mode != "never"
+                && (qualifies || matches!(status, 200 | 403 | 429))
+                && let Some(recovered) = impersonate_recover_feed(db, url, overrides)
             {
+                return recovered;
+            }
+            if qualifies && let Some(recovered) = browser_recover_feed(db, url, proxy, cancel) {
                 return recovered;
             }
             return Err(parse_error);
@@ -424,6 +460,46 @@ pub fn fetch_feed_document_cancellable(
         parsed,
         body_digest: digest,
     })
+}
+
+/// The impersonation recovery attempt behind
+/// `fetch_feed_document_cancellable` (B16's refresh half;
+/// Python providers/local.py's reserved impersonated
+/// attempt, issue #29): one GET on a real-browser TLS
+/// fingerprint — the site's pinned session target when one
+/// exists, else Python's "chrome" default — carrying the
+/// site's stored cookies exactly as the plain request
+/// builder attaches them. None when the fetch fails or
+/// the body does not parse as a feed; the caller then
+/// continues to the browser stage or its original
+/// failure. The recovered body is cached with validators
+/// cleared and its digest is never recorded, the browser
+/// stage's contract.
+fn impersonate_recover_feed(
+    db: &crate::Db,
+    url: &str,
+    overrides: &FeedFetchOverrides,
+) -> Option<Result<FeedFetch, String>> {
+    let pinned = crate::extract::site_impersonation_target(url);
+    let target = if pinned.is_empty() { "chrome" } else { &pinned };
+    let cookie = COOKIE_PATH
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        .map(|path| crate::cookies::site_headers_for(&path, url).0)
+        .unwrap_or_default();
+    let bytes = crate::impersonate::fetch_bytes(
+        url,
+        target,
+        &cookie,
+        std::time::Duration::from_secs(crate::http::timeout_secs()),
+    )?;
+    let parsed = parse_feed(&decode_feed_body(&bytes, &overrides.encoding)).ok()?;
+    let _ = db.cache_feed(url, None, None, &bytes);
+    Some(Ok(FeedFetch::Fetched {
+        parsed,
+        body_digest: String::new(),
+    }))
 }
 
 /// The browser recovery attempt behind

@@ -3063,7 +3063,7 @@ fn impersonate_target_for_ua(ua: &str) -> &'static str {
 /// non-empty result means the direct fetch conceptually
 /// already went out on that handshake, so the fallback
 /// stage would only repeat it.
-fn site_impersonation_target(url: &str) -> String {
+pub fn site_impersonation_target(url: &str) -> String {
     let Some(config_path) = configured_config_path() else {
         return String::new();
     };
@@ -3088,20 +3088,22 @@ fn impersonation_target_list(pinned: &str) -> Vec<&'static str> {
     }
 }
 
-/// One impersonated request. TRANSPORT PENDING (Audit 8
-/// B16): the research record in PARITY.md shows no
-/// compatible, supported Rust TLS-impersonation transport
-/// exists yet — the maintained candidates are async-only
-/// stacks whose stable releases are yanked or only
-/// release candidates (wreq/BoringSSL), or unpublished
-/// git-patched forks of the whole HTTP stack (impit) —
-/// so this seam resolves to no body, the same shape
-/// Python takes when every impersonated request failed.
-/// Certificate validation is never weakened here, and a
-/// future transport drops into this one function.
+/// One impersonated request (Audit 8 B16, landed): the
+/// transport is `crate::impersonate` — wreq/BoringSSL on a
+/// per-call blocking bridge, with the target key selecting
+/// the browser fingerprint profile. Certificate validation
+/// is never weakened. The timeout is the configured feed
+/// timeout, the same value the shared ureq agent carries.
+/// Python's per-attempt timeout is its extraction timeout;
+/// the cascade gives this stage no separate budget in
+/// either implementation.
 fn impersonated_fetch(url: &str, target: &str, cookie_header: &str) -> Option<String> {
-    let _ = (url, target, cookie_header);
-    None
+    crate::impersonate::fetch(
+        url,
+        target,
+        cookie_header,
+        std::time::Duration::from_secs(crate::http::timeout_secs()),
+    )
 }
 
 /// Python `_download_via_impersonation`: refetch the
@@ -4759,9 +4761,8 @@ pub fn fetch_full_text_opts(
     // Impersonated refetch: skipped when the site's
     // pinned session already forced that handshake on the
     // direct fetch, unless stale clearance was just
-    // dropped (Python's rule). The transport is the
-    // pending B16 fidelity; the stage resolves to no body
-    // until it lands.
+    // dropped (Python's rule). The transport is
+    // crate::impersonate (B16, landed).
     if (site_impersonation_target(url).is_empty() || dropped_stale_clearance)
         && let Some(html) = fetch_via_impersonation(url, cookie_header)
         && let Ok(win) = process_fetched_page(

@@ -6997,3 +6997,157 @@ Local gate on the release tree: 969 tests passed, 0 failed
 (956 + 13 new: core date/collapse/detect-media/menu-label
 unit tests and 7 app source-scan guards). Acceptance of
 the ten fixes is Brandon's NVDA pass on v0.1.64.
+
+## B16 landed — TLS impersonation transport (2026-11-06, shipped v0.1.65)
+
+The last Audit 8 transport gap is closed. The local spike
+recorded earlier (wreq 0.16.3 + wreq-util 0.2.0 + BoringSSL
+building clean, the per-call blocking bridge driving the
+async client, the emulated Chrome 131 user-agent crossing
+a real socket, HTTPS completing through a proxy with a
+caller-supplied CA store) is now the production path:
+
+- New core module `impersonate.rs`: `fetch(url, target,
+  cookie_header, timeout)` spawns one OS thread per call
+  running a current-thread tokio runtime (core is
+  synchronous throughout), builds a wreq client with the
+  target's emulation profile, and returns the body only
+  on a 200..400 status — Python's success rule in
+  `_download_via_impersonation`; the caller
+  (`fetch_via_impersonation`) still rejects empty and
+  interstitial bodies and cycles the targets. Certificate
+  validation is never weakened (default root store), and
+  the system proxy configuration is honored the way
+  requests honors it.
+- Profile map (`profile_for_target`): Python's targets
+  are curl_cffi keys. `""`/`"chrome"` (Python's default,
+  `utils.IMPERSONATE_TARGET = "chrome"`) → Chrome149;
+  `"safari184"` → Safari18_5 (the nearest Safari 18
+  profile wreq-util ships to curl_cffi's 18.4 — same
+  fingerprint family); `"firefox"` → Firefox151. Unknown
+  keys fall back to Chrome, mirroring Python's
+  `impersonate_target or IMPERSONATE_TARGET`.
+- Headers follow Python's `_impersonated_headers`
+  division of labor: the profile owns the identity set
+  (User-Agent / Sec-CH-UA / Sec-Fetch, self-consistent
+  with the handshake — the loopback test captures the
+  emulated Chrome 149 set on the wire); the request
+  carries only the functional headers, Python's
+  `_HTML_ACCEPT_HEADERS` (Accept, Accept-Language)
+  plus the caller's cookie header when supplied.
+- Timeout: the configured feed timeout
+  (`http::timeout_secs()`), the same value the shared
+  ureq agent carries; Python threads its extraction
+  timeout through the equivalent call.
+- Tests: profile-map unit test + two loopback tests
+  (profile identity/cookie/Accept headers cross a real
+  socket; a 403 yields no body). Live JA3-wall acceptance
+  remains a manual check on Brandon's machine — this
+  sandbox's egress is refused by the endpoints this stage
+  exists for, so no live verdict is claimed from here.
+- §10's B16 entry is superseded by this section. Still
+  open: B17 (unchanged, needs design + Windows test
+  pass) and the owner-decision items (Task 23 Deno
+  packaging, Task 30 B14 workflow step, close_to_tray
+  default).
+
+## Launch reports against v0.1.64 (2026-11-06, shipped v0.1.65)
+
+Two reports from Brandon's first v0.1.64 launch, root-caused
+as one chain, plus B16's refresh half landed alongside.
+
+**The status-line error is real, and it is the YouTube
+root cause.** At launch the managed yt-dlp maintenance
+tried to download the nightly binary and the status line
+showed `yt-dlp download: yt-dlp download: the response
+body is larger than request limit: 10485760`. Three
+defects composed it: (1) `dependency::download_to_file`
+read the body with ureq's `read_to_vec`, whose default
+read limit is 10 MiB — every yt-dlp nightly binary is
+larger, so the managed download could NEVER succeed;
+(2) the error was prefixed twice, once in core
+(`download_to_file`) and once in the app's status
+formatter, which now shows the core string as-is (the
+core strings are complete: "yt-dlp download: ...",
+"install: ..."); (3) `dependency::download_bytes` (the
+ffmpeg archive path) carried the same capped read and
+got the same raised cap. Fix: downloads stream to disk
+through the body reader under an explicit 1 GiB sanity
+cap (`TOOL_DOWNLOAD_LIMIT`), a failed copy removes the
+partial file (the maintenance flow verifies before
+swapping, and a truncated file must never be what it
+verifies), and the ffmpeg path reads under the same cap.
+Regression test: `tool_download_streams_past_the_ureq_default_read_limit`
+serves 11 MiB over loopback and lands it whole.
+
+**YouTube feeds: add never completes, refresh errors.**
+Verified from serrebiradio.com at Brandon's direction:
+the channel page answers 200 while
+`feeds/videos.xml?channel_id=UCxXMMQl_aakstul0tzu41Fg`
+answers 404 with Google's generic error page for EVERY
+anonymous client tried — curl (plain, browser UA, full
+browser header set, CONSENT cookie, HTTP/1.1 and /2),
+python requests, and curl_cffi with chrome/safari184/
+firefox fingerprints; a control channel feed 404s
+identically while NPR answers 200. The endpoint refuses
+anonymous fetches from these IPs outright — the exact
+condition Python's issue #107 comment records ("answers
+404/500 at random for some channels"), whose designed
+recovery is the yt-dlp uploads-playlist listing. That
+listing works from the same server (real entries
+returned). The Rust refresh already carried the #107
+fallback, but it shells to yt-dlp — and on Brandon's
+machine yt-dlp was the managed copy whose download the
+10 MiB cap had just killed. One root cause, both
+reports. The subscribe path had a second, independent
+gap: `resolve_subscribe_url` ran a failed videos.xml
+parse into the generic page-discovery chain (probe
+paths, OpenRSS), which grinds and fails even though the
+listing would resolve the channel at once. It now tries,
+after the direct parse fails and before page discovery,
+the same uploads-playlist listing refresh uses, and
+subscribes with the listing's title and entries under
+the original videos.xml URL — refresh then keeps its
+RSS-first + fallback shape. Tests:
+`crates/core/tests/impersonation_refresh.rs` covers the
+stage below; the listing machinery itself was already
+covered by the sources tests.
+
+**B16 refresh half — per-feed impersonation stage.**
+Section 10 recorded Python refresh's `_response_looks_blocked`
+escalation as part of B16 ("both land or stay pending
+together"); with the transport landed, the stage is now
+wired into `feeds::fetch_feed_document_cancellable`
+behind the per-feed `impersonate` setting
+(`FeedFetchOverrides.impersonate`, from
+`feed_settings::impersonate_value`; providers/local.py
+lines 2196 and 3369-3460 are the spec). Modes: "always"
+tries the impersonated fetch first (a plain-pipeline
+success remains possible when impersonation fails —
+Python's always attempts impersonate exclusively; the
+divergence only ever turns a failure into a success and
+is recorded here); "auto" makes ONE reserved
+impersonated attempt when the plain fetch errors, or
+when the response fails to parse and looks blocked
+(challenge qualification, or status 200/403/429 — the
+status half of `_response_looks_blocked`); "never"
+disables the stage. The attempt is
+`impersonate::fetch_bytes`: same blocking bridge as the
+extractor's fetch, feed Accept header, the site's pinned
+session target when one exists else "chrome", the site's
+stored cookies attached exactly as the plain builder
+attaches them. A recovered body follows the browser
+stage's contract: cached with validators cleared, digest
+never recorded. Deviations from Python's choreography,
+stated plainly: Python interleaves the reserved attempt
+inside its retry budget (conditional headers and all);
+the Rust stage runs as a recovery stage beside the
+browser stage, so an impersonation-recovered refresh
+always transfers the full body and never answers 304.
+Tests: `refresh_recovers_a_blocked_feed_through_impersonation`
+(a loopback WAF that serves the feed only to requests
+carrying the impersonated client's Sec-Fetch headers)
+and `refresh_never_mode_skips_the_impersonation_stage`
+(exactly one request reaches the server), plus
+`impersonated_fetch_bytes_returns_the_raw_body`.
+

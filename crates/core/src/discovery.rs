@@ -754,6 +754,24 @@ pub fn resolve_subscribe_url(url: &str) -> Result<(String, crate::feeds::ParsedF
     if let Ok(parsed) = crate::feeds::fetch_and_parse(url) {
         return Ok((url.trim().to_string(), parsed));
     }
+    // A native YouTube channel feed whose RSS fetch failed:
+    // resolve it through the uploads-playlist listing
+    // instead of the generic page-discovery chain (the
+    // #107 recovery refresh uses — the endpoint answers
+    // 404/500 at random, and the listing holds exactly
+    // what the feed holds). Without this, subscribing to a
+    // videos.xml URL ground through page probing and
+    // failed even though refresh would have recovered.
+    if let Some(cid) = crate::sources::youtube_channel_id(url)
+        && let Ok((title, items)) = crate::sources::fetch_youtube_channel_items(&cid, 30)
+        && !items.is_empty()
+    {
+        let parsed = crate::feeds::ParsedFeed {
+            title,
+            entries: crate::sources::items_to_entries(items),
+        };
+        return Ok((url.trim().to_string(), parsed));
+    }
     let (html, effective) =
         discovery_page(url).map_err(|e| format!("no feed at URL and page fetch failed: {e}"))?;
     if body_looks_like_feed(&html, "") {

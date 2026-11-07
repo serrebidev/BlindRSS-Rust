@@ -698,16 +698,34 @@ pub fn latest_ytdlp_version_from(api_url: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Read cap for managed-tool downloads. ureq's buffered
+/// reads default to a 10 MiB limit, which every yt-dlp
+/// nightly binary exceeds — the managed download failed at
+/// launch with "the response body is larger than request
+/// limit: 10485760". Tool archives are tens of megabytes;
+/// the cap stays as a sanity bound, far above any real
+/// asset, and downloads stream to disk instead of
+/// buffering in memory.
+const TOOL_DOWNLOAD_LIMIT: u64 = 1 << 30;
+
 fn download_to_file(url: &str, dest: &std::path::Path) -> Result<(), String> {
     let mut resp = crate::http::agent()
         .get(url)
         .call()
         .map_err(|e| format!("yt-dlp download: {e}"))?;
-    let bytes = resp
+    let mut file = std::fs::File::create(dest).map_err(|e| format!("write: {e}"))?;
+    let mut reader = resp
         .body_mut()
-        .read_to_vec()
-        .map_err(|e| format!("yt-dlp download: {e}"))?;
-    std::fs::write(dest, &bytes).map_err(|e| format!("write: {e}"))?;
+        .with_config()
+        .limit(TOOL_DOWNLOAD_LIMIT)
+        .reader();
+    if let Err(e) = std::io::copy(&mut reader, &mut file) {
+        // No partial binary left behind: the maintenance
+        // flow verifies before swapping, and a truncated
+        // file must never be what it verifies.
+        let _ = std::fs::remove_file(dest);
+        return Err(format!("yt-dlp download: {e}"));
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1082,7 +1100,11 @@ fn download_bytes(url: &str) -> Result<Vec<u8>, String> {
         .get(url)
         .call()
         .map_err(|e| format!("download: {e}"))?;
+    // Same raised cap as download_to_file: an ffmpeg
+    // archive is far over ureq's 10 MiB default read limit.
     resp.body_mut()
+        .with_config()
+        .limit(TOOL_DOWNLOAD_LIMIT)
         .read_to_vec()
         .map_err(|e| format!("download: {e}"))
 }
@@ -1292,4 +1314,58 @@ pub fn install_ffmpeg(data_dir: &std::path::Path) -> Result<std::path::PathBuf, 
         ));
     }
     Ok(dir)
+}
+
+#[cfg(test)]
+mod download_tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    /// Serve one response with a body of `size` bytes over
+    /// loopback and return the URL.
+    fn serve_sized_body(size: usize) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf: Vec<u8> = Vec::new();
+            let mut chunk = [0u8; 4096];
+            while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = stream.read(&mut chunk).unwrap();
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {size}\r\nConnection: close\r\n\r\n"
+            );
+            stream.write_all(head.as_bytes()).unwrap();
+            let block = [0xABu8; 64 * 1024];
+            let mut left = size;
+            while left > 0 {
+                let n = left.min(block.len());
+                stream.write_all(&block[..n]).unwrap();
+                left -= n;
+            }
+        });
+        format!("http://{addr}/tool")
+    }
+
+    #[test]
+    fn tool_download_streams_past_the_ureq_default_read_limit() {
+        // Regression (Brandon, 2026-11-06): the managed
+        // yt-dlp download died at launch with "the response
+        // body is larger than request limit: 10485760" —
+        // ureq's buffered-read default. 11 MiB stands in for
+        // the (larger) real nightly binary.
+        let size = 11 * 1024 * 1024;
+        let url = serve_sized_body(size);
+        let dir = std::env::temp_dir().join(format!("blindrss-dl-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("tool.bin");
+        download_to_file(&url, &dest).expect("download over the old limit succeeds");
+        assert_eq!(std::fs::metadata(&dest).unwrap().len() as usize, size);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

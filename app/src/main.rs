@@ -10576,7 +10576,11 @@ fn main() {
                             );
                             announce("general", "yt-dlp installed");
                         }
-                        Err(e) => frame_tick.set_status_text(&format!("yt-dlp download: {e}"), 0),
+                        // The core error strings are complete
+                        // ("yt-dlp download: ...", "install:
+                        // ..."); prefixing here doubled them
+                        // on the status line.
+                        Err(e) => frame_tick.set_status_text(&e, 0),
                     },
                     Ok(RefreshMsg::Translated(request, result)) => {
                         // Audit 8 O08: a late translation applies

@@ -41,6 +41,7 @@ pub mod help_topics;
 pub mod http;
 pub mod http_headers;
 pub mod i18n;
+pub mod impersonate;
 pub mod maintenance;
 pub mod media;
 pub mod media_url;
