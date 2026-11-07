@@ -7597,3 +7597,17 @@ change. Status text and the refresh sounds are unchanged —
 speech only. Tests: announce_slice defaults test reworked
 (refresh family none, everything else both) plus
 `refresh_results_event_exists_and_is_opt_in`.
+
+**v0.1.69 VERIFIED** (2026-11-07): commits `6d3beaf` (refill
+capture/restore) and `6924638` (refresh announcements opt-in),
+tag on `6924638`. Local gate: fmt clean, clippy zero with real
+exit codes (workspace + core windows-gnu), 995 passed / 0 failed
+on the final tree (one OPML test flaked once with a readonly-DB
+error in the run started right after a SIGTERM-killed compile;
+it passed in isolation and in the clean full re-run). Main CI
+42399698521 completed/success (all 3 jobs read directly);
+Release run 42401122453 completed/success (all 3 Package jobs +
+Publish). API verify: Latest = v0.1.69, draft=false, exactly 7
+assets; the release body is the CHANGELOG 0.1.69 section
+verbatim. Signature: SIGNATURE VALID on BlindRSS.tar.gz +
+tamper control ok.
