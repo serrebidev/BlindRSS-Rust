@@ -7709,3 +7709,13 @@ crash half is attributed to the instance churn — the only
 libVLC lifecycle abuse in the save/open path; the live
 player's apply_preferred_soundcard routes to the existing
 session and creates nothing.
+
+**v0.1.70 VERIFIED** (2026-11-07): tag on `763981f`; main CI
+42405966063 success; Release run 42407317995 success (all
+three Package jobs + Publish). API verification: Latest =
+v0.1.70, draft = false, exactly 7 assets (BlindRSS.zip,
+BlindRSS.tar.gz, BlindRSS.dmg, each with .minisig, plus
+SHA256SUMS), body identical to the CHANGELOG.md 0.1.70
+section. Signature verified locally against the compiled-in
+public key: SIGNATURE VALID, tamper control rejected a
+flipped byte. 995 tests on the ship tree.
