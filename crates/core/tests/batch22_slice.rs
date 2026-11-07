@@ -162,6 +162,10 @@ fn translation_updates_round_trip() {
     assert_eq!(tu::last_check_time(&dir), 1_700_000_000);
     assert!(tu::is_due(&dir, "weekly", 1_700_000_000 + 8 * 86_400));
     assert!(!tu::is_due(&dir, "weekly", 1_700_000_000 + 86_400));
+    // "never" (the Disabled frequency) is never due, however
+    // much time passed and whatever the stored last check.
+    assert!(!tu::is_due(&dir, "never", 1_700_000_000 + 365 * 86_400));
+    assert!(!tu::is_due(&dir, "Never", 1_700_000_000 + 365 * 86_400));
 
     // A too-small catalog is refused as damaged.
     let mut responses = HashMap::new();

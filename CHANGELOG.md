@@ -6,6 +6,10 @@ as `0.1.2-0.1.3`. Each release's section below is its GitHub release note,
 taken from this file by the release workflow. The in-app updater shows the
 same text.
 
+## 0.1.70
+
+- The General tab's "Check for updates:" frequency (translation updates) gains a Never option: automatic update checking can now be fully disabled from that control. The manual Check for Updates button still works with Never selected.
+
 ## 0.1.69
 
 - A refresh finishing while you read no longer throws you back to the top of the article list. The article you have selected and focused is kept by identity and restored at its new position after the rebuild, so new articles arriving above yours do not move you.

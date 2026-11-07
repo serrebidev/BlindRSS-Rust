@@ -550,7 +550,10 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
         "Update translations automatically",
         cfg.get_bool(blindrss_core::translation_updates::CFG_ENABLED, true),
     );
-    let tu_freq_values = ["ten_minutes", "daily", "weekly", "monthly"];
+    // "never" appended last (Brandon's order, 2026-11-07: a
+    // Disabled option for update checking) — existing indices
+    // keep their meaning and tab position.
+    let tu_freq_values = ["ten_minutes", "daily", "weekly", "monthly", "never"];
     let tu_freq_sel = tu_freq_values
         .iter()
         .position(|v| {
@@ -564,7 +567,7 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
         &general.win,
         &tu_group,
         "Check for updates:",
-        &["10 minutes", "Daily", "Weekly", "Monthly"],
+        &["10 minutes", "Daily", "Weekly", "Monthly", "Never"],
         tu_freq_sel,
     );
     let tu_status = StaticText::builder(&general.win).with_label("").build();

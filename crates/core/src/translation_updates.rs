@@ -22,6 +22,9 @@ const CATALOG_URL_TEMPLATE: &str = "https://raw.githubusercontent.com/serrebidev
 
 pub fn frequency_seconds(frequency: &str) -> Option<i64> {
     match frequency.to_lowercase().as_str() {
+        // Explicit: "never" has no interval (is_due short-
+        // circuits it before this fallback is consulted).
+        "never" => None,
         "startup" => Some(0),
         "ten_minutes" => Some(600),
         "daily" => Some(86_400),
@@ -164,7 +167,13 @@ pub fn last_check_time(data_dir: &Path) -> i64 {
 }
 
 /// True when the configured interval since the last check elapsed.
+/// "never" (Brandon's order, 2026-11-07: the General tab's
+/// update-check frequency gains a Disabled option) is never due —
+/// automatic checks stop; manual checks bypass is_due entirely.
 pub fn is_due(data_dir: &Path, frequency: &str, now: i64) -> bool {
+    if frequency.eq_ignore_ascii_case("never") {
+        return false;
+    }
     let interval = frequency_seconds(frequency)
         .unwrap_or_else(|| frequency_seconds(DEFAULT_FREQUENCY).unwrap_or(86_400));
     let last = last_check_time(data_dir);

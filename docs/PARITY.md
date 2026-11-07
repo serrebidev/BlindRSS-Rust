@@ -7611,3 +7611,26 @@ Publish). API verify: Latest = v0.1.69, draft=false, exactly 7
 assets; the release body is the CHANGELOG 0.1.69 section
 verbatim. Signature: SIGNATURE VALID on BlindRSS.tar.gz +
 tamper control ok.
+
+## Settings audit: refresh-on-start + update frequency (2026-11-07)
+
+Brandon reported two things. (1) "Automatically refresh feeds
+upon start" appearing on BOTH the General and the Feeds &
+Articles tabs, to be removed from General. Audit result: the
+checkbox exists exactly once — Feeds & Articles
+(settings.rs, `feeds.win`) — in every shipped build
+v0.1.61–v0.1.68, in current main, and in Python (feeds_panel).
+No General copy exists to remove; the end state he asked for
+is the shipped state. The likely mechanism of the report is
+NVDA browse mode flattening a wx notebook's pages into one
+accessibility tree, making the Feeds controls readable while
+General is the selected tab. No code change made for (1); the
+finding was reported to Brandon as-is. (2) The General tab's
+"Check for updates:" frequency (translation updates) had no
+disabled option. Added: value `never` / label "Never",
+appended to the choice (indices 0–3 unchanged); core
+`translation_updates::is_due` short-circuits "never" to false
+so automatic checks stop, while the manual Check for Updates
+button (which calls check_and_update directly) keeps working.
+Deliberate deviation from Python, whose choice has the same
+four values and no Never.
