@@ -41,7 +41,7 @@ jobs:
             libgstreamer-plugins-bad1.0-dev libwebkit2gtk-4.1-dev \
             libsecret-1-dev libnotify-dev libsdl2-dev \
             gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-libav gstreamer1.0-x \
-            vlc
+            vlc ffmpeg
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -123,6 +123,72 @@ jobs:
           mkdir -p dist/BlindRSS/docs
           cp -r docs/help dist/BlindRSS/docs/
           cp crates/core/assets/minisign.pub dist/BlindRSS/
+
+      # Bundled tools in bin/, mirroring Python's build
+      # (Audit 8 Task 23, landed at the owner's 2026-11-06
+      # finish-everything order): the yt-dlp nightly binary and
+      # Deno from the same URLs Python's build.bat/build.sh use,
+      # ffmpeg copied from the build machine exactly as Python's
+      # ensure_ffmpeg does (Linux apt / macOS brew). Windows has
+      # no system ffmpeg to copy (Python's Windows build bundles
+      # none and finds it at runtime), so the Windows leg stages
+      # the gyan.dev static essentials build — that keeps the
+      # packaged smoke below honest on every leg: all four tools
+      # resolve from the package under a minimal PATH.
+      - name: Bundle tools (bin/)
+        shell: bash
+        run: |
+          mkdir -p dist/BlindRSS/bin
+          YTDLP_BASE=https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/latest/download
+          DENO_BASE=https://github.com/denoland/deno/releases/latest/download
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            curl -fL -o dist/BlindRSS/bin/yt-dlp.exe "$YTDLP_BASE/yt-dlp.exe"
+            curl -fL -o deno.zip "$DENO_BASE/deno-x86_64-pc-windows-msvc.zip"
+            7z x deno.zip -odeno-x > /dev/null
+            cp deno-x/deno.exe dist/BlindRSS/bin/
+            curl -fL -o ffmpeg.zip https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip
+            7z x ffmpeg.zip -offmpeg-x > /dev/null
+            cp ffmpeg-x/*/bin/ffmpeg.exe ffmpeg-x/*/bin/ffprobe.exe dist/BlindRSS/bin/
+          elif [ "$RUNNER_OS" = "Linux" ]; then
+            curl -fL -o dist/BlindRSS/bin/yt-dlp "$YTDLP_BASE/yt-dlp_linux"
+            curl -fL -o deno.zip "$DENO_BASE/deno-x86_64-unknown-linux-gnu.zip"
+            unzip -o -j deno.zip deno -d deno-x > /dev/null
+            cp deno-x/deno dist/BlindRSS/bin/
+            cp /usr/bin/ffmpeg /usr/bin/ffprobe dist/BlindRSS/bin/
+          else
+            curl -fL -o dist/BlindRSS/bin/yt-dlp "$YTDLP_BASE/yt-dlp_macos"
+            if [ "$(uname -m)" = "arm64" ]; then
+              DENO_ASSET=deno-aarch64-apple-darwin.zip
+            else
+              DENO_ASSET=deno-x86_64-apple-darwin.zip
+            fi
+            curl -fL -o deno.zip "$DENO_BASE/$DENO_ASSET"
+            unzip -o -j deno.zip deno -d deno-x > /dev/null
+            cp deno-x/deno dist/BlindRSS/bin/
+            command -v ffmpeg > /dev/null || brew install ffmpeg
+            cp "$(command -v ffmpeg)" dist/BlindRSS/bin/ffmpeg
+            cp "$(command -v ffprobe)" dist/BlindRSS/bin/ffprobe
+          fi
+          chmod +x dist/BlindRSS/bin/* 2>/dev/null || true
+          ls -la dist/BlindRSS/bin/
+
+      # Packaged smoke (Task 23): the staged binary must find
+      # and run its bundled tools and pass the extraction check
+      # with a minimal PATH — proving the shipped layout, not
+      # the runner's toolchain. Runs before signing, so a broken
+      # package never gets a signature.
+      - name: Packaged smoke test
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            PATH="/usr/bin:/bin:/c/Windows/System32:/c/Windows" ./dist/BlindRSS/blindrss.exe --blindrss-runtime-self-test
+          else
+            env -i PATH=/usr/bin:/bin HOME="$HOME" ./dist/BlindRSS/blindrss --blindrss-runtime-self-test
+          fi
+
+      - name: Archive
+        shell: bash
+        run: |
           cd dist/BlindRSS
           if [ "$RUNNER_OS" = "Windows" ]; then
             7z a ../BlindRSS.zip *
@@ -130,7 +196,14 @@ jobs:
             tar -czf ../BlindRSS.tar.gz *
           else
             cd ..
-            hdiutil create -volname BlindRSS -srcfolder BlindRSS -ov -format UDZO BlindRSS.dmg
+            # B14 (Audit 8 Task 30, landed with Task 23 at the
+            # owner's 2026-11-06 order): assemble BlindRSS.app
+            # from the staging folder and build the dmg from
+            # the bundle folder, so the .app sits at the dmg
+            # root and the fixed asset name holds.
+            VERSION="${GITHUB_REF_NAME#v}"
+            cargo xtask bundle-app BlindRSS bundle "$VERSION"
+            hdiutil create -volname BlindRSS -srcfolder bundle -ov -format UDZO BlindRSS.dmg
           fi
 
       # Every asset carries its minisign signature, so the

@@ -3991,7 +3991,7 @@ fn main() {
             let quit = quit_flag.clone();
             frame.bind_internal(EventType::CLOSE_WINDOW, move |ev| {
                 let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
-                if cfg.get_bool("close_to_tray", false) && !quit.get() {
+                if cfg.get_bool("close_to_tray", true) && !quit.get() {
                     ev.veto();
                     frame_tray.show(false);
                 }

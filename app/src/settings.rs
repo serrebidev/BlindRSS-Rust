@@ -700,7 +700,7 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
         &general.win,
         &startup_group,
         "Close to system tray",
-        cfg.get_bool("close_to_tray", false),
+        cfg.get_bool("close_to_tray", true),
     );
     let minimize_tray_cb = add_check(
         &general.win,

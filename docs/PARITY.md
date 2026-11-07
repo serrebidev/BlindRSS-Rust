@@ -6562,41 +6562,40 @@ cross-check confirms all 162 ID tokens in the audit doc
 are addressed in this file. Final state of the items that
 are not plain "fixed":
 
-- B16 (TLS impersonation transport): PENDING, research
-  complete and cited in the Task 24 resolution. Both
-  credible transports are unusable today (wreq releases
-  yanked / pre-release only, impit only as patched forks,
-  both async-only against the blocking core). The stage
-  stays wired behind `extract.rs::impersonated_fetch`;
-  targets are fingerprint profile keys, never UA strings.
-  Python refresh's `_response_looks_blocked` escalation
-  (Task 24 adjacent find) is this same item: it is the
-  trigger INTO impersonation, and with the transport
-  pending the Rust refresh escalates blocked responses to
-  the browser stage via B01's ported qualification, which
-  covers the same challenge/WAF shapes. Both land or stay
-  pending together.
+- B16 (TLS impersonation transport): LANDED v0.1.65 —
+  wreq 0.16.3 / BoringSSL shipped after all (the yanked /
+  pre-release state this entry cited had resolved by the
+  2026-11-06 spike); see the "## B16 landed" section at
+  the end of this file. Python refresh's
+  `_response_looks_blocked` escalation is the same item
+  and landed with it as refresh's per-feed impersonation
+  stage.
 - B17: the privileged Chromium v20 master-key resolution
   (SYSTEM/CNG/UAC helper, VSS) — LANDED v0.1.66; see the
   "## B17 landed" section at the end of this file. The
   earlier "deliberately not built" disposition is
   superseded by Brandon's 2026-11-06 finish-everything
   order.
-- Task 20 deviation: local MP4/M4A/M4B embedded chapters
-  are not ported (no MP4 chapter-atom reader exists in
-  the tree; Python uses mutagen). ID3, Podcasting 2.0 and
-  YouTube chapters are ported.
+- Task 20 deviation: SUPERSEDED — local MP4/M4A/M4B
+  embedded chapters were ported in Audit 9 and shipped
+  v0.1.63 (see the Audit 9 section). ID3, Podcasting 2.0
+  and YouTube chapters were already ported.
 - O17 (update download cancellation/retry): superseded —
   the hand-rolled updater it cited was deleted by Task 6;
   updates are ship-shape's, whose behavior owns this now.
 - Task 23's Deno packaging and Task 30's B14 bundle-app
-  workflow step: recorded proposals awaiting the owner's
-  workflow decision; the code-side pieces shipped.
-- `close_to_tray` default: owner-disposition item,
-  untouched per the Task 29 scope note.
+  workflow step: LANDED v0.1.67 under the owner's
+  2026-11-06 finish-everything order (which is the
+  workflow decision these proposals awaited); see the
+  final-sweep section at the end of this file.
+- `close_to_tray` default: DECIDED by Python parity —
+  Python's defaults table seeds it True; the Rust read
+  sites fell back to False. Flipped to True at both read
+  sites in v0.1.67; stored user values are unaffected.
 - Remaining per-task deviations (wxDragon limits, relay
-  shapes, probe byte windows, and the rest) stand as
-  recorded in their resolutions.
+  shapes, probe byte windows, and the rest): given final
+  verdicts in the final-sweep section at the end of this
+  file (2026-11-06).
 
 Two adjacent finds were closed during reconciliation:
 the YouTube `ST-` token pruning (Task 25's open find)
@@ -7216,3 +7215,141 @@ and unit-proven only in their pure parts; first-run acceptance —
 import from a real v20 Chrome profile on Brandon's machine, one
 registration prompt, silent task runs after — is Brandon's
 hands-on pass, as with every Windows-only surface in this port.
+
+**v0.1.65 VERIFIED (2026-11-06).** Release run 42346548518
+completed success (all three Package jobs). Verified by
+direct API reads: /releases/latest is v0.1.65, draft=false,
+exactly 7 assets (BlindRSS.zip / .tar.gz / .dmg, each with
+.minisig, plus SHA256SUMS); the tarball's contents sit at
+the archive root; the tarball signature verifies VALID
+with the tree's verify-sig harness and a flipped-byte copy
+is rejected. Main CI for the tagged commit (46b3c65) was
+fully green on all three OSes (run 42344699180) — the
+Windows MSVC leg is B16's BoringSSL-in-CI proof. One
+blemish, not in the release path: the duplicate CI run on
+the tag ref failed its macOS leg on
+`end_to_end_range_cache_on_loopback` (origin hits 2 -> 3,
+bytes correct) — root-caused the same night to parallel
+tests retuning the process-wide range-cache singleton and
+fixed in the two test commits that follow v0.1.66's code
+(3a0ce2d, 7908d41; see the final-sweep section).
+
+## Final deviations sweep — Task 23, Task 30 B14, close_to_tray, and the recorded remainder (2026-11-06, shipped v0.1.67)
+
+Brandon's 2026-11-06 order ("Finish everything d16 d17,
+all the d's that are left") closed every open item in
+§10. This section is the completion record; §10's list
+lines were updated to point here.
+
+**Task 23 Deno packaging — LANDED.** release.yml gained a
+"Bundle tools (bin/)" step and a "Packaged smoke test"
+step. All three legs stage `bin/` beside the executable
+with the yt-dlp nightly binary and Deno from the same
+URLs Python's build.bat/build.sh use (yt-dlp nightly
+builds repo per-platform assets; denoland/deno latest,
+macOS asset picked by runner arch). ffmpeg follows
+Python's ensure_ffmpeg where Python has one: the Linux
+leg copies the apt ffmpeg/ffprobe, the macOS leg copies
+the brew ffmpeg/ffprobe. Python's Windows build bundles
+no ffmpeg (it is found on the system at runtime), but the
+smoke contract below requires all four tools resolvable
+from the package under a minimal PATH, so the Windows leg
+stages the gyan.dev static essentials ffmpeg/ffprobe
+instead — a recorded, deliberate superset of Python's
+Windows layout in the direction of a self-contained
+package. The app's own precedence is unchanged: the
+managed yt-dlp/ffmpeg copies in the data dir still win
+over the packaged ones once provisioned, so the nightly
+self-update behavior is preserved. The smoke step runs
+the staged binary with `--blindrss-runtime-self-test`
+under a minimal PATH (Unix: `env -i PATH=/usr/bin:/bin`;
+Windows: system directories only) after packaging and
+before signing, so a package whose tools do not resolve
+from its own layout never gets signed. One caveat shared
+with Python: the Linux/macOS ffmpeg is the build machine's
+dynamically linked copy, exactly as Python's build ships;
+a machine lacking its libraries falls back to the app's
+managed ffmpeg provisioning.
+
+**Task 30 B14 bundle-app workflow step — LANDED.** The
+macOS leg's archive step now runs
+`cargo xtask bundle-app BlindRSS bundle "$VERSION"`
+(staging dir, bundle out dir, tag version without the
+leading v) and points `hdiutil create -srcfolder` at
+`dist/bundle`, so BlindRSS.app sits at the dmg root under
+the fixed BlindRSS.dmg asset name. No other leg changed
+shape; the Package step was split into staging and
+archive steps on all legs to give the bundle and smoke
+steps their place, with identical archive contents.
+
+**close_to_tray default — DECIDED AND FLIPPED.** Python's
+defaults table (core/config.py) seeds
+`"close_to_tray": True`; the `.get(..., False)` fallbacks
+in Python's GUI are overridden by that merged table, so
+Python's effective default is True. Rust had no seeded
+default and both read sites fell back to False. Both —
+`app/src/main.rs`'s close veto and
+`app/src/settings.rs`'s Settings checkbox — now fall back
+to True, matching `minimize_to_tray`, which already did.
+Stored user values are unaffected.
+
+**Stale records corrected (already ported, verified in
+the current tree).** (1) The GSMArena battery-table sort:
+`normalize_gsmarena_battery_table_html` exists in
+`crates/core/src/extract.rs` behind its
+battery-test-v2.php3 URL gate and is called from
+`article_html.rs` — the §1 table's "not ported" is a
+stale snapshot; the Audit-era resolution in this file
+already recorded the port. (2) Installed-browser
+true-version UA detection: `user_agents::resolve` routes
+"auto" through `resolve_with_installed`, which prefers a
+detected installed browser at its real major version
+(Chromium channel version directories and Firefox's
+application.ini on Windows, with the other platforms'
+detectors below them in the same module), and
+`installed:<family>` modes plus `installed_choices` back
+the Settings picker — the §1/§2-era "not ported" lines
+are stale snapshots of a state before that port landed.
+
+**Final verdicts on the recorded per-task deviations.**
+These stand as the port's shipped shapes; each is bound
+to a named platform or architecture limit, and none has
+a user-facing behavior gap left to close:
+
+- wxDragon FFI limits: the Takeout checklist uses a
+  Checkbox-style TreeListCtrl (the one wxDragon control
+  with native checked state) instead of a report ListCtrl,
+  which has no checkbox binding in wxDragon's FFI; slider
+  dragging is inferred from user events plus a 600 ms tick
+  (no true drag-start/end events); per-notification
+  balloon data, WebView navigation introspection
+  (IsTargetMainFrame / GetNavigationAction), and
+  menu-highlight help topics have no wxDragon surface.
+  Revisit only if wxDragon grows these APIs.
+- Silence-skip pacing: the skip policy runs on the
+  player's 1 s tick and Python's 250–4000 ms diagnostic
+  seek probes are not ported — they are diagnostic-only
+  in Python (they emit log lines, they do not move the
+  playhead policy); budgets, windows and thresholds are
+  Python's.
+- Caster HlsRelay: the shipped relay is the range-cache
+  proxy's managed ffmpeg `-c copy` HLS route; Caster's
+  piped TsSource reader internals are not reproduced.
+  Playback, resume-seek correction and discovery merge
+  behavior are ported and tested; physical-device
+  acceptance remains Brandon's.
+- Casting probe reads: probing goes through ureq with a
+  Range header where Python reads the response stream;
+  the byte windows can differ by a few bytes per attempt
+  and the classification is unchanged.
+- Range-cache test isolation (the v0.1.65 tag-CI blemish
+  above): the proxy is a process-wide singleton and its
+  tests now hold one static guard per test, after the
+  failure was traced to a parallel test's retune landing
+  between another test's retune and its entry creation.
+
+With this sweep, every Audit 8 finding and every §10
+item is fixed, superseded, or closed with a final
+verdict above. The only remaining step in the migration
+is the classic-branch swap, which happens only on
+Brandon's explicit word.
