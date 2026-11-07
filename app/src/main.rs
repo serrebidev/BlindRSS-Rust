@@ -11488,7 +11488,7 @@ fn main() {
                     frame_tick
                         .set_status_text(&format!("Refresh complete: {new_total} new articles"), 0);
                     announce(
-                        "general",
+                        "refresh_complete",
                         &format!("Refresh complete: {new_total} new articles"),
                     );
                 }

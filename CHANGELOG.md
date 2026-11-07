@@ -9,6 +9,7 @@ same text.
 ## 0.1.69
 
 - A refresh finishing while you read no longer throws you back to the top of the article list. The article you have selected and focused is kept by identity and restored at its new position after the rebuild, so new articles arriving above yours do not move you.
+- Refreshes are silent by default now: the spoken "Refresh Feeds", "Refresh stopped" and "Refresh complete: N new articles" alerts are off unless you turn them on. Each has its own setting in Settings → Announcements — Start update, Stop update, and the new Refresh results row at the end of the list. The status bar still shows the result, and the completion sound is unchanged.
 
 ## 0.1.68
 

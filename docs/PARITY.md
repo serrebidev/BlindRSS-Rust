@@ -7576,3 +7576,24 @@ ensure_visible instead of Python's explicit top-item restore —
 the focused row is the one the screen reader tracks. Guard test
 `refill_restores_the_reading_place`: capture/restore calls must
 bracket `refill_inner` inside `refill_articles`.
+
+## Refresh announcements opt-in (2026-11-07, Brandon's order)
+
+Brandon: every refresh speaks how many feeds and new articles
+arrived; he wants those spoken alerts OFF by default, turned on
+in Settings by the user. Deliberate deviation from Python
+(whose announcement events all default to MODE_BOTH): the
+refresh family now defaults to none via `event_default` in
+crates/core/src/announce.rs — `start_update` and `stop_update`
+keep their ids and settings rows but default to Mode::None,
+and the refresh-completion line ("Refresh complete: N new
+articles") moved off the catch-all `general` event onto a new
+appended event `refresh_complete` ("Refresh results"), also
+defaulting to none. Stored user choices still win
+(`from_value` merges by event id, so existing configs are
+untouched in meaning). The Settings → Announcements page
+iterates EVENTS, so the new row appears at the end with no UI
+change. Status text and the refresh sounds are unchanged —
+speech only. Tests: announce_slice defaults test reworked
+(refresh family none, everything else both) plus
+`refresh_results_event_exists_and_is_opt_in`.

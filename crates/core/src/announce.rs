@@ -6,7 +6,9 @@
 //! speech and/or Braille channels instead of only the status bar.
 //! Each event carries its own output mode, persisted under the
 //! config's "announcements" map: none / speech / braille / both
-//! (the default is both, as in Python).
+//! (the default is both, as in Python — except the refresh
+//! family, which defaults to none per Brandon's 2026-11-07
+//! order: spoken refresh alerts are opt-in).
 //!
 //! Output paths: Windows speaks and brailles through NVDA's
 //! controller client DLL (the same one Python drives; JAWS's COM
@@ -65,7 +67,7 @@ pub struct Event {
 
 /// The event table, ids stable because they persist in config
 /// (Python core/announcements.py EVENTS, same order).
-pub const EVENTS: [Event; 9] = [
+pub const EVENTS: [Event; 10] = [
     Event {
         id: "filter_change",
         label: "Filter change",
@@ -111,9 +113,31 @@ pub const EVENTS: [Event; 9] = [
         label: "Other notifications",
         help: "Announce other significant interface changes and notifications.",
     },
+    // Appended 2026-11-07 (Brandon's order): the refresh family
+    // (start_update, stop_update and this result event) defaults
+    // to none — spoken refresh alerts are opt-in. The event sits
+    // at the end so existing settings rows keep their order.
+    Event {
+        id: "refresh_complete",
+        label: "Refresh results",
+        help: "Announce the result when a feed refresh finishes, including how many new articles arrived.",
+    },
 ];
 
-/// Per-event modes resolved from config (defaults: all "both").
+/// An event's factory default. Python defaults every event to
+/// both; Brandon's standing order (2026-11-07) overrides that
+/// for the refresh family — start, stop and result — which
+/// default to none so a refresh stays silent unless the user
+/// turns the alerts on in Settings.
+fn event_default(id: &str) -> Mode {
+    match id {
+        "start_update" | "stop_update" | "refresh_complete" => Mode::None,
+        _ => Mode::Both,
+    }
+}
+
+/// Per-event modes resolved from config (defaults per
+/// `event_default`: both, refresh family none).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Announcements {
     modes: Vec<Mode>,
@@ -122,7 +146,7 @@ pub struct Announcements {
 impl Default for Announcements {
     fn default() -> Self {
         Announcements {
-            modes: vec![Mode::Both; EVENTS.len()],
+            modes: EVENTS.iter().map(|ev| event_default(ev.id)).collect(),
         }
     }
 }
