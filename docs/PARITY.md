@@ -7353,3 +7353,39 @@ item is fixed, superseded, or closed with a final
 verdict above. The only remaining step in the migration
 is the classic-branch swap, which happens only on
 Brandon's explicit word.
+
+**v0.1.66 VERIFIED (2026-11-06).** Release run 42352261344
+completed success (all three Package jobs; the Windows leg
+was slow but inside its timeout). Verified by direct API
+reads: /releases/latest is v0.1.66, draft=false, exactly
+7 assets; the tarball's contents sit at the archive root;
+the tarball signature verifies VALID with the tree's
+verify-sig harness and a flipped-byte copy is rejected.
+Main CI for the tagged commit (7908d41) was fully green
+on all three OSes (run 42351104602) — the Windows MSVC
+leg compiling the B17 FFI cold is its compile proof.
+
+**v0.1.67 VERIFIED (2026-11-06).** Release run 42356689413
+completed success — all three Package jobs plus Publish,
+with the new steps green on their first live run: Bundle
+tools (bin/) and the Packaged smoke test on all three
+legs, and the bundle-app Archive step on macOS. Verified
+by direct API reads: /releases/latest is v0.1.67,
+draft=false, exactly 7 assets; the tarball signature
+verifies VALID and a flipped-byte copy is rejected; the
+downloaded BlindRSS.tar.gz contains bin/yt-dlp, bin/deno,
+bin/ffmpeg, bin/ffprobe; the Windows BlindRSS.zip contains
+bin/yt-dlp.exe, bin/deno.exe, bin/ffmpeg.exe,
+bin/ffprobe.exe; the BlindRSS.dmg decompresses to an APFS
+image carrying BlindRSS.app (Contents/MacOS,
+Contents/Resources, Info.plist) with the tool names
+present. Main CI for the tagged commit (84be0d0) was
+fully green on all three OSes (run 42355352077), and the
+local gate before it ran 990 tests green.
+
+With v0.1.67, the finish-everything order is complete:
+B16 (v0.1.65), B17 (v0.1.66), Task 23, Task 30 B14, the
+close_to_tray parity flip, and every recorded deviation
+in section 10 is fixed, superseded, or closed with a
+final verdict. The only step left in the migration is
+the classic-branch swap, on Brandon's explicit word.
