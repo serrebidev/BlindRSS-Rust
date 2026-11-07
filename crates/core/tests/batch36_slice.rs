@@ -66,6 +66,7 @@ fn header_parsers_match_python() {
 
 #[test]
 fn player_gate_rules() {
+    let _guard = singleton_guard();
     let cfg = blindrss_core::config::Config::default();
     // Non-http and loopback pass through untouched.
     assert_eq!(
@@ -95,6 +96,7 @@ fn player_gate_rules() {
 
 #[test]
 fn disabled_gate_returns_direct_url() {
+    let _guard = singleton_guard();
     let mut cfg = blindrss_core::config::Config::default();
     cfg.raw_mut()["range_cache_enabled"] = serde_json::json!(false);
     assert_eq!(
@@ -181,6 +183,24 @@ fn start_origin(body: Vec<u8>) -> Origin {
     }
 }
 
+/// The range-cache proxy is a process-wide singleton and
+/// every entry point used below (`retune_from_config`,
+/// `proxify`, `maybe_range_cache_url`) replaces or reads its
+/// global config. Tests that touch it must therefore run one
+/// at a time: a concurrent test's retune can land between
+/// this test's retune and its entry creation, handing the
+/// entry another test's cache directory and background
+/// settings — observed on CI as a vanished cache chunk
+/// (Windows) and as an extra background origin hit racing
+/// the hit-count assertions (macOS).
+static RANGE_CACHE_SINGLETON_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn singleton_guard() -> std::sync::MutexGuard<'static, ()> {
+    RANGE_CACHE_SINGLETON_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 fn http_get(url: &str, range: Option<&str>) -> (u16, Vec<u8>, String) {
     use std::io::{Read, Write};
     let after = url.split("://").nth(1).unwrap();
@@ -206,6 +226,7 @@ fn http_get(url: &str, range: Option<&str>) -> (u16, Vec<u8>, String) {
 
 #[test]
 fn end_to_end_range_cache_on_loopback() {
+    let _guard = singleton_guard();
     // A 300 KB deterministic body.
     let body: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
     let origin = start_origin(body.clone());
@@ -244,13 +265,13 @@ fn end_to_end_range_cache_on_loopback() {
     // cache before asserting the repeat read is a pure cache
     // serve. The chunk file's name is deterministic
     // (chunk_path's zero-padded start-end), and its rename into
-    // place is what registers the segment; under heavy CI load
-    // the repeat request could otherwise race the tail of the
-    // first request's bookkeeping and fetch once more from the
-    // origin (seen once on a macOS runner: hits 2 -> 3 with
-    // correct bytes throughout). The bounded poll keeps the
-    // test honest: a cache that never writes the chunk still
-    // fails here.
+    // place is what registers the segment. (The CI failures
+    // that motivated this — hits 2 -> 3 on macOS, chunk never
+    // in this test's dir on Windows — were traced to parallel
+    // tests retuning the shared proxy singleton; the
+    // singleton_guard above is the fix, this poll is the
+    // settle check.) The bounded poll keeps the test honest: a
+    // cache that never writes the chunk still fails here.
     let chunk_name = "000000001000-000000001999.bin";
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
     let mut chunk_on_disk = false;
@@ -436,6 +457,7 @@ fn rc_test_cfg(tag: &str) -> blindrss_core::config::Config {
 
 #[test]
 fn probe_403_then_206_recovers() {
+    let _guard = singleton_guard();
     // M03: googlevideo can refuse a freshly minted URL's first
     // probe with 403 and serve ranges a second later. The probe
     // retries once and the session must end up range-supported,
@@ -470,6 +492,7 @@ fn probe_403_then_206_recovers() {
 
 #[test]
 fn probe_refusal_never_permanently_disables_cache() {
+    let _guard = singleton_guard();
     // M03: a probe round that is refused twice (initial +
     // retry) leaves range support UNKNOWN, not unsupported —
     // the next request probes again and can recover.
@@ -514,6 +537,7 @@ fn probe_refusal_never_permanently_disables_cache() {
 
 #[test]
 fn gate_registers_original_url_as_cache_identity() {
+    let _guard = singleton_guard();
     // M20: when the player hands the gate a resolved URL plus
     // its original, the persisted mapping is keyed by the
     // ORIGINAL (stable) URL — an expired signed redirect later
