@@ -6794,3 +6794,13 @@ are dispositioned with fresh evidence.
   Deno packaging and Task 30's B14 workflow integration
   (both need Brandon's workflow OK), and the
   `close_to_tray` default disposition.
+
+**v0.1.63 VERIFIED** (2026-11-06): release commit
+`57f4dac`, CI run 42328945643 fully green (all three jobs
+read directly), Release run 42330251144 success (3 Package
++ Publish). API verification: draft=false,
+`/releases/latest` = v0.1.63, exactly 7 assets with the
+fixed ship-shape names. Linux tarball contents sit at the
+archive root; signature verified VALID with the committed
+public key and the tamper control (flipped byte) rejected.
+Local gate on the release tree: 956 tests passed, 0 failed.
