@@ -437,11 +437,7 @@ fn open(path: &Path) -> Result<Connection, String> {
     // scans are claimed and queued from several threads while
     // refreshes run, so WAL + a 60-second busy timeout apply
     // here too — 5 seconds surfaced as locked-database errors.
-    connection
-        .execute_batch(
-            "PRAGMA busy_timeout=60000; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;",
-        )
-        .map_err(|e| e.to_string())?;
+    crate::db::Db::configure(&connection).map_err(|e| e.to_string())?;
     connection
         .execute_batch(SCHEMA)
         .map_err(|e| e.to_string())?;

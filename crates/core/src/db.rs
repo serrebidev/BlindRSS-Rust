@@ -480,15 +480,39 @@ impl Db {
     /// locked` during refresh and the UI stalling while feeds
     /// refresh. WAL persists in the database file, so the first
     /// open under this build heals an existing library.
-    fn configure(conn: &Connection) -> rusqlite::Result<()> {
-        // busy_timeout FIRST (Python's order): switching the
-        // journal mode needs a momentary exclusive lock, and
-        // with the connection's default zero timeout a racing
-        // opener would fail instantly instead of waiting.
-        conn.execute_batch(
-            "PRAGMA busy_timeout=60000; PRAGMA journal_mode=WAL; \
-             PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;",
-        )
+    pub(crate) fn configure(conn: &Connection) -> rusqlite::Result<()> {
+        // busy_timeout FIRST (Python's order).
+        conn.execute_batch("PRAGMA busy_timeout=60000; PRAGMA foreign_keys=ON;")?;
+        // Flipping the file to WAL needs a momentary exclusive
+        // lock, and SQLite does NOT apply the busy handler to
+        // that transition: racing openers get SQLITE_BUSY at
+        // once (the batch32 concurrent-open test failed on
+        // Windows CI exactly this way while Linux passed).
+        // Retry briefly — once one opener flips the file,
+        // later calls are no-ops.
+        let mut flipped = false;
+        for _ in 0..100 {
+            match conn.query_row("PRAGMA journal_mode=WAL;", [], |row| {
+                row.get::<_, String>(0)
+            }) {
+                Ok(mode) if mode == "wal" || mode == "memory" => {
+                    flipped = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(rusqlite::Error::SqliteFailure(f, _))
+                    if f.code == rusqlite::ErrorCode::DatabaseBusy => {}
+                Err(e) => return Err(e),
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        if !flipped {
+            return Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(5),
+                Some("database is locked switching to WAL".to_string()),
+            ));
+        }
+        conn.execute_batch("PRAGMA synchronous=NORMAL;")
     }
 
     /// Open an existing BlindRSS database. Fails if the file is missing:

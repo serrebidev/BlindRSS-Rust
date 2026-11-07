@@ -7719,3 +7719,16 @@ SHA256SUMS), body identical to the CHANGELOG.md 0.1.70
 section. Signature verified locally against the compiled-in
 public key: SIGNATURE VALID, tamper control rejected a
 flipped byte. 995 tests on the ship tree.
+
+WAL fallout found by the gate and Windows CI before v0.1.71
+tagged (recorded here so it is not re-diagnosed): (1) the
+journal flip ignores busy_timeout — `PRAGMA journal_mode`
+needs a momentary exclusive lock and SQLite does not run the
+busy handler for it, so the batch32 concurrent-open test
+failed on Windows while Linux passed; Db::configure now sets
+busy_timeout first and retries the flip briefly (shared with
+the archive store). (2) A WAL file's -wal/-shm sidecars pair
+by NAME: core_slice's fixture copies used fixed temp names,
+so a stale -wal resurrected the previous run's state into a
+fresh copy and mark_read_roundtrip flaked; fixture_copy now
+uses unique names and clears sidecars first.

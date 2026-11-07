@@ -18,7 +18,27 @@ fn fixture(name: &str) -> PathBuf {
 /// working tree on every test run and, with two tests opening the
 /// same file at once, failed with SQLITE_READONLY.
 fn fixture_copy(name: &str, as_name: &str) -> PathBuf {
-    let tmp = std::env::temp_dir().join(as_name);
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let unique = format!(
+        "{}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    let tmp = std::env::temp_dir().join(format!("{as_name}-{unique}"));
+    // A WAL database's -wal/-shm sidecars belong to the file by
+    // NAME: a stale pair under a reused fixed name would be
+    // paired with the fresh copy and resurrect the old state
+    // (mark_read_roundtrip flaked exactly this way once Db
+    // connections switched to WAL).
+    for suffix in ["-wal", "-shm"] {
+        let mut side = tmp.clone().into_os_string();
+        side.push(suffix);
+        std::fs::remove_file(side).ok();
+    }
     std::fs::copy(fixture(name), &tmp).unwrap();
     tmp
 }
@@ -46,8 +66,7 @@ fn reads_python_built_database() {
 
 #[test]
 fn mark_read_roundtrip_on_copy() {
-    let tmp = std::env::temp_dir().join("blindrss_test_mark_read.db");
-    std::fs::copy(fixture("sample.db"), &tmp).unwrap();
+    let tmp = fixture_copy("sample.db", "blindrss_test_mark_read.db");
     let db = Db::open(&tmp).unwrap();
     assert_eq!(db.unread_count(None).unwrap(), 1);
     db.mark_read("a1", true).unwrap();
