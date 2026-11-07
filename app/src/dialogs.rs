@@ -3244,8 +3244,15 @@ pub fn show_podcast_archive(
         close_btn.on_click(move |_| request_close());
     }
     dialog.bind_internal(EventType::CLOSE_WINDOW, move |ev| {
-        ev.veto();
-        request_close();
+        // Only a vetoable close can be re-driven through the
+        // stop-and-close confirmation; a forced close (app
+        // shutdown, session end) must proceed natively —
+        // Veto() on a non-vetoable event breaks wx's contract
+        // (the 2026-11-07 debugging-check dialog).
+        if ev.can_veto() {
+            ev.veto();
+            request_close();
+        }
     });
 
     fill_feeds(None);

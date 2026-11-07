@@ -3991,7 +3991,15 @@ fn main() {
             let quit = quit_flag.clone();
             frame.bind_internal(EventType::CLOSE_WINDOW, move |ev| {
                 let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
-                if cfg.get_bool("close_to_tray", true) && !quit.get() {
+                // Veto() is only legal on a vetoable close.
+                // Forced closes (File/tray Exit close(true), the
+                // updater's restart, a Windows session end)
+                // arrive with CanVeto() false, and vetoing one
+                // breaks wx's contract — the "call to Veto()
+                // ignored" debugging-check dialog Brandon hit
+                // while updating (2026-11-07). Those closes
+                // must simply proceed.
+                if cfg.get_bool("close_to_tray", true) && !quit.get() && ev.can_veto() {
                     ev.veto();
                     frame_tray.show(false);
                 }
@@ -11674,6 +11682,68 @@ mod ui_parity_tests {
             }
         }
         assert!(checked >= 30, "scan found only {checked} dialogs");
+    }
+
+    #[test]
+    fn close_handlers_only_veto_vetoable_events() {
+        // Brandon (2026-11-07): updating popped wx's
+        // debugging-check dialog — wx/event.h "assert
+        // m_canVeto failed in Veto(): call to Veto() ignored
+        // (can't veto this event)". A close that wx marks
+        // non-vetoable (a forced close(true), the updater's
+        // restart, a Windows session end) must never be
+        // vetoed; in builds with wx's checks compiled in the
+        // call aborts the handler behind a modal dialog.
+        // Every CLOSE_WINDOW handler in the app crate must
+        // check can_veto() before it vetoes.
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut checked = 0;
+        for entry in std::fs::read_dir(&src_dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            let lines: Vec<&str> = text.lines().collect();
+            for (i, line) in lines.iter().enumerate() {
+                if line.contains("EventType::CLOSE_WINDOW") {
+                    checked += 1;
+                    let window: String = lines[i..(i + 16).min(lines.len())].join("\n");
+                    let guard = window.find("can_veto()");
+                    let veto = window.find(".veto()");
+                    assert!(
+                        guard.is_some() && (veto.is_none() || guard < veto),
+                        "{}:{}: CLOSE_WINDOW handler vetoes without a can_veto() guard",
+                        path.display(),
+                        i + 1
+                    );
+                }
+            }
+        }
+        assert!(checked >= 2, "scan found only {checked} close handlers");
+    }
+
+    #[test]
+    fn player_tick_speeds_up_while_skip_silence_is_on() {
+        // Audit 10 (2026-11-07): Python's player timer runs
+        // at 280 ms while Skip Silence is enabled ("so jumps
+        // feel snappier"); the Rust player ticked at a fixed
+        // 1000 ms, so a skip could land up to a second after
+        // the position entered a silent span. The cadence
+        // resolves from the skip_silence config at every
+        // load, and the tick applies it to the wx timer.
+        let player = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/player.rs"),
+        )
+        .unwrap();
+        assert!(
+            player.contains("s.tick_fast = cfg.get_bool(\"skip_silence\", true)"),
+            "queue_silence_scan must resolve the cadence from the skip_silence config"
+        );
+        assert!(
+            player.contains("timer_cadence.start(if s.tick_fast { 280 } else { 1000 }, false)"),
+            "the player tick must apply the 280 ms / 1000 ms cadence"
+        );
     }
 
     #[test]

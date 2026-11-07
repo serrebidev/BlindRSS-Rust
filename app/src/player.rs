@@ -245,6 +245,14 @@ struct PlayerState {
     silence_gap_ms: i64,
     silence_resume_backoff: i64,
     silence_retrigger: i64,
+    /// Desired player-tick cadence: Python runs its player
+    /// timer at 280 ms while Skip Silence is on ("so jumps
+    /// feel snappier"); this player's tick is 1000 ms
+    /// otherwise. Resolved from config at every load in
+    /// `queue_silence_scan`; the tick applies a change to
+    /// the wx timer as it notices it (Audit 10).
+    tick_fast: bool,
+    tick_fast_applied: bool,
     /// Seek-slider drag state for the policy's drag guard:
     /// set by user slider events, cleared by the tick after
     /// a quiet interval (wxDragon exposes no drag-end event;
@@ -704,7 +712,12 @@ fn silence_remote(url: &str) -> bool {
 /// the URL is non-empty. The publish tunables resolve here,
 /// with the remote adjustments applied.
 fn queue_silence_scan(s: &mut PlayerState, cfg: &blindrss_core::config::Config, url: &str) {
-    if !cfg.get_bool("skip_silence", true) || url.is_empty() {
+    // The tick cadence follows the same config switch
+    // (Python restarts its player timer at the faster rate
+    // whenever Skip Silence is on), so resolve it before
+    // the early return below.
+    s.tick_fast = cfg.get_bool("skip_silence", true);
+    if !s.tick_fast || url.is_empty() {
         return;
     }
     s.silence_remote = silence_remote(url);
@@ -1776,6 +1789,8 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
         silence_gap_ms: 260,
         silence_resume_backoff: 360,
         silence_retrigger: 1400,
+        tick_fast: false,
+        tick_fast_applied: false,
         silence_dragging: false,
         silence_drag_at: None,
         last_chapter: None,
@@ -2506,13 +2521,19 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
         });
     }
 
-    // 1-second tick: drain skip ranges, resume seek once length
+    // Player tick: drain skip ranges, resume seek once length
     // is known, apply skips, announce chapter crossings, update
-    // the position label, and save playback state.
+    // the position label, and save playback state. The tick
+    // runs at 1 s, sped up to 280 ms while Skip Silence is on
+    // (Python's cadence, applied inside the tick below).
     // The Chapters menu's availability as last refreshed by
     // the tick: (chapter count, active index, link available).
     let menu_state_last = Rc::new(std::cell::Cell::new((usize::MAX, i64::MIN, false)));
-    let timer = Box::leak(Box::new(Timer::new(&frame)));
+    // One shared handle, copied into each closure that
+    // needs it (the tick, the close handler): Timer's
+    // methods all take &self.
+    let timer: &'static Timer<_> = Box::leak(Box::new(Timer::new(&frame)));
+    let timer_cadence = timer;
     let m = media;
     let st = state.clone();
     let frame_tick = frame;
@@ -2796,6 +2817,16 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
             {
                 let now = std::time::Instant::now();
                 let remote = s.silence_remote;
+                // Cadence (Audit 10): Python restarts its
+                // player timer at 280 ms while Skip Silence
+                // is on, so a skip fires within a few hundred
+                // ms of the position entering a silent span
+                // instead of up to a second late. Apply a
+                // resolved change as it is noticed.
+                if s.tick_fast != s.tick_fast_applied {
+                    s.tick_fast_applied = s.tick_fast;
+                    timer_cadence.start(if s.tick_fast { 280 } else { 1000 }, false);
+                }
                 if let Some(target) = s.silence.verify_tick(pos, now, remote) {
                     s.silence.note_app_seek(target, pos, now);
                     reseek_to = Some(target);
