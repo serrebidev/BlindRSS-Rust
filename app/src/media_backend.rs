@@ -10,10 +10,13 @@ use std::rc::Rc;
 use wxdragon::prelude::*;
 use wxdragon::widgets::media_ctrl::SeekMode;
 
-pub fn soundcards(cfg: &Config) -> Vec<(String, String)> {
-    vlc::VlcPlayer::new(cfg)
-        .map(|engine| engine.soundcards())
-        .unwrap_or_default()
+/// Enumerate soundcards for Settings (Python's async
+/// enumeration): a minimal throwaway libVLC instance on the
+/// CALLER's thread — callers run this on a background thread,
+/// never synchronously on the UI thread (a full instance
+/// creation takes seconds and made Settings slow to open).
+pub fn enumerate_soundcards() -> Vec<(String, String)> {
+    vlc::enumerate_soundcards()
 }
 
 struct Entry {

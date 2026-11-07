@@ -52,6 +52,14 @@ fn add_field(
 }
 
 /// A labeled checkbox row; returns the checkbox.
+/// (label, id) soundcard options, shared between the Settings
+/// build, the async enumeration swap-in and the save path.
+type SoundcardList = std::rc::Rc<std::cell::RefCell<Vec<(String, String)>>>;
+
+/// The soundcard enumeration thread's delivery slot (None
+/// until the enumeration lands).
+type SoundcardSlot = std::sync::Arc<std::sync::Mutex<Option<Vec<(String, String)>>>>;
+
 fn add_check(parent: &impl WxWidget, sizer: &Sizer, label: &str, value: bool) -> CheckBox {
     let cb = CheckBox::builder(parent)
         .with_label(&crate::tr(label))
@@ -1067,26 +1075,84 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
     youtube.sizer.add(&clear_cache_btn, 0, SizerFlag::All, 2);
 
     // ---- Media Player page (Python's order) ----
-    let mut soundcards = vec![("System Default".to_string(), String::new())];
-    soundcards.extend(crate::media_backend::soundcards(&cfg));
+    // Soundcard enumeration is ASYNC (Python gui/dialogs.py
+    // _load_soundcards_async): it creates a libVLC instance,
+    // which takes seconds — doing it synchronously here made
+    // Settings take seconds to open, and churning a full
+    // player instance in process destabilized the app
+    // (Brandon, 2026-11-07). The choice starts with System
+    // Default plus the saved device; a background thread
+    // enumerates through a minimal instance and the dialog
+    // timer below swaps the real list in when it lands.
     let saved_soundcard = cfg.get_str("preferred_soundcard", "").to_string();
-    if !saved_soundcard.is_empty() && !soundcards.iter().any(|(_, id)| id == &saved_soundcard) {
-        soundcards.push((
-            format!("Saved device (currently unavailable): {saved_soundcard}"),
-            saved_soundcard.to_string(),
-        ));
-    }
-    let labels: Vec<&str> = soundcards.iter().map(|(label, _)| label.as_str()).collect();
+    let soundcards_rc: SoundcardList = std::rc::Rc::new(std::cell::RefCell::new({
+        let mut v = vec![("System Default".to_string(), String::new())];
+        if !saved_soundcard.is_empty() {
+            v.push((
+                format!("Saved device (currently unavailable): {saved_soundcard}"),
+                saved_soundcard.clone(),
+            ));
+        }
+        v
+    }));
+    let labels: Vec<String> = soundcards_rc
+        .borrow()
+        .iter()
+        .map(|(label, _)| label.clone())
+        .collect();
+    let label_refs: Vec<&str> = labels.iter().map(|s| s.as_str()).collect();
     let soundcard_choice = add_choice(
         &media.win,
         &media.sizer,
         "Preferred Soundcard:",
-        &labels,
-        soundcards
-            .iter()
-            .position(|(_, id)| id == &saved_soundcard)
-            .unwrap_or(0),
+        &label_refs,
+        if saved_soundcard.is_empty() { 0 } else { 1 },
     );
+    {
+        let slot: SoundcardSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        {
+            let slot_t = slot.clone();
+            std::thread::spawn(move || {
+                let devices = crate::media_backend::enumerate_soundcards();
+                *slot_t.lock().unwrap_or_else(|p| p.into_inner()) = Some(devices);
+            });
+        }
+        let sc_timer = &*Box::leak(Box::new(wxdragon::timer::Timer::new(&dialog)));
+        let sc_timer_stop = sc_timer;
+        let options_t = soundcards_rc.clone();
+        let saved_t = saved_soundcard.clone();
+        sc_timer.on_tick(move |_| {
+            let taken = slot.lock().unwrap_or_else(|p| p.into_inner()).take();
+            let Some(devices) = taken else { return };
+            sc_timer_stop.stop();
+            // Keep whatever is selected now (the saved device,
+            // or a pick the user already made from the
+            // placeholder list).
+            let current_id = soundcard_choice
+                .get_selection()
+                .and_then(|i| options_t.borrow().get(i as usize).map(|(_, id)| id.clone()))
+                .unwrap_or_default();
+            let mut list = vec![("System Default".to_string(), String::new())];
+            list.extend(devices);
+            if !saved_t.is_empty() && !list.iter().any(|(_, id)| id == &saved_t) {
+                list.push((
+                    format!("Saved device (currently unavailable): {saved_t}"),
+                    saved_t.clone(),
+                ));
+            }
+            let sel = list
+                .iter()
+                .position(|(_, id)| id == &current_id)
+                .unwrap_or(0);
+            soundcard_choice.clear();
+            for (label, _) in &list {
+                soundcard_choice.append(label);
+            }
+            soundcard_choice.set_selection(sel as u32);
+            *options_t.borrow_mut() = list;
+        });
+        sc_timer.start(100, false);
+    }
     let silence_cb = add_check(
         &media.win,
         &media.sizer,
@@ -2051,6 +2117,7 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
     let dialog_s = dialog;
     let save_all: std::rc::Rc<dyn Fn()> = {
         let cfg_s = cfg_rc.clone();
+        let soundcards_s = soundcards_rc.clone();
         let path_s = cfg_path_buf.clone();
         std::rc::Rc::new(move || {
             let mut cfg = cfg_s.borrow_mut();
@@ -2194,9 +2261,13 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
                 serde_json::json!(
                     soundcard_choice
                         .get_selection()
-                        .and_then(|i| soundcards.get(i as usize))
-                        .map(|(_, id)| id.as_str())
-                        .unwrap_or(&saved_soundcard)
+                        .and_then(|i| {
+                            soundcards_s
+                                .borrow()
+                                .get(i as usize)
+                                .map(|(_, id)| id.clone())
+                        })
+                        .unwrap_or_else(|| saved_soundcard.clone())
                 ),
             );
             for (key, control) in &structure_choices {

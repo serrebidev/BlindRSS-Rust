@@ -6,6 +6,12 @@ as `0.1.2-0.1.3`. Each release's section below is its GitHub release note,
 taken from this file by the release workflow. The in-app updater shows the
 same text.
 
+## 0.1.71
+
+- Feeds failing with "feed cache: database is locked" during a refresh, and the app stalling so it was hard to move around while feeds refreshed: the database now uses the same connection setup as Python (WAL journal mode, 60-second busy timeout), so refresh workers writing no longer block reading and navigation.
+- NPR program feeds refresh with no audio: fixed. NPR audio is now discovered per session, the way Python does it — every refresh re-resolves each story's audio from NPR's embed player, so stories whose audio posts after the story itself gain it on the next refresh, and NPR feeds are always fetched in full instead of being shortcut as unchanged.
+- The Settings window took seconds to open and the app could destabilize after saving: opening Settings no longer builds a throwaway media player just to list soundcards. The list is filled in the background through a minimal audio-only instance, like Python, and the window opens immediately.
+
 ## 0.1.70
 
 - The General tab's "Check for updates:" frequency (translation updates) gains a Never option: automatic update checking can now be fully disabled from that control. The manual Check for Updates button still works with Never selected.

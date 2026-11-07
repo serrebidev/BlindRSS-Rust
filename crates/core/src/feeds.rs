@@ -364,6 +364,15 @@ pub fn fetch_feed_document_cancellable(
             body_digest: String::new(),
         });
     }
+    // NPR feeds never take the fast paths (Python
+    // providers/local.py: `use_conditional` excludes NPR feeds
+    // and logs "Skipping conditional headers for NPR feed"):
+    // no validators are sent, and the body-digest shortcut does
+    // not apply, because NPR audio is discovered per session —
+    // a story's audio can post after the story with the feed
+    // body unchanged, and only a full parse + store re-resolves
+    // it (Brandon's 2026-11-07 NPR report).
+    let npr_feed = crate::sources::is_npr_url(url);
     let cached = db
         .cached_feed(url)
         .map_err(|e| format!("feed cache: {e}"))?;
@@ -380,7 +389,7 @@ pub fn fetch_feed_document_cancellable(
     {
         return recovered;
     }
-    let mut response = match fetch_response(url, force_full, &cached, overrides) {
+    let mut response = match fetch_response(url, force_full || npr_feed, &cached, overrides) {
         Ok(response) => response,
         Err(error) => {
             if impersonate_mode != "never"
@@ -400,7 +409,7 @@ pub fn fetch_feed_document_cancellable(
         let (_, _, body) =
             cached.ok_or_else(|| "Feed returned 304 without cached content".to_string())?;
         let digest = feed_body_digest(&body);
-        if !force_full && stored_digest == Some(digest.as_str()) {
+        if !force_full && !npr_feed && stored_digest == Some(digest.as_str()) {
             return Ok(FeedFetch::NotModified);
         }
         return Ok(FeedFetch::Fetched {
@@ -417,7 +426,7 @@ pub fn fetch_feed_document_cancellable(
     let (etag, modified) = response_validators(&response);
     let body = read_body(&mut response)?;
     let digest = feed_body_digest(&body);
-    if !force_full && stored_digest == Some(digest.as_str()) {
+    if !force_full && !npr_feed && stored_digest == Some(digest.as_str()) {
         db.cache_feed(url, etag.as_deref(), modified.as_deref(), &body)
             .map_err(|e| format!("feed cache: {e}"))?;
         return Ok(FeedFetch::NotModified);

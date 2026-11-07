@@ -433,8 +433,14 @@ fn open(path: &Path) -> Result<Connection, String> {
         return Err("Archive database does not exist".into());
     }
     let connection = Connection::open(path).map_err(|e| e.to_string())?;
+    // Same connection setup as rss.db (Db::configure): archive
+    // scans are claimed and queued from several threads while
+    // refreshes run, so WAL + a 60-second busy timeout apply
+    // here too — 5 seconds surfaced as locked-database errors.
     connection
-        .busy_timeout(std::time::Duration::from_secs(5))
+        .execute_batch(
+            "PRAGMA busy_timeout=60000; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;",
+        )
         .map_err(|e| e.to_string())?;
     connection
         .execute_batch(SCHEMA)

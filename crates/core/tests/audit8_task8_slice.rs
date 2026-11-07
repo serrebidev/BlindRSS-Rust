@@ -341,6 +341,111 @@ fn slow_npr_attach_runs_inside_the_worker_refresh() {
     std::fs::remove_file(&path).ok();
 }
 
+#[test]
+fn npr_audio_is_resolved_per_session_for_existing_articles() {
+    // Python resolves NPR audio for every entry at every
+    // refresh (providers/local.py phase 1) and never fetches
+    // NPR feeds conditionally; the port resolved only at first
+    // insert and let NPR feeds take the unchanged-body fast
+    // path, so a story whose audio posted late NEVER gained it
+    // (Brandon, 2026-11-07). The story slug carries no parseable
+    // story id, so resolution deterministically uses the story
+    // page fallback against this loopback server.
+    let audio_posted = Arc::new(Mutex::new(false));
+    let posted = audio_posted.clone();
+    let feed_url = Arc::new(Mutex::new(String::new()));
+    let feed_url2 = feed_url.clone();
+    let (base, requests) = start_server(6, move |request, _n| {
+        if request.contains("story-page") {
+            let line = if *posted.lock().unwrap() {
+                "Listen: https://ondemand.npr.org/anon.npr-mp3/npr/me/2026/11/episode.mp3"
+            } else {
+                "Audio posts later today."
+            };
+            return http_response(
+                "200 OK",
+                "Content-Type: text/html\r\n",
+                &format!("<html><body><p>{line}</p></body></html>"),
+            );
+        }
+        let link = feed_url2.lock().unwrap().clone();
+        http_response(
+            "200 OK",
+            "ETag: \"np1\"\r\n",
+            &format!(
+                "<rss version=\"2.0\"><channel><title>NPR Program</title>\n\
+                 <item><title>Story</title><link>{link}/npr.org/story-page</link>\
+                 <guid>npr-1</guid><description>Story</description></item></channel></rss>"
+            ),
+        )
+    });
+    *feed_url.lock().unwrap() = base.clone();
+    let path = scratch_path("nprsession");
+    let db = Db::open_or_create(&path).unwrap();
+    let feed = db
+        .add_feed(&format!("{base}/feeds.npr.org/feed.xml"), "NPR", None)
+        .unwrap();
+    // Session 1: the story is up, its audio is not.
+    refresh_feed_with_options(&db, &feed, "deleted", None, false, &no_cancel()).unwrap();
+    let articles = db.articles(Some(&feed.id), 10).unwrap();
+    assert_eq!(articles.len(), 1);
+    assert_eq!(articles[0].media_url, None);
+    // Session 2: the audio has posted; the feed body is byte-
+    // identical and the server holds an ETag from session 1.
+    *audio_posted.lock().unwrap() = true;
+    refresh_feed_with_options(&db, &feed, "deleted", None, false, &no_cancel()).unwrap();
+    let articles = db.articles(Some(&feed.id), 10).unwrap();
+    assert_eq!(
+        articles[0].media_url.as_deref(),
+        Some("https://ondemand.npr.org/anon.npr-mp3/npr/me/2026/11/episode.mp3")
+    );
+    assert_eq!(articles[0].media_type.as_deref(), Some("audio/mpeg"));
+    // The second feed fetch must not have gone conditional.
+    let seen = requests.lock().unwrap();
+    let feed_requests: Vec<&String> = seen
+        .iter()
+        .filter(|r| r.contains("feeds.npr.org"))
+        .collect();
+    assert_eq!(feed_requests.len(), 2);
+    assert!(
+        !feed_requests[1].to_lowercase().contains("if-none-match"),
+        "NPR feeds are fetched unconditionally, got: {}",
+        feed_requests[1]
+    );
+    drop(seen);
+    // Session 3: the resolver no longer confirms the audio —
+    // per-session truth replaces the stored value (Python).
+    *audio_posted.lock().unwrap() = false;
+    refresh_feed_with_options(&db, &feed, "deleted", None, false, &no_cancel()).unwrap();
+    let articles = db.articles(Some(&feed.id), 10).unwrap();
+    assert_eq!(articles[0].media_url, None);
+    drop(db);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn db_files_run_in_wal_mode_with_python_connection_setup() {
+    // Python core/db.py sets journal_mode=WAL,
+    // synchronous=NORMAL and busy_timeout=60000 on every
+    // connection; the port set none of them, so refresh workers
+    // writing in rollback-journal mode blocked the UI's reads
+    // and feeds failed with "database is locked" (Brandon,
+    // 2026-11-07). WAL persists in the database file, so a
+    // fresh raw connection still reports it after the fact.
+    let path = scratch_path("wal");
+    let db = Db::open_or_create(&path).unwrap();
+    drop(db);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let mode: String = conn
+        .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(mode, "wal");
+    drop(conn);
+    std::fs::remove_file(&path).ok();
+    std::fs::remove_file(format!("{}-wal", path.display())).ok();
+    std::fs::remove_file(format!("{}-shm", path.display())).ok();
+}
+
 // ---------------------------------------------------------------------------
 // F01 — shared subscribe/refresh source dispatch
 // ---------------------------------------------------------------------------

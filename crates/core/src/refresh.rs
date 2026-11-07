@@ -107,6 +107,32 @@ pub fn store_parsed_with_retention(
             continue;
         }
         let mut article = entry_to_article(&feed.id, entry);
+        // NPR / Sky media resolution (Python providers/local.py's
+        // per-entry media resolution, phase 1): those program
+        // feeds ship no enclosure, so the audio is resolved from
+        // the story page for EVERY entry at EVERY refresh — new
+        // and existing alike — before the row branches split.
+        // The existing-row sync below then stores the fresh
+        // result, so a story whose audio posts after the story
+        // gains it on the next refresh, and stored media the
+        // resolver no longer confirms is cleared (Python's
+        // per-session semantics; Brandon's 2026-11-07 report:
+        // NPR feeds refreshing with no audio because the port
+        // only resolved at first insert). Brandon's words:
+        // audio should be discovered and fetched per session.
+        if article.media_url.is_none() {
+            let attach = if crate::sources::is_npr_url(&article.url) {
+                crate::sources::npr_audio(&article.url)
+            } else if crate::sources::is_sky_news_url(&article.url) {
+                crate::sources::sky_podcast_audio(&article.url, &article.title, &entry.content_text)
+            } else {
+                None
+            };
+            if let Some((mu, mt)) = attach {
+                article.media_url = Some(mu);
+                article.media_type = Some(mt);
+            }
+        }
         // Existing row for THIS feed, under the raw or scoped id:
         // sync publisher-owned metadata and keep local state.
         let existing_id = match db.article_by_id(&base_id) {
@@ -139,25 +165,6 @@ pub fn store_parsed_with_retention(
             .map_err(|e| format!("store failed: {e}"))?
         {
             outcome.inserted += 1;
-            // NPR / Sky media attach (Python's generic parse path):
-            // those program feeds ship no enclosure, so resolve the
-            // audio for media-less new articles at store time.
-            if article.media_url.is_none() {
-                let attach = if crate::sources::is_npr_url(&article.url) {
-                    crate::sources::npr_audio(&article.url)
-                } else if crate::sources::is_sky_news_url(&article.url) {
-                    crate::sources::sky_podcast_audio(
-                        &article.url,
-                        &article.title,
-                        &entry.content_text,
-                    )
-                } else {
-                    None
-                };
-                if let Some((mu, mt)) = attach {
-                    let _ = db.update_article_media(&article.id, &mu, Some(&mt));
-                }
-            }
             if !entry.tags.is_empty() {
                 db.apply_enrichment(
                     &article.id,

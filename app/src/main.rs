@@ -11910,6 +11910,36 @@ mod ui_parity_tests {
     }
 
     #[test]
+    fn settings_enumerates_soundcards_off_the_ui_thread() {
+        // Brandon, 2026-11-07: Settings took seconds to open
+        // and the app destabilized around saves. The build
+        // created a full libVLC player instance synchronously
+        // just to list soundcards; Python enumerates on a
+        // background thread through a minimal instance and
+        // populates the choice when it lands.
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let settings = std::fs::read_to_string(src_dir.join("settings.rs")).unwrap();
+        assert!(
+            !settings.contains("media_backend::soundcards("),
+            "settings build enumerates soundcards synchronously again"
+        );
+        assert!(settings.contains("media_backend::enumerate_soundcards()"));
+        let backend = std::fs::read_to_string(src_dir.join("media_backend.rs")).unwrap();
+        assert!(backend.contains("vlc::enumerate_soundcards()"));
+        let vlc = std::fs::read_to_string(src_dir.join("media_backend/vlc.rs")).unwrap();
+        let start = vlc.find("pub fn enumerate_soundcards()").unwrap();
+        let body = &vlc[start..(start + 1800).min(vlc.len())];
+        assert!(
+            body.contains("--no-video"),
+            "enumeration instance lost --no-video"
+        );
+        assert!(
+            !body.contains("media_player_new"),
+            "enumeration creates a media player again"
+        );
+    }
+
+    #[test]
     fn tree_appends_uncategorized_after_smart_folders() {
         // Issue 7: Uncategorized sat directly under Favorites;
         // the owner wants it at the bottom of the tree.

@@ -7634,3 +7634,78 @@ so automatic checks stop, while the manual Check for Updates
 button (which calls check_and_update directly) keeps working.
 Deliberate deviation from Python, whose choice has the same
 four values and no Never.
+
+## Locked database + refresh stalls (2026-11-07, Brandon's report)
+
+Brandon: many feeds failing with `feed cache: database is
+locked`, and the app hard to navigate while feeds refresh.
+Root cause, a Python-parity miss in connection setup: Python
+`core/db.py` sets `PRAGMA journal_mode=WAL`,
+`synchronous=NORMAL` and `busy_timeout=60000` on EVERY
+connection. The port set none of them — rollback journal mode
+with busy_timeout=5000 (set only inside init_schema). In
+rollback mode the 16 refresh workers' writes block the UI
+connection's reads (navigation stalls), and contention past
+5 s fails refreshes outright with the exact error Brandon
+pasted. Fixed: `Db::configure` applies Python's pragma set on
+every `Db::open`/`open_or_create`; init_schema's timeout is
+60000; the archive store's own open() gets the same set. WAL
+persists in the file, so an existing library heals on first
+open. Regression tests:
+`db_files_run_in_wal_mode_with_python_connection_setup`.
+
+## NPR audio per session (2026-11-07, Brandon's report)
+
+Brandon: NPR program feeds (feeds.npr.org/7/rss.xml given)
+still refresh with no audio; "audio should be discovered and
+fetched per session". Audit against Python providers/local.py:
+(1) Python resolves media per entry in phase 1 of EVERY
+refresh — new and existing rows alike — and the existing-row
+update stores the fresh result (a story whose audio posts
+late gains it next refresh; stored media the resolver no
+longer confirms is cleared). The port resolved only at first
+insert, so every already-stored NPR article stayed silent
+forever. (2) Python never fetches NPR feeds conditionally
+(`use_conditional` excludes them) and has no unchanged-body
+shortcut; the port sent validators and took the body-digest
+fast path, so NPR stores often never ran at all. (3) The
+extractor itself (story-id shapes incl. nx-s1-…, embed player
+first, story-page markers) was already at parity — verified
+live against feeds.npr.org/7/rss.xml (10 items, zero
+enclosures) and the embed page for a current story. Fixes:
+media resolution moved above the existing/new branch in
+store_parsed (the existing-row sync already writes media,
+including clearing); fetch_feed_document_cancellable treats
+NPR feed URLs as always-full (no validators, no digest
+shortcut). Regression test:
+`npr_audio_is_resolved_per_session_for_existing_articles`
+(three sessions: audio posts late → gained; resolver stops
+confirming → cleared; second fetch carries no If-None-Match).
+
+## Settings slow open + instability (2026-11-07, Brandon's report)
+
+Brandon: Settings takes a few seconds to open; after making
+changes and saving, the app loses stability and finally
+crashes. Root cause found in the Media Player page build:
+`media_backend::soundcards` constructed a FULL VlcPlayer —
+libVLC instance + media player + output set + equalizer —
+synchronously on the UI thread, just to enumerate audio
+devices, then destroyed it. libVLC instance creation takes
+seconds (the open delay), and churning full player instances
+in process is the destabilizer. Python gui/dialogs.py does
+the opposite on every point: the choice opens instantly, a
+background thread enumerates through a MINIMAL instance
+(`--no-video --aout=mmdevice`, no player object), and the
+result populates the choice afterwards. Ported: vlc.rs gains
+`enumerate_soundcards` (minimal instance; the device-list
+walk is factored into `device_list`, shared with
+VlcPlayer::soundcards); the Settings build starts with
+System Default + the saved device, a worker thread
+enumerates, and a 100 ms dialog timer swaps the real list
+in, preserving the current selection; the save path reads
+the swapped list through the shared Rc. Guard test:
+`settings_enumerates_soundcards_off_the_ui_thread`. The
+crash half is attributed to the instance churn — the only
+libVLC lifecycle abuse in the save/open path; the live
+player's apply_preferred_soundcard routes to the existing
+session and creates nothing.

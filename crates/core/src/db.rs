@@ -467,6 +467,30 @@ impl Db {
             params![url, etag, modified, body])?;
         Ok(())
     }
+    /// Connection setup for every rss.db connection (Python
+    /// `core/db.py::get_connection`, applied on EVERY connection
+    /// there): WAL journal mode so refresh workers writing never
+    /// block the UI connection's reads, synchronous=NORMAL (the
+    /// safe pairing under WAL), and a 60-second busy timeout so
+    /// writer-vs-writer contention is ridden out instead of
+    /// surfacing as "database is locked". The port previously set
+    /// none of this — rollback journal mode with a 5-second
+    /// timeout — which is the root cause of Brandon's 2026-11-07
+    /// report: feeds failing with `feed cache: database is
+    /// locked` during refresh and the UI stalling while feeds
+    /// refresh. WAL persists in the database file, so the first
+    /// open under this build heals an existing library.
+    fn configure(conn: &Connection) -> rusqlite::Result<()> {
+        // busy_timeout FIRST (Python's order): switching the
+        // journal mode needs a momentary exclusive lock, and
+        // with the connection's default zero timeout a racing
+        // opener would fail instantly instead of waiting.
+        conn.execute_batch(
+            "PRAGMA busy_timeout=60000; PRAGMA journal_mode=WAL; \
+             PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;",
+        )
+    }
+
     /// Open an existing BlindRSS database. Fails if the file is missing:
     /// silently creating an empty database would hide a wrong path and
     /// look like data loss to the user.
@@ -478,7 +502,7 @@ impl Db {
             ));
         }
         let conn = Connection::open(path)?;
-        conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+        Self::configure(&conn)?;
         let db = Self { conn };
         db.init_schema()?;
         Ok(db)
@@ -489,7 +513,7 @@ impl Db {
     /// brand-new user starts with an empty, valid library).
     pub fn open_or_create(path: &Path) -> rusqlite::Result<Self> {
         let conn = Connection::open(path)?;
-        conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+        Self::configure(&conn)?;
         let db = Self { conn };
         db.init_schema()?;
         Ok(db)
@@ -506,7 +530,7 @@ impl Db {
         // database together). BEGIN IMMEDIATE takes the write
         // lock up front; busy_timeout makes the other opener
         // wait instead of erroring.
-        self.conn.execute_batch("PRAGMA busy_timeout=5000;")?;
+        self.conn.execute_batch("PRAGMA busy_timeout=60000;")?;
         self.conn.execute_batch("BEGIN IMMEDIATE")?;
         let result = self.init_schema_locked();
         match result {

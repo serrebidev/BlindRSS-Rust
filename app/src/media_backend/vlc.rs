@@ -449,18 +449,22 @@ impl VlcPlayer {
             }
         }
     }
+}
 
-    pub fn soundcards(&self) -> Vec<(String, String)> {
-        let module = if cfg!(windows) {
-            c"mmdevice"
-        } else if cfg!(target_os = "macos") {
-            c"auhal"
-        } else {
-            c"pulse"
-        };
-        let head =
-            unsafe { (self.api.audio_output_device_list_get)(self.instance, module.as_ptr()) };
+/// The audio output device list of one libVLC instance
+/// (label, id) pairs, deduplicated by id.
+fn device_list(api: &Api, instance: Handle) -> Vec<(String, String)> {
+    let module = if cfg!(windows) {
+        c"mmdevice"
+    } else if cfg!(target_os = "macos") {
+        c"auhal"
+    } else {
+        c"pulse"
+    };
+    let head = unsafe { (api.audio_output_device_list_get)(instance, module.as_ptr()) };
+    {
         let mut next = head;
+        // (kept in a block so `head` is released before return)
         let mut devices = Vec::new();
         let mut seen = std::collections::HashSet::new();
         for _ in 0..512 {
@@ -488,11 +492,53 @@ impl VlcPlayer {
             next = device.next;
         }
         if !head.is_null() {
-            unsafe { (self.api.audio_output_device_list_release)(head) };
+            unsafe { (api.audio_output_device_list_release)(head) };
         }
         devices
     }
+}
 
+/// Enumerate soundcards through a throwaway MINIMAL libVLC
+/// instance (Python `gui/dialogs.py::_build_soundcard_choices`:
+/// `Instance("--no-video", "--aout=mmdevice")` — no media
+/// player, no output setting, no equalizer). Settings used to
+/// build a full VlcPlayer just to list devices: creating a
+/// libVLC instance takes seconds, so Settings took seconds to
+/// open on the UI thread, and churning full player instances
+/// in process destabilized the app (Brandon, 2026-11-07).
+/// Callers run this OFF the UI thread (Python enumerates on a
+/// background thread and populates the choice afterwards).
+pub fn enumerate_soundcards() -> Vec<(String, String)> {
+    let Ok((api, _lib_path)) = load_api() else {
+        return Vec::new();
+    };
+    let aout = if cfg!(windows) {
+        "--aout=mmdevice"
+    } else if cfg!(target_os = "macos") {
+        "--aout=auhal"
+    } else {
+        "--aout=pulse"
+    };
+    let args = build_instance_args(&[
+        "--no-video".to_owned(),
+        "--quiet".to_owned(),
+        aout.to_owned(),
+    ]);
+    let cargs: Vec<CString> = args
+        .iter()
+        .map(|s| CString::new(s.as_str()).unwrap())
+        .collect();
+    let argv: Vec<_> = cargs.iter().map(|s| s.as_ptr()).collect();
+    let instance = unsafe { (api.new)(argv.len() as i32, argv.as_ptr()) };
+    if instance.is_null() {
+        return Vec::new();
+    }
+    let devices = device_list(&api, instance);
+    unsafe { (api.release)(instance) };
+    devices
+}
+
+impl VlcPlayer {
     pub fn apply_equalizer(&self, config: &EqConfig) -> bool {
         if !config.enabled {
             return unsafe {
@@ -828,7 +874,7 @@ mod tests {
         assert_eq!(player.length(), 4000);
         assert!(player.set_rate(1.25));
         assert!(player.apply_equalizer(&EqConfig::default()));
-        let devices = player.soundcards();
+        let devices = device_list(&player.api, player.instance);
         let ids: std::collections::HashSet<_> = devices.iter().map(|(_, id)| id).collect();
         assert_eq!(ids.len(), devices.len());
         assert!(
