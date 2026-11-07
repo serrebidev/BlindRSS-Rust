@@ -7534,3 +7534,14 @@ AudioDetected handler window must not contain `refill_articles` and
 must contain the in-place cell write. Deviation note: under a
 "no media" media filter the row now stays visible until the next
 refill, exactly as Python's in-place refresh leaves it.
+
+**v0.1.68 VERIFIED** (2026-11-07): commits `b3e0197` (veto guards +
+Audit 10 cadence) and `d45e44f` (release notes + Detect Audio row
+refresh), tag on `d45e44f`. Local gate: fmt clean, clippy zero
+(workspace + core windows-gnu), 993 passed / 0 failed, build ok. Main
+CI 42388997565 completed/success (all 3 jobs read directly); Release
+run 42390517256 completed/success (all 3 Package jobs + Publish).
+API verify: Latest = v0.1.68, draft=false, exactly 7 assets; the
+release body is the CHANGELOG 0.1.68 section verbatim — the new
+extraction step worked on its first live run. Signature: SIGNATURE
+VALID on BlindRSS.tar.gz + tamper control ok.
