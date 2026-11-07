@@ -3293,7 +3293,95 @@ fn merge_recommendations(mut base: Vec<Article>, extra: Vec<Article>) -> Vec<Art
     base
 }
 
+/// The user's place in the article list, captured by article
+/// identity before a rebuild (Python's
+/// `_capture_list_view_state`): the selected article, the
+/// focused article, and whether the focus sat on the paging
+/// placeholder row (which has no article).
+struct ListPlace {
+    selected_id: Option<String>,
+    focused_id: Option<String>,
+    on_placeholder: bool,
+}
+
+fn capture_list_place(state: &State, list: &ListCtrl) -> ListPlace {
+    let id_at = |idx: i64| -> Option<String> {
+        if idx < 0 {
+            None
+        } else {
+            state.articles.get(idx as usize).map(|a| a.id.clone())
+        }
+    };
+    let focused_idx = list.get_next_item(
+        -1,
+        wxdragon::prelude::ListNextItemFlag::All,
+        wxdragon::prelude::ListItemState::Focused,
+    );
+    ListPlace {
+        selected_id: id_at(list.get_first_selected_item() as i64).or_else(|| {
+            state
+                .selected_article
+                .and_then(|i| state.articles.get(i))
+                .map(|a| a.id.clone())
+        }),
+        focused_id: id_at(focused_idx as i64),
+        on_placeholder: focused_idx >= 0 && focused_idx as usize == state.articles.len(),
+    }
+}
+
+/// Put the captured place back after a rebuild (Python's
+/// `_restore_list_view`): re-select and re-focus the same
+/// articles at their new indices and make the focused row
+/// visible. An article that left the view restores nothing —
+/// the refill's own first-row placeholder focus stands.
+/// wxdragon exposes no top-item getter, so scroll position
+/// follows the focused row via ensure_visible; that row is
+/// the one the screen reader tracks.
+fn restore_list_place(state: &mut State, list: &ListCtrl, place: &ListPlace) {
+    if place.on_placeholder && state.view_total > state.articles.len() as i64 {
+        // Python's _restore_load_more_focus: the placeholder
+        // row is the place; keep it selected and focused.
+        let at = state.articles.len() as i64;
+        list.set_item_state(
+            at,
+            wxdragon::prelude::ListItemState::Selected | wxdragon::prelude::ListItemState::Focused,
+            wxdragon::prelude::ListItemState::Selected | wxdragon::prelude::ListItemState::Focused,
+        );
+        list.ensure_visible(at);
+        return;
+    }
+    if let Some(id) = &place.selected_id
+        && let Some(idx) = state.articles.iter().position(|a| &a.id == id)
+    {
+        state.selected_article = Some(idx);
+        list.set_item_state(
+            idx as i64,
+            wxdragon::prelude::ListItemState::Selected,
+            wxdragon::prelude::ListItemState::Selected,
+        );
+    }
+    if let Some(id) = place.focused_id.as_ref().or(place.selected_id.as_ref())
+        && let Some(idx) = state.articles.iter().position(|a| &a.id == id)
+    {
+        list.set_item_state(
+            idx as i64,
+            wxdragon::prelude::ListItemState::Focused,
+            wxdragon::prelude::ListItemState::Focused,
+        );
+        list.ensure_visible(idx as i64);
+    }
+}
+
 fn refill_articles(state: &mut State, list: &ListCtrl) {
+    // Brandon's report (2026-11-07): a refresh finishing
+    // while he reads through the list rebuilt the rows and
+    // dumped him back at the first article. Every Python
+    // rebuild captures the place first and restores it after
+    // (_capture_list_view_state / _restore_list_view); the
+    // port's refill did neither. Capture/restore here, in the
+    // one funnel every rebuild goes through, so refresh
+    // completions (and every other refill) keep the place.
+    let place = capture_list_place(state, list);
     state.reader_generation = state.reader_generation.wrapping_add(1);
     state.pending_fulltext = None;
     // Freeze/Thaw around the whole fill: without it every
@@ -3304,6 +3392,7 @@ fn refill_articles(state: &mut State, list: &ListCtrl) {
     list.freeze();
     refill_inner(state, list);
     list.thaw();
+    restore_list_place(state, list, &place);
 }
 
 fn refill_inner(state: &mut State, list: &ListCtrl) {
@@ -11850,6 +11939,36 @@ mod ui_parity_tests {
         assert!(
             window.contains("focus_first_row_if_unvisited(list)"),
             "render_refill_rows no longer focuses the first row"
+        );
+    }
+
+    #[test]
+    fn refill_restores_the_reading_place() {
+        // Brandon's report (2026-11-07): a refresh finishing
+        // while he read through the list rebuilt the rows and
+        // jumped him to the first article. Python captures the
+        // focused/selected article ids before every rebuild
+        // and restores them after (_capture_list_view_state /
+        // _restore_list_view); the refill funnel must keep the
+        // capture/restore bracket around the rebuild.
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let main = std::fs::read_to_string(src_dir.join("main.rs")).unwrap();
+        assert!(main.contains("fn capture_list_place"));
+        assert!(main.contains("fn restore_list_place"));
+        let start = main.find("fn refill_articles").unwrap();
+        let window = &main[start..(start + 2500).min(main.len())];
+        let capture = window
+            .find("capture_list_place(state, list)")
+            .expect("refill does not capture the place");
+        let inner = window
+            .find("refill_inner(state, list)")
+            .expect("refill_inner call missing");
+        let restore = window
+            .find("restore_list_place(state, list, &place)")
+            .expect("refill does not restore the place");
+        assert!(
+            capture < inner && inner < restore,
+            "capture/restore no longer bracket the refill"
         );
     }
 

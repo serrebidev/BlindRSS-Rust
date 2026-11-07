@@ -7545,3 +7545,34 @@ API verify: Latest = v0.1.68, draft=false, exactly 7 assets; the
 release body is the CHANGELOG 0.1.68 section verbatim — the new
 extraction step worked on its first live run. Signature: SIGNATURE
 VALID on BlindRSS.tar.gz + tamper control ok.
+
+## Refresh place-keeping (2026-11-07, Brandon's report)
+
+Brandon: "if I'm reading through the list of articles, and a
+refresh happens, I get jumped to the top of the list." Audit:
+the refresh-completion drain (AllDone) calls `rebuild_tree` +
+`refill_articles`; the refill deletes every row and re-inserts,
+and nothing restored the widget's selection or focus — the same
+missing machinery behind the Detect Audio jump, there fixed by
+not refilling. Python never loses the place: EVERY article-list
+rebuild captures the focused article id, the selected article id
+and the top article id first (`_capture_list_view_state`) and
+restores them after the render (`_restore_list_view`: re-select,
+re-focus, EnsureVisible, scroll-top trick, placeholder focus
+only when nothing was restored), and the refresh completion
+funnels into those same reload paths. The port now matches at
+the funnel: `refill_articles` captures a `ListPlace` (selected
+id from the widget, falling back to `state.selected_article`;
+focused id from the widget's focused row; a flag for the paging
+placeholder row) before `refill_inner` and restores it after the
+Thaw — selection re-set at the article's new index (and
+`state.selected_article` corrected to it), focus re-set +
+`ensure_visible`, placeholder focus restored via
+`_restore_load_more_focus`'s shape when the focus sat on the
+placeholder. Articles that left the view restore nothing, as in
+Python. One shape difference, recorded: wxdragon exposes no
+top-item getter, so scroll position follows the focused row via
+ensure_visible instead of Python's explicit top-item restore —
+the focused row is the one the screen reader tracks. Guard test
+`refill_restores_the_reading_place`: capture/restore calls must
+bracket `refill_inner` inside `refill_articles`.
