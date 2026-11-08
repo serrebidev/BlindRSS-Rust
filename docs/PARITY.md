@@ -7823,6 +7823,60 @@ key, tamper control rejected. Local gate on the ship
 tree: 995 tests passed, clippy zero on Linux and
 windows-gnu.
 
+## Settings close plays a stray chime (Brandon's report, 2026-11-08; ships in v0.1.76)
+
+**Report (Brandon, 2026-11-08, on v0.1.74):** "as I
+close BlindRSS Rust's Settings dialog, I hear an extra
+chime or ding as if something has gone wrong. But
+nothing goes wrong and the app stays alive."
+
+**Root cause (from the wx sources in the build
+tree):** the app itself plays no sound on that path
+(no bell/beep call exists in the app or core announce
+code; on MSW wxBell is MessageBeep, and wx calls it
+only from validators and propgrid, neither used here).
+wxDialogBase::OnCharHook answers Escape through
+SendCloseButtonClickEvent, which calls
+EmulateButtonClickIfPresent(GetEscapeId()) —
+src/common/dlgcmn.cpp: it finds the button carrying
+the escape id and clicks it. Settings set its escape
+id to 5101 but built its Cancel button with an
+anonymous id, so FindWindow(5101) found nothing, the
+emulation returned false, OnCharHook skipped the key,
+and it fell through to the native Windows dialog
+handling, which beeps and only then closes. The
+affirmative side had the same hole: the affirmative
+id defaulted to 5100, carried by no button (Enter in
+a field is a primary close path since v0.1.74 made
+Save the default button). Python's SettingsDialog
+has neither hole: `CreateButtonSizer(wx.OK |
+wx.CANCEL)` builds its buttons with wxID_OK (5100)
+and wxID_CANCEL (5101) on them. Rig check (Xvfb +
+openbox, 2026-11-08): on the v0.1.76 build, Enter in
+the dialog saves (config written) and closes, and
+Escape closes without saving — behavior identical to
+the v0.1.75 build driven the same way. (The rig's
+known key-leak artifact, where the Return release
+re-opens Settings after the modal closes, appears on
+both builds alike and is not part of this change.)
+
+**Fix (Python parity):** the Save button is built
+with id 5100 and the Cancel button with id 5101 (the
+same values the codebase already uses as its modal
+result codes), and the dialog calls
+set_affirmative_id(5100) beside its existing
+set_escape_id(5101). The click handlers are unchanged
+(they are bound to the button objects, not the ids),
+and the end_modal(5100/5101) results are unchanged.
+Guarded by
+settings_buttons_carry_the_standard_dialog_ids.
+Brandon's retest on Windows is the acceptance check:
+closing Settings — Enter in a field above all — must
+be silent.
+
+Local gate and release verification are recorded below
+once run.
+
 ## Extraction junk, reading-place loss, find bugs, tree shape (Brandon's reports, 2026-11-08; ships in v0.1.75)
 
 **Reports (Brandon, 2026-11-08, on v0.1.74), five items:**
@@ -7937,8 +7991,27 @@ This also resolves the stale PARITY note (v0.1.64
 section) that the port lacked an "All Articles" root
 node.
 
-Local gate and release verification are recorded below
-once run.
+VERIFIED 2026-11-08: local gate green (fmt,
+clippy --workspace --all-targets -D warnings, 1004
+tests passed, build). Main CI run 42508629348 success
+(all three jobs). Release run 42511547508 success
+(three Package jobs + Publish). v0.1.75 is Latest,
+draft=false, exactly the 7 contract assets, and the
+release body is identical to the CHANGELOG.md 0.1.75
+section. BlindRSS.tar.gz signature verified VALID
+with the tamper control rejected (verify-0175).
+Brandon's acceptance checks: the named Ars article
+reads with no caption/"Credit:" lines and no rail
+tail; MacRumors articles have no Popular Stories
+block and no push/footer tail; Windows Latest
+articles have no image captions/credits and no
+"appeared first on" ending; reading position in
+article text survives a Tab/Shift+Tab round-trip;
+Ctrl+F + Enter lands on the first match from the
+current place; Shift+F3 pressed again at the first
+match announces "No more occurrences"; the tree opens
+flat with All Articles / Favorites / categories as
+top-level siblings.
 
 ## Settings values silently not saving (Brandon's report, 2026-11-08; ships in v0.1.74)
 

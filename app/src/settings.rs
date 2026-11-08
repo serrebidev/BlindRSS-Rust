@@ -475,6 +475,17 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
     let cfg = Config::load(config_path).unwrap_or_default();
     let dialog = Dialog::builder(frame, "BlindRSS Settings").build();
     dialog.set_escape_id(5101);
+    // The Save button below carries the standard OK id
+    // (5100), so the dialog's affirmative id names it
+    // explicitly. Python's SettingsDialog builds its buttons
+    // with CreateButtonSizer(wx.OK | wx.CANCEL), which does
+    // the same: wx's own key handling can then resolve Enter
+    // and Escape to a real button. With id-less buttons the
+    // key press fell through to the native dialog manager,
+    // which answered with the Windows default beep as the
+    // dialog closed (Brandon's stray-chime report,
+    // 2026-11-08).
+    dialog.set_affirmative_id(5100);
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let notebook = Notebook::builder(&dialog).build();
     sizer.add(&notebook, 1, SizerFlag::Expand | SizerFlag::All, 4);
@@ -2038,13 +2049,23 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
     sizer.add_sizer(&maint_row2, 0, SizerFlag::All, 2);
 
     let btn_row = BoxSizer::builder(Orientation::Horizontal).build();
-    let save_btn = Button::builder(&dialog).with_label(&t("Save")).build();
+    let save_btn = Button::builder(&dialog)
+        .with_id(5100)
+        .with_label(&t("Save"))
+        .build();
     // Python's SettingsDialog makes OK the default button, so
     // Enter in any field saves and closes. Match that: without
     // a default button, Enter in a field did nothing at all
-    // (reproduced 2026-11-08 under Xvfb).
+    // (reproduced 2026-11-08 under Xvfb). The standard ids
+    // matter as much as the default flag: Python's button
+    // sizer gives its buttons wxID_OK / wxID_CANCEL, and wx
+    // resolves Enter/Escape through those ids (see
+    // set_affirmative_id at the dialog build above).
     save_btn.set_default();
-    let cancel_btn = Button::builder(&dialog).with_label(&t("Cancel")).build();
+    let cancel_btn = Button::builder(&dialog)
+        .with_id(5101)
+        .with_label(&t("Cancel"))
+        .build();
     btn_row.add(&save_btn, 0, SizerFlag::All, 4);
     btn_row.add(&cancel_btn, 0, SizerFlag::All, 4);
     sizer.add_sizer(&btn_row, 0, SizerFlag::All, 4);

@@ -11879,6 +11879,45 @@ mod ui_parity_tests {
     }
 
     #[test]
+    fn settings_buttons_carry_the_standard_dialog_ids() {
+        // Brandon's report, 2026-11-08: closing Settings
+        // played an extra chime, as if something had gone
+        // wrong, though nothing had. Settings is the dialog
+        // whose primary close path is Enter in a field
+        // (Save became the default button in v0.1.74), and
+        // its Save/Cancel buttons were built with anonymous
+        // ids: wx resolves Enter through the dialog's
+        // affirmative id and Escape by emulating a click on
+        // the button carrying its escape id
+        // (wxDialogBase::OnCharHook in wx's dlgcmn.cpp —
+        // with no such button the key is skipped and the
+        // native dialog handling beeps), and Python's
+        // SettingsDialog satisfies both by
+        // building its buttons with CreateButtonSizer(wx.OK
+        // | wx.CANCEL) — buttons carrying wxID_OK (5100) and
+        // wxID_CANCEL (5101). With no button carrying those
+        // ids, the key press fell through to the native
+        // dialog manager, which answers an unresolved Enter
+        // with the Windows default beep. Keep the standard
+        // ids on the buttons and the affirmative id on the
+        // dialog.
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let settings = std::fs::read_to_string(src_dir.join("settings.rs")).unwrap();
+        assert!(
+            settings.contains("dialog.set_affirmative_id(5100);"),
+            "Settings must name its Save button as the affirmative button"
+        );
+        assert!(
+            settings.contains(".with_id(5100)"),
+            "the Save button must carry the standard OK id"
+        );
+        assert!(
+            settings.contains(".with_id(5101)"),
+            "the Cancel button must carry the standard Cancel id"
+        );
+    }
+
+    #[test]
     fn close_handlers_only_veto_vetoable_events() {
         // Brandon (2026-11-07): updating popped wx's
         // debugging-check dialog — wx/event.h "assert

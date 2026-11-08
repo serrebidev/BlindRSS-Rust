@@ -6,6 +6,10 @@ as `0.1.2-0.1.3`. Each release's section below is its GitHub release note,
 taken from this file by the release workflow. The in-app updater shows the
 same text.
 
+## 0.1.76
+
+- Fixed an extra chime or ding when the Settings dialog closes. The Save and Cancel buttons now carry the standard dialog button ids, the way the Python version's OK and Cancel buttons do, so pressing Enter in a field to save and close no longer falls through to the Windows default beep.
+
 ## 0.1.75
 
 - Fixed figure captions and photo credits leaking into article text. Ars Technica, Windows Latest, and other sites print a caption and a "Credit:" line under each photo; both now stay out of the article, in the plain text view and the HTML view alike. Ars Technica also hid a second copy of each caption in its photo lightbox data; that copy is gone too.
