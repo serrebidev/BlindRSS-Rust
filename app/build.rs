@@ -6,6 +6,11 @@
 //! old common controls.
 
 fn main() {
+    // Compile the gettext catalogs (po/*.po) into locale/ for
+    // patois::embed_domain! to embed. Without the gettext
+    // tools on PATH this warns and builds without translations
+    // (patois-build's contract); CI installs them.
+    patois_build::compile_translations("po", "locale");
     // wxdragon-sys 0.9.24 link gap (Linux, media-ctrl feature): the wx
     // GStreamer media backend calls gst_player_* but the sys crate does
     // not emit the gstplayer link. Windows/macOS backends don't need it.

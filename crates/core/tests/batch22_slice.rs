@@ -1,5 +1,5 @@
 //! Batch 22 (final sweep): media_url, article_lang,
-//! translation_updates, cookies_import.
+//! cookies_import.
 
 use blindrss_core::article_lang::{
     ContentLangSources, lang_from_page_html, normalize_lang, resolve_content_language,
@@ -9,8 +9,6 @@ use blindrss_core::cookies_import as ci;
 use blindrss_core::media_url::{
     is_media_url, looks_like_direct_media_file, normalize_media_url, title_from_url,
 };
-use blindrss_core::translation_updates as tu;
-use std::collections::HashMap;
 use std::path::PathBuf;
 
 fn scratch(name: &str) -> PathBuf {
@@ -104,98 +102,6 @@ fn article_lang_normalize_and_priority() {
     let empty = ContentLangSources::default();
     assert_eq!(resolve_content_language(&empty, "fr"), "fr");
     assert_eq!(resolve_content_language(&empty, "junk value"), "en");
-}
-
-struct FakeFetch {
-    responses: HashMap<String, tu::FetchOutcome>,
-}
-
-impl tu::CatalogFetch for FakeFetch {
-    fn fetch(&self, url: &str, _etag: &str) -> tu::FetchOutcome {
-        for lang in self.responses.keys() {
-            if url.contains(&format!("/{lang}/")) {
-                // Can't move out of a borrow; rebuild by kind.
-                return match self.responses.get(lang).unwrap() {
-                    tu::FetchOutcome::Updated { text, etag } => tu::FetchOutcome::Updated {
-                        text: text.clone(),
-                        etag: etag.clone(),
-                    },
-                    tu::FetchOutcome::Unchanged => tu::FetchOutcome::Unchanged,
-                    tu::FetchOutcome::Missing => tu::FetchOutcome::Missing,
-                    tu::FetchOutcome::Failed(e) => tu::FetchOutcome::Failed(e.clone()),
-                };
-            }
-        }
-        tu::FetchOutcome::Missing
-    }
-}
-
-fn big_po(msgid: &str, msgstr: &str) -> String {
-    let mut out = String::new();
-    for i in 0..60 {
-        out.push_str(&format!(
-            "msgid \"{msgid} {i}\"\nmsgstr \"{msgstr} {i}\"\n\n"
-        ));
-    }
-    out
-}
-
-#[test]
-fn translation_updates_round_trip() {
-    let dir = scratch("tu");
-    let bundled = vec![dir.join("bundled")];
-    let mut responses = HashMap::new();
-    responses.insert(
-        "fr".to_string(),
-        tu::FetchOutcome::Updated {
-            text: big_po("Hello", "Bonjour"),
-            etag: "W/\"abc\"".to_string(),
-        },
-    );
-    responses.insert("de".to_string(), tu::FetchOutcome::Unchanged);
-    let fetch = FakeFetch { responses };
-    let langs = vec!["fr".to_string(), "de".to_string(), "en".to_string()];
-    let result = tu::check_and_update(&dir, &bundled, &langs, &fetch, 1_700_000_000, false);
-    assert_eq!(result.updated, vec!["fr".to_string()]);
-    assert_eq!(result.checked, 2);
-    assert_eq!(tu::installed_languages(&dir), vec!["fr".to_string()]);
-    assert_eq!(tu::last_check_time(&dir), 1_700_000_000);
-    assert!(tu::is_due(&dir, "weekly", 1_700_000_000 + 8 * 86_400));
-    assert!(!tu::is_due(&dir, "weekly", 1_700_000_000 + 86_400));
-    // "never" (the Disabled frequency) is never due, however
-    // much time passed and whatever the stored last check.
-    assert!(!tu::is_due(&dir, "never", 1_700_000_000 + 365 * 86_400));
-    assert!(!tu::is_due(&dir, "Never", 1_700_000_000 + 365 * 86_400));
-
-    // A too-small catalog is refused as damaged.
-    let mut responses = HashMap::new();
-    responses.insert(
-        "fr".to_string(),
-        tu::FetchOutcome::Updated {
-            text: "msgid \"a\"\nmsgstr \"b\"\n".to_string(),
-            etag: "W/\"x\"".to_string(),
-        },
-    );
-    let fetch = FakeFetch { responses };
-    let result = tu::check_and_update(&dir, &bundled, &langs[..1], &fetch, 1_700_000_100, false);
-    assert!(result.updated.is_empty());
-
-    // Version transition wipes overrides once.
-    assert_eq!(
-        tu::prepare_overrides_for_app_version(&dir, &bundled, "0.1.22"),
-        tu::PrepareOutcome::Reset
-    );
-    assert!(tu::installed_languages(&dir).is_empty());
-    assert_eq!(
-        tu::prepare_overrides_for_app_version(&dir, &bundled, "0.1.22"),
-        tu::PrepareOutcome::Current
-    );
-
-    // Stand-down when the override root IS a bundled root.
-    let dir2 = scratch("tu2");
-    let same = vec![tu::override_root(&dir2)];
-    let result = tu::check_and_update(&dir2, &same, &langs, &fetch, 1, false);
-    assert_eq!(result.checked, 0);
 }
 
 #[test]

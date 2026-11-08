@@ -10,7 +10,6 @@ use blindrss_core::article_columns::{
     set_visible,
 };
 use blindrss_core::help::{language_candidates, load_document, parse_guide, render_plain_text};
-use blindrss_core::i18n::Catalog;
 use blindrss_core::translate::{
     LANGUAGE_PRESETS, language_code_from_ui, language_display, language_display_value,
     language_name, openrouter_model_choices, openrouter_models_from_payload,
@@ -248,28 +247,6 @@ spanning two lines.
 }
 
 // ---------- S10: shipped catalog covers display strings ----------
-
-#[test]
-fn german_catalog_translates_column_and_settings_labels() {
-    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../locale");
-    let cat = Catalog::load(&root, "de");
-    assert!(!cat.is_empty());
-    for msgid in ["Title", "Author", "Date", "Description", "Media"] {
-        assert_ne!(cat.get(msgid), msgid, "de catalog lacks {msgid}");
-    }
-    assert_ne!(
-        cat.get("Enable Sound Notifications"),
-        "Enable Sound Notifications"
-    );
-    assert_ne!(
-        cat.get("Automatic (system language)"),
-        "Automatic (system language)"
-    );
-    // Available-language enumeration sees the shipped tree.
-    let langs = blindrss_core::i18n::Catalog::available_languages(&[root]);
-    assert!(langs.contains(&"de".to_string()));
-    assert!(langs.contains(&"pt_BR".to_string()));
-}
 
 // ---------- S09/S19: language names and codes ----------
 

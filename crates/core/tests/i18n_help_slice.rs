@@ -1,27 +1,8 @@
-//! i18n catalog, shortcuts registry, and help parsing tests.
+//! Shortcuts registry and help parsing tests.
 
 use blindrss_core::help::{to_plain_text, topics};
-use blindrss_core::i18n::Catalog;
 use blindrss_core::shortcuts::{commands, conflicts, effective, normalize_accelerator};
 use std::collections::HashMap;
-
-#[test]
-fn po_parse_multiline_and_escapes() {
-    let po = r#"msgid ""
-msgstr "Content-Type: text/plain; charset=UTF-8\n"
-
-msgid "Refresh All Feeds"
-msgstr "Alle Feeds aktualisieren"
-
-msgid "Multi "
-"line key"
-msgstr "Mehrzeilig \"zitiert\""
-"#;
-    let cat = Catalog::parse(po);
-    assert_eq!(cat.get("Refresh All Feeds"), "Alle Feeds aktualisieren");
-    assert_eq!(cat.get("Multi line key"), "Mehrzeilig \"zitiert\"");
-    assert_eq!(cat.get("Untranslated"), "Untranslated");
-}
 
 #[test]
 fn shortcuts_registry() {
@@ -47,16 +28,10 @@ fn shortcuts_registry() {
 }
 
 #[test]
-fn real_python_assets_parse() {
+fn real_python_guide_parses() {
     // Against the Python checkout when present (skips elsewhere):
     // the shipped German catalog and English guide must parse.
     let root = std::path::Path::new("/home/hatch/workspace/blindrss-work");
-    let po = root.join("locale/de/LC_MESSAGES/blindrss.po");
-    if po.exists() {
-        let text = std::fs::read_to_string(&po).unwrap();
-        let cat = Catalog::parse(&text);
-        assert!(cat.len() > 100, "de catalog too small: {}", cat.len());
-    }
     let guide_path = root.join("docs/help/en.md");
     if guide_path.exists() {
         let guide = std::fs::read_to_string(&guide_path).unwrap();

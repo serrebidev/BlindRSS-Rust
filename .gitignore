@@ -1,3 +1,5 @@
 /target
 *.db-shm
 *.db-wal
+# patois-build output: compiled catalogs embedded at build time
+/app/locale/

@@ -22,6 +22,7 @@
 
 use blindrss_core::config::Config;
 use blindrss_core::shortcuts as sc;
+use patois::t;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
@@ -161,13 +162,13 @@ pub fn show_shortcuts(frame: &Frame, config_path: &Path) {
     for (i, cmd) in commands.iter().enumerate() {
         // Display strings pass through tr() (Audit 8 S10); the
         // stored command ids and binding keys never change.
-        list.insert_item(i as i64, &crate::tr(&cmd.category), None);
-        list.set_item_text_by_column(i as i64, 1, &crate::tr(&cmd.label));
+        list.insert_item(i as i64, &t(&cmd.category), None);
+        list.set_item_text_by_column(i as i64, 1, &t(&cmd.label));
     }
     for (j, (keys, desc)) in sc::fixed_key_rows().iter().enumerate() {
         let i = (commands.len() + j) as i64;
-        list.insert_item(i, &crate::tr("Fixed keys"), None);
-        list.set_item_text_by_column(i, 1, &crate::tr(desc));
+        list.insert_item(i, &t("Fixed keys"), None);
+        list.set_item_text_by_column(i, 1, &t(desc));
         list.set_item_text_by_column(i, 2, keys);
     }
     refresh_list(&list, &working.borrow());
@@ -239,7 +240,7 @@ pub fn show_shortcuts(frame: &Frame, config_path: &Path) {
                 return;
             };
             let cmd = &commands[*ci];
-            let Some(accel) = capture_shortcut(&dialog, &crate::tr(&cmd.label)) else {
+            let Some(accel) = capture_shortcut(&dialog, &t(&cmd.label)) else {
                 return;
             };
             let bindings = sc::resolve_bindings(&working.borrow());
@@ -252,8 +253,8 @@ pub fn show_shortcuts(frame: &Frame, config_path: &Path) {
                     &format!(
                         "{} is already assigned to {}. Reassign it to {}?",
                         accel,
-                        crate::tr(&other.label),
-                        crate::tr(&cmd.label)
+                        t(&other.label),
+                        t(&cmd.label)
                     ),
                     "Shortcut Conflict",
                 )

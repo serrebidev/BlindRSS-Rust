@@ -30,6 +30,7 @@ use blindrss_core::playback::{
 use blindrss_core::player_session::{Activation, ChapterGate, PlayerSession, SessionIdentity};
 use blindrss_core::silence::{SilenceScanSettings, SilenceSkipPolicy, SkipContext};
 use blindrss_core::{Article, Db, PlaybackState};
+use patois::t;
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -992,7 +993,7 @@ fn start_loaded_stream(
     }
     media.set_volume((cfg.get_i64("volume", 100) as f64 / 100.0).clamp(0.0, 1.0));
     media.play();
-    play_btn.set_label(&crate::tr("Pause"));
+    play_btn.set_label(&t("Pause"));
     let start_speed = cfg_f64(&cfg, "playback_speed", 1.0);
     if (start_speed - 1.0).abs() > 0.001 {
         media.set_playback_rate(start_speed);
@@ -1584,12 +1585,8 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
         .with_size(Size::new(560, 460))
         .build();
     let media = MediaBackend::new(&frame, &cfg);
-    let play_btn = Button::builder(&frame)
-        .with_label(&crate::tr("Play"))
-        .build();
-    let stop_btn = Button::builder(&frame)
-        .with_label(&crate::tr("Stop"))
-        .build();
+    let play_btn = Button::builder(&frame).with_label(&t("Play")).build();
+    let stop_btn = Button::builder(&frame).with_label(&t("Stop")).build();
     let back_btn = Button::builder(&frame)
         .with_label(&format!("Back {}s", seek_back_ms / 1000))
         .build();
@@ -1597,22 +1594,16 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
         .with_label(&format!("Forward {}s", seek_fwd_ms / 1000))
         .build();
     let vdown_btn = Button::builder(&frame)
-        .with_label(&crate::tr("Volume Down"))
+        .with_label(&t("Volume Down"))
         .build();
-    let vup_btn = Button::builder(&frame)
-        .with_label(&crate::tr("Volume Up"))
-        .build();
-    let slower_btn = Button::builder(&frame)
-        .with_label(&crate::tr("Slower"))
-        .build();
-    let faster_btn = Button::builder(&frame)
-        .with_label(&crate::tr("Faster"))
-        .build();
+    let vup_btn = Button::builder(&frame).with_label(&t("Volume Up")).build();
+    let slower_btn = Button::builder(&frame).with_label(&t("Slower")).build();
+    let faster_btn = Button::builder(&frame).with_label(&t("Faster")).build();
     let prev_ch_btn = Button::builder(&frame)
-        .with_label(&crate::tr("Previous Chapter"))
+        .with_label(&t("Previous Chapter"))
         .build();
     let next_ch_btn = Button::builder(&frame)
-        .with_label(&crate::tr("Next Chapter"))
+        .with_label(&t("Next Chapter"))
         .build();
     // Speed picker (Audit 8 M15, Python's read-only speed
     // combo): the full 0.5–4.0 ladder in 0.1 steps. Appended
@@ -1633,9 +1624,7 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
     // Chapters button (Python's "Chapters Menu"): opens the
     // dynamic chapter popup — open-link item with live
     // availability, then one jump item per chapter.
-    let chapters_btn = Button::builder(&frame)
-        .with_label(&crate::tr("Chapters"))
-        .build();
+    let chapters_btn = Button::builder(&frame).with_label(&t("Chapters")).build();
     // Absolute volume (Audit 8 M15, Python's volume slider +
     // percent readout): a new row appended after the chapter
     // list, so the existing tab order is untouched.
@@ -1653,7 +1642,7 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
     let pos_label = TextCtrl::builder(&frame)
         .with_style(TextCtrlStyle::ReadOnly)
         .build();
-    pos_label.set_value(&crate::tr("No media loaded"));
+    pos_label.set_value(&t("No media loaded"));
     // Position snapshot for the seek slider's accessible
     // value: the tick (UI thread) stores, the MSAA callback
     // (NVDA's thread) only loads. See SeekAccessible.
@@ -1674,29 +1663,27 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
     // "slider" and a bare list box as just "list" — the names
     // are what a screen reader announces for them (Python's
     // player labels every control the same way).
-    crate::msaa_names::set_name(&seek_slider, &crate::tr("Seek"));
-    crate::msaa_names::set_name(&chapter_list, &crate::tr("Chapters"));
-    crate::msaa_names::set_name(&pos_label, &crate::tr("Playback Time"));
-    crate::msaa_names::set_name(&speed_combo, &crate::tr("Playback Speed"));
-    crate::msaa_names::set_name(&chapters_btn, &crate::tr("Chapters Menu"));
-    crate::msaa_names::set_name(&volume_slider, &crate::tr("Volume"));
+    crate::msaa_names::set_name(&seek_slider, &t("Seek"));
+    crate::msaa_names::set_name(&chapter_list, &t("Chapters"));
+    crate::msaa_names::set_name(&pos_label, &t("Playback Time"));
+    crate::msaa_names::set_name(&speed_combo, &t("Playback Speed"));
+    crate::msaa_names::set_name(&chapters_btn, &t("Chapters Menu"));
+    crate::msaa_names::set_name(&volume_slider, &t("Volume"));
     crate::msaa_names::set_name(
         &volume_value,
-        &format!("{} {volume_pct}%", crate::tr("Volume Level:")),
+        &format!("{} {volume_pct}%", t("Volume Level:")),
     );
     crate::msaa_names::set_name(
         &back_btn,
-        &format!("{} {}s", crate::tr("Rewind"), seek_back_ms / 1000),
+        &format!("{} {}s", t("Rewind"), seek_back_ms / 1000),
     );
     crate::msaa_names::set_name(
         &fwd_btn,
-        &format!("{} {}s", crate::tr("Fast Forward"), seek_fwd_ms / 1000),
+        &format!("{} {}s", t("Fast Forward"), seek_fwd_ms / 1000),
     );
-    let seek_caption = StaticText::builder(&frame)
-        .with_label(&crate::tr("Seek"))
-        .build();
+    let seek_caption = StaticText::builder(&frame).with_label(&t("Seek")).build();
     let chapters_caption = StaticText::builder(&frame)
-        .with_label(&crate::tr("Chapters"))
+        .with_label(&t("Chapters"))
         .build();
     // The chapter list starts empty: chapters arrive with the
     // delivery (or after it, via update_chapters).
@@ -2516,7 +2503,7 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
             volume_value.set_value(&format!("{percent}%"));
             crate::msaa_names::set_name(
                 &volume_value,
-                &format!("{} {percent}%", crate::tr("Volume Level:")),
+                &format!("{} {percent}%", t("Volume Level:")),
             );
         });
     }
@@ -3005,11 +2992,7 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
                 if playing_now {
                     hidden_announce(&mut s, &frame_tick, "Playing");
                 }
-                let label = if playing_now {
-                    crate::tr("Pause")
-                } else {
-                    crate::tr("Play")
-                };
+                let label = if playing_now { t("Pause") } else { t("Play") };
                 play_btn.set_label(&label);
             }
         }
@@ -3070,7 +3053,7 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
                 volume_value.set_value(&format!("{percent}%"));
                 crate::msaa_names::set_name(
                     &volume_value,
-                    &format!("{} {percent}%", crate::tr("Volume Level:")),
+                    &format!("{} {percent}%", t("Volume Level:")),
                 );
             }
         }

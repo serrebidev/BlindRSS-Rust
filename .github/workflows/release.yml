@@ -117,7 +117,6 @@ jobs:
           fi
           cp README.md dist/BlindRSS/
           cp docs/PARITY.md dist/BlindRSS/
-          cp -r locale dist/BlindRSS/
           mkdir -p dist/BlindRSS/sounds
           cp app/assets/sounds/*.wav dist/BlindRSS/sounds/
           mkdir -p dist/BlindRSS/docs

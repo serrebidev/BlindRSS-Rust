@@ -7,6 +7,7 @@
 //! shown for another requested language, a notice at the top
 //! says so, as Python's viewer does.
 
+use patois::t;
 use std::path::PathBuf;
 use std::rc::Rc;
 use wxdragon::prelude::*;
@@ -64,27 +65,23 @@ pub fn show_help_topic(frame: &Frame, locale: &str, topic_id: Option<&str>) {
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     if doc.is_fallback() {
         let notice = StaticText::builder(&dialog)
-            .with_label(&crate::tr(
+            .with_label(&t(
                 "This guide has not been translated into your language yet, so it is shown in English.",
             ))
             .build();
-        crate::msaa_names::set_name(&notice, &crate::tr("Guide language"));
+        crate::msaa_names::set_name(&notice, &t("Guide language"));
         sizer.add(&notice, 0, SizerFlag::All, 4);
     }
     // Find row (Python's order: find controls above the body).
     let find_row = BoxSizer::builder(Orientation::Horizontal).build();
-    let find_label = StaticText::builder(&dialog)
-        .with_label(&crate::tr("Find:"))
-        .build();
+    let find_label = StaticText::builder(&dialog).with_label(&t("Find:")).build();
     let find_ctrl = TextCtrl::builder(&dialog)
         .with_style(TextCtrlStyle::ProcessEnter)
         .build();
-    crate::msaa_names::set_name(&find_ctrl, &crate::tr("Find in guide"));
-    let find_next_btn = Button::builder(&dialog)
-        .with_label(&crate::tr("Find Next"))
-        .build();
+    crate::msaa_names::set_name(&find_ctrl, &t("Find in guide"));
+    let find_next_btn = Button::builder(&dialog).with_label(&t("Find Next")).build();
     let find_prev_btn = Button::builder(&dialog)
-        .with_label(&crate::tr("Find Previous"))
+        .with_label(&t("Find Previous"))
         .build();
     find_row.add(&find_label, 0, SizerFlag::All, 4);
     find_row.add(&find_ctrl, 1, SizerFlag::Expand | SizerFlag::All, 4);
@@ -94,26 +91,24 @@ pub fn show_help_topic(frame: &Frame, locale: &str, topic_id: Option<&str>) {
 
     let row = BoxSizer::builder(Orientation::Horizontal).build();
     let list = ListBox::builder(&dialog).build();
-    crate::msaa_names::set_name(&list, &crate::tr("Guide contents"));
+    crate::msaa_names::set_name(&list, &t("Guide contents"));
     for (_, title, level) in &contents {
         let indent = "    ".repeat(level.saturating_sub(2));
-        list.append(&format!("{}{}", indent, crate::tr(title)));
+        list.append(&format!("{}{}", indent, t(title)));
     }
     let reader = TextCtrl::builder(&dialog)
         .with_style(TextCtrlStyle::MultiLine | TextCtrlStyle::ReadOnly | TextCtrlStyle::Rich2)
         .build();
-    crate::msaa_names::set_name(&reader, &crate::tr("User guide text"));
+    crate::msaa_names::set_name(&reader, &t("User guide text"));
     if rendered.text.is_empty() {
-        reader.set_value(&crate::tr("The user guide could not be loaded."));
+        reader.set_value(&t("The user guide could not be loaded."));
     } else {
         reader.set_value(&rendered.text);
     }
     row.add(&list, 1, SizerFlag::Expand | SizerFlag::All, 4);
     row.add(&reader, 2, SizerFlag::Expand | SizerFlag::All, 4);
     sizer.add_sizer(&row, 1, SizerFlag::Expand | SizerFlag::All, 2);
-    let close_btn = Button::builder(&dialog)
-        .with_label(&crate::tr("Close"))
-        .build();
+    let close_btn = Button::builder(&dialog).with_label(&t("Close")).build();
     sizer.add(&close_btn, 0, SizerFlag::All, 4);
     dialog.set_sizer(sizer, true);
     dialog.set_size(Size::new(760, 520));

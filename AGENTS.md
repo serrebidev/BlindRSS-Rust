@@ -275,11 +275,12 @@ Python `core/casting.py`, in that order.
 - `sponsorblock.rs`: SponsorBlock lookup uses only the hash-prefix
   endpoint (never the bare video id) and returns no segments on any
   failure.
-- `translate.rs` / `translation_updates.rs` / `i18n.rs`: optional
-  article translation (off by default; API keys live only in local
-  `config.json`, never logged) and gettext catalog handling. Downloaded
-  translation overrides win only within the same app version and stand
-  down entirely when the override root resolves to the bundled tree.
+- `translate.rs`: optional article translation (off by default; API
+  keys live only in local `config.json`, never logged). Interface
+  gettext runs on patois in the app crate (since v0.1.72): catalogs
+  live in `app/po/`, compile at build time and embed in the binary;
+  the old core `i18n.rs` / `translation_updates.rs` downloadable-
+  override lifecycle is deleted (see PARITY.md, Patois adoption).
 - `maintenance.rs`: backup/restore. Restore
   stages beside the database the app actually opens and swaps at
   relaunch (a restore that targets a path the app never opens silently

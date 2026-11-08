@@ -12,6 +12,7 @@
 //! browser, paste the final URL back, exchange the code.
 
 use blindrss_core::config::Config;
+use patois::t;
 use std::path::Path;
 use wxdragon::prelude::*;
 use wxdragon::sizers::base::Sizer;
@@ -35,9 +36,7 @@ fn add_field(
     password: bool,
 ) -> TextCtrl {
     let row = BoxSizer::builder(Orientation::Horizontal).build();
-    let text = StaticText::builder(parent)
-        .with_label(&crate::tr(label))
-        .build();
+    let text = StaticText::builder(parent).with_label(&t(label)).build();
     let style = if password {
         TextCtrlStyle::Password
     } else {
@@ -61,9 +60,7 @@ type SoundcardList = std::rc::Rc<std::cell::RefCell<Vec<(String, String)>>>;
 type SoundcardSlot = std::sync::Arc<std::sync::Mutex<Option<Vec<(String, String)>>>>;
 
 fn add_check(parent: &impl WxWidget, sizer: &Sizer, label: &str, value: bool) -> CheckBox {
-    let cb = CheckBox::builder(parent)
-        .with_label(&crate::tr(label))
-        .build();
+    let cb = CheckBox::builder(parent).with_label(&t(label)).build();
     cb.set_value(value);
     sizer.add(&cb, 0, SizerFlag::All, 2);
     cb
@@ -78,15 +75,13 @@ fn add_choice(
     selected: usize,
 ) -> Choice {
     let row = BoxSizer::builder(Orientation::Horizontal).build();
-    let text = StaticText::builder(parent)
-        .with_label(&crate::tr(label))
-        .build();
+    let text = StaticText::builder(parent).with_label(&t(label)).build();
     let choice = Choice::builder(parent).build();
     // Display strings pass through tr() (Audit 8 S10); callers
     // always read the selection by index, never by comparing
     // the shown text, so stored keys stay stable.
     for item in items {
-        choice.append(&crate::tr(item));
+        choice.append(&t(item));
     }
     choice.set_selection(selected.min(items.len().saturating_sub(1)) as u32);
     row.add(&text, 0, SizerFlag::All, 4);
@@ -115,24 +110,15 @@ fn add_sound_row(
     default_rel: &'static str,
 ) -> TextCtrl {
     let row = BoxSizer::builder(Orientation::Horizontal).build();
-    let text = StaticText::builder(parent)
-        .with_label(&crate::tr(label))
-        .build();
+    let text = StaticText::builder(parent).with_label(&t(label)).build();
     let ctrl = TextCtrl::builder(parent).build();
     ctrl.set_value(value);
     let field_name = label.trim_end_matches(':').to_string();
     crate::msaa_names::set_name(&ctrl, &field_name);
-    let browse_btn = Button::builder(parent)
-        .with_label(&crate::tr("Browse..."))
-        .build();
-    crate::msaa_names::set_name(
-        &browse_btn,
-        &format!("{} {}", crate::tr("Browse for"), field_name),
-    );
-    let play_btn = Button::builder(parent)
-        .with_label(&crate::tr("Play"))
-        .build();
-    crate::msaa_names::set_name(&play_btn, &format!("{} {}", crate::tr("Play"), field_name));
+    let browse_btn = Button::builder(parent).with_label(&t("Browse...")).build();
+    crate::msaa_names::set_name(&browse_btn, &format!("{} {}", t("Browse for"), field_name));
+    let play_btn = Button::builder(parent).with_label(&t("Play")).build();
+    crate::msaa_names::set_name(&play_btn, &format!("{} {}", t("Play"), field_name));
     row.add(&text, 0, SizerFlag::All, 4);
     row.add(&ctrl, 1, SizerFlag::Expand | SizerFlag::All, 4);
     row.add(&browse_btn, 0, SizerFlag::All, 4);
@@ -142,7 +128,7 @@ fn add_sound_row(
     let label_owned = label.to_string();
     browse_btn.on_click(move |_| {
         let dlg = FileDialog::builder(&dialog_b)
-            .with_message(&crate::tr(&label_owned))
+            .with_message(&t(&label_owned))
             .with_wildcard("WAV files (*.wav)|*.wav|All files (*.*)|*.*")
             .with_style(FileDialogStyle::Open)
             .build();
@@ -360,7 +346,7 @@ fn inoreader_listener_connect(
     dialog2.set_escape_id(5101);
     let sizer2 = BoxSizer::builder(Orientation::Vertical).build();
     let label = StaticText::builder(&dialog2)
-        .with_label(&crate::tr("Waiting for the browser sign-in to complete..."))
+        .with_label(&t("Waiting for the browser sign-in to complete..."))
         .build();
     sizer2.add(&label, 0, SizerFlag::All, 8);
     dialog2.set_sizer(sizer2, true);
@@ -451,21 +437,16 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
     let headers = SettingsPage::new(&notebook);
     let advanced = SettingsPage::new(&notebook);
     let captcha_page = SettingsPage::new(&notebook);
-    notebook.add_page(&general.win, &crate::tr("General"), true, None);
-    notebook.add_page(&feeds.win, &crate::tr("Feeds && Articles"), false, None);
-    notebook.add_page(&youtube.win, &crate::tr("YouTube"), false, None);
-    notebook.add_page(&media.win, &crate::tr("Media Player"), false, None);
-    notebook.add_page(&provider.win, &crate::tr("Provider"), false, None);
-    notebook.add_page(&notifications.win, &crate::tr("Notifications"), false, None);
-    notebook.add_page(&translate.win, &crate::tr("Translate"), false, None);
-    notebook.add_page(&headers.win, &crate::tr("List Headers"), false, None);
-    notebook.add_page(&advanced.win, &crate::tr("Advanced"), false, None);
-    notebook.add_page(
-        &captcha_page.win,
-        &crate::tr("CAPTCHA Solving"),
-        false,
-        None,
-    );
+    notebook.add_page(&general.win, &t("General"), true, None);
+    notebook.add_page(&feeds.win, &t("Feeds && Articles"), false, None);
+    notebook.add_page(&youtube.win, &t("YouTube"), false, None);
+    notebook.add_page(&media.win, &t("Media Player"), false, None);
+    notebook.add_page(&provider.win, &t("Provider"), false, None);
+    notebook.add_page(&notifications.win, &t("Notifications"), false, None);
+    notebook.add_page(&translate.win, &t("Translate"), false, None);
+    notebook.add_page(&headers.win, &t("List Headers"), false, None);
+    notebook.add_page(&advanced.win, &t("Advanced"), false, None);
+    notebook.add_page(&captcha_page.win, &t("CAPTCHA Solving"), false, None);
     // F1 resolves through the current page (Audit 8 S06): the
     // English source titles, in add_page order, key core's
     // NOTEBOOK_PAGE_TOPICS exactly as Python's per-page
@@ -549,115 +530,6 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
         cfg.get_bool("remember_last_feed", false),
     );
 
-    // Translation updates (OTA catalog channel): Python groups
-    // these on General, directly under the language picker.
-    let tu_group = general.group(&crate::tr("Translation Updates"));
-    let tu_enabled_cb = add_check(
-        &general.win,
-        &tu_group,
-        "Update translations automatically",
-        cfg.get_bool(blindrss_core::translation_updates::CFG_ENABLED, true),
-    );
-    // "never" appended last (Brandon's order, 2026-11-07: a
-    // Disabled option for update checking) — existing indices
-    // keep their meaning and tab position.
-    let tu_freq_values = ["ten_minutes", "daily", "weekly", "monthly", "never"];
-    let tu_freq_sel = tu_freq_values
-        .iter()
-        .position(|v| {
-            *v == cfg.get_str(
-                blindrss_core::translation_updates::CFG_FREQUENCY,
-                blindrss_core::translation_updates::DEFAULT_FREQUENCY,
-            )
-        })
-        .unwrap_or(1);
-    let tu_freq_choice = add_choice(
-        &general.win,
-        &tu_group,
-        "Check for updates:",
-        &["10 minutes", "Daily", "Weekly", "Monthly", "Never"],
-        tu_freq_sel,
-    );
-    let tu_status = StaticText::builder(&general.win).with_label("").build();
-    {
-        let row = BoxSizer::builder(Orientation::Horizontal).build();
-        let check_btn = Button::builder(&general.win)
-            .with_label(&crate::tr("Check for Updates"))
-            .build();
-        row.add(&check_btn, 0, SizerFlag::All, 4);
-        row.add(&tu_status, 0, SizerFlag::All, 4);
-        tu_group.add_sizer(&row, 0, SizerFlag::Expand | SizerFlag::All, 2);
-        let (txc, rxc) = std::sync::mpsc::channel::<String>();
-        let rxc = std::rc::Rc::new(std::cell::RefCell::new(rxc));
-        let timer = Box::leak(Box::new(Timer::new(&dialog)));
-        timer.start(200, false);
-        {
-            let rxc_tick = rxc.clone();
-            timer.on_tick(move |_| {
-                if let Ok(note) = rxc_tick.borrow().try_recv() {
-                    tu_status.set_label(&note);
-                }
-            });
-        }
-        check_btn.on_click(move |_| {
-            tu_status.set_label("Checking...");
-            let txc = txc.clone();
-            std::thread::spawn(move || {
-                let cfg =
-                    blindrss_core::config::Config::load(&crate::config_path()).unwrap_or_default();
-                let mut langs: Vec<String> = Vec::new();
-                for root in crate::locale_roots() {
-                    if let Ok(entries) = std::fs::read_dir(&root) {
-                        for entry in entries.flatten() {
-                            if entry.path().is_dir()
-                                && let Some(name) = entry.file_name().to_str()
-                                && name != "en"
-                                && !langs.contains(&name.to_string())
-                            {
-                                langs.push(name.to_string());
-                            }
-                        }
-                    }
-                }
-                // The UI language goes first: it is the one the
-                // user can see.
-                let ui = crate::ui_language();
-                langs.retain(|l| l != &ui);
-                langs.insert(0, ui);
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0) as i64;
-                // The manual check is Python's forced check
-                // (gui/dialogs.py on_check_translations_now):
-                // validators are bypassed so a stale or
-                // stranded catalog state always re-fetches;
-                // only the scheduled checks stay conditional
-                // (Audit 8 O16).
-                let result = blindrss_core::translation_updates::check_and_update(
-                    &crate::data_dir(),
-                    &crate::locale_roots(),
-                    &langs,
-                    &blindrss_core::translation_updates::HttpFetch,
-                    now,
-                    true,
-                );
-                let _ = cfg;
-                let note = if result.changed() {
-                    format!(
-                        "Updated: {}. Applies on next launch.",
-                        result.updated.join(", ")
-                    )
-                } else if let Some(e) = result.error {
-                    format!("Check failed: {e}")
-                } else {
-                    "Translations are up to date.".to_string()
-                };
-                let _ = txc.send(note);
-            });
-        });
-    }
-
     // Python's tree-state control is an expanded/collapsed choice;
     // the Rust checkbox for the same key predates this restructure
     // and keeps its form.
@@ -689,9 +561,7 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
         .build();
     let open_cmd_field = TextCtrl::builder(&general.win).build();
     open_cmd_field.set_value(cfg.get_str("article_open_command", ""));
-    let open_cmd_test_btn = Button::builder(&general.win)
-        .with_label(&crate::tr("Test"))
-        .build();
+    let open_cmd_test_btn = Button::builder(&general.win).with_label(&t("Test")).build();
     open_cmd_row.add(&open_cmd_label, 0, SizerFlag::All, 4);
     open_cmd_row.add(&open_cmd_field, 1, SizerFlag::Expand | SizerFlag::All, 4);
     open_cmd_row.add(&open_cmd_test_btn, 0, SizerFlag::All, 4);
@@ -701,12 +571,12 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
     add_note(
         &general.win,
         &general.sizer,
-        &crate::tr("Use %1 for the article URL. Example: chrome --incognito %1"),
+        &t("Use %1 for the article URL. Example: chrome --incognito %1"),
     );
 
     // Startup & Tray group (a group inside General in Python, not
     // its own tab).
-    let startup_group = general.group(&crate::tr("Startup && Tray"));
+    let startup_group = general.group(&t("Startup && Tray"));
     let close_tray_cb = add_check(
         &general.win,
         &startup_group,
@@ -758,7 +628,7 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
     }
 
     // Backup group (inside General in Python).
-    let backup_group = general.group(&crate::tr("Backup"));
+    let backup_group = general.group(&t("Backup"));
     let auto_backup_cb = add_check(
         &general.win,
         &backup_group,
@@ -774,34 +644,20 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
     );
 
     // Interface language (Audit 8 S09; Python gui/dialogs.py:1640).
-    // Python places the picker above the Translation Updates
-    // group; here it is appended at the end of the General page
-    // per the append-only rule, so no existing control's tab
-    // position moves. The stored `language` key is honored at
-    // startup (crate::ui_language); the change applies on the
-    // next launch — Python's "requires restart" — and no
-    // hot-swap is invented.
+    // Appended at the end of the General page per the
+    // append-only rule, so no existing control's tab position
+    // moves. The list is the catalogs EMBEDDED in the binary
+    // (patois LanguageManager via crate::i18n_languages), with
+    // patois' native language names. The stored `language` key
+    // is honored at startup (crate::init_i18n); the change
+    // applies on the next launch — Python's "requires
+    // restart" — and no hot-swap is invented.
     let (lang_codes, lang_items) = {
         let mut codes: Vec<String> = vec!["auto".to_string()];
         let mut items: Vec<String> = vec!["Automatic (system language)".to_string()];
-        let mut roots = vec![blindrss_core::translation_updates::override_root(
-            &crate::data_dir(),
-        )];
-        roots.extend(crate::locale_roots());
-        let mut avail = blindrss_core::i18n::Catalog::available_languages(&roots);
-        if !avail.iter().any(|c| c == "en") {
-            avail.push("en".to_string());
-        }
-        let mut rest: Vec<(String, String)> = avail
+        let mut rest: Vec<(String, String)> = crate::i18n_languages()
             .into_iter()
-            .filter(|c| c != "auto")
-            .map(|code| {
-                let display = match blindrss_core::translate::language_name(&code) {
-                    Some(name) => format!("{} ({})", crate::tr(name), code),
-                    None => code.clone(),
-                };
-                (display, code)
-            })
+            .map(|info| (format!("{} ({})", info.name, info.code), info.code))
             .collect();
         rest.sort_by(|a, b| a.0.cmp(&b.0));
         for (display, code) in rest {
@@ -927,14 +783,14 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
     add_note(
         &feeds.win,
         &feeds.sizer,
-        &crate::tr(
+        &t(
             "Using the Local RSS feed cache lowers CPU and network use. Manual Refresh All always checks every feed.",
         ),
     );
     add_note(
         &feeds.win,
         &feeds.sizer,
-        &crate::tr(
+        &t(
             "Article formatting: preserve structure from the original page as spoken text markers. Applies to newly loaded articles and full text.",
         ),
     );
@@ -984,7 +840,7 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
     add_note(
         &youtube.win,
         &youtube.sizer,
-        &crate::tr(
+        &t(
             "Cookies are only needed for age-restricted, private, or members-only content. BlindRSS reads them automatically from your installed browsers (Firefox, Chrome, Edge, Brave, Opera, Vivaldi, Chromium and their beta/nightly variants). A cookies.txt export remains a manual fallback.",
         ),
     );
@@ -1034,7 +890,7 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
     // YouTube account sign-in (its own dialog; Python reaches it
     // from the Tools menu, the settings entry point is Rust's).
     let youtube_btn = Button::builder(&youtube.win)
-        .with_label(&crate::tr("Connect YouTube Account..."))
+        .with_label(&t("Connect YouTube Account..."))
         .build();
     youtube.sizer.add(&youtube_btn, 0, SizerFlag::All, 2);
     // Audit 8 Task 22 (S12): Python's remaining YouTube
@@ -1070,7 +926,7 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
         false,
     );
     let clear_cache_btn = Button::builder(&youtube.win)
-        .with_label(&crate::tr("Clear cache now"))
+        .with_label(&t("Clear cache now"))
         .build();
     youtube.sizer.add(&clear_cache_btn, 0, SizerFlag::All, 2);
 
@@ -1294,14 +1150,14 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
     // Equalizer (its own dialog, opened via the intent mechanism
     // like Article Columns).
     let eq_btn = Button::builder(&media.win)
-        .with_label(&crate::tr("Equalizer..."))
+        .with_label(&t("Equalizer..."))
         .build();
     media.sizer.add(&eq_btn, 0, SizerFlag::All, 2);
 
     // Media tools group (Python's group on the Media Player page):
     // user-chosen executable paths take the highest detection
     // priority (blank = auto-detect).
-    let tools_group = media.group(&crate::tr("Media tools (ffmpeg, ffprobe, yt-dlp)"));
+    let tools_group = media.group(&t("Media tools (ffmpeg, ffprobe, yt-dlp)"));
     let ffmpeg_path_field = add_field(
         &media.win,
         &tools_group,
@@ -1327,7 +1183,7 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
     // Downloads group: Python builds the Downloads panel eagerly
     // and shows it inside the Media Player page under this group
     // (it is not a notebook page of its own).
-    let downloads_group = media.group(&crate::tr("Downloads"));
+    let downloads_group = media.group(&t("Downloads"));
     let downloads_enabled_cb = add_check(
         &media.win,
         &downloads_group,
@@ -1376,7 +1232,7 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
     );
 
     // Sounds group (inside Media Player in Python).
-    let sounds_group = media.group(&crate::tr("Sounds"));
+    let sounds_group = media.group(&t("Sounds"));
     let sounds_cb = add_check(
         &media.win,
         &sounds_group,
@@ -1499,13 +1355,13 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
     );
     let provider_btn_row = BoxSizer::builder(Orientation::Horizontal).build();
     let connect_btn = Button::builder(&provider.win)
-        .with_label(&crate::tr("Connect Inoreader..."))
+        .with_label(&t("Connect Inoreader..."))
         .build();
     let connect_listener_btn = Button::builder(&provider.win)
-        .with_label(&crate::tr("Connect Inoreader (browser sign-in)..."))
+        .with_label(&t("Connect Inoreader (browser sign-in)..."))
         .build();
     let test_miniflux_btn = Button::builder(&provider.win)
-        .with_label(&crate::tr("Test Miniflux Connection"))
+        .with_label(&t("Test Miniflux Connection"))
         .build();
     provider_btn_row.add(&connect_btn, 0, SizerFlag::All, 4);
     provider_btn_row.add(&connect_listener_btn, 0, SizerFlag::All, 4);
@@ -1522,11 +1378,11 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
     // appended at the end of the page (append-only rule).
     // A group is announced by a screen reader with the field,
     // which is why each credential gets its own group.
-    let gio_group = provider.group(&crate::tr("Groups.io"));
+    let gio_group = provider.group(&t("Groups.io"));
     add_note(
         &provider.win,
         &gio_group,
-        &crate::tr(
+        &t(
             "Groups.io API key (optional). Public groups and RSS work without a key; the key enables complete paginated topics and member-only archives. Create one at groups.io/settings/apikeys.",
         ),
     );
@@ -1537,19 +1393,19 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
         cfg.get_str("groups_io_api_key", ""),
         true,
     );
-    crate::msaa_names::set_name(&gio_key_field, &crate::tr("Groups.io API key"));
+    crate::msaa_names::set_name(&gio_key_field, &t("Groups.io API key"));
     add_note(
         &provider.win,
         &gio_group,
-        &crate::tr(
+        &t(
             "Search subscriptions keep the search URL and refresh results in the background. Browser cookies are imported only from Groups.io domains.",
         ),
     );
-    let gh_group = provider.group(&crate::tr("GitHub"));
+    let gh_group = provider.group(&t("GitHub"));
     add_note(
         &provider.win,
         &gh_group,
-        &crate::tr(
+        &t(
             "GitHub personal access token (optional). Full text of pull requests, issues and commits works without one, but GitHub allows only 60 page reads an hour per connection; a token raises that limit and reaches private repositories. Create one at github.com/settings/tokens.",
         ),
     );
@@ -1560,14 +1416,14 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
         cfg.get_str("github_token", ""),
         true,
     );
-    crate::msaa_names::set_name(&gh_token_field, &crate::tr("GitHub personal access token"));
+    crate::msaa_names::set_name(&gh_token_field, &t("GitHub personal access token"));
 
     // ---- Notifications page (Python's order, with the
     // Announcements group it absorbs) ----
     add_note(
         &notifications.win,
         &notifications.sizer,
-        &crate::tr("Windows toast notifications for new articles. Disabled by default."),
+        &t("Windows toast notifications for new articles. Disabled by default."),
     );
     let notif_cb = add_check(
         &notifications.win,
@@ -1597,10 +1453,10 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
     );
     let notif_row = BoxSizer::builder(Orientation::Horizontal).build();
     let test_notif_btn = Button::builder(&notifications.win)
-        .with_label(&crate::tr("Test Notification"))
+        .with_label(&t("Test Notification"))
         .build();
     let exclude_btn = Button::builder(&notifications.win)
-        .with_label(&crate::tr("Exclude Feeds..."))
+        .with_label(&t("Exclude Feeds..."))
         .build();
     notif_row.add(&test_notif_btn, 0, SizerFlag::All, 4);
     notif_row.add(&exclude_btn, 0, SizerFlag::All, 4);
@@ -1610,7 +1466,7 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
 
     // Announcements group (PARITY 7.4): per-event speech/Braille
     // mode, mirroring Python's announcements group on this page.
-    let announce_group = notifications.group(&crate::tr("Announcements"));
+    let announce_group = notifications.group(&t("Announcements"));
     let current_modes = blindrss_core::announce::Announcements::from_config(&cfg);
     let mut announce_choices: Vec<Choice> = Vec::new();
     for ev in blindrss_core::announce::EVENTS.iter() {
@@ -1629,7 +1485,7 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
         announce_choices.push(choice);
     }
     let announce_test_btn = Button::builder(&notifications.win)
-        .with_label(&crate::tr("Test Announcement"))
+        .with_label(&t("Test Announcement"))
         .build();
     announce_group.add(&announce_test_btn, 0, SizerFlag::All, 4);
 
@@ -1638,7 +1494,7 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
     add_note(
         &translate.win,
         &translate.sizer,
-        &crate::tr(
+        &t(
             "Configure automatic article translation. Your API key is stored locally in config.json.",
         ),
     );
@@ -1668,8 +1524,8 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
     let tr_lang_map: std::rc::Rc<Vec<(String, String)>> = {
         let mut map: Vec<(String, String)> = Vec::new();
         for (name, code) in blindrss_core::translate::LANGUAGE_PRESETS {
-            map.push((format!("{} ({})", crate::tr(name), code), code.to_string()));
-            map.push((crate::tr(name), code.to_string()));
+            map.push((format!("{} ({})", t(name), code), code.to_string()));
+            map.push((t(name), code.to_string()));
             map.push((format!("{name} ({code})"), code.to_string()));
             map.push((name.to_string(), code.to_string()));
         }
@@ -1677,14 +1533,14 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
     };
     let target_row = BoxSizer::builder(Orientation::Horizontal).build();
     let target_label = StaticText::builder(&translate.win)
-        .with_label(&crate::tr("Target language:"))
+        .with_label(&t("Target language:"))
         .build();
     target_row.add(&target_label, 0, SizerFlag::All, 4);
     let tr_target_combo = ComboBox::builder(&translate.win).build();
     {
         let mut choices: Vec<String> = blindrss_core::translate::LANGUAGE_PRESETS
             .iter()
-            .map(|(name, code)| format!("{} ({})", crate::tr(name), code))
+            .map(|(name, code)| format!("{} ({})", t(name), code))
             .collect();
         choices.sort();
         choices.dedup();
@@ -1695,18 +1551,18 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
     {
         let saved_lang = cfg.get_str("translation_target_language", "en");
         let initial = if saved_lang.trim().is_empty() {
-            format!("{} (en)", crate::tr("English"))
+            format!("{} (en)", t("English"))
         } else {
             let disp = blindrss_core::translate::language_display_value(saved_lang);
             if disp == saved_lang.trim() {
                 disp
             } else {
-                crate::tr(&disp)
+                t(&disp)
             }
         };
         tr_target_combo.set_value(&initial);
     }
-    crate::msaa_names::set_name(&tr_target_combo, &crate::tr("Target language"));
+    crate::msaa_names::set_name(&tr_target_combo, &t("Target language"));
     target_row.add(&tr_target_combo, 1, SizerFlag::Expand | SizerFlag::All, 4);
     translate
         .sizer
@@ -1714,7 +1570,7 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
     add_note(
         &translate.win,
         &translate.sizer,
-        &crate::tr("Choose a language or type a code (e.g. en, es, fr, pt-BR)."),
+        &t("Choose a language or type a code (e.g. en, es, fr, pt-BR)."),
     );
     // Per-provider model + API key rows (Python's order: model
     // before key). Models are editable combos seeded with the
@@ -1732,7 +1588,7 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
     {
         let model_row = BoxSizer::builder(Orientation::Horizontal).build();
         let model_label = StaticText::builder(&translate.win)
-            .with_label(&crate::tr(&format!("{label} model (optional):")))
+            .with_label(&t(&format!("{label} model (optional):")))
             .build();
         model_row.add(&model_label, 0, SizerFlag::All, 4);
         let model_combo = ComboBox::builder(&translate.win).build();
@@ -1740,7 +1596,7 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
             model_combo.append(model);
         }
         model_combo.set_value(cfg.get_str(&format!("translation_{key}_model"), ""));
-        crate::msaa_names::set_name(&model_combo, &crate::tr(&format!("{label} model")));
+        crate::msaa_names::set_name(&model_combo, &t(&format!("{label} model")));
         model_row.add(&model_combo, 1, SizerFlag::Expand | SizerFlag::All, 4);
         translate
             .sizer
@@ -1760,10 +1616,10 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
             // combo above, failure-safe.
             let tools_row = BoxSizer::builder(Orientation::Horizontal).build();
             let load_btn = Button::builder(&translate.win)
-                .with_label(&crate::tr("Load OpenRouter Models"))
+                .with_label(&t("Load OpenRouter Models"))
                 .build();
             let status = StaticText::builder(&translate.win)
-                .with_label(&crate::tr("Loads all available model IDs from OpenRouter."))
+                .with_label(&t("Loads all available model IDs from OpenRouter."))
                 .build();
             tools_row.add(&load_btn, 0, SizerFlag::All, 4);
             tools_row.add(&status, 0, SizerFlag::All, 4);
@@ -1806,20 +1662,20 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
                             model_combo.set_value(&current);
                         }
                         status.set_label(&if models.len() == 1 {
-                            crate::tr("Loaded 1 OpenRouter model.")
+                            t("Loaded 1 OpenRouter model.")
                         } else {
                             format!(
                                 "{} {} {}",
-                                crate::tr("Loaded"),
+                                t("Loaded"),
                                 models.len(),
-                                crate::tr("OpenRouter models.")
+                                t("OpenRouter models.")
                             )
                         });
                     }
                     Err(error) => {
                         status.set_label(&format!(
                             "{}: {}",
-                            crate::tr("OpenRouter model load failed"),
+                            t("OpenRouter model load failed"),
                             error
                         ));
                     }
@@ -1832,7 +1688,7 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
             }
             *or_loading.borrow_mut() = true;
             load_btn.enable(false);
-            status.set_label(&crate::tr("Loading OpenRouter models..."));
+            status.set_label(&t("Loading OpenRouter models..."));
             let key = key_field.get_value();
             let or_tx = or_tx.clone();
             std::thread::spawn(move || {
@@ -1852,17 +1708,17 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
     add_note(
         &headers.win,
         &headers.sizer,
-        &crate::tr(
+        &t(
             "Choose which columns the article list shows, and in what order. The editor opens as its own dialog and saves when you choose OK there.",
         ),
     );
     let columns_btn = Button::builder(&headers.win)
-        .with_label(&crate::tr("Article Columns..."))
+        .with_label(&t("Article Columns..."))
         .build();
     headers.sizer.add(&columns_btn, 0, SizerFlag::All, 2);
 
     // ---- Advanced page (Python's groups, in its order) ----
-    let storage_group = advanced.group(&crate::tr("Data Storage Location"));
+    let storage_group = advanced.group(&t("Data Storage Location"));
     let data_loc = StaticText::builder(&advanced.win)
         .with_label(&format!("Data folder: {}", crate::data_dir().display()))
         .build();
@@ -1888,7 +1744,7 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
         ))
         .build();
     storage_group.add(&storage_paths, 0, SizerFlag::All, 4);
-    let updates_group = advanced.group(&crate::tr("Updates"));
+    let updates_group = advanced.group(&t("Updates"));
     let auto_install_cb = add_check(
         &advanced.win,
         &updates_group,
@@ -1897,7 +1753,7 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
     );
     // Browser identity (core user_agents): the User-Agent the
     // app reports when fetching feeds and articles.
-    let ua_group = advanced.group(&crate::tr("Browser Identification"));
+    let ua_group = advanced.group(&t("Browser Identification"));
     let mut ua_options: Vec<(String, String)> =
         vec![("auto".into(), "Automatic (matches this computer)".into())];
     ua_options.extend(blindrss_core::user_agents::installed_choices());
@@ -1941,7 +1797,7 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
     // is verifiable without leaving the dialog. The custom
     // field is enabled only in Custom mode, as in Python.
     let ua_preview = StaticText::builder(&advanced.win).with_label("").build();
-    crate::msaa_names::set_name(&ua_preview, &crate::tr("Current User-Agent"));
+    crate::msaa_names::set_name(&ua_preview, &t("Current User-Agent"));
     ua_group.add(&ua_preview, 0, SizerFlag::All, 4);
     let update_ua_preview: std::rc::Rc<dyn Fn()> = {
         let ua_options = ua_options.clone();
@@ -1966,9 +1822,9 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
             };
             ua_preview.set_label(&format!(
                 "{}: {}",
-                crate::tr("Current User-Agent"),
+                t("Current User-Agent"),
                 if effective.is_empty() {
-                    crate::tr("(not set)")
+                    t("(not set)")
                 } else {
                     effective
                 }
@@ -1991,7 +1847,7 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
     // registry gate (videosearch searchable_sites) reads the
     // key, and even when on, an adult site must still be
     // selected explicitly to be searched.
-    let adult_group = advanced.group(&crate::tr("Video Search"));
+    let adult_group = advanced.group(&t("Video Search"));
     let adult_cb = add_check(
         &advanced.win,
         &adult_group,
@@ -2001,7 +1857,7 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
     add_note(
         &advanced.win,
         &adult_group,
-        &crate::tr(
+        &t(
             "When off, adult sites never appear in the Video Search site list.\nWhen on, adult sites are added and must still be selected explicitly to search them.",
         ),
     );
@@ -2010,7 +1866,7 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
     add_note(
         &captcha_page.win,
         &captcha_page.sizer,
-        &crate::tr(
+        &t(
             "Optional paid CAPTCHA-solving service for sites whose Cloudflare challenge defeats every automated browser attempt. BlindRSS then sends only the challenge parameters to the service and injects the solved token. The service sees which blocked URL is being solved. Your API key is stored locally in config.json.",
         ),
     );
@@ -2060,31 +1916,31 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
     let intent: std::rc::Rc<std::cell::RefCell<Option<&'static str>>> =
         std::rc::Rc::new(std::cell::RefCell::new(None));
     let maint_label = StaticText::builder(&dialog)
-        .with_label(&crate::tr("Maintenance"))
+        .with_label(&t("Maintenance"))
         .build();
     sizer.add(&maint_label, 0, SizerFlag::All, 4);
     let maint_row1 = BoxSizer::builder(Orientation::Horizontal).build();
     let maint_row2 = BoxSizer::builder(Orientation::Horizontal).build();
     let backup_btn = Button::builder(&dialog)
-        .with_label(&crate::tr("Backup Now"))
+        .with_label(&t("Backup Now"))
         .build();
     let restore_btn = Button::builder(&dialog)
-        .with_label(&crate::tr("Restore Backup..."))
+        .with_label(&t("Restore Backup..."))
         .build();
     let takeout_btn = Button::builder(&dialog)
-        .with_label(&crate::tr("Import YouTube Takeout..."))
+        .with_label(&t("Import YouTube Takeout..."))
         .build();
     let archive_btn = Button::builder(&dialog)
-        .with_label(&crate::tr("Rescan Podcast Archive"))
+        .with_label(&t("Rescan Podcast Archive"))
         .build();
     let sync_btn = Button::builder(&dialog)
-        .with_label(&crate::tr("Sync Providers Now"))
+        .with_label(&t("Sync Providers Now"))
         .build();
     let prune_btn = Button::builder(&dialog)
-        .with_label(&crate::tr("Prune Old Articles"))
+        .with_label(&t("Prune Old Articles"))
         .build();
     let update_btn = Button::builder(&dialog)
-        .with_label(&crate::tr("Check for Updates"))
+        .with_label(&t("Check for Updates"))
         .build();
     maint_row1.add(&backup_btn, 0, SizerFlag::All, 4);
     maint_row1.add(&restore_btn, 0, SizerFlag::All, 4);
@@ -2097,12 +1953,8 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
     sizer.add_sizer(&maint_row2, 0, SizerFlag::All, 2);
 
     let btn_row = BoxSizer::builder(Orientation::Horizontal).build();
-    let save_btn = Button::builder(&dialog)
-        .with_label(&crate::tr("Save"))
-        .build();
-    let cancel_btn = Button::builder(&dialog)
-        .with_label(&crate::tr("Cancel"))
-        .build();
+    let save_btn = Button::builder(&dialog).with_label(&t("Save")).build();
+    let cancel_btn = Button::builder(&dialog).with_label(&t("Cancel")).build();
     btn_row.add(&save_btn, 0, SizerFlag::All, 4);
     btn_row.add(&cancel_btn, 0, SizerFlag::All, 4);
     sizer.add_sizer(&btn_row, 0, SizerFlag::All, 4);
@@ -2487,18 +2339,6 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
                 "translation_target_language",
                 serde_json::json!(tr_lang_code),
             );
-            cfg.set_path(
-                blindrss_core::translation_updates::CFG_ENABLED,
-                serde_json::json!(tu_enabled_cb.is_checked()),
-            );
-            if let Some(sel) = tu_freq_choice.get_selection()
-                && let Some(v) = tu_freq_values.get(sel as usize)
-            {
-                cfg.set_path(
-                    blindrss_core::translation_updates::CFG_FREQUENCY,
-                    serde_json::json!(v),
-                );
-            }
             for (key, (key_field, model_field)) in blindrss_core::translate::PROVIDERS
                 .iter()
                 .zip(tr_fields.iter())

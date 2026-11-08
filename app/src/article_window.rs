@@ -1,5 +1,6 @@
 //! Standalone reader with cached plain/rich modes and window-local commands.
 
+use patois::t;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use wxdragon::event::webview_events::WebViewEvents;
@@ -163,7 +164,7 @@ fn open_impl(
     let reader = TextCtrl::builder(&frame)
         .with_style(TextCtrlStyle::MultiLine | TextCtrlStyle::ReadOnly | TextCtrlStyle::Rich2)
         .build();
-    crate::msaa_names::set_name(&reader, &crate::tr("Article text"));
+    crate::msaa_names::set_name(&reader, &t("Article text"));
     reader.set_value(body);
     layout.add(&reader, 1, SizerFlag::Expand | SizerFlag::All, 4);
     let web = WebView::is_backend_available(WebViewBackend::Default)

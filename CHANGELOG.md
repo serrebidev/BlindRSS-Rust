@@ -6,6 +6,10 @@ as `0.1.2-0.1.3`. Each release's section below is its GitHub release note,
 taken from this file by the release workflow. The in-app updater shows the
 same text.
 
+## 0.1.72
+
+- Interface translations now run on patois (the gettext system by Quin that Paperback uses): the 15 language catalogs are compiled into the app itself instead of shipping as a folder of files, and wxWidgets' own stock strings — standard dialog buttons and the like — follow the same interface language for the first time. One visible removal: the Translation Updates settings are gone, because translations now arrive with app releases rather than downloading separately between them. Regional catalogs that existed but could never be selected before, such as Flemish (nl_BE), now work.
+
 ## 0.1.71
 
 - Feeds failing with "feed cache: database is locked" during a refresh, and the app stalling so it was hard to move around while feeds refreshed: the database now uses the same connection setup as Python (WAL journal mode, 60-second busy timeout), so refresh workers writing no longer block reading and navigation.

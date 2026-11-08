@@ -12,6 +12,7 @@
 
 use blindrss_core::Db;
 use blindrss_core::config::Config;
+use patois::t;
 use serde_json::{Value, json};
 use std::cell::RefCell;
 use std::path::Path;
@@ -90,7 +91,7 @@ impl CondBlock {
     fn build(dialog: &Dialog, sizer: &BoxSizer, rule0: &Value) -> CondBlock {
         let match_row = BoxSizer::builder(Orientation::Horizontal).build();
         let match_label = StaticText::builder(dialog)
-            .with_label(&crate::tr("Show articles that match"))
+            .with_label(&t("Show articles that match"))
             .build();
         let match_choice = Choice::builder(dialog).build();
         match_choice.append("All conditions (AND)");
@@ -131,10 +132,10 @@ impl CondBlock {
         op_choice.set_selection(0);
         let value_ctrl = TextCtrl::builder(dialog).build();
         let add_btn = Button::builder(dialog)
-            .with_label(&crate::tr("Add Condition"))
+            .with_label(&t("Add Condition"))
             .build();
         let remove_btn = Button::builder(dialog)
-            .with_label(&crate::tr("Remove Condition"))
+            .with_label(&t("Remove Condition"))
             .build();
         row.add(&field_choice, 0, SizerFlag::All, 4);
         row.add(&op_choice, 0, SizerFlag::All, 4);
@@ -230,12 +231,10 @@ fn choice_row(
     selected: usize,
 ) -> Choice {
     let row = BoxSizer::builder(Orientation::Horizontal).build();
-    let text = StaticText::builder(parent)
-        .with_label(&crate::tr(label))
-        .build();
+    let text = StaticText::builder(parent).with_label(&t(label)).build();
     let choice = Choice::builder(parent).build();
     for item in items {
-        choice.append(&crate::tr(item));
+        choice.append(&t(item));
     }
     if !items.is_empty() {
         choice.set_selection(selected.min(items.len() - 1) as u32);
@@ -250,10 +249,8 @@ fn choice_row(
 /// standard modal codes (5100 = OK, like TextEntryDialog).
 fn ok_cancel(dialog: &Dialog, sizer: &BoxSizer) {
     let row = BoxSizer::builder(Orientation::Horizontal).build();
-    let ok_btn = Button::builder(dialog).with_label(&crate::tr("OK")).build();
-    let cancel_btn = Button::builder(dialog)
-        .with_label(&crate::tr("Cancel"))
-        .build();
+    let ok_btn = Button::builder(dialog).with_label(&t("OK")).build();
+    let cancel_btn = Button::builder(dialog).with_label(&t("Cancel")).build();
     row.add(&ok_btn, 0, SizerFlag::All, 4);
     row.add(&cancel_btn, 0, SizerFlag::All, 4);
     sizer.add_sizer(&row, 0, SizerFlag::All, 2);
@@ -331,7 +328,7 @@ pub fn edit_filter_rule(
     let block = CondBlock::build(&dialog, &sizer, &rule0);
 
     let act_label = StaticText::builder(&dialog)
-        .with_label(&crate::tr("When an article matches:"))
+        .with_label(&t("When an article matches:"))
         .build();
     sizer.add(&act_label, 0, SizerFlag::All, 4);
     let flag = |key: &str| actions0.get(key).and_then(|v| v.as_bool()).unwrap_or(false);
@@ -709,7 +706,7 @@ pub fn show_category_picker(
         .unwrap_or(0);
     list.set_selection(initial as u32, true);
     let new_btn = Button::builder(&dialog)
-        .with_label(&crate::tr("New Category..."))
+        .with_label(&t("New Category..."))
         .build();
     sizer.add(&new_btn, 0, SizerFlag::All, 4);
     ok_cancel(&dialog, &sizer);
@@ -864,11 +861,11 @@ pub fn show_feed_properties(frame: &Frame, db: &Db, feed: &blindrss_core::Feed) 
     let general = ScrolledWindow::builder(&notebook).build();
     general.set_scroll_rate(0, 12);
     let gsizer = BoxSizer::builder(Orientation::Vertical).build();
-    notebook.add_page(&general, &crate::tr("General"), true, None);
+    notebook.add_page(&general, &t("General"), true, None);
     let headers_page = ScrolledWindow::builder(&notebook).build();
     headers_page.set_scroll_rate(0, 12);
     let hsizer = BoxSizer::builder(Orientation::Vertical).build();
-    notebook.add_page(&headers_page, &crate::tr("List Headers"), false, None);
+    notebook.add_page(&headers_page, &t("List Headers"), false, None);
     sizer.add(&notebook, 1, SizerFlag::Expand | SizerFlag::All, 2);
     // F1 resolves through the current page (Python's per-page
     // help topics for this dialog exist in core's table).
@@ -889,7 +886,7 @@ pub fn show_feed_properties(frame: &Frame, db: &Db, feed: &blindrss_core::Feed) 
     // Choose... opens the category picker (existing categories
     // plus inline creation) and fills the field.
     let choose_cat_btn = Button::builder(&general)
-        .with_label(&crate::tr("Choose Category..."))
+        .with_label(&t("Choose Category..."))
         .build();
     gsizer.add(&choose_cat_btn, 0, SizerFlag::All, 4);
     {
@@ -922,7 +919,7 @@ pub fn show_feed_properties(frame: &Frame, db: &Db, feed: &blindrss_core::Feed) 
     );
     enc_ctrl.set_name("Feed encoding");
     let reset_btn = Button::builder(&general)
-        .with_label(&crate::tr("Reset Title to Feed's Own"))
+        .with_label(&t("Reset Title to Feed's Own"))
         .build();
     gsizer.add(&reset_btn, 0, SizerFlag::All, 4);
 
@@ -944,14 +941,14 @@ pub fn show_feed_properties(frame: &Frame, db: &Db, feed: &blindrss_core::Feed) 
     );
     // Custom request headers, one "Name: Value" per line.
     let headers_label = StaticText::builder(&general)
-        .with_label(&crate::tr("Custom request headers:"))
+        .with_label(&t("Custom request headers:"))
         .build();
     gsizer.add(&headers_label, 0, SizerFlag::All, 4);
     let headers_ctrl = TextCtrl::builder(&general)
         .with_style(TextCtrlStyle::MultiLine)
         .build();
     headers_ctrl.set_value(&fs::headers_text(&settings0));
-    crate::msaa_names::set_name(&headers_ctrl, &crate::tr("Custom request headers"));
+    crate::msaa_names::set_name(&headers_ctrl, &t("Custom request headers"));
     gsizer.add(&headers_ctrl, 1, SizerFlag::Expand | SizerFlag::All, 4);
     let timeout_ctrl = name_row(
         &general,
@@ -1040,7 +1037,7 @@ pub fn show_feed_properties(frame: &Frame, db: &Db, feed: &blindrss_core::Feed) 
         &Config::load(&crate::config_path()).unwrap_or_default(),
     );
     let inherit_cb = CheckBox::builder(&headers_page)
-        .with_label(&crate::tr("Use the global column layout"))
+        .with_label(&t("Use the global column layout"))
         .build();
     inherit_cb.set_value(inherit0);
     hsizer.add(&inherit_cb, 0, SizerFlag::All, 4);
@@ -1062,12 +1059,8 @@ pub fn show_feed_properties(frame: &Frame, db: &Db, feed: &blindrss_core::Feed) 
     // OK validates the encoding fields before anything is
     // saved (Python refuses the dialog with its codec error).
     let btn_row = BoxSizer::builder(Orientation::Horizontal).build();
-    let ok_btn = Button::builder(&dialog)
-        .with_label(&crate::tr("OK"))
-        .build();
-    let cancel_btn = Button::builder(&dialog)
-        .with_label(&crate::tr("Cancel"))
-        .build();
+    let ok_btn = Button::builder(&dialog).with_label(&t("OK")).build();
+    let cancel_btn = Button::builder(&dialog).with_label(&t("Cancel")).build();
     btn_row.add(&ok_btn, 0, SizerFlag::All, 4);
     btn_row.add(&cancel_btn, 0, SizerFlag::All, 4);
     sizer.add_sizer(&btn_row, 0, SizerFlag::All, 2);
@@ -1211,9 +1204,7 @@ pub fn show_about(frame: &Frame) {
         let t = StaticText::builder(&dialog).with_label(line).build();
         sizer.add(&t, 0, SizerFlag::All, 4);
     }
-    let ok_btn = Button::builder(&dialog)
-        .with_label(&crate::tr("OK"))
-        .build();
+    let ok_btn = Button::builder(&dialog).with_label(&t("OK")).build();
     sizer.add(&ok_btn, 0, SizerFlag::All, 4);
     let d = dialog;
     ok_btn.on_click(move |_| d.end_modal(5100));
@@ -1242,7 +1233,7 @@ pub fn show_open_article_dialog(
     bind_f1(frame, &dialog, "OpenArticleDialog");
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let intro = StaticText::builder(&dialog)
-        .with_label(&crate::tr(
+        .with_label(&t(
             "Paste the address of an article or web page.\nBlindRSS reads it the way it reads a feed article, without the\npage's own layout, menus, or pop-ups.",
         ))
         .build();
@@ -1250,12 +1241,12 @@ pub fn show_open_article_dialog(
     let url_ctrl = name_row(&dialog, &sizer, "Article address:", initial_url);
     url_ctrl.set_name("Article address");
     let rich_cb = CheckBox::builder(&dialog)
-        .with_label(&crate::tr("Open in &HTML view"))
+        .with_label(&t("Open in &HTML view"))
         .build();
     rich_cb.set_value(rich_default);
     sizer.add(&rich_cb, 0, SizerFlag::All, 4);
     let note = StaticText::builder(&dialog)
-        .with_label(&crate::tr(
+        .with_label(&t(
             "Cleared, the article opens as plain full text. Checked, it keeps headings, links, and embedded video.",
         ))
         .build();
@@ -1324,9 +1315,7 @@ pub fn show_article_history(frame: &Frame, db: &Db, article: &blindrss_core::Art
         .build();
     row.add(&text, 2, SizerFlag::Expand | SizerFlag::All, 4);
     sizer.add_sizer(&row, 1, SizerFlag::Expand | SizerFlag::All, 2);
-    let close_btn = Button::builder(&dialog)
-        .with_label(&crate::tr("Close"))
-        .build();
+    let close_btn = Button::builder(&dialog).with_label(&t("Close")).build();
     sizer.add(&close_btn, 0, SizerFlag::All, 4);
     let versions = Rc::new(versions);
     let show_version: Rc<dyn Fn(usize)> = {
@@ -1393,30 +1382,24 @@ impl ColumnEditor {
         let state: Rc<RefCell<Vec<ColumnLayout>>> = Rc::new(RefCell::new(initial));
         if with_help_text {
             let help = StaticText::builder(parent)
-                .with_label(&crate::tr(
+                .with_label(&t(
                     "Columns (checked = shown). Use Move Up / Move Down to reorder:",
                 ))
                 .build();
             sizer.add(&help, 0, SizerFlag::All, 4);
         }
         let list = CheckListBox::builder(parent).build();
-        crate::msaa_names::set_name(&list, &crate::tr("Columns"));
+        crate::msaa_names::set_name(&list, &t("Columns"));
         sizer.add(&list, 1, SizerFlag::Expand | SizerFlag::All, 4);
         let note = StaticText::builder(parent)
-            .with_label(&crate::tr(
-                "Title is always the first column and cannot be hidden.",
-            ))
+            .with_label(&t("Title is always the first column and cannot be hidden."))
             .build();
         sizer.add(&note, 0, SizerFlag::All, 4);
         let row = BoxSizer::builder(Orientation::Horizontal).build();
-        let up_btn = Button::builder(parent)
-            .with_label(&crate::tr("Move Up"))
-            .build();
-        let down_btn = Button::builder(parent)
-            .with_label(&crate::tr("Move Down"))
-            .build();
+        let up_btn = Button::builder(parent).with_label(&t("Move Up")).build();
+        let down_btn = Button::builder(parent).with_label(&t("Move Down")).build();
         let reset_btn = Button::builder(parent)
-            .with_label(&crate::tr("Reset All to Defaults"))
+            .with_label(&t("Reset All to Defaults"))
             .build();
         row.add(&up_btn, 0, SizerFlag::All, 4);
         row.add(&down_btn, 0, SizerFlag::All, 4);
@@ -1430,13 +1413,9 @@ impl ColumnEditor {
                 list.clear();
                 for (i, c) in st.iter().enumerate() {
                     if c.key == blindrss_core::article_columns::PINNED_KEY {
-                        list.append(&format!(
-                            "{} {}",
-                            crate::tr(&c.label),
-                            crate::tr("(always first)")
-                        ));
+                        list.append(&format!("{} {}", t(&c.label), t("(always first)")));
                     } else {
-                        list.append(&crate::tr(&c.label));
+                        list.append(&t(&c.label));
                     }
                     list.check(i as u32, c.visible);
                 }
@@ -1568,12 +1547,8 @@ pub fn show_article_columns(frame: &Frame, config_path: &Path) {
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let editor = ColumnEditor::build(&dialog, &sizer, layout_from_config(&cfg), true);
     let row = BoxSizer::builder(Orientation::Horizontal).build();
-    let ok_btn = Button::builder(&dialog)
-        .with_label(&crate::tr("OK"))
-        .build();
-    let cancel_btn = Button::builder(&dialog)
-        .with_label(&crate::tr("Cancel"))
-        .build();
+    let ok_btn = Button::builder(&dialog).with_label(&t("OK")).build();
+    let cancel_btn = Button::builder(&dialog).with_label(&t("Cancel")).build();
     row.add(&ok_btn, 0, SizerFlag::All, 4);
     row.add(&cancel_btn, 0, SizerFlag::All, 4);
     sizer.add_sizer(&row, 0, SizerFlag::All, 2);
@@ -1624,7 +1599,7 @@ pub fn show_add_feed(
     let hint = StaticText::builder(&dialog).with_label("").build();
     sizer.add(&hint, 0, SizerFlag::All, 4);
     let cat_label = StaticText::builder(&dialog)
-        .with_label(&crate::tr("Category:"))
+        .with_label(&t("Category:"))
         .build();
     sizer.add(&cat_label, 0, SizerFlag::All, 4);
     let cat_ctrl = ComboBox::builder(&dialog).build();
@@ -1665,7 +1640,7 @@ pub fn show_add_feed(
             while let Ok((url, supported)) = rx.try_recv() {
                 if url_ctrl.get_value().trim() == url {
                     let text = if supported {
-                        crate::tr("OK: Supported by yt-dlp")
+                        t("OK: Supported by yt-dlp")
                     } else {
                         String::new()
                     };
@@ -1690,13 +1665,13 @@ pub fn show_add_feed(
             }
             let lower = url.to_lowercase();
             if lower.contains("youtube.com") || lower.contains("youtu.be") {
-                hint.set_label(&crate::tr("OK: Recognized as YouTube source"));
+                hint.set_label(&t("OK: Recognized as YouTube source"));
                 if let Some(pos) = youtube_pos {
                     cat_ctrl.set_selection(pos as u32);
                 }
                 return;
             }
-            hint.set_label(&crate::tr("Checking compatibility..."));
+            hint.set_label(&t("Checking compatibility..."));
             let tx = tx.clone();
             std::thread::spawn(move || {
                 let supported = blindrss_core::discovery::ytdlp_supported_offline(&url);
@@ -1742,7 +1717,7 @@ pub fn show_detected_feed_choice(
     bind_f1(frame, &dialog, "DetectFeedsDialog");
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let label = StaticText::builder(&dialog)
-        .with_label(&crate::tr("Select a feed to subscribe to:"))
+        .with_label(&t("Select a feed to subscribe to:"))
         .build();
     sizer.add(&label, 0, SizerFlag::All, 4);
     let list = ListBox::builder(&dialog).build();
@@ -1799,7 +1774,7 @@ pub fn show_video_search(
     let query_ctrl = name_row(&dialog, &sizer, "Search:", "");
     let opt_row = BoxSizer::builder(Orientation::Horizontal).build();
     let scope_label = StaticText::builder(&dialog)
-        .with_label(&crate::tr("Search Sites:"))
+        .with_label(&t("Search Sites:"))
         .build();
     opt_row.add(&scope_label, 0, SizerFlag::All, 4);
     let mut scope_items: Vec<String> = vec!["All sites".to_string()];
@@ -1811,7 +1786,7 @@ pub fn show_video_search(
     scope_choice.set_selection(0);
     opt_row.add(&scope_choice, 1, SizerFlag::All, 4);
     let sort_label = StaticText::builder(&dialog)
-        .with_label(&crate::tr("Sort by:"))
+        .with_label(&t("Sort by:"))
         .build();
     opt_row.add(&sort_label, 0, SizerFlag::All, 4);
     let sort_choice = Choice::builder(&dialog).build();
@@ -1831,7 +1806,7 @@ pub fn show_video_search(
     list.insert_column(4, "Uploader", ListColumnFormat::Left, 160);
     sizer.add(&list, 1, SizerFlag::Expand | SizerFlag::All, 4);
     let status = StaticText::builder(&dialog)
-        .with_label(&crate::tr("Ready."))
+        .with_label(&t("Ready."))
         .build();
     sizer.add(&status, 0, SizerFlag::All, 4);
     let row = BoxSizer::builder(Orientation::Horizontal).build();
@@ -2108,11 +2083,11 @@ pub fn show_persistent_searches(frame: &Frame, config_path: &Path) -> Option<Str
     bind_f1(frame, &dialog, "PersistentSearchDialog");
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let list_label = StaticText::builder(&dialog)
-        .with_label(&crate::tr("Saved searches:"))
+        .with_label(&t("Saved searches:"))
         .build();
     sizer.add(&list_label, 0, SizerFlag::All, 4);
     let list = ListBox::builder(&dialog).build();
-    crate::msaa_names::set_name(&list, &crate::tr("Saved searches"));
+    crate::msaa_names::set_name(&list, &t("Saved searches"));
     sizer.add(&list, 1, SizerFlag::Expand | SizerFlag::All, 4);
     let reload = {
         let searches = searches.clone();
@@ -2131,11 +2106,11 @@ pub fn show_persistent_searches(frame: &Frame, config_path: &Path) -> Option<Str
         row.add(&b, 0, SizerFlag::All, 4);
         b
     };
-    let run_btn = mk(&crate::tr("Run Search"));
-    let add_btn = mk(&crate::tr("Add..."));
-    let remove_btn = mk(&crate::tr("Remove"));
-    let ok_btn = mk(&crate::tr("OK"));
-    let cancel_btn = mk(&crate::tr("Cancel"));
+    let run_btn = mk(&t("Run Search"));
+    let add_btn = mk(&t("Add..."));
+    let remove_btn = mk(&t("Remove"));
+    let ok_btn = mk(&t("OK"));
+    let cancel_btn = mk(&t("Cancel"));
     sizer.add_sizer(&row, 0, SizerFlag::Expand | SizerFlag::All, 2);
 
     let chosen: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
@@ -2222,11 +2197,11 @@ pub fn show_persistent_searches(frame: &Frame, config_path: &Path) -> Option<Str
 /// Heading line for the Feed Errors dialog (Python's wording).
 pub(crate) fn feed_errors_heading(count: usize) -> String {
     if count == 0 {
-        crate::tr("No feeds reported errors during their most recent update.")
+        t("No feeds reported errors during their most recent update.")
     } else {
         format!(
             "{count} {}",
-            crate::tr("feed(s) failed to update during their most recent attempt:")
+            t("feed(s) failed to update during their most recent attempt:")
         )
     }
 }
@@ -2248,11 +2223,11 @@ pub(crate) fn feed_error_oneline(error: &str) -> String {
 /// shapes).
 pub(crate) fn feed_error_failures_line(count: i64) -> String {
     if count <= 1 {
-        crate::tr("1 failed attempt so far (this may be a one-off glitch).")
+        t("1 failed attempt so far (this may be a one-off glitch).")
     } else {
         format!(
             "{count} {}",
-            crate::tr("consecutive failed attempt(s) (likely a persistent problem).")
+            t("consecutive failed attempt(s) (likely a persistent problem).")
         )
     }
 }
@@ -2262,7 +2237,7 @@ pub(crate) fn feed_error_failures_line(count: i64) -> String {
 fn feed_error_ts(ts: Option<f64>) -> String {
     match ts {
         Some(t) if t > 0.0 => crate::fmt_ts(Some(t)),
-        _ => crate::tr("Unknown"),
+        _ => t("Unknown"),
     }
 }
 
@@ -2278,7 +2253,7 @@ pub(crate) fn feed_error_detail(e: &blindrss_core::db::FeedError) -> String {
         feed_error_ts(e.error_at),
         match e.success_at {
             Some(t) if t > 0.0 => crate::fmt_ts(Some(t)),
-            _ => crate::tr("No successful update recorded."),
+            _ => t("No successful update recorded."),
         },
         feed_error_failures_line(e.consecutive_failures),
         e.error,
@@ -2306,37 +2281,35 @@ pub fn show_feed_errors(frame: &Frame) -> bool {
     let list = ListCtrl::builder(&dialog)
         .with_style(ListCtrlStyle::Report | ListCtrlStyle::SingleSel)
         .build();
-    crate::msaa_names::set_name(&list, &crate::tr("Feeds with errors"));
-    list.insert_column(0, &crate::tr("Feed"), ListColumnFormat::Left, 250);
-    list.insert_column(1, &crate::tr("Last attempt"), ListColumnFormat::Left, 160);
-    list.insert_column(2, &crate::tr("Failures"), ListColumnFormat::Left, 80);
-    list.insert_column(3, &crate::tr("Error"), ListColumnFormat::Left, 320);
+    crate::msaa_names::set_name(&list, &t("Feeds with errors"));
+    list.insert_column(0, &t("Feed"), ListColumnFormat::Left, 250);
+    list.insert_column(1, &t("Last attempt"), ListColumnFormat::Left, 160);
+    list.insert_column(2, &t("Failures"), ListColumnFormat::Left, 80);
+    list.insert_column(3, &t("Error"), ListColumnFormat::Left, 320);
     sizer.add(&list, 1, SizerFlag::Expand | SizerFlag::All, 4);
     let detail_label = StaticText::builder(&dialog)
-        .with_label(&crate::tr("Error details:"))
+        .with_label(&t("Error details:"))
         .build();
     sizer.add(&detail_label, 0, SizerFlag::All, 4);
     let detail = TextCtrl::builder(&dialog)
         .with_style(TextCtrlStyle::MultiLine | TextCtrlStyle::ReadOnly)
         .build();
-    crate::msaa_names::set_name(&detail, &crate::tr("Error details"));
+    crate::msaa_names::set_name(&detail, &t("Error details"));
     sizer.add(&detail, 1, SizerFlag::Expand | SizerFlag::All, 4);
     let btn_row = BoxSizer::builder(Orientation::Horizontal).build();
     let refresh_btn = Button::builder(&dialog)
-        .with_label(&crate::tr("Refresh Selected"))
+        .with_label(&t("Refresh Selected"))
         .build();
     let copy_btn = Button::builder(&dialog)
-        .with_label(&crate::tr("Copy Details"))
+        .with_label(&t("Copy Details"))
         .build();
     let props_btn = Button::builder(&dialog)
-        .with_label(&crate::tr("Feed Properties..."))
+        .with_label(&t("Feed Properties..."))
         .build();
     let remove_btn = Button::builder(&dialog)
-        .with_label(&crate::tr("Remove Feed"))
+        .with_label(&t("Remove Feed"))
         .build();
-    let close_btn = Button::builder(&dialog)
-        .with_label(&crate::tr("Close"))
-        .build();
+    let close_btn = Button::builder(&dialog).with_label(&t("Close")).build();
     for b in [&refresh_btn, &copy_btn, &props_btn, &remove_btn, &close_btn] {
         btn_row.add(b, 0, SizerFlag::All, 4);
     }
@@ -2382,7 +2355,7 @@ pub fn show_feed_errors(frame: &Frame) -> bool {
             props_btn.enable(has);
             remove_btn.enable(has);
             if !has {
-                detail.set_value(&crate::tr(
+                detail.set_value(&t(
                     "No feeds reported errors during their most recent update.\n\nWhen a feed cannot be updated, its error appears here with options to refresh it, copy the details, open its properties, or remove it.",
                 ));
                 return;
@@ -2463,7 +2436,7 @@ pub fn show_feed_errors(frame: &Frame) -> bool {
                 .unwrap_or_default();
             *busy.borrow_mut() = true;
             refresh_btn.enable(false);
-            heading.set_label(&format!("{} '{title}'...", crate::tr("Refreshing")));
+            heading.set_label(&format!("{} '{title}'...", t("Refreshing")));
             let done_tx = done_tx.clone();
             std::thread::spawn(move || {
                 if let Ok(db) = Db::open(&crate::db_path())
@@ -2607,24 +2580,24 @@ pub fn show_podcast_archive(
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let feed_row = BoxSizer::builder(Orientation::Horizontal).build();
     let feed_label = StaticText::builder(&dialog)
-        .with_label(&crate::tr("Podcast:"))
+        .with_label(&t("Podcast:"))
         .build();
     feed_row.add(&feed_label, 0, SizerFlag::All, 4);
     let feed_choice = Choice::builder(&dialog).build();
     feed_choice.set_name("Podcast feed");
     feed_row.add(&feed_choice, 1, SizerFlag::Expand | SizerFlag::All, 4);
     let find_btn = Button::builder(&dialog)
-        .with_label(&crate::tr("Find or add podcast..."))
+        .with_label(&t("Find or add podcast..."))
         .build();
     feed_row.add(&find_btn, 0, SizerFlag::All, 4);
     let rescan_btn = Button::builder(&dialog)
-        .with_label(&crate::tr("Rescan archive"))
+        .with_label(&t("Rescan archive"))
         .build();
     feed_row.add(&rescan_btn, 0, SizerFlag::All, 4);
     sizer.add_sizer(&feed_row, 0, SizerFlag::Expand | SizerFlag::All, 2);
     let filter_row = BoxSizer::builder(Orientation::Horizontal).build();
     let filter_label = StaticText::builder(&dialog)
-        .with_label(&crate::tr("Filter episodes:"))
+        .with_label(&t("Filter episodes:"))
         .build();
     filter_row.add(&filter_label, 0, SizerFlag::All, 4);
     let filter_ctrl = TextCtrl::builder(&dialog).build();
@@ -2632,7 +2605,7 @@ pub fn show_podcast_archive(
     filter_row.add(&filter_ctrl, 1, SizerFlag::Expand | SizerFlag::All, 4);
     sizer.add_sizer(&filter_row, 0, SizerFlag::Expand | SizerFlag::All, 2);
     let status = StaticText::builder(&dialog)
-        .with_label(&crate::tr("Choose a subscribed podcast."))
+        .with_label(&t("Choose a subscribed podcast."))
         .build();
     status.set_name("Podcast archive status");
     sizer.add(&status, 0, SizerFlag::Expand | SizerFlag::All, 4);
@@ -2650,11 +2623,11 @@ pub fn show_podcast_archive(
         btn_row.add(&b, 0, SizerFlag::All, 4);
         b
     };
-    let play_btn = mk(&crate::tr("Play"));
-    let dl_selected_btn = mk(&crate::tr("Download selected"));
-    let dl_all_btn = mk(&crate::tr("Download all"));
-    let cancel_btn = mk(&crate::tr("Cancel downloads"));
-    let close_btn = mk(&crate::tr("Close"));
+    let play_btn = mk(&t("Play"));
+    let dl_selected_btn = mk(&t("Download selected"));
+    let dl_all_btn = mk(&t("Download all"));
+    let cancel_btn = mk(&t("Cancel downloads"));
+    let close_btn = mk(&t("Close"));
     sizer.add_sizer(&btn_row, 0, SizerFlag::Expand | SizerFlag::All, 2);
 
     let all_articles: Rc<RefCell<Vec<blindrss_core::Article>>> = Rc::new(RefCell::new(Vec::new()));
@@ -3604,7 +3577,7 @@ pub fn select_takeout_sources(
     bind_f1(frame, &dialog, "TakeoutImportSelectionDialog");
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let label = StaticText::builder(&dialog)
-        .with_label(&crate::tr(
+        .with_label(&t(
             "Select what to import from this YouTube Takeout file. Press Space to check or uncheck an item:",
         ))
         .build();
@@ -3670,7 +3643,7 @@ pub fn choose_takeout_category(frame: &Frame, categories: &[String]) -> Option<S
     bind_f1(frame, &dialog, "TakeoutCategoryDialog");
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let label = StaticText::builder(&dialog)
-        .with_label(&crate::tr("Choose the destination category:"))
+        .with_label(&t("Choose the destination category:"))
         .build();
     sizer.add(&label, 0, SizerFlag::All, 4);
     let list = ListBox::builder(&dialog).build();
@@ -3879,7 +3852,7 @@ pub fn show_exclude_feeds(frame: &impl WxWidget, config_path: &Path) {
     dialog.set_escape_id(5101);
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let label = StaticText::builder(&dialog)
-        .with_label(&crate::tr("Checked feeds will not send notifications:"))
+        .with_label(&t("Checked feeds will not send notifications:"))
         .build();
     sizer.add(&label, 0, SizerFlag::All, 4);
     let list = CheckListBox::builder(&dialog).build();
@@ -3926,14 +3899,12 @@ pub fn show_youtube_signin(frame: &impl WxWidget, config_path: &Path) {
     dialog.set_escape_id(5101);
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let status = StaticText::builder(&dialog)
-        .with_label(&crate::tr("Contacting Google..."))
+        .with_label(&t("Contacting Google..."))
         .build();
     sizer.add(&status, 0, SizerFlag::All, 8);
     let code_label = StaticText::builder(&dialog).with_label("").build();
     sizer.add(&code_label, 0, SizerFlag::All, 8);
-    let close_btn = Button::builder(&dialog)
-        .with_label(&crate::tr("Cancel"))
-        .build();
+    let close_btn = Button::builder(&dialog).with_label(&t("Cancel")).build();
     sizer.add(&close_btn, 0, SizerFlag::All, 4);
     let (tx, rx) = std::sync::mpsc::channel::<Result<String, String>>();
     let rx = Rc::new(rx);
@@ -4078,9 +4049,7 @@ pub fn show_import_cookies(frame: &Frame, config_path: &Path) {
     bind_f1(frame, &dialog, "site-cookies");
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let label = StaticText::builder(&dialog)
-        .with_label(&crate::tr(
-            "Choose the browser profiles to import cookies from:",
-        ))
+        .with_label(&t("Choose the browser profiles to import cookies from:"))
         .build();
     sizer.add(&label, 0, SizerFlag::All, 4);
     let profiles = chromium::list_profiles();
@@ -4104,13 +4073,9 @@ pub fn show_import_cookies(frame: &Frame, config_path: &Path) {
         .build();
     sizer.add(&status, 0, SizerFlag::All, 4);
     let row = BoxSizer::builder(Orientation::Horizontal).build();
-    let import_btn = Button::builder(&dialog)
-        .with_label(&crate::tr("Import"))
-        .build();
+    let import_btn = Button::builder(&dialog).with_label(&t("Import")).build();
     row.add(&import_btn, 0, SizerFlag::All, 4);
-    let close_btn = Button::builder(&dialog)
-        .with_label(&crate::tr("Close"))
-        .build();
+    let close_btn = Button::builder(&dialog).with_label(&t("Close")).build();
     row.add(&close_btn, 0, SizerFlag::All, 4);
     sizer.add_sizer(&row, 0, SizerFlag::All, 2);
     // Python's dialog also carries an exported-file import and
@@ -4120,20 +4085,18 @@ pub fn show_import_cookies(frame: &Frame, config_path: &Path) {
     // reader can decrypt (Chrome v20 app-bound, B17), and for
     // browsers with no direct reader at all.
     let file_label = StaticText::builder(&dialog)
-        .with_label(&crate::tr("Cookies file:"))
+        .with_label(&t("Cookies file:"))
         .build();
     sizer.add(&file_label, 0, SizerFlag::All, 4);
     let file_row = BoxSizer::builder(Orientation::Horizontal).build();
     let file_ctrl = TextCtrl::builder(&dialog).build();
     file_ctrl.set_name("Cookies file path");
-    let browse_btn = Button::builder(&dialog)
-        .with_label(&crate::tr("Browse..."))
-        .build();
+    let browse_btn = Button::builder(&dialog).with_label(&t("Browse...")).build();
     file_row.add(&file_ctrl, 1, SizerFlag::Expand | SizerFlag::All, 4);
     file_row.add(&browse_btn, 0, SizerFlag::All, 4);
     sizer.add_sizer(&file_row, 0, SizerFlag::Expand | SizerFlag::All, 2);
     let ua_label = StaticText::builder(&dialog)
-        .with_label(&crate::tr("Browser User-Agent (recommended):"))
+        .with_label(&t("Browser User-Agent (recommended):"))
         .build();
     sizer.add(&ua_label, 0, SizerFlag::All, 4);
     let ua_ctrl = TextCtrl::builder(&dialog).build();
@@ -4148,10 +4111,10 @@ pub fn show_import_cookies(frame: &Frame, config_path: &Path) {
     sizer.add(&ua_ctrl, 0, SizerFlag::Expand | SizerFlag::All, 4);
     let file_btn_row = BoxSizer::builder(Orientation::Horizontal).build();
     let firefox_btn = Button::builder(&dialog)
-        .with_label(&crate::tr("Import from Firefox..."))
+        .with_label(&t("Import from Firefox..."))
         .build();
     let file_import_btn = Button::builder(&dialog)
-        .with_label(&crate::tr("Import File / Save User-Agent"))
+        .with_label(&t("Import File / Save User-Agent"))
         .build();
     file_btn_row.add(&firefox_btn, 0, SizerFlag::All, 4);
     file_btn_row.add(&file_import_btn, 0, SizerFlag::All, 4);
@@ -4423,7 +4386,7 @@ fn pick_firefox_profile(
     dialog.set_escape_id(5101);
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let label = StaticText::builder(&dialog)
-        .with_label(&crate::tr("Choose the Firefox profile to import from:"))
+        .with_label(&t("Choose the Firefox profile to import from:"))
         .build();
     sizer.add(&label, 0, SizerFlag::All, 4);
     let list = ListBox::builder(&dialog).build();
@@ -4462,14 +4425,14 @@ pub fn show_equalizer(frame: &Frame, config_path: &Path) {
     bind_f1(frame, &dialog, "EqualizerDialog");
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let enabled_cb = CheckBox::builder(&dialog)
-        .with_label(&crate::tr("Enable equalizer"))
+        .with_label(&t("Enable equalizer"))
         .build();
     enabled_cb.set_value(current.enabled);
     sizer.add(&enabled_cb, 0, SizerFlag::All, 4);
 
     let preset_row = BoxSizer::builder(Orientation::Horizontal).build();
     let preset_label = StaticText::builder(&dialog)
-        .with_label(&crate::tr("Preset:"))
+        .with_label(&t("Preset:"))
         .build();
     let preset_choice = Choice::builder(&dialog).build();
     preset_row.add(&preset_label, 0, SizerFlag::All, 4);
@@ -4487,7 +4450,7 @@ pub fn show_equalizer(frame: &Frame, config_path: &Path) {
     };
     let preamp_row = BoxSizer::builder(Orientation::Horizontal).build();
     let preamp_label = StaticText::builder(&dialog)
-        .with_label(&crate::tr("Preamp (dB):"))
+        .with_label(&t("Preamp (dB):"))
         .build();
     let preamp_spin = make_spin(&dialog);
     preamp_spin.set_value(current.preamp);
@@ -4575,14 +4538,14 @@ pub fn show_equalizer(frame: &Frame, config_path: &Path) {
 
     let name_row = BoxSizer::builder(Orientation::Horizontal).build();
     let name_label = StaticText::builder(&dialog)
-        .with_label(&crate::tr("Preset name:"))
+        .with_label(&t("Preset name:"))
         .build();
     let name_field = TextCtrl::builder(&dialog).build();
     let save_btn = Button::builder(&dialog)
-        .with_label(&crate::tr("Save Preset"))
+        .with_label(&t("Save Preset"))
         .build();
     let delete_btn = Button::builder(&dialog)
-        .with_label(&crate::tr("Delete Preset"))
+        .with_label(&t("Delete Preset"))
         .build();
     name_row.add(&name_label, 0, SizerFlag::All, 4);
     name_row.add(&name_field, 1, SizerFlag::Expand | SizerFlag::All, 4);
@@ -4632,12 +4595,8 @@ pub fn show_equalizer(frame: &Frame, config_path: &Path) {
     }
 
     let btn_row = BoxSizer::builder(Orientation::Horizontal).build();
-    let ok_btn = Button::builder(&dialog)
-        .with_label(&crate::tr("OK"))
-        .build();
-    let cancel_btn = Button::builder(&dialog)
-        .with_label(&crate::tr("Cancel"))
-        .build();
+    let ok_btn = Button::builder(&dialog).with_label(&t("OK")).build();
+    let cancel_btn = Button::builder(&dialog).with_label(&t("Cancel")).build();
     btn_row.add(&ok_btn, 0, SizerFlag::All, 4);
     btn_row.add(&cancel_btn, 0, SizerFlag::All, 4);
     sizer.add_sizer(&btn_row, 0, SizerFlag::All, 2);
@@ -4711,20 +4670,18 @@ pub fn show_equalizer(frame: &Frame, config_path: &Path) {
 /// macOS and disables the checkboxes off Windows.
 pub fn show_add_shortcuts(frame: &Frame) {
     use blindrss_core::windows_shortcuts::{self, ShortcutSelection};
-    let dialog = Dialog::builder(frame, &crate::tr("Add BlindRSS Shortcuts")).build();
+    let dialog = Dialog::builder(frame, &t("Add BlindRSS Shortcuts")).build();
     dialog.set_escape_id(5101);
     bind_f1(frame, &dialog, "AddShortcutsDialog");
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let intro = StaticText::builder(&dialog)
-        .with_label(&crate::tr(
+        .with_label(&t(
             "Choose where to add BlindRSS shortcuts.\nTaskbar pinning may be limited by your Windows version/policies.",
         ))
         .build();
     sizer.add(&intro, 0, SizerFlag::All, 10);
     let mk_check = |label: &str, on: bool| {
-        let cb = CheckBox::builder(&dialog)
-            .with_label(&crate::tr(label))
-            .build();
+        let cb = CheckBox::builder(&dialog).with_label(&t(label)).build();
         cb.set_value(on);
         if !windows_shortcuts::is_windows() {
             cb.enable(false);
@@ -4758,7 +4715,7 @@ pub fn show_add_shortcuts(frame: &Frame) {
     } else {
         MessageDialogStyle::OK | MessageDialogStyle::IconInformation
     };
-    let md = MessageDialog::builder(frame, &text, &crate::tr("Shortcuts"))
+    let md = MessageDialog::builder(frame, &text, &t("Shortcuts"))
         .with_style(style)
         .build();
     md.show_modal();

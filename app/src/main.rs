@@ -25,6 +25,7 @@ mod startup;
 mod update;
 
 use blindrss_core::{Article, Db, Feed};
+use patois::t;
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -1138,11 +1139,11 @@ fn selection_reader_text(a: &blindrss_core::db::Article, body_text: &str) -> Str
     format!(
         "{}\n{} {}\n{} {}\n{} {}\n{}\n\n{}",
         a.title,
-        tr("Date:"),
+        t("Date:"),
         human,
-        tr("Author:"),
+        t("Author:"),
         a.author.as_deref().unwrap_or(""),
-        tr("Link:"),
+        t("Link:"),
         a.url,
         "-".repeat(40),
         blindrss_core::postprocess::collapse_blank_lines(body_text),
@@ -1155,18 +1156,18 @@ fn selection_reader_text(a: &blindrss_core::db::Article, body_text: &str) -> Str
 /// blank lines collapsed, whitespace-normalized, one trailing
 /// newline.
 pub(crate) fn fulltext_reader_text(title: &str, author: &str, body: &str) -> String {
-    let unknown = tr("(unknown)");
+    let unknown = t("(unknown)");
     let title = title.trim();
     let author = author.trim();
     let composed = format!(
         "{} {}\n{} {}\n\n{}",
-        tr("Title:"),
+        t("Title:"),
         if title.is_empty() {
             unknown.as_str()
         } else {
             title
         },
-        tr("Author:"),
+        t("Author:"),
         if author.is_empty() {
             unknown.as_str()
         } else {
@@ -2792,19 +2793,14 @@ fn rebuild_tree(state: &mut State, tree: &TreeCtrl) {
 
 /// (Re)build the article list's columns from a layout
 /// (core/article_columns.rs). Title is pinned first. Header
-/// labels pass through tr() (Audit 8 S10).
+/// labels pass through t() (Audit 8 S10).
 fn set_list_columns(list: &ListCtrl, layout: &[blindrss_core::article_columns::ColumnLayout]) {
     list.clear_all();
     for (i, col) in blindrss_core::article_columns::visible_columns(layout)
         .iter()
         .enumerate()
     {
-        list.insert_column(
-            i as i64,
-            &crate::tr(&col.label),
-            ListColumnFormat::Left,
-            col.width,
-        );
+        list.insert_column(i as i64, &t(&col.label), ListColumnFormat::Left, col.width);
     }
 }
 
@@ -2865,7 +2861,7 @@ fn article_cell(
             .filter(|t| !t.is_empty())
             .or_else(|| {
                 if a.media_url.as_deref().is_some_and(|m| !m.is_empty()) {
-                    Some(tr("Media"))
+                    Some(t("Media"))
                 } else {
                     None
                 }
@@ -2884,9 +2880,9 @@ fn article_cell(
             .map(|d| d.split_whitespace().collect::<Vec<_>>().join(" "))
             .unwrap_or_default(),
         "status" => {
-            let mut parts = vec![if a.is_read { tr("Read") } else { tr("Unread") }];
+            let mut parts = vec![if a.is_read { t("Read") } else { t("Unread") }];
             if a.is_favorite {
-                parts.push(tr("Favorite"));
+                parts.push(t("Favorite"));
             }
             parts.join(", ")
         }
@@ -3108,7 +3104,7 @@ fn load_more_articles(state: &mut State, list: &ListCtrl) {
     state.articles.extend(page);
     if state.view_total > state.articles.len() as i64 {
         let at = state.articles.len() as i64;
-        list.insert_item(at, &tr("Load more items (Enter)"), None);
+        list.insert_item(at, &t("Load more items (Enter)"), None);
     }
     list.thaw();
     // Land the user on the first new row.
@@ -3606,7 +3602,7 @@ fn render_refill_rows(state: &mut State, list: &ListCtrl, loaded: Vec<Article>) 
     // placeholder index simply has no entry.
     if state.view_total > state.articles.len() as i64 {
         let at = state.articles.len() as i64;
-        list.insert_item(at, &tr("Load more items (Enter)"), None);
+        list.insert_item(at, &t("Load more items (Enter)"), None);
     }
     focus_first_row_if_unvisited(list);
 }
@@ -3645,100 +3641,76 @@ fn focus_first_row_if_unvisited(list: &ListCtrl) {
     }
 }
 
-/// UI language: config `language` ("auto"/missing = OS locale),
-/// normalised to a primary tag ("de_DE.UTF-8" -> "de").
-/// Translation catalog for the UI, loaded once from the locale
-/// tree (exe_dir/locale in releases, the repo's locale/ in dev)
-/// for the configured language. Strings without a catalog entry
-/// fall back to English (Python's gettext behaviour).
-static I18N: std::sync::OnceLock<blindrss_core::i18n::Catalog> = std::sync::OnceLock::new();
+// UI translations run on patois (Brandon's order,
+// 2026-11-07): the catalogs in app/po compile at build time
+// and embed in the binary — no locale folder ships and
+// nothing is downloaded at runtime (the old downloadable
+// translation-updates lifecycle is superseded). The wx
+// manager keeps wxWidgets' own stock strings on the same
+// language as the app's catalog.
+patois::embed_domain!();
+patois::embed_wx_translations!();
 
-/// Set in main() when the version-reset cleanup of downloaded
-/// translation overrides fails: the stale override tree is
-/// then off-limits for this run and tr() reads bundled
-/// catalogs only (fail closed, Python core/i18n.py's
-/// override_locale_dir answering "" when prepare raises;
-/// Audit 8 O16).
-static OVERRIDES_STANDDOWN: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+/// The app's one WxTranslationManager (the patois wx docs have
+/// the app own it, e.g. in a OnceLock). Initialized before any
+/// UI is created; Settings reads its language list from here.
+static WX_I18N: std::sync::OnceLock<std::sync::Mutex<patois::wx::WxTranslationManager>> =
+    std::sync::OnceLock::new();
 
-/// Bundled locale roots, best first (the exe's locale/ in
-/// releases, the repo's locale/ in dev).
-pub fn locale_roots() -> Vec<std::path::PathBuf> {
-    let mut roots = vec![std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../locale")];
-    for dir in resource_dirs().into_iter().rev() {
-        roots.insert(0, dir.join("locale"));
-    }
-    roots
-}
-
-pub fn tr(text: &str) -> String {
-    let catalog = I18N.get_or_init(|| {
-        let lang = ui_language();
-        // Downloaded translation updates shadow the bundled
-        // catalogs (translation_updates.override_root) —
-        // unless the version-reset cleanup failed this run,
-        // in which case the stale tree stands down (O16).
-        let mut roots: Vec<std::path::PathBuf> = Vec::new();
-        if !OVERRIDES_STANDDOWN.load(std::sync::atomic::Ordering::Relaxed) {
-            roots.push(blindrss_core::translation_updates::override_root(
-                &data_dir(),
-            ));
-        }
-        roots.extend(locale_roots());
-        for root in roots {
-            let cat = blindrss_core::i18n::Catalog::load(&root, &lang);
-            if !cat.is_empty() {
-                return cat;
-            }
-        }
-        blindrss_core::i18n::Catalog::default()
-    });
-    catalog.get(text).to_string()
-}
-
-fn ui_language() -> String {
+/// Initialize translations: the manager's initialize picks
+/// the system-best language; the saved `language` choice then
+/// overrides it when it isn't "auto" (the Settings picker
+/// writes it; it applies at launch, Python's requires-restart
+/// shape).
+fn init_i18n() {
+    let mut manager = patois::wx::WxTranslationManager::new("blindrss");
+    manager.initialize(WxStdCatalogLoader);
     let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
     let chosen = cfg.get_str("language", "auto").to_string();
-    let raw = if chosen.is_empty() || chosen == "auto" {
-        std::env::var("LANG").unwrap_or_else(|_| "en".to_string())
-    } else {
-        chosen
-    };
-    let primary = raw
-        .split(['_', '-', '.'])
-        .next()
-        .unwrap_or("en")
-        .to_lowercase();
-    if primary.is_empty() {
-        "en".to_string()
-    } else {
-        primary
+    if !chosen.is_empty() && chosen != "auto" {
+        manager.set_language(&chosen, WxStdCatalogLoader);
     }
+    let _ = WX_I18N.set(std::sync::Mutex::new(manager));
 }
 
-fn locale_root() -> PathBuf {
-    if let Ok(p) = std::env::var("BLINDRSS_LOCALE") {
-        return PathBuf::from(p);
+/// The UI language code for the language-keyed consumers
+/// that aren't gettext: the help guides (docs/help/<code>.md,
+/// full codes like pt_BR) and the BLINDRSS_UI_LANGUAGE env for
+/// helper processes. The saved `language` choice verbatim, or
+/// the system locale when "auto". (The old implementation
+/// reduced everything to the primary subtag, which made the
+/// nl_BE catalog and guide unreachable; patois' exact codes
+/// fix that.)
+pub fn ui_language() -> String {
+    let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+    let chosen = cfg.get_str("language", "auto").to_string();
+    if !chosen.is_empty() && chosen != "auto" {
+        return chosen;
     }
-    // Release layout: locale/ ships beside the executable; dev builds
-    // use the repo's locale/ tree. Both come from locale_roots(), so
-    // the startup labels and tr() always read the same catalog — the
-    // old dev fallback pointed at a directory that does not exist.
-    locale_roots()
-        .into_iter()
-        .find(|r| r.exists())
-        .unwrap_or_else(app_dir)
+    patois::system_locale()
+}
+
+/// The languages the Settings picker offers (codes + native
+/// names from patois), or just English before init.
+pub fn i18n_languages() -> Vec<patois::LanguageInfo> {
+    WX_I18N
+        .get()
+        .and_then(|m| m.lock().ok())
+        .map(|m| m.available_languages())
+        .unwrap_or_else(|| {
+            vec![patois::LanguageInfo {
+                code: "en".to_string(),
+                name: "English".to_string(),
+            }]
+        })
 }
 
 /// One pass of the background watcher (Python's
-/// CookieImportWatcher tick + the translation-update scheduler):
-/// hands-free cookie imports from Downloads and browser profiles,
-/// plus a due translation-catalog check. Runs on a worker thread;
+/// CookieImportWatcher tick): hands-free cookie imports from
+/// Downloads and browser profiles. Runs on a worker thread;
 /// findings land in the status bar via StatusNote.
 fn run_watcher_once(tx: &std::sync::mpsc::Sender<RefreshMsg>) {
     use blindrss_core::cookies_import as ci;
-    use blindrss_core::translation_updates as tu;
     let cfg_path = config_path();
     let mut cfg = blindrss_core::config::Config::load(&cfg_path).unwrap_or_default();
     let dir = data_dir();
@@ -3774,41 +3746,6 @@ fn run_watcher_once(tx: &std::sync::mpsc::Sender<RefreshMsg>) {
     }
     if cookie_markers(&cfg) != markers_before {
         dirty = true;
-    }
-    if cfg.get_bool(tu::CFG_ENABLED, true) {
-        let frequency = cfg
-            .get_str(tu::CFG_FREQUENCY, tu::DEFAULT_FREQUENCY)
-            .to_string();
-        if tu::is_due(&dir, &frequency, now_s as i64) {
-            let mut langs: Vec<String> = Vec::new();
-            for root in locale_roots() {
-                if let Ok(entries) = std::fs::read_dir(&root) {
-                    for entry in entries.flatten() {
-                        if entry.path().is_dir()
-                            && let Some(name) = entry.file_name().to_str()
-                            && name != "en"
-                            && !langs.contains(&name.to_string())
-                        {
-                            langs.push(name.to_string());
-                        }
-                    }
-                }
-            }
-            let result = tu::check_and_update(
-                &dir,
-                &locale_roots(),
-                &langs,
-                &tu::HttpFetch,
-                now_s as i64,
-                false,
-            );
-            if result.changed() {
-                notes.push(format!(
-                    "Translation updates installed for {}; they apply on next launch",
-                    result.updated.join(", ")
-                ));
-            }
-        }
     }
     if dirty {
         let _ = cfg.save(&cfg_path);
@@ -3887,20 +3824,6 @@ fn main() {
         db_path().display(),
         config_path().display()
     ));
-    // Translation overrides from a previous version stand down
-    // before the catalog loads (translation_updates). If the
-    // reset cleanup fails, the new version stays unrecorded
-    // (the reset retries next launch) and this run fails
-    // closed to the bundled catalogs (Audit 8 O16).
-    if blindrss_core::translation_updates::prepare_overrides_for_app_version(
-        &data_dir(),
-        &locale_roots(),
-        env!("CARGO_PKG_VERSION"),
-    ) == blindrss_core::translation_updates::PrepareOutcome::CleanupFailed
-    {
-        OVERRIDES_STANDDOWN.store(true, std::sync::atomic::Ordering::Relaxed);
-        log_line("Translation override reset failed; using bundled catalogs this run");
-    }
     // Single instance: hand activation to the running copy
     // and exit when one answers.
     if blindrss_core::single_instance::signal_existing() {
@@ -3908,11 +3831,12 @@ fn main() {
         return;
     }
     let _ = wxdragon::main(|_| {
+        // Translations before any UI exists (patois' wx rule).
+        init_i18n();
         apply_http_config();
         startup_maintenance();
         let language = ui_language();
-        let catalog = blindrss_core::i18n::Catalog::load(&locale_root(), &language);
-        let refresh_label = catalog.get("Refresh All Feeds").to_string();
+        let refresh_label = t("Refresh All Feeds");
         let frame = Frame::builder()
             .with_title("BlindRSS")
             .with_size(Size::new(1100, 700))
@@ -4130,7 +4054,7 @@ fn main() {
         let search_box = TextCtrl::builder(&btn_panel)
             .with_style(TextCtrlStyle::ProcessEnter)
             .build();
-        msaa_names::set_name(&search_box, &tr("Search"));
+        msaa_names::set_name(&search_box, &t("Search"));
         let search_btn = Button::builder(&btn_panel).with_label("Search").build();
         let fulltext_btn = Button::builder(&btn_panel)
             .with_label("Read Full Text")
@@ -4168,7 +4092,7 @@ fn main() {
         let (tx, rx): (Sender<RefreshMsg>, Receiver<RefreshMsg>) = channel();
         let splitter = SplitterWindow::builder(&frame).build();
         let tree = TreeCtrl::builder(&splitter).build();
-        msaa_names::set_name(&tree, &tr("Feeds and categories"));
+        msaa_names::set_name(&tree, &t("Feeds and categories"));
         let right = Panel::builder(&splitter).build();
         let list = ListCtrl::builder(&right)
             .with_style(ListCtrlStyle::Report)
@@ -4176,8 +4100,8 @@ fn main() {
         let reader = TextCtrl::builder(&right)
             .with_style(TextCtrlStyle::MultiLine | TextCtrlStyle::ReadOnly | TextCtrlStyle::Rich2)
             .build();
-        msaa_names::set_name(&list, &tr("Articles"));
-        msaa_names::set_name(&reader, &tr("Article text"));
+        msaa_names::set_name(&list, &t("Articles"));
+        msaa_names::set_name(&reader, &t("Article text"));
 
         // Rich reader WebView (opt-in, config full_text_rich_view).
         // Created whenever a backend exists but only shown in rich
@@ -11906,6 +11830,79 @@ mod ui_parity_tests {
                 text.contains("creation_flags(0x0800_0000)"),
                 "{file}: Windows spawn lost CREATE_NO_WINDOW"
             );
+        }
+    }
+
+    #[test]
+    fn patois_embeds_all_fifteen_catalogs() {
+        // Brandon's order, 2026-11-07: translations run on
+        // patois — compiled from app/po at build time and
+        // embedded in the binary. This fails if the gettext
+        // tools were missing at build time (patois-build then
+        // warns and embeds nothing), which is exactly the
+        // silent failure this guard exists to catch.
+        let mut codes: Vec<String> = patois::available_locales("blindrss")
+            .into_iter()
+            .map(|c| c.to_lowercase())
+            .collect();
+        codes.sort();
+        assert_eq!(
+            codes,
+            vec![
+                "de", "es", "fr", "hi", "it", "ja", "nl", "nl_be", "pl", "pt_br", "pt_pt", "ru",
+                "sv", "zh_cn", "zh_tw"
+            ]
+        );
+    }
+
+    #[test]
+    fn patois_lookup_translates_and_falls_back() {
+        patois::set_default_domain("blindrss");
+        patois::set_locale("de");
+        assert_eq!(patois::t("Settings"), "Einstellungen");
+        // The Audit 8 S10 coverage, moved from the deleted
+        // core catalog test: the shipped German catalog covers
+        // the column and settings display labels.
+        for msgid in [
+            "Title",
+            "Author",
+            "Date",
+            "Description",
+            "Media",
+            "Enable Sound Notifications",
+            "Automatic (system language)",
+        ] {
+            assert_ne!(patois::t(msgid), msgid, "de catalog lacks {msgid}");
+        }
+        // A string with no catalog entry stays English.
+        assert_eq!(
+            patois::t("Refresh All Feeds"),
+            "Refresh All Feeds",
+            "untranslated strings must fall back to the msgid"
+        );
+        patois::set_locale("en");
+        assert_eq!(patois::t("Settings"), "Settings");
+    }
+
+    #[test]
+    fn patois_catalogs_pass_the_damage_lint() {
+        // patois-build's checks: no translation may lose or
+        // gain a placeholder, a menu accelerator, or a
+        // keyboard shortcut against its source string.
+        let po_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("po");
+        if let Err(report) = patois_build::lint::check_catalogs(&po_dir) {
+            panic!("catalog lint failed:\n{report}");
+        }
+    }
+
+    #[test]
+    fn patois_sources_have_no_split_literals() {
+        // A translation call that joins two literals with +
+        // would extract only the first one; the string could
+        // never be translated whole.
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        if let Err(report) = patois_build::lint::check_sources(&[&src]) {
+            panic!("source lint failed:\n{report}");
         }
     }
 

@@ -1,8 +1,14 @@
 [package]
 name = "blindrss"
-version = "0.1.71"
+version = "0.1.72"
 edition.workspace = true
 license.workspace = true
+
+# patois: this package's strings (and any translatable
+# library's) are collected into po/blindrss.pot and the
+# compiled catalogs are embedded in the binary.
+[package.metadata.patois]
+translatable = true
 
 [dependencies]
 blindrss-core = { path = "../crates/core" }
@@ -19,8 +25,20 @@ libloading = "0.8.9"
 # explicitly below, so the ONLY build change is the asserts.
 wxdragon = { version = "0.9.24", default-features = false, features = ["media-ctrl", "richtext", "stc", "webview", "wx-printing", "wx-tiff", "wx-jpeg", "wx-tango-icons", "wx-extra-image-formats", "wx-regex", "appindicator"] }
 ship-shape = "0.5.0"
+# Gettext via patois (Brandon's order, 2026-11-07): catalogs
+# live in po/, compile at build time, and embed in the binary
+# — no locale folder ships and there are no downloadable
+# translation updates anymore. The wx feature also carries
+# wxWidgets' own stock-string catalogs on the same language.
+patois = { version = "0.3", features = ["wx"] }
 rcgen = "0.13"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 
 [build-dependencies]
 shipfitter = { version = "0.2.4", features = ["windows-resources"] }
+patois-build = "0.1"
+
+[dev-dependencies]
+# For the catalog lint tests (patois-build's check entry
+# points) — the same crate the build script uses.
+patois-build = "0.1"

@@ -7744,3 +7744,63 @@ tests on the ship tree. Ships the three fixes above: WAL
 connection setup (locked-database errors + refresh stalls),
 NPR audio resolved per session, and Settings' async minimal
 soundcard enumeration.
+
+## Patois adoption (Brandon's order, 2026-11-07; ships in v0.1.72)
+
+Translations moved from the hand-rolled core catalog
+(core/i18n.rs + core/translation_updates.rs, both deleted)
+to Quin's patois crates, the system Paperback, ship-shape
+and wx-utils use: patois 0.3 (wx feature) + patois-build
+0.1 in the app crate. What changed:
+
+- Catalogs moved locale/<lang>/LC_MESSAGES/blindrss.po ->
+  app/po/<lang>.po and locale/blindrss.pot ->
+  app/po/blindrss.pot, contents unchanged (all 15 languages,
+  still the Python-parity msgid set; the .pot is NOT
+  regenerated for this move, so no translation can be lost
+  to extraction gaps). app/examples/gen_pot.rs regenerates
+  the template going forward.
+- Catalogs compile at build time (msgfmt via
+  patois-build::compile_translations in app/build.rs) and
+  embed in the binary, compressed. No locale folder ships;
+  release.yml's `cp -r locale` packaging step is removed.
+- All UI strings now go through patois::t (242 crate::tr
+  call sites + main.rs' own, renamed mechanically). The
+  app's tr(), the OnceLock Catalog, locale_roots() and the
+  BLINDRSS_LOCALE override are gone.
+- Language selection: patois::wx::WxTranslationManager,
+  owned in a OnceLock, initialized before any UI (system-
+  best language), then the saved config `language` applied
+  via set_language; wxWidgets stock strings ride the same
+  language through embed_wx_translations!. The Settings
+  picker keeps its exact shape ("Automatic (system
+  language)" + "Native name (code)", sorted, requires
+  restart) but lists LanguageManager's embedded languages.
+- SUPERSEDED: the downloadable translation-updates
+  lifecycle (Task 29 / Audit 8 O16 — override tree, ETag
+  fetch from this repo's main, version-transition reset,
+  the Settings Translation Updates group with its enable
+  checkbox, frequency choice incl. the v0.1.70 Never
+  option, manual Check for Updates button, and the watcher
+  tick's due check) is deleted with the feature it served:
+  under patois, translations ship inside releases. The
+  translation_updates_* config keys are inert leftovers.
+  i18n_slice.rs (the O16 test file) was deleted with its
+  subject; batch22/i18n_help lost only their TU/catalog
+  tests.
+- ui_language() survives for the non-gettext consumers
+  (help guides, BLINDRSS_UI_LANGUAGE) and now returns the
+  chosen code verbatim / the OS locale instead of the
+  primary subtag — the old reduction made the nl_BE
+  catalog and guide unreachable; both work now.
+- Guards (app tests): the 15 catalogs are embedded (fails
+  loudly when a build lacked gettext), German lookup +
+  English fallback round-trip, patois-build's catalog
+  damage lint over app/po (passes on the inherited
+  catalogs), and its source lint over app/src.
+- Known seam: ship-shape 0.5.0 still uses patois 0.2, so
+  its updater strings stay English until it moves to 0.3
+  (patois' own upgrade rule); the app's catalog is 0.3.
+  Brandon's machine acceptance: switch the interface
+  language in Settings, restart, and confirm the UI (and
+  stock dialog buttons) render in the chosen language.
