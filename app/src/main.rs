@@ -31,6 +31,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use wxdragon::event::webview_events::WebViewEvents;
+use wxdragon::event::window_events::WindowEvents;
 use wxdragon::prelude::*;
 use wxdragon::widgets::webview::{WebView, WebViewBackend};
 
@@ -2598,13 +2599,23 @@ fn rebuild_tree(state: &mut State, tree: &TreeCtrl) {
         .or_else(|| state.selected_feed.clone())
         .unwrap_or_default();
     tree.delete_all_items();
-    let Some(root) = tree.add_root("Feeds", None, None) else {
+    // Python's shape (Brandon's report, 2026-11-08): the wx
+    // root is invisible (HideRoot) and holds NO view of its
+    // own — "All Articles", "Favorites", the categories and
+    // the rest sit side by side as top-level items. The old
+    // port made the root a visible "Feeds" parent that itself
+    // meant "all articles", which read as a folder containing
+    // everything. The root keeps the all-articles filter data
+    // ("") only so programmatic fallbacks land somewhere sane;
+    // the visible all-articles entry is the first child.
+    let Some(root) = tree.add_root("All Articles", None, None) else {
         return;
     };
     // Item data carries the feed filter: empty string = all feeds,
     // otherwise the feed id. (TreeItemId has no PartialEq, so data is
     // the reliable way to identify the selected item.)
     tree.set_custom_data_direct(&root, String::new());
+    let all_item = tree.append_item_with_data(&root, "All Articles", String::new(), None, None);
     let Some(db) = state.db.as_ref() else { return };
     // One grouped count query for the whole tree (Python's
     // shape). Per-feed COUNTs here were the ~30 s startup on
@@ -2782,9 +2793,18 @@ fn rebuild_tree(state: &mut State, tree: &TreeCtrl) {
     tree.expand(&root);
     // Restore (or default) the selection, mirroring Python's
     // SelectItem(selection_target) at the end of every tree build.
-    let found = find_item_by_data(tree, &root, &previous);
+    // The all-articles view restores onto its visible node, not
+    // the hidden root (find_item_by_data would match the root's
+    // identical "" data first).
+    let found = if previous.is_empty() {
+        all_item
+            .clone()
+            .or_else(|| find_item_by_data(tree, &root, &previous))
+    } else {
+        find_item_by_data(tree, &root, &previous)
+    };
     let keep = found.is_some() && !previous.is_empty();
-    let target = found.unwrap_or(root);
+    let target = found.unwrap_or_else(|| all_item.clone().unwrap_or(root));
     tree.select_item(&target);
     tree.set_focused_item(&target);
     tree.ensure_visible(&target);
@@ -4091,7 +4111,9 @@ fn main() {
 
         let (tx, rx): (Sender<RefreshMsg>, Receiver<RefreshMsg>) = channel();
         let splitter = SplitterWindow::builder(&frame).build();
-        let tree = TreeCtrl::builder(&splitter).build();
+        let tree = TreeCtrl::builder(&splitter)
+            .with_style(TreeCtrlStyle::HideRoot)
+            .build();
         msaa_names::set_name(&tree, &t("Feeds and categories"));
         let right = Panel::builder(&splitter).build();
         let list = ListCtrl::builder(&right)
@@ -4100,6 +4122,33 @@ fn main() {
         let reader = TextCtrl::builder(&right)
             .with_style(TextCtrlStyle::MultiLine | TextCtrlStyle::ReadOnly | TextCtrlStyle::Rich2)
             .build();
+        // Reading place survives Tab away and back
+        // (Brandon's report, 2026-11-08): capture the caret
+        // on focus-out, restore it on focus-in — but only
+        // while the text is unchanged; a fresh article
+        // replaces the value and resets the place below.
+        let reader_place = Rc::new(std::cell::Cell::new((String::new(), 0_i64, 0_i64, 0_i64)));
+        {
+            let saved = reader_place.clone();
+            reader.on_kill_focus(move |_| {
+                let (from, to) = reader.get_selection();
+                saved.set((reader.get_value(), reader.get_insertion_point(), from, to));
+            });
+            let saved = reader_place.clone();
+            reader.on_set_focus(move |_| {
+                let (text, pos, from, to) = saved.replace((String::new(), 0, 0, 0));
+                if !text.is_empty() && reader.get_value() == text {
+                    // wx has already reset the native caret by
+                    // the time SET_FOCUS fires; restore after
+                    // the event's default handling completes.
+                    if from != to {
+                        reader.set_selection(from, to);
+                    } else if pos > 0 {
+                        reader.set_insertion_point(pos);
+                    }
+                }
+            });
+        }
         msaa_names::set_name(&list, &t("Articles"));
         msaa_names::set_name(&reader, &t("Article text"));
 
@@ -8865,6 +8914,17 @@ fn main() {
             let frame_fd = frame;
             Rc::new(move || {
                 let current = state_fd.borrow().find_query.clone();
+                // Capture the reading place BEFORE the prompt
+                // opens (Brandon's report, 2026-11-08): the
+                // modal steals focus, and prompt_focus returns
+                // it to the tree/list by design, which reset
+                // the reader's native caret — Enter then
+                // searched from position 0 and left him on the
+                // first line, needing an extra F3. Search from
+                // the captured place, and hand focus back to
+                // the reader when a match lands (run_find does
+                // reader.set_focus()).
+                let start = reader.get_insertion_point().max(0) as usize;
                 let query = prompt_focus(
                     &frame_fd,
                     "Find in article:",
@@ -8878,7 +8938,6 @@ fn main() {
                     return;
                 };
                 state_fd.borrow_mut().find_query = query.clone();
-                let start = reader.get_insertion_point().max(0) as usize;
                 run_find(
                     &reader,
                     &frame_fd,
@@ -8930,7 +8989,12 @@ fn main() {
                     start.max(0) as usize,
                     false,
                     false,
-                    &format!("No previous occurrences of \"{query}\"."),
+                    // Python `_content_find_no_more` uses this
+                    // exact sentence for the backward direction
+                    // too ("No more occurrences"); Brandon's
+                    // report (2026-11-08) is that Shift+F3 at
+                    // the first match announced nothing.
+                    &format!("No more occurrences of \"{query}\"."),
                 );
             })
         };
@@ -12069,6 +12133,111 @@ mod ui_parity_tests {
             window.contains("focus_first_row_if_unvisited(list)"),
             "render_refill_rows no longer focuses the first row"
         );
+    }
+
+    #[test]
+    fn tree_is_flat_with_a_top_level_all_articles_node() {
+        // Brandon's report (2026-11-08): the tree opened on a
+        // visible "Feeds" parent that itself meant "all
+        // articles", so Favorites and the categories nested
+        // under a folder whose name promised feeds. Python
+        // hides the wx root and puts "All Articles",
+        // "Favorites" and the categories side by side at the
+        // top level. The port must keep that shape: HideRoot
+        // on the tree, no visible "Feeds" root, and a real
+        // top-level "All Articles" node carrying the
+        // all-articles filter.
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let main = std::fs::read_to_string(src_dir.join("main.rs")).unwrap();
+        assert!(
+            main.contains("TreeCtrlStyle::HideRoot"),
+            "tree root is visible again"
+        );
+        assert!(
+            !main.contains("add_root(\"Feeds\""),
+            "the Feeds parent is back"
+        );
+        let start = main.find("fn rebuild_tree").unwrap();
+        let window = &main[start..(start + 4000).min(main.len())];
+        assert!(
+            window.contains("append_item_with_data(&root, \"All Articles\", String::new()"),
+            "no top-level All Articles node"
+        );
+    }
+
+    #[test]
+    fn find_searches_from_the_pre_prompt_place_and_announces_both_ends() {
+        // Brandon's reports (2026-11-08): (1) Ctrl+F + Enter
+        // left the cursor on the first line — the prompt
+        // round-trip reset the reader's caret, and the start
+        // position was read AFTER the modal closed. The start
+        // must be captured before prompt_focus runs.
+        // (2) Shift+F3 at the first match announced nothing;
+        // both directions must announce Python's "No more
+        // occurrences" sentence on a terminal miss.
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let main = std::fs::read_to_string(src_dir.join("main.rs")).unwrap();
+        let find_start = main.find("let act_find: Rc<dyn Fn()>").unwrap();
+        let find_window = &main[find_start..(find_start + 2200).min(main.len())];
+        let capture = find_window
+            .find("let start = reader.get_insertion_point()")
+            .expect("act_find no longer captures the start");
+        let prompt = find_window
+            .find("prompt_focus(")
+            .expect("act_find no longer prompts");
+        assert!(
+            capture < prompt,
+            "find start is read after the prompt closes"
+        );
+        // The banned wording is assembled at runtime so this
+        // test's own source does not trip the scan.
+        let banned = format!("No previous {}", "occurrences");
+        assert!(
+            !main.contains(&banned),
+            "Shift+F3 terminal miss must say \"No more occurrences\""
+        );
+        // The count is taken over the implementation region
+        // only (before the test module): this test's own
+        // assertions contain the phrase too. Exactly two
+        // call sites may use it — act_find_next and
+        // act_find_prev.
+        let impl_src = main.split("mod ui_parity_tests").next().unwrap_or(&main);
+        assert_eq!(
+            impl_src.matches("No more occurrences of").count(),
+            2,
+            "F3 and Shift+F3 must both announce the terminal miss"
+        );
+    }
+
+    #[test]
+    fn article_text_keeps_its_place_across_focus_changes() {
+        // Brandon's report (2026-11-08): Tabbing away from
+        // the article text and back put him at the very top
+        // of the article. Every read-only text surface that
+        // holds article text must capture its caret on
+        // focus-out and restore it on focus-in: the main
+        // window's reader pane (guarded by the text being
+        // unchanged, so a new article still starts at the
+        // top) and, via dialogs::keep_text_place, the article
+        // window and the dialogs that reuse it.
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let main = std::fs::read_to_string(src_dir.join("main.rs")).unwrap();
+        let start = main.find("let reader = TextCtrl::builder(&right)").unwrap();
+        let window = &main[start..(start + 3000).min(main.len())];
+        assert!(
+            window.contains("reader.on_kill_focus"),
+            "main reader lost its caret capture"
+        );
+        assert!(
+            window.contains("reader.on_set_focus"),
+            "main reader lost its caret restore"
+        );
+        let dialogs = std::fs::read_to_string(src_dir.join("dialogs.rs")).unwrap();
+        assert!(dialogs.contains("pub(crate) fn keep_text_place"));
+        assert!(dialogs.contains("on_kill_focus"));
+        assert!(dialogs.contains("on_set_focus"));
+        let article_window = std::fs::read_to_string(src_dir.join("article_window.rs")).unwrap();
+        assert!(article_window.contains("keep_text_place(&reader)"));
     }
 
     #[test]

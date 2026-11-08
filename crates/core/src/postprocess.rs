@@ -632,6 +632,81 @@ fn bloomberg_is_end_marker(p: &str) -> bool {
         || p.starts_with("By accepting, you agree to our updated [Terms of Service")
 }
 
+/// MacRumors (Brandon's report, 2026-11-08): the generic
+/// engines read the whole page, so the "Popular Stories"
+/// rail lands mid-article and the page footer (push
+/// notifications pitch, Videos/Guides/Roundups link lists,
+/// "Other Stories") trails the body. Cut at the first
+/// "Popular Stories" heading paragraph, and at any footer
+/// anchor when one appears without the rail. A paragraph
+/// that merely mentions the phrase mid-sentence never
+/// matches (the heading is its own paragraph and short).
+pub fn strip_macrumors_boilerplate(text: &str) -> String {
+    let paras = split_paragraphs(text);
+    if paras.is_empty() {
+        return String::new();
+    }
+    let mut cut = paras.len();
+    for (i, p) in paras.iter().enumerate() {
+        let p = p.trim();
+        // The heading alone, or glued to the first story when
+        // the engine flattened the rail into one paragraph
+        // ("Popular StoriesRIP, MacBook Ultra..." — Brandon's
+        // pasted text, 2026-11-08): cut at the paragraph; any
+        // real prose before the heading inside it is lost with
+        // the rail, which matches what the site puts there.
+        if p.len() <= 40 && p.eq_ignore_ascii_case("Popular Stories")
+            || p.starts_with("Popular Stories")
+        {
+            cut = i;
+            break;
+        }
+        if p.starts_with("Push Notifications")
+            || p.starts_with("To Subscribe or Unsubscribe")
+            || p == "Other Stories"
+        {
+            cut = i;
+            break;
+        }
+    }
+    if cut == paras.len() {
+        return text.to_string();
+    }
+    let kept = paras[..cut].join("\n\n").trim().to_string();
+    if kept.is_empty() {
+        text.to_string()
+    } else {
+        kept
+    }
+}
+
+/// Windows Latest (Brandon's report, 2026-11-08): every
+/// article trails the WordPress syndication line "The post
+/// ... appeared first on Windows Latest". Cut it (and
+/// anything after it) wherever it appears.
+pub fn strip_windowslatest_boilerplate(text: &str) -> String {
+    let paras = split_paragraphs(text);
+    if paras.is_empty() {
+        return String::new();
+    }
+    let mut cut = paras.len();
+    for (i, p) in paras.iter().enumerate() {
+        if p.trim_start().starts_with("The post ") && p.contains("appeared first on") {
+            cut = i;
+            break;
+        }
+    }
+    if cut == paras.len() {
+        return text.to_string();
+    }
+    let kept = paras[..cut].join("\n\n").trim().to_string();
+    if kept.is_empty() {
+        text.to_string()
+    } else {
+        kept
+    }
+}
+
 /// Python `_strip_bloomberg_boilerplate`.
 pub fn strip_bloomberg_boilerplate(text: &str) -> String {
     let original = normalize_whitespace(text);
@@ -1034,6 +1109,10 @@ pub fn postprocess_extracted_text(text: &str, url: &str, published: &str) -> Str
         strip_slashdot_boilerplate(&t)
     } else if netloc.contains("bloomberg.com") {
         strip_bloomberg_boilerplate(&t)
+    } else if netloc.contains("macrumors.com") {
+        strip_macrumors_boilerplate(&t)
+    } else if netloc.contains("windowslatest.com") {
+        strip_windowslatest_boilerplate(&t)
     } else if host_matches(url, "news.sky.com") {
         strip_sky_related_sections(&t)
     } else if netloc.ends_with(".ning.com") || netloc == "ning.com" {

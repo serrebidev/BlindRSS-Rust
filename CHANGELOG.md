@@ -6,6 +6,16 @@ as `0.1.2-0.1.3`. Each release's section below is its GitHub release note,
 taken from this file by the release workflow. The in-app updater shows the
 same text.
 
+## 0.1.75
+
+- Fixed figure captions and photo credits leaking into article text. Ars Technica, Windows Latest, and other sites print a caption and a "Credit:" line under each photo; both now stay out of the article, in the plain text view and the HTML view alike. Ars Technica also hid a second copy of each caption in its photo lightbox data; that copy is gone too.
+- Fixed MacRumors articles carrying the site's Popular Stories rail in the middle of the article and its footer (push notifications pitch, Videos and Guides lists, Other Stories) at the end. Both are cut; the article body is untouched.
+- Fixed Windows Latest articles ending with the "The post ... appeared first on Windows Latest" line. It is removed.
+- Fixed the article text losing your place when you Tab away and back. Your reading position in the article is now kept — in the main window, in the separate article window, and in the article history and feed error details — and a new article still starts at the top.
+- Fixed Find in the article text (Ctrl+F). Pressing Enter after typing your search now moves to the first match from where you were reading, instead of leaving the cursor on the first line. Shift+F3 at the first match now announces "No more occurrences", like F3 does at the last match.
+- Fixed the feed tree's shape. It no longer opens on a "Feeds" parent that contains everything: like the Python version, the top level is now All Articles, Favorites, and your categories side by side, with Uncategorized at the bottom. All Articles is a plain entry in the list, not a folder.
+
+
 ## 0.1.74
 
 - Fixed Settings changes silently not saving. Numeric

@@ -843,6 +843,7 @@ fn publisher_body_fragment(html: &str, url: &str) -> Option<String> {
         return None;
     }
     let mut frag: String = parts.iter().map(|p| &html[p.start..p.end]).collect();
+    frag = drop_elements(&frag, &|_open, _, e| e.name == "figcaption");
     frag = drop_elements(&frag, &|open, _, _| {
         PUBLISHER_JUNK_CLASSES.iter().any(|c| has_class(open, c))
     });
@@ -992,6 +993,12 @@ pub fn clean_article_html(html: &str, url: &str, use_traf_prune: bool) -> String
     // vouch for the quiz's paragraphs (Python does the same).
     let quiz_stripped = crate::extract::strip_css_quizzes(html);
     let html = &quiz_stripped;
+    // Captions go before any pick reads the page, in step
+    // with the text cascade (Brandon's reports, 2026-11-08):
+    // figure captions and PhotoSwipe's hidden caption twins.
+    let caption_stripped =
+        crate::extract::drop_pswp_captions(&crate::extract::drop_figcaptions(html));
+    let html = &caption_stripped;
     // Some layouts have no single node that holds the whole body,
     // so it is rebuilt before the generic pick, in Python's order:
     // publisher body containers, socast/Pattison-portal split

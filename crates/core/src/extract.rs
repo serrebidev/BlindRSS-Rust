@@ -1005,6 +1005,35 @@ pub(crate) fn leaf_text(fragment: &str) -> String {
         .join(" ")
 }
 
+/// Drop every `<figcaption>` subtree (Brandon's reports,
+/// 2026-11-08): figure captions and their "Credit:" /
+/// "Image:" lines are photo furniture, not article prose —
+/// Ars Technica, Windows Latest and others print them inside
+/// the body containers, so they survived every text path.
+/// The image itself stays (alt markers are a separate,
+/// opt-in feature); only the caption element goes. Runs on
+/// the raw page in `extract_article_opts` before any engine
+/// reads it, and inside both publisher-body reconstructions,
+/// so the text cascade and the rich reader agree.
+pub fn drop_figcaptions(html: &str) -> String {
+    let (out, _) = remove_elements(html, &|name, _open| name == "figcaption");
+    out
+}
+
+/// Drop PhotoSwipe lightbox caption blocks: elements whose
+/// class carries `pswp-caption-content` hold a hidden copy of
+/// the figure caption (caption text plus its "Credit:" line)
+/// for the lightbox UI. They are not `<figcaption>` elements,
+/// so `drop_figcaptions` misses them — on Ars Technica pages
+/// the copy inside the visible figure was removed while this
+/// hidden twin survived and printed once (Brandon's report,
+/// 2026-11-08). Class-token match, so hashed suffixes and
+/// sibling classes are fine.
+pub fn drop_pswp_captions(html: &str) -> String {
+    let (out, _) = remove_elements(html, &|_name, open| has_class(open, "pswp-caption-content"));
+    out
+}
+
 /// Reuters dedicated extractor (Python `_extract_reuters_text`):
 /// the `data-testid="paragraph-N"` nodes inside
 /// `data-testid="ArticleBody"`, >= 200 chars.
@@ -1185,8 +1214,8 @@ fn publisher_body_text(html: &str, url: &str) -> String {
         "articleAuthorBioFooter-container",
         "zd-post-footer-pattern",
     ];
-    let (cleaned, _) = remove_elements(&joined, &|_name, open| {
-        JUNK.iter().any(|c| has_class(open, c))
+    let (cleaned, _) = remove_elements(&joined, &|name, open| {
+        name == "figcaption" || JUNK.iter().any(|c| has_class(open, c))
     });
     crate::postprocess::normalize_whitespace(&html_to_text(&cleaned))
 }
@@ -2328,6 +2357,11 @@ pub fn extract_article_opts(
     // their prose otherwise vouches for itself everywhere).
     let quiz_stripped = strip_css_quizzes(html_in);
     let html_in = &quiz_stripped;
+    // Figure captions are furniture, not prose (see
+    // drop_figcaptions); no engine may see them. PhotoSwipe's
+    // hidden caption twins go with them.
+    let figcaption_stripped = drop_pswp_captions(&drop_figcaptions(html_in));
+    let html_in = &figcaption_stripped;
     // GSMArena's battery table arrives in the wrong order
     // (its sorter is a script we do not run); normalize first.
     let gsm_normalized;

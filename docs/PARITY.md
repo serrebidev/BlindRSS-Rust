@@ -7823,6 +7823,123 @@ key, tamper control rejected. Local gate on the ship
 tree: 995 tests passed, clippy zero on Linux and
 windows-gnu.
 
+## Extraction junk, reading-place loss, find bugs, tree shape (Brandon's reports, 2026-11-08; ships in v0.1.75)
+
+**Reports (Brandon, 2026-11-08, on v0.1.74), five items:**
+(1) Ars Technica full text carries the figure caption
+("Multicolored lines show undersea Internet cable
+routes...") plus duplicated "Credit:" / "TeleGeography"
+lines, and a rail tail of unrelated headlines. (2) The
+article text loses the reading place: Tab/Shift+Tab away
+and back lands at the very top — "a more important
+problem". (3) MacRumors full text carries a "Popular
+Stories" block mid-article and a footer tail (Push
+Notifications pitch, Videos/Guides/Roundups, Other
+Stories, author/date runs). (4) Windows Latest articles
+carry figcaption text with "Credit: Windows Latest"
+lines and end with "The post ... appeared first on
+Windows Latest". (5) Ctrl+F is broken two ways: Enter
+after typing leaves the cursor on the first line (an
+extra F3 is needed to reach the first match), and
+Shift+F3 at the first match announces nothing instead
+of "No more occurrences". (6) The tree opens on a
+visible "Feeds" parent that itself means "all articles";
+Python's root is hidden with All Articles / Favorites /
+categories side by side at the top level.
+
+**Extraction — reproduced through the real pipeline**
+(probe harness over the three live pages, fetched
+2026-11-08): Ars site path carried the figcaption twice
+(nested post-content divs) — the rich path once, plus a
+second hidden copy in the PhotoSwipe block
+(`pswp-caption-content`, not a figcaption element);
+MacRumors had no site branch, so the whole-page second
+opinion won and carried the Popular Stories rail
+(`data-track="popular-stories"`, outside `<article>`,
+glued into one paragraph: "Popular StoriesRIP, MacBook
+Ultra...") and story entries after the body; Windows
+Latest fell to the whole-page base engine with its
+figcaptions inline. The Ars rail tail did not reproduce
+in either path (his copy likely came via a route the
+probe does not exercise); no dedicated tail cut was
+needed once captions died at the source.
+
+**Fixes (extraction):** `drop_figcaptions` +
+`drop_pswp_captions` (extract.rs) run on the raw page in
+`extract_article_opts` before any engine reads it, and
+again inside `clean_article_html`; `publisher_body_text`
+and `publisher_body_fragment` also drop figcaption
+elements directly, so no path can resurrect them. The
+image itself stays (alt markers are a separate opt-in).
+Text-layer strips in postprocess.rs, wired into the
+dispatcher: `strip_macrumors_boilerplate` cuts at a
+paragraph starting "Popular Stories" (heading alone or
+glued), or at the footer anchors "Push Notifications" /
+"To Subscribe or Unsubscribe" / "Other Stories";
+`strip_windowslatest_boilerplate` cuts at the "The
+post ... appeared first on" syndication paragraph. Both
+return the original text if the cut would empty the
+article. Probe after the fix, all three live pages:
+caption/credit/rail/footer counts 0 in text AND rich
+paths, bodies intact. Regression cases in
+batch25_slice.rs cover the figcaption + pswp twin, the
+MacRumors rail (incl. a mid-sentence mention surviving)
+and the Windows Latest caption + footer.
+
+**Reading place (fix):** the main window's reader pane
+now captures (text, caret, selection) on focus-out and
+restores on focus-in only when the text is unchanged,
+consuming the capture so a later focus-in cannot
+resurrect a stale position over a fresh article
+(dialogs::keep_text_place does the same, position-only,
+for the article window, Article History text and Feed
+Errors detail — their text never changes under them).
+wx resets the native caret on focus gain; the restore
+runs in the SET_FOCUS handler, after that reset.
+Guarded by the source-scan test
+article_text_keeps_its_place_across_focus_changes.
+Brandon's NVDA pass is the acceptance check, as with
+every focus fix in this port.
+
+**Find (fix):** act_find read the search start AFTER
+prompt_focus closed the modal; the prompt round-trip
+(tree/list focus restore) had already reset the
+reader's caret to 0, so Enter searched from the top
+and its match selection did not survive focus landing
+on the list — the extra F3 "worked" because F3 starts
+from the selection end with focus already in the
+reader. The start is now captured before the prompt
+opens; a landed match takes focus via run_find's
+reader.set_focus(). Bug (5b) was a wording divergence,
+not a dead announce: the backward terminal miss said
+"No previous occurrences" while Python
+(_content_find_no_more) and Brandon's expectation both
+use "No more occurrences" for both directions — the
+backward action now uses that sentence. Guarded by
+find_searches_from_the_pre_prompt_place_and_announces_both_ends.
+
+**Tree (fix):** rebuild_tree's root is now the hidden
+wx root (TreeCtrlStyle::HideRoot at creation, Python's
+AddRoot("Root") shape): the visible top level is a new
+"All Articles" node (all-articles filter data "", the
+same value the root keeps for programmatic fallback),
+then Favorites, YouTube Recommendations when signed in,
+Smart Folders, the categories, and Uncategorized last,
+as before. Selection restore special-cases the empty
+filter to land on the visible All Articles node rather
+than the hidden root. Python also has a "Deleted
+Articles" top-level node; the port's Deleted Articles
+remains a dialog (recorded deviation since Audit 8 —
+restored_view_state maps deleted:all to All), unchanged
+here. Guarded by
+tree_is_flat_with_a_top_level_all_articles_node.
+This also resolves the stale PARITY note (v0.1.64
+section) that the port lacked an "All Articles" root
+node.
+
+Local gate and release verification are recorded below
+once run.
+
 ## Settings values silently not saving (Brandon's report, 2026-11-08; ships in v0.1.74)
 
 **Report (Brandon, 2026-11-08, on v0.1.73):** "settings

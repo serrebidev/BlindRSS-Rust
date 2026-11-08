@@ -4,6 +4,7 @@ use patois::t;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use wxdragon::event::webview_events::WebViewEvents;
+use wxdragon::event::window_events::WindowEvents;
 use wxdragon::prelude::*;
 use wxdragon::widgets::webview::{WebView, WebViewBackend};
 
@@ -164,6 +165,7 @@ fn open_impl(
     let reader = TextCtrl::builder(&frame)
         .with_style(TextCtrlStyle::MultiLine | TextCtrlStyle::ReadOnly | TextCtrlStyle::Rich2)
         .build();
+    crate::dialogs::keep_text_place(&reader);
     crate::msaa_names::set_name(&reader, &t("Article text"));
     reader.set_value(body);
     layout.add(&reader, 1, SizerFlag::Expand | SizerFlag::All, 4);

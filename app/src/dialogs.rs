@@ -14,9 +14,10 @@ use blindrss_core::Db;
 use blindrss_core::config::Config;
 use patois::t;
 use serde_json::{Value, json};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::Path;
 use std::rc::Rc;
+use wxdragon::event::window_events::WindowEvents;
 use wxdragon::prelude::*;
 
 /// (key, label) text fields, Python's TEXT_FIELDS order.
@@ -1214,6 +1215,37 @@ pub fn show_about(frame: &Frame) {
     dialog.destroy();
 }
 
+/// Wire caret place-keeping onto a read-only text control
+/// (Brandon's report, 2026-11-08): wx resets a text control's
+/// caret to the top when focus returns to it, so Tabbing away
+/// from the article text and back lost the reading place.
+/// Capture the insertion point and selection when focus
+/// leaves; restore them when focus returns. The capture is a
+/// plain position, so it stays valid for the control's whole
+/// life (the text never changes under it).
+pub(crate) fn keep_text_place(ctrl: &TextCtrl) {
+    let place = Rc::new(Cell::new((0_i64, 0_i64, 0_i64)));
+    // The handlers outlive this call, so they need the
+    // control by value (Copy handle), not the borrow.
+    let ctrl = *ctrl;
+    let saved = place.clone();
+    ctrl.on_kill_focus(move |_| {
+        let (from, to) = ctrl.get_selection();
+        saved.set((ctrl.get_insertion_point(), from, to));
+    });
+    ctrl.on_set_focus(move |_| {
+        // Consume the capture: a later focus-in with no
+        // intervening focus-out (a fresh value was set
+        // meanwhile) must not resurrect a stale position.
+        let (pos, from, to) = place.replace((0, 0, 0));
+        if from != to {
+            ctrl.set_selection(from, to);
+        } else if pos > 0 {
+            ctrl.set_insertion_point(pos);
+        }
+    });
+}
+
 /// A standalone article window (Python's ArticleWindow): the
 /// article text in its own frame, non-modal.
 /// Open Article dialog (Python's OpenArticleDialog, Audit 8
@@ -1313,6 +1345,7 @@ pub fn show_article_history(frame: &Frame, db: &Db, article: &blindrss_core::Art
     let text = TextCtrl::builder(&dialog)
         .with_style(TextCtrlStyle::MultiLine | TextCtrlStyle::ReadOnly)
         .build();
+    keep_text_place(&text);
     row.add(&text, 2, SizerFlag::Expand | SizerFlag::All, 4);
     sizer.add_sizer(&row, 1, SizerFlag::Expand | SizerFlag::All, 2);
     let close_btn = Button::builder(&dialog).with_label(&t("Close")).build();
@@ -2295,6 +2328,7 @@ pub fn show_feed_errors(frame: &Frame) -> bool {
     let detail = TextCtrl::builder(&dialog)
         .with_style(TextCtrlStyle::MultiLine | TextCtrlStyle::ReadOnly)
         .build();
+    keep_text_place(&detail);
     crate::msaa_names::set_name(&detail, &t("Error details"));
     sizer.add(&detail, 1, SizerFlag::Expand | SizerFlag::All, 4);
     let btn_row = BoxSizer::builder(Orientation::Horizontal).build();

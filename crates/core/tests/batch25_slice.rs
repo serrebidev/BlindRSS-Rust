@@ -476,6 +476,97 @@ fn ars_nested_body_sections_not_duplicated() {
     assert_eq!(text.matches("communications resilience matters").count(), 1);
 }
 
+// ---------------------------------------------------------------------
+// Brandon's 2026-11-08 reports: figure captions, the MacRumors
+// rail/footer, and the Windows Latest syndication line.
+// ---------------------------------------------------------------------
+
+#[test]
+fn ars_figure_caption_and_credit_lines_are_dropped() {
+    // The caption and its Credit lines rode the Ars site path
+    // twice (the figure sits in two nested post-content divs)
+    // and the rich reader once. A second, hidden copy rides
+    // in the PhotoSwipe lightbox block (pswp-caption-content,
+    // not a figcaption). All paths must drop them; the body
+    // around the figure stays.
+    let body = "The ships slowed down and looped over the cable corridor for days, behaviour that suggests mapping work rather than fishing. ".repeat(3);
+    let page = format!(
+        "<html><body><article><div class=\"post-content\"><p>{body}</p><div class=\"post-content\"><figure class=\"ars-wp-img-shortcode\"><div class=\"ars-lightbox\"><img alt=\"Map\" src=\"/m.jpg\"></div><figcaption><div class=\"caption-content\">Multicolored lines show the cable routes. <span class=\"caption-credit\">Credit: <a href=\"https://example.com\">TeleGeography</a></span></div></figcaption><div class=\"pswp-caption-content\"><div class=\"caption-content\">Multicolored lines show the cable routes. <span class=\"caption-credit\">Credit: TeleGeography</span></div></div></figure><p>{body}</p></div></div></article></body></html>"
+    );
+    let url = "https://arstechnica.com/gadgets/2026/11/ships/";
+    let text = article_text(&page, url);
+    assert!(text.contains("suggests mapping work"));
+    assert!(
+        !text.contains("Multicolored lines"),
+        "caption survived: {text}"
+    );
+    assert!(!text.contains("TeleGeography"), "credit survived: {text}");
+    assert!(!text.contains("Credit:"), "credit label survived: {text}");
+    let rich = blindrss_core::article_html::clean_article_html(&page, url, true);
+    let rich_text = blindrss_core::extract::html_to_text(&rich);
+    assert!(rich_text.contains("suggests mapping work"));
+    assert!(
+        !rich_text.contains("Multicolored lines"),
+        "rich caption survived: {rich_text}"
+    );
+    assert!(
+        !rich_text.contains("TeleGeography"),
+        "rich credit survived: {rich_text}"
+    );
+}
+
+#[test]
+fn macrumors_popular_stories_and_footer_are_cut() {
+    // Whole-page engines carry the "Popular Stories" rail
+    // into the middle of the article and the site footer
+    // after it; the postprocess strip cuts at the rail.
+    let body = "The new display looks as good as you would expect from a laptop at this price, with true blacks and no bloom around bright highlights on dark scenes. ".repeat(3);
+    let text_in = format!(
+        "{body}\n\nPopular Stories\n\nRIP, MacBook Ultra Apple today sent out invites for an experience in Los Angeles.\n\n{body}\n\nPush Notifications\n\nApple's Safari browser includes a feature that allows users to subscribe to push notifications.\n\nOther Stories\n\n1 day ago by Joe Rossignol"
+    );
+    let out = pp(
+        &text_in,
+        "https://www.macrumors.com/2026/11/06/oled-macbook-pro-hands-on/",
+    );
+    assert!(out.contains("true blacks and no bloom"));
+    assert!(!out.contains("Popular Stories"));
+    assert!(!out.contains("RIP, MacBook Ultra"));
+    assert!(!out.contains("Push Notifications"));
+    assert!(!out.contains("Other Stories"));
+    // A body paragraph that mentions the phrase mid-sentence
+    // is not a heading and must survive.
+    let mention =
+        format!("{body}\n\nHe listed the Popular Stories of the year in his talk, in full.");
+    let out2 = pp(
+        &mention,
+        "https://www.macrumors.com/2026/11/06/oled-macbook-pro-hands-on/",
+    );
+    assert!(out2.contains("in his talk, in full."));
+}
+
+#[test]
+fn windowslatest_caption_credit_and_syndication_line_are_dropped() {
+    // Captions (with "Credit: Windows Latest") come from
+    // figcaptions and die with them; the trailing "The post
+    // ... appeared first on Windows Latest" line is cut by
+    // the site strip even when an engine inlines it.
+    let body = "Microsoft is testing a welcome change to the sign-in screen, where you can type your PIN while Windows Hello is still checking your face. ".repeat(3);
+    let page = format!(
+        "<html><body><article><div class=\"entry-content\"><p>{body}</p><figure><img src=\"/a.jpg\" alt=\"Sign-in screen\"><figcaption>Windows 11 sign-in screen now shows PIN textbox. Credit: Windows Latest</figcaption></figure><p>{body}</p></div></article></body></html>"
+    );
+    let url = "https://www.windowslatest.com/2026/11/07/windows-hello-update/";
+    let text = article_text(&page, url);
+    assert!(text.contains("type your PIN"));
+    assert!(!text.contains("PIN textbox"), "caption survived: {text}");
+    assert!(!text.contains("Credit:"), "credit survived: {text}");
+    let with_footer = format!(
+        "{body}\n\nThe post Windows 11 won't make you wait appeared first on Windows Latest"
+    );
+    let out = pp(&with_footer, url);
+    assert!(out.contains("type your PIN"));
+    assert!(!out.contains("appeared first on"));
+}
+
 #[test]
 fn reuters_paragraph_nodes_only() {
     let html = r#"<html><body><div data-testid="ArticleBody">
