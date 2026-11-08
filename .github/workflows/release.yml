@@ -43,6 +43,19 @@ jobs:
             gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-libav gstreamer1.0-x \
             vlc ffmpeg
 
+      # Same patois/gettext requirement as ci.yml: without
+      # msgfmt the release binary ships no translations.
+      - name: Install gettext (patois catalog compilation)
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y gettext
+
+      - name: Put msgfmt on PATH (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          ls "C:/Program Files/Git/usr/bin/msgfmt.exe" || echo "msgfmt.exe not in Git userland"
+          echo "C:/Program Files/Git/usr/bin" >> "$GITHUB_PATH"
+
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: false
