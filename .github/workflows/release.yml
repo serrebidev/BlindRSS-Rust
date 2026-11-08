@@ -54,6 +54,9 @@ jobs:
         uses: msys2/setup-msys2@v2
         with:
           msystem: MSYS
+          # inherit puts usr/bin on PATH for the cargo steps;
+          # the default (minimal) only wires the msys2 shell.
+          path-type: inherit
           install: gettext
 
       - uses: Swatinem/rust-cache@v2
