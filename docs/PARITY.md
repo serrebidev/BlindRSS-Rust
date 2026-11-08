@@ -7874,8 +7874,156 @@ Brandon's retest on Windows is the acceptance check:
 closing Settings — Enter in a field above all — must
 be silent.
 
-Local gate and release verification are recorded below
-once run.
+VERIFIED 2026-11-08: local gate green (fmt, clippy
+-D warnings, 1005 tests, build). Main CI 42514860532
+success on all three OSes; tag v0.1.76 on 169ddaa;
+Release run 42517559278 success (three Package jobs +
+Publish). Direct API read: Latest = v0.1.76,
+draft=false, exactly the seven contract assets,
+release body identical to the CHANGELOG 0.1.76
+section. Signature: BlindRSS.tar.gz verifies VALID
+against the compiled-in key, tamper control rejected
+(verify-0176/).
+
+## MacRumors credits and glued footer, focus restore, refresh progress (Brandon's reports, 2026-11-08; ships in v0.1.77)
+
+**Reports (Brandon, 2026-11-08, on v0.1.75), four items:**
+(1) MacRumors image credits are still in articles, and
+worse than before: the credit glues onto the following
+paragraph ("Image credit: MacRumors forum member
+sniffiesIf you'd rather keep the logo dark, ...";
+example:
+https://www.macrumors.com/how-to/turn-glowing-apple-logo-macbook-pro/).
+(2) MacRumors articles still end with the site footer,
+in his copy as one fully glued blob ("Push
+NotificationsApple's Safari browser includes a feature
+that allows users to subscribe to "push" notifications
+... support@macrumors.com.To Subscribe or
+UnsubscribeVideosGuides ... Other Stories1 day ago by
+Joe Rossignol ..."). (3) Tab / Shift+Tab still returns
+the focus to the very top of the article text, "from
+anywhere in the text". (4) The Python app's status bar
+says which feed is being refreshed as a refresh runs
+("refreshing feed x, y of z"); the Rust app only said
+"refreshing 55 feeds" at the start.
+
+**Item 1 — root cause and fix.** The credit is not a
+figcaption (so the v0.1.75 figcaption drop never saw
+it): MacRumors prints it as a short standalone element
+after the image — `<div class="center-wrap"><em>Image
+credit: MacRumors forum member <a ...>sniffies</a></em></div>`
+— and text conversion glues it to the next paragraph.
+New `drop_image_credits` in extract.rs removes any
+short standalone element (div, p, span, em, aside,
+figure, section, td; raw span at most 1200 bytes,
+collapsed text at most 300 chars) whose text starts
+with "Image credit:" or "Image credits:". Outermost
+match wins; a long element that merely opens by
+discussing image credits is body text and survives
+(regression-tested). Wired into both pre-passes beside
+drop_figcaptions / drop_pswp_captions:
+extract_article_opts and article_html's
+clean_article_html. Probe-verified against the real
+how-to page fetched from this network: before the fix
+the classic output carried the credit glued to the
+prose and the rich output carried it as its own line;
+after, "Image credit" and "sniffies" count zero in
+both and the prose is intact. (Verification note: an
+early probe run appeared to clear the function while
+the outputs still carried the credit — that run was in
+fact the stale pre-fix binary, because the rebuild had
+died on a bindgen libclang failure after a VM package
+wipe while its wrapper command still exited 0. The
+function itself was proven directly, then the full
+cascade re-probed on a genuinely fresh build.)
+
+**Item 2 — root cause and fix.** The v0.1.75 strip
+only cut at paragraph starts. In the page variant
+Brandon's app is served, the footer arrives glued —
+onto the last body paragraph or as one blob — so no
+paragraph ever starts with a marker. (The variant does
+not reproduce from this network: the curl fetch of the
+same how-to page contains no footer at all, the same
+fingerprint split recorded in the v0.1.75 round. His
+pasted text is the fixture.) strip_macrumors_boilerplate
+now also cuts at the footer's unambiguous boilerplate
+anchors wherever they appear in the kept text: the
+"Apple's Safari browser includes a feature" pitch
+sentence (taking an immediately preceding "Push
+Notifications" heading with it), "To Subscribe or
+Unsubscribe", and "If you have any questions or
+problems, email support@macrumors.com". A bare "Push
+Notifications" substring is deliberately NOT an anchor
+(a how-to could legitimately bear that heading); the
+pitch sentence is the signature. Regression tests feed
+his pasted blob shape through postprocess, glued and
+subscribe-only.
+
+**Item 3 — root cause and fix.** The v0.1.75
+keep-place pair on the main window's reader was dead:
+wx's SearchDynamicEventTable runs dynamically bound
+handlers for one event in REVERSE connection order and
+stops at the first handler that does not skip
+(wxWidgets src/common/event.cpp). The pair was bound
+at the reader's build site; the mark-as-read-on-focus
+handler is bound later and never skips, so on
+SET_FOCUS it always ran first and consumed the event —
+the restore half never ran at all. (Kill-focus has no
+competitor, so the capture half worked, which is why
+the failure looked like "restore doesn't stick".) The
+pair now binds immediately AFTER the mark-read focus
+handlers in build_main_frame, with the rule recorded
+at the site; the scan test asserts the order. The
+article window reader, article history, and Feed
+Errors detail have no competing focus handlers (grep
+verified) and keep dialogs::keep_text_place as wired
+in v0.1.75. Brandon's retest is the acceptance check,
+above all in the main window; if the article window
+still loses its place on Windows after this, that is
+a separate MSW-specific behaviour needing fresh
+investigation, not covered by this fix's claim.
+
+**Item 4 — Python parity.** Python
+gui/mainframe.py: `_begin_refresh_activity` posts
+"Refreshing feeds..." for a full refresh (total = the
+feed count), "Refreshing feed: {title}..." for one
+feed (no total — the title says more than "1 out of
+1"), "Refreshing category: {name}..." for a category,
+"Refreshing imported feeds..." for OPML imports;
+`_note_refresh_progress_feed` counts DISTINCT feed ids
+(retries count once) and `_refresh_progress_counts`
+never lets the total fall behind the done count;
+`_set_feed_activity_status` posts "Checked {done} out
+of {total}" per success and "Error checking: {title}
+({done} out of {total})" per failure (without a total:
+"Checked: {title}" / "Error checking: {title}"). The
+Rust port mirrors this: State gains refresh_total and
+refresh_seen (a HashSet of feed ids); the four start
+sites set them and use Python's start lines (the old
+"Refreshing {} feeds..." and "Refreshing {}
+({} feeds)..." lines are gone; the single-feed line
+becomes "Refreshing feed: {title}..."); the drain's
+FeedDone arms count and post the per-feed lines,
+replacing the error arm's "{title}: {error}" status
+(the error itself still lands in Feed Errors). The
+end-of-refresh line is unchanged ("Refresh complete:
+N new articles" is a Rust-side summary Brandon has not
+objected to; his report was about progress DURING the
+refresh). Guarded by the scan test
+refresh_status_counts_feeds_as_they_finish. OPML-import
+refresh keeps its existing wording (Python's
+"Refreshing imported feeds..." has no per-feed
+counterpart wired there either — recorded as a
+deviation candidate if Brandon flags it).
+
+Regression coverage: core tests
+macrumors_image_credit_div_is_dropped_not_glued and
+macrumors_glued_footer_is_cut_at_its_anchors in
+crates/core/tests/batch25_slice.rs; app scan tests
+refresh_status_counts_feeds_as_they_finish and the
+extended article_text_keeps_its_place_across_focus_changes
+(bind-order assert). Local gate and release
+verification are recorded below once run.
 
 ## Extraction junk, reading-place loss, find bugs, tree shape (Brandon's reports, 2026-11-08; ships in v0.1.75)
 

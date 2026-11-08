@@ -1956,6 +1956,15 @@ struct State {
     refresh_new: Vec<blindrss_core::notify::FeedBatch>,
     /// Any feed failed in the running refresh (error sound).
     refresh_failed: bool,
+    /// Per-feed progress for the running refresh batch
+    /// (Python's `_refresh_progress_total` / `_seen`,
+    /// issue #85 there): how many feeds the batch holds and
+    /// which feed ids have finished, so the status line can
+    /// count "Checked X out of Y" as feeds complete instead
+    /// of only naming the batch size at the start (Brandon's
+    /// report, 2026-11-08).
+    refresh_total: usize,
+    refresh_seen: std::collections::HashSet<String>,
     /// Article stub for an in-flight queue playback resolve (the
     /// article may not be in the current list).
     pending_play: Option<Article>,
@@ -4122,33 +4131,13 @@ fn main() {
         let reader = TextCtrl::builder(&right)
             .with_style(TextCtrlStyle::MultiLine | TextCtrlStyle::ReadOnly | TextCtrlStyle::Rich2)
             .build();
-        // Reading place survives Tab away and back
-        // (Brandon's report, 2026-11-08): capture the caret
-        // on focus-out, restore it on focus-in — but only
-        // while the text is unchanged; a fresh article
-        // replaces the value and resets the place below.
-        let reader_place = Rc::new(std::cell::Cell::new((String::new(), 0_i64, 0_i64, 0_i64)));
-        {
-            let saved = reader_place.clone();
-            reader.on_kill_focus(move |_| {
-                let (from, to) = reader.get_selection();
-                saved.set((reader.get_value(), reader.get_insertion_point(), from, to));
-            });
-            let saved = reader_place.clone();
-            reader.on_set_focus(move |_| {
-                let (text, pos, from, to) = saved.replace((String::new(), 0, 0, 0));
-                if !text.is_empty() && reader.get_value() == text {
-                    // wx has already reset the native caret by
-                    // the time SET_FOCUS fires; restore after
-                    // the event's default handling completes.
-                    if from != to {
-                        reader.set_selection(from, to);
-                    } else if pos > 0 {
-                        reader.set_insertion_point(pos);
-                    }
-                }
-            });
-        }
+        // The reader's reading-place capture/restore binds
+        // AFTER the mark-read focus handler further down
+        // (see the "Reading place survives Tab away" block):
+        // wx runs dynamically bound handlers for one event
+        // in reverse connection order and stops at the first
+        // that does not skip, so a focus handler bound here
+        // would never run at all.
         msaa_names::set_name(&list, &t("Articles"));
         msaa_names::set_name(&reader, &t("Article text"));
 
@@ -4283,6 +4272,8 @@ fn main() {
             pending_play_gen: 0,
             refresh_new: Vec::new(),
             refresh_failed: false,
+            refresh_total: 0,
+            refresh_seen: std::collections::HashSet::new(),
             search_focused: false,
             expanded_cats: std::collections::HashSet::new(),
             collapsed_cats: std::collections::HashSet::new(),
@@ -4590,6 +4581,42 @@ fn main() {
             });
         }
 
+        // Reading place survives Tab away and back
+        // (Brandon's reports, 2026-11-08): capture the caret
+        // on focus-out, restore it on focus-in — but only
+        // while the text is unchanged; a fresh article
+        // replaces the value and resets the place below.
+        // This pair MUST stay bound after the mark-read
+        // handler above: wx's SearchDynamicEventTable runs
+        // dynamically bound handlers for one event in
+        // REVERSE connection order and stops at the first
+        // handler that does not skip (wxWidgets
+        // src/common/event.cpp), and neither handler skips.
+        // In v0.1.75 this pair was bound at the reader's
+        // build site, before the mark-read handler existed,
+        // so on SET_FOCUS the mark-read handler always ran
+        // first and consumed the event — the restore never
+        // ran at all and Tab back still landed at the top.
+        let reader_place = Rc::new(std::cell::Cell::new((String::new(), 0_i64, 0_i64, 0_i64)));
+        {
+            let saved = reader_place.clone();
+            reader.on_kill_focus(move |_| {
+                let (from, to) = reader.get_selection();
+                saved.set((reader.get_value(), reader.get_insertion_point(), from, to));
+            });
+            let saved = reader_place.clone();
+            reader.on_set_focus(move |_| {
+                let (text, pos, from, to) = saved.replace((String::new(), 0, 0, 0));
+                if !text.is_empty() && reader.get_value() == text {
+                    if from != to {
+                        reader.set_selection(from, to);
+                    } else if pos > 0 {
+                        reader.set_insertion_point(pos);
+                    }
+                }
+            });
+        }
+
         // Refresh: worker threads fetch + parse; results return over a
         // channel; a timer drains them on the main thread, which owns
         // the database connection.
@@ -4883,6 +4910,8 @@ fn main() {
                 st.refreshing = true;
                 st.refresh_new.clear();
                 st.refresh_failed = false;
+                st.refresh_total = st.feeds.len();
+                st.refresh_seen.clear();
                 st.cancel_refresh
                     .store(false, std::sync::atomic::Ordering::Relaxed);
                 st.refresh_stopped
@@ -4893,7 +4922,7 @@ fn main() {
                     st.refresh_stopped.clone(),
                 )
             };
-            frame_btn.set_status_text(&format!("Refreshing {} feeds...", feeds.len()), 0);
+            frame_btn.set_status_text("Refreshing feeds...", 0);
             announce("start_update", "Refresh Feeds");
             spawn_refresh(feeds, tx_refresh.clone(), cancel, stopped, force_full);
         });
@@ -4924,13 +4953,15 @@ fn main() {
                     st.refreshing = true;
                     st.refresh_new.clear();
                     st.refresh_failed = false;
+                    st.refresh_total = feeds.len();
+                    st.refresh_seen.clear();
                     st.cancel_refresh
                         .store(false, std::sync::atomic::Ordering::Relaxed);
                     st.refresh_stopped
                         .store(false, std::sync::atomic::Ordering::Relaxed);
                     (st.cancel_refresh.clone(), st.refresh_stopped.clone())
                 };
-                frame_sub.set_status_text(&format!("Refreshing {} feeds...", feeds.len()), 0);
+                frame_sub.set_status_text("Refreshing feeds...", 0);
                 announce("start_update", "Refresh Feeds");
                 spawn_refresh(feeds, tx_sub.clone(), cancel, stopped, force_full);
             })
@@ -4956,6 +4987,11 @@ fn main() {
                     if found.is_some() {
                         st.refresh_paused_until = None;
                         st.refreshing = true;
+                        // Python: a single feed carries no
+                        // total — its title says more than
+                        // "1 out of 1".
+                        st.refresh_total = 0;
+                        st.refresh_seen.clear();
                     }
                     found
                 };
@@ -4963,7 +4999,7 @@ fn main() {
                     frame_rf.set_status_text("Select a feed in the tree first", 0);
                     return;
                 };
-                frame_rf.set_status_text(&format!("Refreshing {}...", feed.title), 0);
+                frame_rf.set_status_text(&format!("Refreshing feed: {}...", feed.title), 0);
                 announce("start_update", "Refresh Feeds");
                 // Hosted feeds refresh through their provider's
                 // per-feed path, not by fetching the site.
@@ -8224,6 +8260,8 @@ fn main() {
                     }
                     st.refresh_paused_until = None;
                     st.refreshing = true;
+                    st.refresh_total = feeds.len();
+                    st.refresh_seen.clear();
                     st.cancel_refresh
                         .store(false, std::sync::atomic::Ordering::Relaxed);
                     st.refresh_stopped
@@ -8236,10 +8274,7 @@ fn main() {
                     )
                 };
                 let (feeds, cancel, stopped, path) = work;
-                frame_rc.set_status_text(
-                    &format!("Refreshing {} ({} feeds)...", path, feeds.len()),
-                    0,
-                );
+                frame_rc.set_status_text(&format!("Refreshing category: {path}..."), 0);
                 announce("start_update", "Refresh Feeds");
                 spawn_refresh(feeds, tx_rc.clone(), cancel, stopped, true);
             })
@@ -10565,14 +10600,51 @@ fn main() {
                                 resolved: Vec::new(),
                             });
                         }
+                        // Python's per-feed progress status
+                        // (_set_feed_activity_status, Brandon's
+                        // report 2026-11-08): count distinct
+                        // feeds as they finish so the status
+                        // line says how far the refresh has got
+                        // and, without a batch total, which feed
+                        // was just checked.
+                        st.refresh_seen.insert(feed.id.clone());
+                        let done = st.refresh_seen.len();
+                        let total = st.refresh_total.max(done);
+                        if total > 0 {
+                            frame_tick.set_status_text(
+                                &format!("Checked {done} out of {total}"),
+                                0,
+                            );
+                        } else {
+                            frame_tick.set_status_text(&format!("Checked: {}", feed.title), 0);
+                        }
                     }
-                    Ok(RefreshMsg::FeedDone(path, feed, Err(e))) => {
+                    Ok(RefreshMsg::FeedDone(path, feed, Err(_e))) => {
                         let mut st = state_tick.borrow_mut();
                         if path != st.store_path {
                             continue;
                         }
                         st.refresh_failed = true;
-                        frame_tick.set_status_text(&format!("{}: {e}", feed.title), 0);
+                        // Python's wording for a failed check
+                        // (_set_feed_activity_status); the raw
+                        // error still lands in Feed Errors.
+                        st.refresh_seen.insert(feed.id.clone());
+                        let done = st.refresh_seen.len();
+                        let total = st.refresh_total.max(done);
+                        if total > 0 {
+                            frame_tick.set_status_text(
+                                &format!(
+                                    "Error checking: {} ({done} out of {total})",
+                                    feed.title
+                                ),
+                                0,
+                            );
+                        } else {
+                            frame_tick.set_status_text(
+                                &format!("Error checking: {}", feed.title),
+                                0,
+                            );
+                        }
                     }
                     Ok(RefreshMsg::Added(_url, Ok(feed), _add_category)) => {
                         // The subscribe worker resolved, inserted
@@ -12249,6 +12321,41 @@ mod ui_parity_tests {
     }
 
     #[test]
+    fn refresh_status_counts_feeds_as_they_finish() {
+        // Brandon's report (2026-11-08): the Python app's
+        // status bar says which feed is being refreshed —
+        // "Checked 12 out of 55" as feeds finish — while
+        // the Rust app only announced the batch size at the
+        // start ("Refreshing 55 feeds...") and then said
+        // nothing per feed. The drain now counts distinct
+        // finished feeds against the batch total with
+        // Python's wording, and the start lines use
+        // Python's single-feed / category forms.
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let main = std::fs::read_to_string(src_dir.join("main.rs")).unwrap();
+        let impl_src = main.split("mod ui_parity_tests").next().unwrap();
+        for needle in [
+            "Checked {done} out of {total}",
+            "Error checking: {} ({done} out of {total})",
+            "Checked: {}",
+            "Error checking: {}",
+            "Refreshing feed: {}...",
+            "Refreshing category: {path}...",
+            "refresh_seen",
+        ] {
+            assert!(
+                impl_src.contains(needle),
+                "missing refresh progress piece: {needle}"
+            );
+        }
+        let stale = format!("Refreshing {{}} {}...", "feeds");
+        assert!(
+            !impl_src.contains(&stale),
+            "the batch-size-only start line came back"
+        );
+    }
+
+    #[test]
     fn article_text_keeps_its_place_across_focus_changes() {
         // Brandon's report (2026-11-08): Tabbing away from
         // the article text and back put him at the very top
@@ -12261,15 +12368,32 @@ mod ui_parity_tests {
         // window and the dialogs that reuse it.
         let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let main = std::fs::read_to_string(src_dir.join("main.rs")).unwrap();
-        let start = main.find("let reader = TextCtrl::builder(&right)").unwrap();
-        let window = &main[start..(start + 3000).min(main.len())];
         assert!(
-            window.contains("reader.on_kill_focus"),
+            main.contains("reader.on_kill_focus"),
             "main reader lost its caret capture"
         );
+        // wx runs dynamically bound handlers for one event
+        // in reverse connection order and stops at the
+        // first that does not skip, so the reader's restore
+        // handler must be bound AFTER the mark-read focus
+        // handler (the v0.1.75 build bound it at the build
+        // site, before mark-read existed, and the restore
+        // never ran — Brandon's Tab still landed at the
+        // top). The restore is the LAST reader.on_set_focus
+        // in the file and reads the reader_place capture.
+        let impl_src = main.split("mod ui_parity_tests").next().unwrap();
+        let mark_read = impl_src
+            .find("mark_selected_read_opened(&mut st, &frame_rf)")
+            .unwrap();
+        let restore = impl_src.rfind("reader.on_set_focus").unwrap();
         assert!(
-            window.contains("reader.on_set_focus"),
-            "main reader lost its caret restore"
+            restore > mark_read,
+            "main reader caret restore must bind after the mark-read focus handler"
+        );
+        let restore_window = &impl_src[restore..(restore + 700).min(impl_src.len())];
+        assert!(
+            restore_window.contains("reader_place") || restore_window.contains("saved.replace"),
+            "last reader.on_set_focus is not the caret restore"
         );
         let dialogs = std::fs::read_to_string(src_dir.join("dialogs.rs")).unwrap();
         assert!(dialogs.contains("pub(crate) fn keep_text_place"));
@@ -12576,6 +12700,8 @@ mod ui_parity_tests {
                 menu_label_bases: std::collections::HashMap::new(),
                 refresh_new: Vec::new(),
                 refresh_failed: false,
+                refresh_total: 0,
+                refresh_seen: std::collections::HashSet::new(),
                 pending_play: None,
                 pending_queue: None,
                 pending_play_gen: 0,

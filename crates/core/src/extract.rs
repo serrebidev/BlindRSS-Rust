@@ -1034,6 +1034,75 @@ pub fn drop_pswp_captions(html: &str) -> String {
     out
 }
 
+/// Drop standalone image-credit elements (Brandon's
+/// report, 2026-11-08): MacRumors prints credits outside
+/// any `<figcaption>`, as `<div class="center-wrap"><em>`
+/// "Image credit: MacRumors forum member sniffies" `</em>`
+/// `</div>` right after the image, so the figcaption drop
+/// never saw them — and the text engines glue the credit
+/// onto the following paragraph. An element whose whole
+/// text starts with "Image credit:" / "Image credits:"
+/// and stays short is a credit line, not prose; drop the
+/// element. The raw-size gate keeps big containers (the
+/// article body itself) out of the text check entirely.
+pub fn drop_image_credits(html: &str) -> String {
+    const CANDIDATES: &[&str] = &["div", "p", "span", "em", "aside", "figure", "section", "td"];
+    let toks = tag_tokens(html);
+    let mut removals: Vec<(usize, usize)> = Vec::new();
+    let mut cursor = 0usize;
+    let mut i = 0usize;
+    while i < toks.len() {
+        let tok = &toks[i];
+        if tok.close
+            || tok.self_closing
+            || tok.start < cursor
+            || !CANDIDATES.contains(&tok.name.as_str())
+        {
+            i += 1;
+            continue;
+        }
+        let mut depth = 1usize;
+        let mut j = i + 1;
+        let mut span: Option<(usize, usize)> = None;
+        while j < toks.len() {
+            let t2 = &toks[j];
+            if t2.name == tok.name {
+                if t2.close {
+                    depth -= 1;
+                    if depth == 0 {
+                        span = Some((t2.start, t2.end));
+                        break;
+                    }
+                } else if !t2.self_closing {
+                    depth += 1;
+                }
+            }
+            j += 1;
+        }
+        let Some((inner_end, end)) = span else {
+            i += 1;
+            continue;
+        };
+        if end - tok.start <= 1200 {
+            let text = leaf_text(&html[tok.end..inner_end]);
+            let lower = text.to_lowercase();
+            if text.len() <= 300
+                && (lower.starts_with("image credit:") || lower.starts_with("image credits:"))
+            {
+                removals.push((tok.start, end));
+                cursor = end;
+                i = j + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    if removals.is_empty() {
+        return html.to_string();
+    }
+    remove_spans(html, removals)
+}
+
 /// Reuters dedicated extractor (Python `_extract_reuters_text`):
 /// the `data-testid="paragraph-N"` nodes inside
 /// `data-testid="ArticleBody"`, >= 200 chars.
@@ -2359,8 +2428,10 @@ pub fn extract_article_opts(
     let html_in = &quiz_stripped;
     // Figure captions are furniture, not prose (see
     // drop_figcaptions); no engine may see them. PhotoSwipe's
-    // hidden caption twins go with them.
-    let figcaption_stripped = drop_pswp_captions(&drop_figcaptions(html_in));
+    // hidden caption twins go with them, and standalone
+    // "Image credit:" elements (MacRumors prints credits
+    // outside any figcaption) go too.
+    let figcaption_stripped = drop_image_credits(&drop_pswp_captions(&drop_figcaptions(html_in)));
     let html_in = &figcaption_stripped;
     // GSMArena's battery table arrives in the wrong order
     // (its sorter is a script we do not run); normalize first.

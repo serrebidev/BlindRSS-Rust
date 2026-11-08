@@ -996,8 +996,9 @@ pub fn clean_article_html(html: &str, url: &str, use_traf_prune: bool) -> String
     // Captions go before any pick reads the page, in step
     // with the text cascade (Brandon's reports, 2026-11-08):
     // figure captions and PhotoSwipe's hidden caption twins.
-    let caption_stripped =
-        crate::extract::drop_pswp_captions(&crate::extract::drop_figcaptions(html));
+    let caption_stripped = crate::extract::drop_image_credits(&crate::extract::drop_pswp_captions(
+        &crate::extract::drop_figcaptions(html),
+    ));
     let html = &caption_stripped;
     // Some layouts have no single node that holds the whole body,
     // so it is rebuilt before the generic pick, in Python's order:

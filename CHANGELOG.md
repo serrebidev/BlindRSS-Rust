@@ -6,6 +6,13 @@ as `0.1.2-0.1.3`. Each release's section below is its GitHub release note,
 taken from this file by the release workflow. The in-app updater shows the
 same text.
 
+## 0.1.77
+
+- Fixed MacRumors image credits still appearing in articles. The credit is not part of a figure caption — MacRumors prints it as a short line of its own after the photo ("Image credit: MacRumors forum member ..."), and it was gluing itself onto the next paragraph. Standalone image credit lines are now removed before the article is read, in the plain text view and the HTML view alike.
+- Fixed the MacRumors footer still appearing at the end of articles when it arrives glued onto the article text with no paragraph break (push notifications pitch, subscribe links, Videos and Guides lists, Other Stories). The footer is now cut at its own wording wherever it starts, not only when it begins a paragraph.
+- Fixed the article text still losing your place when you Tab away and back in the main window. The first fix for this was in place but never ran: another focus handler, bound after it, was taking the event first (wxWidgets runs focus handlers in reverse binding order). The reading-place restore is now bound last, so it actually runs. Your place is kept, and a new article still starts at the top.
+- The status bar now reports refresh progress the way the Python version does. A full refresh counts "Checked 12 out of 55" as feeds finish, a failed feed names itself ("Error checking: Site Name (12 out of 55)"), refreshing one feed says "Refreshing feed: Site Name...", and a category refresh says "Refreshing category: Name...". Before, a refresh only announced the total number of feeds at the start and then went quiet.
+
 ## 0.1.76
 
 - Fixed an extra chime or ding when the Settings dialog closes. The Save and Cancel buttons now carry the standard dialog button ids, the way the Python version's OK and Cancel buttons do, so pressing Enter in a field to save and close no longer falls through to the Windows default beep.

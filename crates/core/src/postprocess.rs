@@ -669,15 +669,60 @@ pub fn strip_macrumors_boilerplate(text: &str) -> String {
             break;
         }
     }
-    if cut == paras.len() {
-        return text.to_string();
-    }
-    let kept = paras[..cut].join("\n\n").trim().to_string();
-    if kept.is_empty() {
+    let kept = if cut == paras.len() {
         text.to_string()
     } else {
-        kept
+        let kept = paras[..cut].join("\n\n").trim().to_string();
+        if kept.is_empty() {
+            text.to_string()
+        } else {
+            kept
+        }
+    };
+    // Glued variant (Brandon's pasted text, 2026-11-08, on
+    // v0.1.75): in the page variant his app is served, the
+    // whole footer flattens into the last body text with no
+    // paragraph break anywhere ("...Push
+    // NotificationsApple's Safari browser includes a feature
+    // that allows users to subscribe..."), so no paragraph
+    // starts with a marker and the cuts above never fire.
+    // Cut at the footer's unambiguous boilerplate anchors
+    // wherever they appear in the text.
+    let mut byte_cut: Option<usize> = None;
+    let mut note = |idx: usize| {
+        byte_cut = Some(match byte_cut {
+            Some(c) => c.min(idx),
+            None => idx,
+        });
+    };
+    if let Some(pos) = kept.find("Apple's Safari browser includes a feature") {
+        // The "Push Notifications" heading sits immediately
+        // before the pitch sentence (glued or spaced); take
+        // the heading with the tail when it is the suffix of
+        // what precedes.
+        let before = kept[..pos].trim_end();
+        match before.rfind("Push Notifications") {
+            Some(label) if label + "Push Notifications".len() == before.len() => note(label),
+            _ => note(pos),
+        }
     }
+    if let Some(pos) = kept.find("To Subscribe or Unsubscribe") {
+        note(pos);
+    }
+    if let Some(pos) =
+        kept.find("If you have any questions or problems, email support@macrumors.com")
+    {
+        note(pos);
+    }
+    if let Some(c) = byte_cut
+        && c > 0
+    {
+        let out = kept[..c].trim_end().to_string();
+        if !out.is_empty() {
+            return out;
+        }
+    }
+    kept
 }
 
 /// Windows Latest (Brandon's report, 2026-11-08): every

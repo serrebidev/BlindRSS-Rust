@@ -545,6 +545,96 @@ fn macrumors_popular_stories_and_footer_are_cut() {
 }
 
 #[test]
+fn macrumors_image_credit_div_is_dropped_not_glued() {
+    // Brandon's report (2026-11-08, on v0.1.75): the credit
+    // survived and, worse, glued itself onto the next
+    // paragraph ("...forum member sniffiesIf you'd rather
+    // keep the logo dark..."). The credit is not a
+    // figcaption: it is a short standalone div whose text
+    // starts "Image credit:", dropped at the HTML level.
+    let body = "The new display looks as good as you would expect from a laptop at this price, with true blacks and no bloom around bright highlights on dark scenes. ".repeat(3);
+    let page = format!(
+        "<html><body><article><div class=\"entry-content\"><p>{body}</p><p><img src=\"/logo.jpg\" class=\"aligncenter size-full\" /></p><div class=\"center-wrap\"><em>Image credit: MacRumors forum member <a href=\"https://forums.macrumors.com/threads/x\">sniffies</a></em></div><br /><p>If you'd rather keep the logo dark, Apple has shared a way to turn it off. Unusually though, there's no switch in System Settings.</p><p>{body}</p></div></article></body></html>"
+    );
+    let url = "https://www.macrumors.com/how-to/turn-glowing-apple-logo-macbook-pro/";
+    let text = article_text(&page, url);
+    assert!(text.contains("If you'd rather keep the logo dark"));
+    assert!(
+        !text.contains("Image credit"),
+        "classic credit survived: {text}"
+    );
+    assert!(
+        !text.contains("sniffies"),
+        "classic credit name survived: {text}"
+    );
+    let rich = blindrss_core::article_html::clean_article_html(&page, url, true);
+    let rich_text = blindrss_core::extract::html_to_text(&rich);
+    assert!(rich_text.contains("If you'd rather keep the logo dark"));
+    assert!(
+        !rich_text.contains("Image credit"),
+        "rich credit survived: {rich_text}"
+    );
+    assert!(
+        !rich_text.contains("sniffies"),
+        "rich credit name survived: {rich_text}"
+    );
+    // A long element that merely OPENS by discussing image
+    // credits is body text, not a credit line: the drop only
+    // fires on short standalone elements.
+    let discussion = format!(
+        "<html><body><article><div class=\"entry-content\"><p>Image credit: this explainer walks through how credit lines work, who writes them, why photographers insist on them, how editors trim them for space, and what happens to syndicated copies when the credit is stripped away in transit between wire services and the papers that republish their pictures every single day of the week.</p><p>{body}</p></div></article></body></html>"
+    );
+    let text2 = article_text(&discussion, url);
+    assert!(
+        text2.contains("how credit lines work"),
+        "long credit discussion wrongly dropped: {text2}"
+    );
+}
+
+#[test]
+fn macrumors_glued_footer_is_cut_at_its_anchors() {
+    // Brandon's pasted text (2026-11-08, on v0.1.75): in the
+    // page variant his app is served, the whole footer is
+    // ONE glued blob — no paragraph break before "Push
+    // Notifications", and it runs straight into "Other
+    // Stories" — so the paragraph-start cuts never fired.
+    // The strip now also cuts at the footer's unambiguous
+    // boilerplate anchors wherever they appear.
+    let body = "The new display looks as good as you would expect from a laptop at this price, with true blacks and no bloom around bright highlights on dark scenes. ".repeat(3);
+    let glued = format!(
+        "{body}Push NotificationsApple's Safari browser includes a feature that allows users to subscribe to \"push\" notifications from any website. Pushes show up as notification badges on the top right of your screen and can be used to be instantly notified when there are new MacRumors stories.If you have any questions or problems, email support@macrumors.com.To Subscribe or UnsubscribeVideosGuidesOur comprehensive guide highlighting every major new addition in iOS 27.Other Stories1 day ago by Joe Rossignol3 days ago by Tim Hardwick"
+    );
+    let url = "https://www.macrumors.com/how-to/turn-glowing-apple-logo-macbook-pro/";
+    let out = pp(&glued, url);
+    assert!(out.contains("true blacks and no bloom"), "body lost: {out}");
+    assert!(
+        !out.contains("Push Notifications"),
+        "push block survived: {out}"
+    );
+    assert!(
+        !out.contains("support@macrumors.com"),
+        "support line survived: {out}"
+    );
+    assert!(
+        !out.contains("To Subscribe"),
+        "subscribe tail survived: {out}"
+    );
+    assert!(
+        !out.contains("Other Stories"),
+        "stories tail survived: {out}"
+    );
+    // The subscribe anchor alone also cuts, even without
+    // the push block before it.
+    let glued2 = format!("{body}To Subscribe or UnsubscribeVideosGuides trailing junk");
+    let out2 = pp(&glued2, url);
+    assert!(out2.contains("true blacks and no bloom"));
+    assert!(
+        !out2.contains("To Subscribe"),
+        "subscribe-only tail survived: {out2}"
+    );
+}
+
+#[test]
 fn windowslatest_caption_credit_and_syndication_line_are_dropped() {
     // Captions (with "Credit: Windows Latest") come from
     // figcaptions and die with them; the trailing "The post
