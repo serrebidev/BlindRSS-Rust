@@ -7822,3 +7822,29 @@ BlindRSS.tar.gz signature VALID against the compiled-in
 key, tamper control rejected. Local gate on the ship
 tree: 995 tests passed, clippy zero on Linux and
 windows-gnu.
+
+## Settings close crash (Brandon's report, 2026-11-07; ships in v0.1.73)
+
+Report: open Settings, do nothing, press Escape — the app
+crashes. Root cause proven from the code and the wxdragon
+sources: the v0.1.71 async soundcard fill runs on a
+`Box::leak`ed wxTimer started at 100 ms. wxdragon's
+`wxd_Timer_Create` makes a plain wxTimer whose owner is
+only the event sink, so destroying the dialog does not
+stop the timer, and the tick only disarmed itself when
+the libVLC enumeration landed. Any close (Escape, Cancel,
+OK) that beat the enumeration left the timer firing into
+destroyed controls — `soundcard_choice.clear()/append()`
+on a dead wxChoice. The codebase's frame-owned leaked
+timers all stop in `on_close` (player, article window,
+cast queue); the seven dialog-owned ones had no stop
+anywhere. Fix: stop-before-destroy at every dialog site —
+show_settings (soundcard + OpenRouter timers, both
+hoisted to function scope so the end of the function can
+stop them after show_modal), the Inoreader sign-in wait
+dialog, and dialogs.rs' show_video_search,
+show_feed_errors, show_youtube_signin and
+show_import_cookies. A source-scan regression test
+(`dialog_owned_timers_stop_before_the_dialog_is_destroyed`)
+holds the rule, including the stop-after-show_modal-
+before-destroy order in show_settings.

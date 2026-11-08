@@ -6,6 +6,10 @@ as `0.1.2-0.1.3`. Each release's section below is its GitHub release note,
 taken from this file by the release workflow. The in-app updater shows the
 same text.
 
+## 0.1.73
+
+- Opening Settings and closing it again — with Escape, Cancel, or OK — could crash the app if the soundcard list had not finished loading yet: the background timer that fills the list in kept running after the window was gone and wrote into its controls. Fixed: the window's background timers now stop before the window closes. The same latent fault was fixed in the Video Search, Feed Errors, YouTube sign-in, and Import Cookies windows, which shared the pattern.
+
 ## 0.1.72
 
 - Interface translations now run on patois (the gettext system by Quin that Paperback uses): the 15 language catalogs are compiled into the app itself instead of shipping as a folder of files, and wxWidgets' own stock strings — standard dialog buttons and the like — follow the same interface language for the first time. One visible removal: the Translation Updates settings are gone, because translations now arrive with app releases rather than downloading separately between them. Regional catalogs that existed but could never be selected before, such as Flemish (nl_BE), now work.

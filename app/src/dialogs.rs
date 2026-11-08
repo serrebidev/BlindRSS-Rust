@@ -2028,6 +2028,7 @@ pub fn show_video_search(
     } else {
         None
     };
+    timer.stop();
     dialog.destroy();
     picked
 }
@@ -2509,6 +2510,7 @@ pub fn show_feed_errors(frame: &Frame) -> bool {
     let d = dialog;
     close_btn.on_click(move |_| d.end_modal(5100));
     dialog.show_modal();
+    timer.stop();
     dialog.destroy();
     *changed.borrow()
 }
@@ -3997,6 +3999,7 @@ pub fn show_youtube_signin(frame: &impl WxWidget, config_path: &Path) {
     dialog.set_sizer(sizer, true);
     dialog.set_size(Size::new(520, 260));
     dialog.show_modal();
+    timer.stop();
     dialog.destroy();
 }
 
@@ -4373,6 +4376,7 @@ pub fn show_import_cookies(frame: &Frame, config_path: &Path) {
         }
     });
     dialog.show_modal();
+    timer.stop();
     dialog.destroy();
 }
 

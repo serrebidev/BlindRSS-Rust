@@ -408,6 +408,7 @@ fn inoreader_listener_connect(
     });
     timer.start(200, false);
     dialog2.show_modal();
+    timer.stop();
     dialog2.destroy();
 }
 
@@ -964,6 +965,10 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
         &label_refs,
         if saved_soundcard.is_empty() { 0 } else { 1 },
     );
+    // Hoisted to function scope so the end of show_settings
+    // can stop it before the dialog is destroyed (see the
+    // stop calls at the bottom of this function).
+    let sc_timer = &*Box::leak(Box::new(wxdragon::timer::Timer::new(&dialog)));
     {
         let slot: SoundcardSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
         {
@@ -973,7 +978,6 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
                 *slot_t.lock().unwrap_or_else(|p| p.into_inner()) = Some(devices);
             });
         }
-        let sc_timer = &*Box::leak(Box::new(wxdragon::timer::Timer::new(&dialog)));
         let sc_timer_stop = sc_timer;
         let options_t = soundcards_rc.clone();
         let saved_t = saved_soundcard.clone();
@@ -1633,13 +1637,16 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
     }
     // The OpenRouter load runs on a worker; a dialog timer
     // drains the result (the Translation Updates pattern).
+    // Hoisted to function scope (created unstarted; the
+    // if-let below starts it) so the end of show_settings
+    // can stop it before the dialog is destroyed.
+    let or_timer = &*Box::leak(Box::new(Timer::new(&dialog)));
     if let (Some(load_btn), Some(status), Some(model_combo), Some(key_field)) =
         (or_load_btn, or_status, or_model_combo, or_key_field)
     {
         let (or_tx, or_rx) = std::sync::mpsc::channel::<Result<Vec<String>, String>>();
         let or_rx = std::rc::Rc::new(std::cell::RefCell::new(or_rx));
         let or_loading = std::rc::Rc::new(std::cell::RefCell::new(false));
-        let or_timer = Box::leak(Box::new(Timer::new(&dialog)));
         or_timer.start(250, false);
         {
             let or_rx_tick = or_rx.clone();
@@ -2759,6 +2766,14 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
     });
 
     dialog.show_modal();
+    // Stop this dialog's timers before destroying it. They
+    // are leaked wxTimers: destroying the owner does not
+    // stop them, and a tick that lands afterwards writes
+    // into dead controls — the soundcard tick crashed the
+    // app when Settings closed before the enumeration
+    // landed (Brandon, 2026-11-07).
+    sc_timer.stop();
+    or_timer.stop();
     dialog.destroy();
     *intent.borrow()
 }

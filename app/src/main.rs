@@ -11713,6 +11713,72 @@ mod ui_parity_tests {
     }
 
     #[test]
+    fn dialog_owned_timers_stop_before_the_dialog_is_destroyed() {
+        // Crash (Brandon, 2026-11-07): open Settings, do
+        // nothing, press Escape — the app died. A leaked
+        // wxTimer is a plain wxTimer whose owner is only its
+        // event sink (wxd_Timer_Create): destroying the
+        // dialog does NOT stop it, and the Settings soundcard
+        // timer only disarmed itself when the libVLC
+        // enumeration landed. A close that beat the
+        // enumeration left it firing every 100 ms into
+        // destroyed controls. Frame-owned leaked timers stop
+        // in their on_close handlers; the modal-dialog
+        // equivalent is stop() after show_modal(), before
+        // destroy(). This scan holds every dialog-owned
+        // leaked timer in settings.rs/dialogs.rs to that
+        // rule: the bound variable must be stopped somewhere
+        // after its binding.
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let stopped = |text: &str, var: &str| {
+            let needle = format!("{var}.stop();");
+            text.match_indices(&needle).any(|(at, _)| {
+                at == 0
+                    || !text.as_bytes()[at - 1].is_ascii_alphanumeric()
+                        && text.as_bytes()[at - 1] != b'_'
+            })
+        };
+        let mut checked = 0;
+        for name in ["settings.rs", "dialogs.rs"] {
+            let text = std::fs::read_to_string(src_dir.join(name)).unwrap();
+            let lines: Vec<&str> = text.lines().collect();
+            for (i, line) in lines.iter().enumerate() {
+                if !line.contains("Box::leak(Box::new(") || !line.contains("Timer::new(&dialog") {
+                    continue;
+                }
+                let var = line
+                    .split("let ")
+                    .nth(1)
+                    .and_then(|rest| rest.split('=').next())
+                    .map(str::trim)
+                    .unwrap_or("");
+                assert!(!var.is_empty(), "{name}:{}: unparsed timer binding", i + 1);
+                checked += 1;
+                let after: String = lines[i..].join("\n");
+                assert!(
+                    stopped(&after, var),
+                    "{name}:{}: dialog-owned timer {var} is never stopped: {}",
+                    i + 1,
+                    line.trim()
+                );
+            }
+        }
+        assert!(checked >= 7, "scan found only {checked} dialog timers");
+        // Order matters in show_settings: the stops must sit
+        // between the final modal call and the destroy.
+        let settings = std::fs::read_to_string(src_dir.join("settings.rs")).unwrap();
+        let show = settings.rfind("dialog.show_modal();").unwrap();
+        let destroy = settings.rfind("dialog.destroy();").unwrap();
+        for stop in ["sc_timer.stop()", "or_timer.stop()"] {
+            let at = settings.rfind(stop).unwrap();
+            assert!(
+                show < at && at < destroy,
+                "{stop} must run after show_modal and before destroy in show_settings"
+            );
+        }
+    }
+
+    #[test]
     fn close_handlers_only_veto_vetoable_events() {
         // Brandon (2026-11-07): updating popped wx's
         // debugging-check dialog — wx/event.h "assert
