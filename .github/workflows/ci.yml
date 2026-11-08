@@ -62,14 +62,13 @@ jobs:
           path-type: inherit
           install: gettext
 
-      - name: Probe MSYS2 gettext layout (diagnostic)
+      # setup-msys2 provisions its own tree under the runner
+      # temp (D:/a/_temp/msys64) and path-type inherit does
+      # not land its usr/bin on cargo's PATH; add it plainly.
+      - name: Put msgfmt on PATH (Windows)
         if: runner.os == 'Windows'
-        shell: msys2 {0}
-        run: |
-          echo "msys root (windows form): $(cygpath -w /)"
-          which msgfmt || echo "msgfmt NOT on msys2 PATH"
-          ls /usr/bin/msgfmt* 2>/dev/null || echo "no msgfmt in /usr/bin"
-          pacman -Q | grep -i gettext || echo "no gettext packages installed"
+        shell: bash
+        run: echo "${RUNNER_TEMP}\\msys64\\usr\\bin" >> "$GITHUB_PATH"
 
       - uses: Swatinem/rust-cache@v2
         with:

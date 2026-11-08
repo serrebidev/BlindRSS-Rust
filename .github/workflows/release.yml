@@ -59,6 +59,14 @@ jobs:
           path-type: inherit
           install: gettext
 
+      # setup-msys2 provisions its own tree under the runner
+      # temp (D:/a/_temp/msys64) and path-type inherit does
+      # not land its usr/bin on cargo's PATH; add it plainly.
+      - name: Put msgfmt on PATH (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: echo "${RUNNER_TEMP}\\msys64\\usr\\bin" >> "$GITHUB_PATH"
+
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: false
