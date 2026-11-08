@@ -62,6 +62,15 @@ jobs:
           path-type: inherit
           install: gettext
 
+      - name: Probe MSYS2 gettext layout (diagnostic)
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: |
+          echo "msys root (windows form): $(cygpath -w /)"
+          which msgfmt || echo "msgfmt NOT on msys2 PATH"
+          ls /usr/bin/msgfmt* 2>/dev/null || echo "no msgfmt in /usr/bin"
+          pacman -Q | grep -i gettext || echo "no gettext packages installed"
+
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: false
