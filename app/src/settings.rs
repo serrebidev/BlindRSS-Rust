@@ -50,6 +50,63 @@ fn add_field(
     ctrl
 }
 
+/// A labeled integer spin row (Python's wx.SpinCtrl for
+/// numeric settings). A spin control always holds a valid
+/// value inside its range, so saving writes the key
+/// unconditionally — the free-text fields this replaces
+/// silently kept the old value whenever the text was
+/// cleared or unparseable (Brandon's report, 2026-11-08:
+/// clearing the Refresh Interval's 300 and pressing Save
+/// left 300 in place). Built on SpinCtrlDouble with 0
+/// digits: wxdragon's integer SpinCtrl has set_value but
+/// no get_value, while SpinCtrlDouble has both (the EQ
+/// dialog already relies on it).
+fn add_spin(
+    parent: &impl WxWidget,
+    sizer: &Sizer,
+    label: &str,
+    value: i64,
+    lo: i64,
+    hi: i64,
+) -> SpinCtrlDouble {
+    let row = BoxSizer::builder(Orientation::Horizontal).build();
+    let text = StaticText::builder(parent).with_label(&t(label)).build();
+    let ctrl = SpinCtrlDouble::builder(parent)
+        .with_range(lo as f64, hi as f64)
+        .build();
+    ctrl.set_digits(0);
+    ctrl.set_increment(1.0);
+    ctrl.set_value(value.clamp(lo, hi) as f64);
+    row.add(&text, 0, SizerFlag::All, 4);
+    row.add(&ctrl, 1, SizerFlag::Expand | SizerFlag::All, 4);
+    sizer.add_sizer(&row, 0, SizerFlag::Expand | SizerFlag::All, 2);
+    ctrl
+}
+
+/// A labeled float spin row; same always-valid rationale
+/// as [`add_spin`].
+fn add_spin_f64(
+    parent: &impl WxWidget,
+    sizer: &Sizer,
+    label: &str,
+    value: f64,
+    lo: f64,
+    hi: f64,
+    digits: u32,
+    increment: f64,
+) -> SpinCtrlDouble {
+    let row = BoxSizer::builder(Orientation::Horizontal).build();
+    let text = StaticText::builder(parent).with_label(&t(label)).build();
+    let ctrl = SpinCtrlDouble::builder(parent).with_range(lo, hi).build();
+    ctrl.set_digits(digits);
+    ctrl.set_increment(increment);
+    ctrl.set_value(value.clamp(lo, hi));
+    row.add(&text, 0, SizerFlag::All, 4);
+    row.add(&ctrl, 1, SizerFlag::Expand | SizerFlag::All, 4);
+    sizer.add_sizer(&row, 0, SizerFlag::Expand | SizerFlag::All, 2);
+    ctrl
+}
+
 /// A labeled checkbox row; returns the checkbox.
 /// (label, id) soundcard options, shared between the Settings
 /// build, the async enumeration swap-in and the save path.
@@ -691,44 +748,59 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
     );
 
     // ---- Feeds & Articles page (Python's order) ----
-    // Refresh scheduling (Python keys: refresh_interval is in
-    // seconds, 300 default, 0 = off; Python picks from presets,
-    // the Rust field takes seconds directly, as before).
-    let interval_field = add_field(
+    // Refresh scheduling: Python's control is a preset
+    // Choice (refresh_map: "Never" = 0 through "4 hours");
+    // the free-text field this replaces silently kept the
+    // old value when its text was cleared (Brandon,
+    // 2026-11-08). Presets live in core feed_settings.
+    let interval_labels: Vec<String> = blindrss_core::feed_settings::GLOBAL_REFRESH_INTERVALS
+        .iter()
+        .map(|(_, label)| t(label))
+        .collect();
+    let interval_refs: Vec<&str> = interval_labels.iter().map(|s| s.as_str()).collect();
+    let interval_choice = add_choice(
         &feeds.win,
         &feeds.sizer,
-        "Refresh Interval (seconds, 0 = off):",
-        &cfg.get_i64("refresh_interval", 300).to_string(),
-        false,
+        "Refresh Interval:",
+        &interval_refs,
+        blindrss_core::feed_settings::global_refresh_interval_index(
+            cfg.get_i64("refresh_interval", 300),
+        ),
     );
-    // Refresh engine (Audit 3 keys).
-    let max_conc_field = add_field(
+    // Refresh engine (Audit 3 keys). Spin controls (Python's
+    // wx.SpinCtrl): always hold a valid value, so the save
+    // below writes them unconditionally.
+    let max_conc_field = add_spin(
         &feeds.win,
         &feeds.sizer,
         "Max Concurrent Refreshes:",
-        &cfg.get_i64("max_concurrent_refreshes", 16).to_string(),
-        false,
+        cfg.get_i64("max_concurrent_refreshes", 16),
+        1,
+        64,
     );
-    let per_host_field = add_field(
+    let per_host_field = add_spin(
         &feeds.win,
         &feeds.sizer,
         "Max Connections Per Host:",
-        &cfg.get_i64("per_host_max_connections", 4).to_string(),
-        false,
+        cfg.get_i64("per_host_max_connections", 4),
+        1,
+        64,
     );
-    let timeout_field = add_field(
+    let timeout_field = add_spin(
         &feeds.win,
         &feeds.sizer,
         "Feed Timeout (seconds):",
-        &cfg.get_i64("feed_timeout_seconds", 15).to_string(),
-        false,
+        cfg.get_i64("feed_timeout_seconds", 15),
+        1,
+        300,
     );
-    let retries_field = add_field(
+    let retries_field = add_spin(
         &feeds.win,
         &feeds.sizer,
         "Feed Retry Attempts:",
-        &cfg.get_i64("feed_retry_attempts", 1).to_string(),
-        false,
+        cfg.get_i64("feed_retry_attempts", 1),
+        1,
+        10,
     );
     let cache_full_text_cb = add_check(
         &feeds.win,
@@ -919,12 +991,13 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
         cfg.get_str("youtube_play_cache_dir", ""),
         false,
     );
-    let play_cache_max_mb_field = add_field(
+    let play_cache_max_mb_field = add_spin(
         &youtube.win,
         &youtube.sizer,
         "Max cache size (MB, 0 = unlimited):",
-        &cfg.get_i64("youtube_play_cache_max_mb", 500).to_string(),
-        false,
+        cfg.get_i64("youtube_play_cache_max_mb", 500),
+        0,
+        1_000_000,
     );
     let clear_cache_btn = Button::builder(&youtube.win)
         .with_label(&t("Clear cache now"))
@@ -1019,16 +1092,18 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
         "Skip Silence (Experimental)",
         cfg.get_bool("skip_silence", true),
     );
-    let speed_field = add_field(
+    let speed_field = add_spin_f64(
         &media.win,
         &media.sizer,
         "Default Playback Speed:",
-        &cfg.raw()
+        cfg.raw()
             .get("playback_speed")
             .and_then(|v| v.as_f64())
-            .unwrap_or(1.0)
-            .to_string(),
-        false,
+            .unwrap_or(1.0),
+        0.25,
+        4.0,
+        2,
+        0.25,
     );
     let show_player_cb = add_check(
         &media.win,
@@ -1045,7 +1120,7 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
         "Resume playback from the saved position",
         cfg.get_bool("resume_playback", true),
     );
-    let playback_fields: Vec<(&str, TextCtrl, i64, i64)> = [
+    let playback_fields: Vec<(&str, SpinCtrlDouble)> = [
         (
             "vlc_network_caching_ms",
             "Network Cache (ms):",
@@ -1100,56 +1175,61 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
     .map(|(key, label, default, lo, hi)| {
         (
             key,
-            add_field(
+            add_spin(
                 &media.win,
                 &media.sizer,
                 label,
-                &cfg.get_i64(key, default).to_string(),
-                false,
+                cfg.get_i64(key, default),
+                lo,
+                hi,
             ),
-            lo,
-            hi,
         )
     })
     .collect();
-    let seek_back_field = add_field(
+    let seek_back_field = add_spin(
         &media.win,
         &media.sizer,
         "Seek back (milliseconds)",
-        &cfg.get_i64("seek_back_ms", 10_000).to_string(),
-        false,
+        cfg.get_i64("seek_back_ms", 10_000),
+        0,
+        600_000,
     );
-    let seek_fwd_field = add_field(
+    let seek_fwd_field = add_spin(
         &media.win,
         &media.sizer,
         "Seek forward (milliseconds)",
-        &cfg.get_i64("seek_forward_ms", 10_000).to_string(),
-        false,
+        cfg.get_i64("seek_forward_ms", 10_000),
+        0,
+        600_000,
     );
-    let vol_step_field = add_field(
+    let vol_step_field = add_spin(
         &media.win,
         &media.sizer,
         "Volume step (percent)",
-        &cfg.get_i64("volume_step", 5).to_string(),
-        false,
+        cfg.get_i64("volume_step", 5),
+        1,
+        50,
     );
-    let silence_db_field = add_field(
+    let silence_db_field = add_spin_f64(
         &media.win,
         &media.sizer,
         "Silence threshold (dB)",
-        &cfg.raw()
+        cfg.raw()
             .get("silence_skip_threshold_db")
             .and_then(|v| v.as_f64())
-            .unwrap_or(-38.0)
-            .to_string(),
-        false,
+            .unwrap_or(-38.0),
+        -100.0,
+        0.0,
+        1,
+        1.0,
     );
-    let silence_ms_field = add_field(
+    let silence_ms_field = add_spin(
         &media.win,
         &media.sizer,
         "Minimum silence (milliseconds)",
-        &cfg.get_i64("silence_skip_min_ms", 700).to_string(),
-        false,
+        cfg.get_i64("silence_skip_min_ms", 700),
+        50,
+        60_000,
     );
     // Equalizer (its own dialog, opened via the intent mechanism
     // like Article Columns).
@@ -1227,12 +1307,13 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
         &format_labels,
         format_sel,
     );
-    let max_dl_field = add_field(
+    let max_dl_field = add_spin(
         &media.win,
         &downloads_group,
         "Max downloads kept in the queue",
-        &cfg.get_i64("max_downloads", 32).to_string(),
-        false,
+        cfg.get_i64("max_downloads", 32),
+        1,
+        1000,
     );
 
     // Sounds group (inside Media Player in Python).
@@ -1441,13 +1522,13 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
         "Include feed name in notification text",
         cfg.get_bool("windows_notifications_include_feed_name", true),
     );
-    let notif_max_field = add_field(
+    let notif_max_field = add_spin(
         &notifications.win,
         &notifications.sizer,
         "Max notifications per refresh (0 = no limit):",
-        &cfg.get_i64("windows_notifications_max_per_refresh", 0)
-            .to_string(),
-        false,
+        cfg.get_i64("windows_notifications_max_per_refresh", 0),
+        0,
+        1000,
     );
     let notif_summary_cb = add_check(
         &notifications.win,
@@ -1961,6 +2042,11 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
 
     let btn_row = BoxSizer::builder(Orientation::Horizontal).build();
     let save_btn = Button::builder(&dialog).with_label(&t("Save")).build();
+    // Python's SettingsDialog makes OK the default button, so
+    // Enter in any field saves and closes. Match that: without
+    // a default button, Enter in a field did nothing at all
+    // (reproduced 2026-11-08 under Xvfb).
+    save_btn.set_default();
     let cancel_btn = Button::builder(&dialog).with_label(&t("Cancel")).build();
     btn_row.add(&save_btn, 0, SizerFlag::All, 4);
     btn_row.add(&cancel_btn, 0, SizerFlag::All, 4);
@@ -2088,9 +2174,14 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
                 "refresh_on_startup",
                 serde_json::json!(refresh_startup_cb.is_checked()),
             );
-            if let Ok(secs) = interval_field.get_value().trim().parse::<i64>() {
-                cfg.set_path("refresh_interval", serde_json::json!(secs.max(0)));
-            }
+            cfg.set_path(
+                "refresh_interval",
+                serde_json::json!(
+                    blindrss_core::feed_settings::global_refresh_interval_seconds(
+                        interval_choice.get_selection().unwrap_or(6) as usize
+                    )
+                ),
+            );
             let mut modes = blindrss_core::announce::Announcements::from_config(&cfg);
             for (ev, choice) in blindrss_core::announce::EVENTS
                 .iter()
@@ -2101,18 +2192,13 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
             }
             cfg.set_path("announcements", modes.to_json());
             // Refresh engine, reading, downloads, player,
-            // notifications/sounds, tray, backup, updates, advanced.
-            let num = |f: &TextCtrl, key: &str, lo: i64, hi: i64| {
-                if let Ok(v) = f.get_value().trim().parse::<i64>() {
-                    Some((key.to_string(), v.clamp(lo, hi)))
-                } else {
-                    None
-                }
-            };
-            for (key, field, lo, hi) in &playback_fields {
-                if let Some((key, value)) = num(field, key, *lo, *hi) {
-                    cfg.set_path(&key, serde_json::json!(value));
-                }
+            // notifications/sounds, tray, backup, updates,
+            // advanced. Every numeric control is a spin (or the
+            // interval preset choice), so each always holds a
+            // valid value and every key is written — no
+            // parse-and-skip.
+            for (key, field) in &playback_fields {
+                cfg.set_path(key, serde_json::json!(field.get_value() as i64));
             }
             cfg.set_path("resume_playback", serde_json::json!(resume_cb.is_checked()));
             cfg.set_path(
@@ -2132,34 +2218,28 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
             for (key, control) in &structure_choices {
                 cfg.set_path(key, serde_json::json!(control.is_checked()));
             }
-            for (key, v) in [
-                num(&max_conc_field, "max_concurrent_refreshes", 1, 64),
-                num(&timeout_field, "feed_timeout_seconds", 1, 300),
-                num(&retries_field, "feed_retry_attempts", 1, 10),
-                num(&per_host_field, "per_host_max_connections", 1, 64),
-                num(&max_dl_field, "max_downloads", 1, 1000),
-                num(&seek_back_field, "seek_back_ms", 0, 600_000),
-                num(&seek_fwd_field, "seek_forward_ms", 0, 600_000),
-                num(&vol_step_field, "volume_step", 1, 50),
-                num(&silence_ms_field, "silence_skip_min_ms", 50, 60_000),
-                num(
-                    &notif_max_field,
-                    "windows_notifications_max_per_refresh",
-                    0,
-                    1000,
-                ),
-            ]
-            .into_iter()
-            .flatten()
-            {
-                cfg.set_path(&key, serde_json::json!(v));
+            for (key, field) in [
+                ("max_concurrent_refreshes", &max_conc_field),
+                ("feed_timeout_seconds", &timeout_field),
+                ("feed_retry_attempts", &retries_field),
+                ("per_host_max_connections", &per_host_field),
+                ("max_downloads", &max_dl_field),
+                ("seek_back_ms", &seek_back_field),
+                ("seek_forward_ms", &seek_fwd_field),
+                ("volume_step", &vol_step_field),
+                ("silence_skip_min_ms", &silence_ms_field),
+                ("windows_notifications_max_per_refresh", &notif_max_field),
+            ] {
+                cfg.set_path(key, serde_json::json!(field.get_value() as i64));
             }
-            if let Ok(v) = speed_field.get_value().trim().parse::<f64>() {
-                cfg.set_path("playback_speed", serde_json::json!(v.clamp(0.25, 4.0)));
-            }
-            if let Ok(v) = silence_db_field.get_value().trim().parse::<f64>() {
-                cfg.set_path("silence_skip_threshold_db", serde_json::json!(v));
-            }
+            cfg.set_path(
+                "playback_speed",
+                serde_json::json!(speed_field.get_value().clamp(0.25, 4.0)),
+            );
+            cfg.set_path(
+                "silence_skip_threshold_db",
+                serde_json::json!(silence_db_field.get_value()),
+            );
             cfg.set_path(
                 "ignore_feed_cache",
                 serde_json::json!(refresh_workload.get_selection() == Some(2)),
@@ -2422,14 +2502,7 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
             );
             cfg.set_path(
                 "youtube_play_cache_max_mb",
-                serde_json::json!(
-                    play_cache_max_mb_field
-                        .get_value()
-                        .trim()
-                        .parse::<i64>()
-                        .unwrap_or(500)
-                        .clamp(0, 1_000_000)
-                ),
+                serde_json::json!(play_cache_max_mb_field.get_value() as i64),
             );
             cfg.set_path(
                 "cache_full_text",

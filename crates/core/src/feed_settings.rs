@@ -78,6 +78,64 @@ pub fn refresh_interval_value(index: usize) -> Option<i64> {
         .and_then(|(value, _)| *value)
 }
 
+/// Refresh-interval presets for the GLOBAL setting (Python
+/// SettingsDialog `refresh_map`, gui/dialogs.py): (seconds,
+/// display label). The global Settings control is a Choice
+/// over these, as in Python, so it always holds a valid
+/// value — the free-text field it replaces silently kept the
+/// old value whenever the text was cleared or unparseable
+/// (Brandon's report, 2026-11-08).
+pub const GLOBAL_REFRESH_INTERVALS: &[(i64, &str)] = &[
+    (0, "Never"),
+    (30, "30 seconds"),
+    (60, "1 minute"),
+    (120, "2 minutes"),
+    (180, "3 minutes"),
+    (240, "4 minutes"),
+    (300, "5 minutes"),
+    (600, "10 minutes"),
+    (900, "15 minutes"),
+    (1800, "30 minutes"),
+    (3600, "60 minutes"),
+    (7200, "2 hours"),
+    (10800, "3 hours"),
+    (14400, "4 hours"),
+];
+
+/// The preset index Python's SettingsDialog selects for a
+/// stored global interval: 0 selects "Never"; any other
+/// value selects the closest positive preset (absolute
+/// difference, in preset order, first best wins; Python's
+/// pre-loop fallback is "5 minutes").
+pub fn global_refresh_interval_index(seconds: i64) -> usize {
+    if seconds <= 0 {
+        return 0;
+    }
+    let mut best = 6usize;
+    let mut best_diff = i64::MAX;
+    for (i, (value, _)) in GLOBAL_REFRESH_INTERVALS.iter().enumerate() {
+        if *value <= 0 {
+            continue;
+        }
+        let diff = (seconds - value).abs();
+        if diff < best_diff {
+            best_diff = diff;
+            best = i;
+        }
+    }
+    best
+}
+
+/// Seconds for a global preset index; an out-of-range index
+/// falls back to 300, mirroring Python's save fallback
+/// (`refresh_map.get(selection, 300)`).
+pub fn global_refresh_interval_seconds(index: usize) -> i64 {
+    GLOBAL_REFRESH_INTERVALS
+        .get(index)
+        .map(|(value, _)| *value)
+        .unwrap_or(300)
+}
+
 /// The effective scheduled-refresh interval for a feed
 /// (Python `_filter_scheduled_due_rows`): its
 /// `refresh_interval_seconds` override when set, else the
@@ -262,6 +320,26 @@ mod tests {
             refresh_interval_index(&json!({"refresh_interval_seconds": "300"})),
             0
         );
+    }
+
+    #[test]
+    fn global_interval_selection_matches_python_presets() {
+        // Python SettingsDialog refresh_map: "Never" = 0, then
+        // presets; a stored value selects the closest preset.
+        assert_eq!(global_refresh_interval_index(0), 0);
+        assert_eq!(global_refresh_interval_index(-5), 0);
+        assert_eq!(global_refresh_interval_index(30), 1);
+        assert_eq!(global_refresh_interval_index(300), 6);
+        assert_eq!(global_refresh_interval_index(290), 6);
+        // Tie (45 is 15 from both 30 and 60): first best wins.
+        assert_eq!(global_refresh_interval_index(45), 1);
+        assert_eq!(global_refresh_interval_index(14400), 13);
+        assert_eq!(global_refresh_interval_index(99999), 13);
+        assert_eq!(global_refresh_interval_seconds(0), 0);
+        assert_eq!(global_refresh_interval_seconds(6), 300);
+        assert_eq!(global_refresh_interval_seconds(13), 14400);
+        // Out of range: Python's save fallback.
+        assert_eq!(global_refresh_interval_seconds(99), 300);
     }
 
     #[test]

@@ -7823,6 +7823,69 @@ key, tamper control rejected. Local gate on the ship
 tree: 995 tests passed, clippy zero on Linux and
 windows-gnu.
 
+## Settings values silently not saving (Brandon's report, 2026-11-08; ships in v0.1.74)
+
+**Report (Brandon, 2026-11-08, on v0.1.73):** "settings
+mostly don't save. For instance, if I set the Refresh
+Interval (seconds, 0 = off) to 0, and clear the 300
+option, upon closing and returning to the Settings
+window I see 300 there."
+
+**Reproduced under Xvfb** driving the real GUI
+(xdotool; screenshots + notes in the chains repro0174
+folder): the mouse path works — type 0, click Save,
+config gains refresh_interval=0, reopen shows 0. Two
+defects proven: (1) clearing the interval field to
+EMPTY and clicking Save closed the dialog with the
+stored value unchanged — no error, no write; (2)
+pressing Enter inside a field did nothing at all
+(no default button), where Python's SettingsDialog
+activates OK.
+
+**Root cause:** every numeric setting in show_settings
+was a free-text TextCtrl saved through an
+`if let Ok(v) = text.parse()` guard (the interval
+directly, the rest through the `num()` helper), so
+empty or unparseable text silently skipped the write
+and the previously stored value survived. A keyboard
+user clearing a field (select-all + Delete) to retype
+or to zero it hit this exactly. Python cannot produce
+the state: its interval is a preset wx.Choice
+(refresh_map, "Never" = 0 … "4 hours") and its
+numerics are wx.SpinCtrl, which always hold a valid
+clamped number.
+
+**Fix (Python parity):** the Refresh Interval is a
+preset Choice again — the table and Python's
+closest-preset selection rule live in core
+feed_settings (GLOBAL_REFRESH_INTERVALS,
+global_refresh_interval_index,
+global_refresh_interval_seconds) with unit tests —
+and every other numeric Settings field is now a
+spin control (add_spin/add_spin_f64 on
+SpinCtrlDouble, which unlike wxdragon's SpinCtrl has
+a get_value) with the same ranges the old save path
+clamped to, read and written unconditionally; the
+parse-guard `num()` helper is deleted. The Save
+button is the dialog's default button
+(Button::set_default), so Enter in any field saves
+and closes, as Python's OK does. A source-scan test
+(settings_numeric_controls_always_hold_a_value) bans
+parse::<i64>/parse::<f64> and the num-closure pattern
+from settings.rs and pins the preset save + default
+button.
+
+**Fix verified by driving the rebuilt GUI** (same
+rig): the Choice shows "5 minutes" for a stored 300;
+selecting "Never" + Save writes refresh_interval=0;
+spin edits (Max Concurrent 7/9/11 across runs) write
+unconditionally; Enter inside a spin field saves and
+closes. One rig artifact chased down: with no window
+manager, the Return event leaked to the main window
+after the modal closed and re-opened Settings; under
+openbox the same Enter saved and closed with no
+reopen — WM-less focus plumbing, not app behavior.
+
 ## Settings close crash (Brandon's report, 2026-11-07; ships in v0.1.73)
 
 Report: open Settings, do nothing, press Escape — the app

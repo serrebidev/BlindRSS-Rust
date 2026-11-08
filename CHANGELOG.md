@@ -6,6 +6,22 @@ as `0.1.2-0.1.3`. Each release's section below is its GitHub release note,
 taken from this file by the release workflow. The in-app updater shows the
 same text.
 
+## 0.1.74
+
+- Fixed Settings changes silently not saving. Numeric
+  settings were plain text boxes whose contents were only
+  written when they parsed as a number, so clearing a
+  field — for example clearing the Refresh Interval's
+  300 to turn scheduled refresh off — quietly kept the
+  old value. The Refresh Interval is now a list of
+  presets from Never to 4 hours, like the Python
+  version, and every other numeric setting is now a
+  spin control that always holds a valid value, so what
+  you see in Settings is always what gets saved.
+- Pressing Enter in a Settings field now saves and
+  closes the dialog, matching the Python version's OK
+  button.
+
 ## 0.1.73
 
 - Opening Settings and closing it again — with Escape, Cancel, or OK — could crash the app if the soundcard list had not finished loading yet: the background timer that fills the list in kept running after the window was gone and wrote into its controls. Fixed: the window's background timers now stop before the window closes. The same latent fault was fixed in the Video Search, Feed Errors, YouTube sign-in, and Import Cookies windows, which shared the pattern.

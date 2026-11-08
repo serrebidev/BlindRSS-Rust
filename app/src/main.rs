@@ -11779,6 +11779,42 @@ mod ui_parity_tests {
     }
 
     #[test]
+    fn settings_numeric_controls_always_hold_a_value() {
+        // Brandon's report, 2026-11-08: Settings mostly do
+        // not save — clearing the Refresh Interval's 300 and
+        // pressing Save left 300 in place. Reproduced under
+        // Xvfb: every numeric setting was a free-text field
+        // saved through an if-let-Ok(parse) guard, so empty
+        // or invalid text silently skipped the write and the
+        // old value survived. Python uses wx.SpinCtrl for
+        // numerics and a preset Choice for the interval, so
+        // the state cannot occur there. The fix made the
+        // interval a preset choice (core
+        // GLOBAL_REFRESH_INTERVALS) and every other numeric
+        // a spin control, whose value is always valid and is
+        // written unconditionally; Save is the default
+        // button, so Enter in a field saves, as Python's OK
+        // does. Keep the parse-guard pattern out of
+        // settings.rs.
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let settings = std::fs::read_to_string(src_dir.join("settings.rs")).unwrap();
+        assert!(
+            settings.contains("global_refresh_interval_seconds"),
+            "the interval must save through the core preset table"
+        );
+        assert!(
+            settings.contains("save_btn.set_default();"),
+            "Save must be the dialog's default button (Enter saves)"
+        );
+        for banned in ["parse::<i64>()", "parse::<f64>()", "let num = |"] {
+            assert!(
+                !settings.contains(banned),
+                "settings.rs must not parse-guard numeric saves: found {banned}"
+            );
+        }
+    }
+
+    #[test]
     fn close_handlers_only_veto_vetoable_events() {
         // Brandon (2026-11-07): updating popped wx's
         // debugging-check dialog — wx/event.h "assert
