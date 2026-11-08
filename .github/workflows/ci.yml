@@ -52,12 +52,12 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get install -y gettext
 
-      - name: Put msgfmt on PATH (Windows)
+      - name: Install gettext (patois catalog compilation, Windows)
         if: runner.os == 'Windows'
-        shell: bash
-        run: |
-          ls "C:/Program Files/Git/usr/bin/msgfmt.exe" || echo "msgfmt.exe not in Git userland"
-          echo "C:/Program Files/Git/usr/bin" >> "$GITHUB_PATH"
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MSYS
+          install: gettext
 
       - uses: Swatinem/rust-cache@v2
         with:
