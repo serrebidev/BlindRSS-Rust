@@ -7886,6 +7886,22 @@ after the modal closed and re-opened Settings; under
 openbox the same Enter saved and closed with no
 reopen — WM-less focus plumbing, not app behavior.
 
+**v0.1.74 VERIFIED** (2026-11-08): tag on `0ebfb41`
+(the fix commit `77ab723` plus a clippy -D warnings
+fix — CI's clippy runs with -D warnings and caught
+add_spin_f64's 8 arguments; the local gate now runs
+clippy the same way). Main CI 42494384383 success
+(all three jobs); Release run 42497232441 success
+(3 Package jobs + Publish). API read: Latest =
+v0.1.74, draft=false, exactly 7 assets, release body
+identical to this CHANGELOG's `## 0.1.74` section.
+BlindRSS.tar.gz signature VALID against the
+compiled-in key, tamper control rejected. Local gate
+on the ship tree: 998 tests passed. Brandon's
+acceptance: in Settings, set the Refresh Interval to
+Never, Save, reopen — Never stays; numeric fields
+hold what was typed; Enter in a field saves.
+
 ## Settings close crash (Brandon's report, 2026-11-07; ships in v0.1.73)
 
 Report: open Settings, do nothing, press Escape — the app
