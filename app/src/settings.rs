@@ -84,7 +84,8 @@ fn add_spin(
 }
 
 /// A labeled float spin row; same always-valid rationale
-/// as [`add_spin`].
+/// as [`add_spin`]. Callers set digits/increment on the
+/// returned control.
 fn add_spin_f64(
     parent: &impl WxWidget,
     sizer: &Sizer,
@@ -92,14 +93,10 @@ fn add_spin_f64(
     value: f64,
     lo: f64,
     hi: f64,
-    digits: u32,
-    increment: f64,
 ) -> SpinCtrlDouble {
     let row = BoxSizer::builder(Orientation::Horizontal).build();
     let text = StaticText::builder(parent).with_label(&t(label)).build();
     let ctrl = SpinCtrlDouble::builder(parent).with_range(lo, hi).build();
-    ctrl.set_digits(digits);
-    ctrl.set_increment(increment);
     ctrl.set_value(value.clamp(lo, hi));
     row.add(&text, 0, SizerFlag::All, 4);
     row.add(&ctrl, 1, SizerFlag::Expand | SizerFlag::All, 4);
@@ -1102,9 +1099,9 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
             .unwrap_or(1.0),
         0.25,
         4.0,
-        2,
-        0.25,
     );
+    speed_field.set_digits(2);
+    speed_field.set_increment(0.25);
     let show_player_cb = add_check(
         &media.win,
         &media.sizer,
@@ -1220,9 +1217,9 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
             .unwrap_or(-38.0),
         -100.0,
         0.0,
-        1,
-        1.0,
     );
+    silence_db_field.set_digits(1);
+    silence_db_field.set_increment(1.0);
     let silence_ms_field = add_spin(
         &media.win,
         &media.sizer,
