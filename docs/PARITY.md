@@ -7804,3 +7804,21 @@ and wx-utils use: patois 0.3 (wx feature) + patois-build
   Brandon's machine acceptance: switch the interface
   language in Settings, restart, and confirm the UI (and
   stock dialog buttons) render in the chosen language.
+
+**v0.1.72 VERIFIED** (2026-11-07): tag on `f96c739`;
+main CI 42435516264 success (all three jobs — Windows
+green only after four workflow-fix commits got msgfmt
+onto every platform: gettext apt step on Linux, MSYS2
+gettext on Windows, and the explicit
+`${RUNNER_TEMP}\msys64\usr\bin` PATH append, because
+setup-msys2's path propagation never reached the cargo
+steps; the two embedding guard tests caught every one
+of these silent no-translation builds and were never
+weakened). Release run 42437805928 success (3 Package
+jobs + Publish). API read: Latest = v0.1.72,
+draft=false, exactly 7 assets, release body identical
+to this CHANGELOG's `## 0.1.72` section.
+BlindRSS.tar.gz signature VALID against the compiled-in
+key, tamper control rejected. Local gate on the ship
+tree: 995 tests passed, clippy zero on Linux and
+windows-gnu.
