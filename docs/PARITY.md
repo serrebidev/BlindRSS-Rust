@@ -7848,3 +7848,15 @@ show_import_cookies. A source-scan regression test
 (`dialog_owned_timers_stop_before_the_dialog_is_destroyed`)
 holds the rule, including the stop-after-show_modal-
 before-destroy order in show_settings.
+
+**v0.1.73 VERIFIED** (2026-11-07): tag on `ad76b36`;
+main CI 42443173646 success (all three jobs); Release
+run 42445447665 success (3 Package jobs + Publish). API
+read: Latest = v0.1.73, draft=false, exactly 7 assets,
+release body identical to this CHANGELOG's `## 0.1.73`
+section. BlindRSS.tar.gz signature VALID against the
+compiled-in key, tamper control rejected. Local gate on
+the ship tree: 996 tests passed (995 + the new scan),
+clippy zero. Brandon's acceptance: open Settings and
+close it immediately (Escape) before the soundcard list
+fills in — no crash.
