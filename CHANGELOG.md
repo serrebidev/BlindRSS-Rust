@@ -6,6 +6,10 @@ as `0.1.2-0.1.3`. Each release's section below is its Forgejo release note,
 taken from this file by the release workflow. The in-app updater shows the
 same text.
 
+## 0.1.81
+
+- Fixed the "Refresh complete" count missing most new articles. Only feeds that finished on the very last tick were counted, so a 54-feed refresh could report a handful of new articles while the list showed many more. The count now covers the whole refresh.
+
 ## 0.1.80
 
 - New articles now appear while a refresh is still running. Before, the article list and unread counts only updated when the last feed finished; now each feed's articles show up as that feed completes, the way the Python version behaves. Your place in the list and your keyboard focus stay put while the rows arrive.

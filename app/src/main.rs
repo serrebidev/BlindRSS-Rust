@@ -2033,6 +2033,12 @@ struct State {
     /// notification-eligible articles themselves, so
     /// notifications carry per-article payloads (Audit 8 B09).
     refresh_new: Vec<blindrss_core::notify::FeedBatch>,
+    /// Notification-eligible new articles in the running
+    /// refresh, summed across every drain tick (the old
+    /// per-tick local undercounted whenever a refresh
+    /// spanned ticks). Reset wherever `refresh_new` is;
+    /// AllDone takes it for the completion figure.
+    refresh_new_total: usize,
     /// Any feed failed in the running refresh (error sound).
     refresh_failed: bool,
     /// Per-feed progress for the running refresh batch
@@ -4528,6 +4534,7 @@ fn main() {
             pending_queue: None,
             pending_play_gen: 0,
             refresh_new: Vec::new(),
+            refresh_new_total: 0,
             refresh_failed: false,
             refresh_total: 0,
             refresh_seen: std::collections::HashSet::new(),
@@ -5257,6 +5264,7 @@ fn main() {
                 st.refresh_paused_until = None;
                 st.refreshing = true;
                 st.refresh_new.clear();
+                st.refresh_new_total = 0;
                 st.refresh_failed = false;
                 st.refresh_total = st.feeds.len();
                 st.refresh_seen.clear();
@@ -5296,6 +5304,7 @@ fn main() {
                     st.refresh_paused_until = None;
                     st.refreshing = true;
                     st.refresh_new.clear();
+                    st.refresh_new_total = 0;
                     st.refresh_failed = false;
                     st.refresh_total = feeds.len();
                     st.refresh_seen.clear();
@@ -8034,6 +8043,7 @@ fn main() {
                 st.reader_generation = st.reader_generation.wrapping_add(1);
                 st.reader_cache = blindrss_core::reader_cache::ReaderCache::default();
                 st.refresh_new.clear();
+                st.refresh_new_total = 0;
                 st.refresh_failed = false;
                 st.expanded_cats.clear();
                 st.collapsed_cats.clear();
@@ -10795,7 +10805,6 @@ fn main() {
                     }
                 }
             }
-            let mut new_total = 0usize;
             let mut finished = false;
             // Feeds that finished this tick: (feed id, rows
             // stored). The live update below refreshes the
@@ -10815,7 +10824,7 @@ fn main() {
                         // notifications is Python's new_items:
                         // rule-removed and notification-suppressed
                         // articles do not count (Audit 8 D13).
-                        new_total += outcome.notify_count;
+                        st.refresh_new_total += outcome.notify_count;
                         incremental_feeds.push((feed.id.clone(), outcome.inserted));
                         if outcome.notify_count > 0 {
                             st.refresh_new.push(blindrss_core::notify::FeedBatch {
@@ -11854,15 +11863,18 @@ fn main() {
                 // the per-feed live update above.
                 refresh_tree_gate(&mut st, &tree);
                 refill_articles(&mut st, &list);
+                let batch_total = std::mem::take(&mut st.refresh_new_total);
                 if stopped {
                     frame_tick.set_status_text("Refresh stopped", 0);
                     announce("stop_update", "Refresh stopped");
                 } else {
-                    frame_tick
-                        .set_status_text(&format!("Refresh complete: {new_total} new articles"), 0);
+                    frame_tick.set_status_text(
+                        &format!("Refresh complete: {batch_total} new articles"),
+                        0,
+                    );
                     announce(
                         "refresh_complete",
-                        &format!("Refresh complete: {new_total} new articles"),
+                        &format!("Refresh complete: {batch_total} new articles"),
                     );
                 }
                 let new_batches = std::mem::take(&mut st.refresh_new);
@@ -13158,6 +13170,7 @@ mod ui_parity_tests {
                 refill_pending: false,
                 menu_label_bases: std::collections::HashMap::new(),
                 refresh_new: Vec::new(),
+                refresh_new_total: 0,
                 refresh_failed: false,
                 refresh_total: 0,
                 refresh_seen: std::collections::HashSet::new(),
@@ -13319,6 +13332,25 @@ mod ui_parity_tests {
         assert!(main.contains("fn feed_affects_view"));
         assert!(main.contains("fn refresh_tree_gate"));
         assert!(main.contains("incremental_feeds"));
+    }
+
+    #[test]
+    fn refresh_completion_counts_every_tick() {
+        // The completion figure used to be a per-tick local:
+        // only feeds finishing on the AllDone tick counted,
+        // so "Refresh complete: N new articles" undercounted
+        // whenever a refresh spanned ticks (always, with 54
+        // feeds). The count accumulates in state across the
+        // whole batch and the completion takes it from there.
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let main = std::fs::read_to_string(src_dir.join("main.rs")).unwrap();
+        let impl_src = main.split("mod ui_parity_tests").next().unwrap();
+        assert!(impl_src.contains("refresh_new_total"));
+        assert!(impl_src.contains("std::mem::take(&mut st.refresh_new_total)"));
+        assert!(
+            !impl_src.contains("Refresh complete: {new_total}"),
+            "completion still reads the per-tick local"
+        );
     }
 
     #[test]
