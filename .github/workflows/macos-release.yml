@@ -1,0 +1,166 @@
+# Generated from release.yml (package job): the macOS leg only, for the Forgejo Mac runner.
+# Dispatch with release_tag to attach the macOS build to an existing release.
+name: macOS release
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing release tag to build macOS for and attach to
+        required: true
+        type: string
+permissions:
+  contents: write
+jobs:
+  macos:
+    runs-on: macos-latest
+    timeout-minutes: 90
+    env:
+      TAG: ${{ inputs.release_tag }}
+      CARGO_TERM_COLOR: always
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        ref: ${{ inputs.release_tag }}
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        components: clippy,rustfmt
+    - uses: Swatinem/rust-cache@v2
+      with:
+        cache-on-failure: false
+    - name: Validate release
+      shell: bash
+      run: |
+        cargo fmt --all --check
+        cargo clippy --locked --workspace --all-targets -- -D warnings
+        cargo test --locked --workspace
+    - name: Build release binary
+      run: cargo build --release --locked -p blindrss
+    - name: Bundle libVLC
+      shell: bash
+      run: |
+        if [ "$RUNNER_OS" = "Linux" ]; then
+          mkdir -p dist/BlindRSS/vlc/lib dist/BlindRSS/vlc/plugins
+          cp -L /usr/lib/x86_64-linux-gnu/libvlc.so.5 /usr/lib/x86_64-linux-gnu/libvlccore.so.* dist/BlindRSS/vlc/lib/
+          cp -r /usr/lib/x86_64-linux-gnu/vlc/plugins/. dist/BlindRSS/vlc/plugins/
+        elif [ "$RUNNER_OS" = "Windows" ]; then
+          curl -fL -o vlc-win.zip https://download.videolan.org/pub/videolan/vlc/3.0.21/win64/vlc-3.0.21-win64.zip
+          7z x vlc-win.zip -ovlc-win > /dev/null
+          mkdir -p dist/BlindRSS/vlc/plugins
+          cp vlc-win/vlc-3.0.21/libvlc.dll vlc-win/vlc-3.0.21/libvlccore.dll dist/BlindRSS/vlc/
+          cp -r vlc-win/vlc-3.0.21/plugins/. dist/BlindRSS/vlc/plugins/
+        elif [ "$RUNNER_OS" = "macOS" ]; then
+          curl -fL -o vlc.dmg https://download.videolan.org/pub/videolan/vlc/3.0.21/macosx/vlc-3.0.21-arm64.dmg
+          hdiutil attach vlc.dmg -mountpoint "$RUNNER_TEMP/vlc-mnt" -nobrowse
+          mkdir -p dist/BlindRSS/vlc/lib dist/BlindRSS/vlc/plugins
+          cp -a "$RUNNER_TEMP/vlc-mnt/VLC.app/Contents/MacOS/lib/"libvlc*.dylib "$RUNNER_TEMP/vlc-mnt/VLC.app/Contents/MacOS/lib/"libvlccore*.dylib dist/BlindRSS/vlc/lib/
+          cp -r "$RUNNER_TEMP/vlc-mnt/VLC.app/Contents/MacOS/plugins/." dist/BlindRSS/vlc/plugins/
+          hdiutil detach "$RUNNER_TEMP/vlc-mnt"
+        fi
+    - name: Package
+      shell: bash
+      run: |
+        mkdir -p dist/BlindRSS
+        if [ "$RUNNER_OS" = "Windows" ]; then
+          cp target/release/blindrss.exe dist/BlindRSS/
+        else
+          cp target/release/blindrss dist/BlindRSS/
+        fi
+        if [ "$RUNNER_OS" = "Windows" ]; then
+          cp app/assets/nvdaControllerClient.dll dist/BlindRSS/
+          cp app/assets/nvdaControllerClient-LICENSE.txt dist/BlindRSS/
+        fi
+        cp README.md dist/BlindRSS/
+        cp docs/PARITY.md dist/BlindRSS/
+        mkdir -p dist/BlindRSS/sounds
+        cp app/assets/sounds/*.wav dist/BlindRSS/sounds/
+        mkdir -p dist/BlindRSS/docs
+        cp -r docs/help dist/BlindRSS/docs/
+        cp crates/core/assets/minisign.pub dist/BlindRSS/
+    - name: Bundle tools (bin/)
+      shell: bash
+      run: |
+        mkdir -p dist/BlindRSS/bin
+        YTDLP_BASE=https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/latest/download
+        DENO_BASE=https://github.com/denoland/deno/releases/latest/download
+        if [ "$RUNNER_OS" = "Windows" ]; then
+          curl -fL -o dist/BlindRSS/bin/yt-dlp.exe "$YTDLP_BASE/yt-dlp.exe"
+          curl -fL -o deno.zip "$DENO_BASE/deno-x86_64-pc-windows-msvc.zip"
+          7z x deno.zip -odeno-x > /dev/null
+          cp deno-x/deno.exe dist/BlindRSS/bin/
+          curl -fL -o ffmpeg.zip https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip
+          7z x ffmpeg.zip -offmpeg-x > /dev/null
+          cp ffmpeg-x/*/bin/ffmpeg.exe ffmpeg-x/*/bin/ffprobe.exe dist/BlindRSS/bin/
+        elif [ "$RUNNER_OS" = "Linux" ]; then
+          curl -fL -o dist/BlindRSS/bin/yt-dlp "$YTDLP_BASE/yt-dlp_linux"
+          curl -fL -o deno.zip "$DENO_BASE/deno-x86_64-unknown-linux-gnu.zip"
+          unzip -o -j deno.zip deno -d deno-x > /dev/null
+          cp deno-x/deno dist/BlindRSS/bin/
+          cp /usr/bin/ffmpeg /usr/bin/ffprobe dist/BlindRSS/bin/
+        else
+          curl -fL -o dist/BlindRSS/bin/yt-dlp "$YTDLP_BASE/yt-dlp_macos"
+          if [ "$(uname -m)" = "arm64" ]; then
+            DENO_ASSET=deno-aarch64-apple-darwin.zip
+          else
+            DENO_ASSET=deno-x86_64-apple-darwin.zip
+          fi
+          curl -fL -o deno.zip "$DENO_BASE/$DENO_ASSET"
+          unzip -o -j deno.zip deno -d deno-x > /dev/null
+          cp deno-x/deno dist/BlindRSS/bin/
+          command -v ffmpeg > /dev/null || brew install ffmpeg
+          cp "$(command -v ffmpeg)" dist/BlindRSS/bin/ffmpeg
+          cp "$(command -v ffprobe)" dist/BlindRSS/bin/ffprobe
+        fi
+        chmod +x dist/BlindRSS/bin/* 2>/dev/null || true
+        ls -la dist/BlindRSS/bin/
+    - name: Packaged smoke test
+      shell: bash
+      run: |
+        if [ "$RUNNER_OS" = "Windows" ]; then
+          PATH="/usr/bin:/bin:/c/Windows/System32:/c/Windows" ./dist/BlindRSS/blindrss.exe --blindrss-runtime-self-test
+        else
+          env -i PATH=/usr/bin:/bin HOME="$HOME" ./dist/BlindRSS/blindrss --blindrss-runtime-self-test
+        fi
+    - name: Archive
+      shell: bash
+      run: |
+        cd dist/BlindRSS
+        if [ "$RUNNER_OS" = "Windows" ]; then
+          7z a ../BlindRSS.zip *
+        elif [ "$RUNNER_OS" = "Linux" ]; then
+          tar -czf ../BlindRSS.tar.gz *
+        else
+          cd ..
+          # B14 (Audit 8 Task 30, landed with Task 23 at the
+          # owner's 2026-11-06 order): assemble BlindRSS.app
+          # from the staging folder and build the dmg from
+          # the bundle folder, so the .app sits at the dmg
+          # root and the fixed asset name holds.
+          VERSION="${TAG#v}"
+          cargo xtask bundle-app BlindRSS bundle "$VERSION"
+          hdiutil create -volname BlindRSS -srcfolder bundle -ov -format UDZO BlindRSS.dmg
+        fi
+    - name: Sign release assets (minisign)
+      shell: bash
+      env:
+        MINISIGN_KEY: ${{ secrets.MINISIGN_KEY }}
+        MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+      run: |
+        files=$(ls dist/BlindRSS.zip dist/BlindRSS.tar.gz dist/BlindRSS.dmg 2>/dev/null || true)
+        test -n "$files"
+        echo "$files" | xargs cargo xtask sign
+    - name: Attach to the Forgejo release
+      env:
+        FORGEJO_TOKEN: ${{ secrets.FORGEJO_TOKEN }}
+      run: |
+        set -euo pipefail
+        api="$GITHUB_SERVER_URL/api/v1/repos/$GITHUB_REPOSITORY"
+        h="Authorization: token $FORGEJO_TOKEN"
+        release="$(curl -sf -H "$h" "$api/releases/tags/$TAG")"
+        id="$(echo "$release" | jq -r .id)"
+        for file in dist/BlindRSS.dmg dist/BlindRSS.dmg.minisig; do
+          name="$(basename "$file")"
+          old="$(echo "$release" | jq -r --arg n "$name" '.assets[] | select(.name == $n) | .id')"
+          [ -z "$old" ] || curl -sf -X DELETE -H "$h" "$api/releases/$id/assets/$old"
+          curl -sf -o /dev/null -H "$h" -F "attachment=@$file" "$api/releases/$id/assets?name=$name"
+          echo "Attached $name to $TAG"
+        done
