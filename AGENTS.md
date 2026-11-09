@@ -46,29 +46,49 @@ stated here and in `docs/PARITY.md`.
   `crates/core` for `x86_64-pc-windows-gnu` when `cfg(windows)` code was
   touched), `cargo test --workspace` fully green, `cargo build -p
   blindrss`.
-- Ship a release:
+- Ship a release (Forgejo era, since v0.1.78 — GitHub is suspended,
+  there is no CI, and `.github/workflows/` is dormant):
   1. Bump `version` in `app/Cargo.toml` to the next number above the
-     latest PUBLISHED GitHub release AND the latest tag. Never reuse or
+     latest PUBLISHED Forgejo release AND the latest tag. Never reuse or
      re-tag an older version, even one whose release failed.
-  2. Push to `main` and wait for the CI workflow to go fully green on
-     all OSes. Read the run's `conclusion` field directly (via
-     `gh api`/`gh run view`); never infer success from a piped watch
-     command's exit code.
-  3. Tag `vX.Y.Z` on the green commit and push the tag. `release.yml`
-     builds the three platform packages and `SHA256SUMS`, then publishes.
-  4. Verify by direct API read: the release exists, `draft=false`, all
-     seven assets are present, and `/releases/latest` returns the new
-     tag. A handoff or script summary is not verification.
+  2. Run the gate locally (the same commands `release.yml` ran per leg):
+     `cargo fmt --all --check`, `cargo clippy --locked --workspace
+     --all-targets -- -D warnings`, `cargo test --locked --workspace`.
+     The agent shell's `TEMP` (`C:\Windows\TEMP`) is not listable and
+     fails temp-listing tests: run tests with `TEMP`/`TMP` pointed at
+     the user temp dir.
+  3. Push to `main` on the `forgejo` remote, tag `vX.Y.Z` on the green
+     commit, push the tag.
+  4. Build each leg from the tag, staging `dist/BlindRSS` exactly as
+     `release.yml` does (VLC bundle, `bin/` tools, packaged smoke
+     test, archive at root): Windows locally (`cargo build --release
+     --locked -p blindrss`), Linux on the VPS (`ssh
+     root@serrebiradio.com`). There is no macOS builder while the
+     GitHub runners are gone: ship Windows+Linux and say so.
+  5. Sign every package with `cargo xtask sign` and `cargo xtask
+     verify` each one (see **Release signing** for the key).
+  6. Publish from the VPS (the Forgejo token never leaves
+     `/root/forgejo-muse-token.txt`): `SHA256SUMS` over the packages
+     and signatures, create the release as a draft with the tag's
+     CHANGELOG section as notes, upload attachments (the multipart
+     field MUST be `attachment`), flip `draft=false`.
+  7. Verify by direct Forgejo API read: the release exists,
+     `draft=false`, every asset is present, and `/releases/latest`
+     returns the new tag — then `cargo xtask update-check <previous>`
+     to prove the updater is offered the build and its signature
+     verifies. A handoff or script summary is not verification.
 - Artifacts (fixed ship-shape names, owner decision 2026-11-03 —
   BlindRadio's scheme, replacing the old versioned names):
   `BlindRSS.zip` (Windows), `BlindRSS.tar.gz` (Linux), `BlindRSS.dmg`
-  (macOS), each with its `.minisig`, plus `SHA256SUMS` — 7 assets.
+  (macOS), each with its `.minisig`, plus `SHA256SUMS` — 7 assets when
+  all three legs build. A leg with no builder is omitted (no macOS leg
+  while the GitHub runners are gone); the publish step refuses to
+  proceed when a promised asset or signature is missing.
   Archive contents sit at the root (no wrapping folder): ship-shape's
   Portable apply extracts over the app folder without stripping one.
-  Tag pushes also trigger a duplicate CI run on the tag ref; that is
-  harmless.
-- Pushing to `main` cancels the in-flight main CI run. Do not push
-  mid-verification unless the new commit is the one being verified.
+- There is no CI: `.github/workflows/` is dormant while GitHub is
+  suspended. Never edit it without the owner's direct OK, and never
+  claim a CI result.
 - Signing: releases use the previous (unsigned/development) method until
   the owner says otherwise. SignPath scope, when it lands, is BlindPilot
   and BlindTerm only — not this app.
@@ -79,8 +99,9 @@ stated here and in `docs/PARITY.md`.
   and `wxdragon` when the lib is missing after cache restore, plus
   `cache-on-failure: false`. Do not remove either.
 - Updater visibility: the in-app self-update reads only the latest
-  published GitHub release. A release that stays a draft, or is not
-  Latest, reaches no one — the publish + verify step above is part of
+  published Forgejo release (`https://git.serrebiradio.com/api/v1`, no
+  GitHub fallback). A release that stays a draft, or is not Latest,
+  reaches no one — the publish + verify step above is part of
   shipping, not an optional extra.
 
 ## Casting
@@ -455,7 +476,8 @@ must stay compatible with):
 - `cargo fmt` after the last edit, clippy zero warnings, full test
   suite green — all three, every time, before a release tag. A local
   failure waved off as "pre-existing/environment" does not clear a
-  release; verify on CI's conclusion instead.
+  release; reproduce it on the base commit and fix the cause instead —
+  there is no CI to appeal to.
 
 ## Blunt Things To Remember
 - BlindRSS is accessibility-first. A fix that works visually but
@@ -475,7 +497,8 @@ must stay compatible with):
 - Do not invent new release steps. The flow in **Build & Release** is
   the release process.
 - Never claim a test suite, harness or CI result you did not actually
-  read. Verify release state only by direct `gh` API reads.
+  read. Verify release state only by direct Forgejo API reads (from the
+  VPS — the token never leaves it).
 - Do not log secrets: provider API keys, cookies, Authorization
   headers, the YouTube refresh token, and translation request text
   are user data.
@@ -494,9 +517,8 @@ must stay compatible with):
    because the Python repo holds the plain name during the migration.
 6. Timeouts: all provider/feed HTTP requests set finite timeouts.
 7. Releases: follow **Build & Release** exactly — version from
-   `app/Cargo.toml`, next above latest release AND tag, CI green
-   first (conclusion read directly), then tag, then verify published
-   + Latest by API read.
+   `app/Cargo.toml`, next above latest release AND tag, local gate
+   green first, then tag, then verify published + Latest by API read.
 8. Tests: add/extend tests for behaviour changes and regressions.
 9. Secrets: never print, log, commit, or include API keys/cookies/
    Authorization headers in tests or diagnostics.
@@ -523,14 +545,14 @@ Single-context: the domain authority for this port is `docs/PARITY.md`
 - Releases are minisign-signed (BlindRadio's pattern): `cargo xtask sign`
   in each release leg, `.minisig` beside every package, publish refuses to
   proceed when any asset or signature is missing.
-- The secret key lives ONLY in the `MINISIGN_KEY` repository secret
-  (`MINISIGN_PASSWORD` unlocks it when a future key is encrypted; the
-  current key loads unencrypted, and the xtask treats an empty
-  password variable as unset because GitHub passes unset secrets as
-  empty strings) — never in git, never in a file on
-  this box. Losing it means rotating the key, and already-installed
-  copies can then never verify a new release. The public half is
-  `crates/core/assets/minisign.pub`; changing it takes a new release.
+- The secret key lives ONLY in the offline SigningThings store
+  (`blindrss-rust/minisign.key`, password in `password.txt` — the FC14
+  key IS password-protected), used at release time through
+  `MINISIGN_KEY` / `MINISIGN_PASSWORD` — never in git. The xtask treats
+  an empty password variable as unset. Losing it means rotating the key,
+  and already-installed copies can then never verify a new release. The
+  public half is `crates/core/assets/minisign.pub`; changing it takes a
+  new release.
 - The updater (ship-shape, see §6 Updates) verifies the `.minisig`
   against that embedded key before installing (fail closed) — do not
   weaken it to a warning.
