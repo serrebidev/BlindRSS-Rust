@@ -19,11 +19,7 @@ fn entry_to_article(feed_id: &str, e: &ParsedEntry) -> Article {
     Article {
         id: e.id.clone(),
         feed_id: feed_id.to_string(),
-        title: if e.title.trim().is_empty() {
-            "No Title".to_string()
-        } else {
-            e.title.clone()
-        },
+        title: crate::feeds::article_title(&e.title, &content),
         url: e.url.clone(),
         content: Some(content),
         description: Some(e.summary.clone()),

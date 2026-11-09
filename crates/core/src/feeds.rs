@@ -694,6 +694,40 @@ fn entry_text(e: &Entry) -> (String, String) {
     (content, summary)
 }
 
+/// Python local provider's titleless-post fallback: an 83-character
+/// plain-text preview, including the trailing three dots when truncated.
+pub fn article_title(title: &str, body: &str) -> String {
+    if !title.trim().is_empty() && !title.trim().eq_ignore_ascii_case("No Title") {
+        return title.to_string();
+    }
+    let text = if body.contains('<') && body.contains('>') {
+        dom_smoothie::Readability::new(body, None, None)
+            .map(|page| {
+                page.doc.select("script, style").remove();
+                page.doc
+                    .root()
+                    .descendants_it()
+                    .filter(|node| node.is_text())
+                    .map(|node| node.text().to_string())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .unwrap_or_else(|_| body.to_string())
+    } else {
+        body.to_string()
+    };
+    let preview = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if preview.is_empty() {
+        return "No Title".to_string();
+    }
+    if preview.chars().count() > 83 {
+        let prefix: String = preview.chars().take(80).collect();
+        format!("{}...", prefix.trim_end())
+    } else {
+        preview
+    }
+}
+
 fn entry_from(e: &Entry) -> ParsedEntry {
     let (content, summary) = entry_text(e);
     let webpage = |link: &&feed_rs::model::Link| {

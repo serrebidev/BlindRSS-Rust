@@ -1132,7 +1132,7 @@ fn local_utc_offset_secs() -> i64 {
     let offset = pseudo - now_unix();
     // Round to the nearest minute; real offsets are whole
     // minutes and the two clocks are read a breath apart.
-    (offset / 60).clamp(-14 * 60, 14 * 60) * 60
+    ((offset + 30).div_euclid(60)).clamp(-14 * 60, 14 * 60) * 60
 }
 
 /// Miniflux stored bodies are server content: when the
@@ -3221,6 +3221,7 @@ fn article_cell(
     a: &Article,
     key: &str,
     feed_titles: &std::collections::HashMap<&str, &str>,
+    date_clock: (i64, i64),
 ) -> String {
     match key {
         "author" => a.author.clone().unwrap_or_default(),
@@ -3236,7 +3237,11 @@ fn article_cell(
                 }
             })
             .unwrap_or_default(),
-        "date" => a.date.clone().unwrap_or_default(),
+        "date" => blindrss_core::postprocess::humanize_article_date(
+            a.date.as_deref().unwrap_or(""),
+            date_clock.0,
+            date_clock.1,
+        ),
         "feed" => feed_titles
             .get(a.feed_id.as_str())
             .copied()
@@ -3363,7 +3368,7 @@ fn sort_for_display(
             a.author.as_deref().unwrap_or("").trim().to_lowercase()
         }),
         "description" => keyed(loaded, ascending, |a| {
-            article_cell(a, "description", feed_titles).to_lowercase()
+            article_cell(a, "description", feed_titles, (0, 0)).to_lowercase()
         }),
         "status" => keyed(loaded, ascending, |a| {
             if a.is_read { "read" } else { "unread" }.to_string()
@@ -3394,6 +3399,7 @@ fn insert_article_rows(
     visible: &[&blindrss_core::article_columns::ColumnLayout],
     annotations: &RowAnnotations,
 ) {
+    let date_clock = (now_unix(), local_utc_offset_secs());
     for (j, a) in rows.iter().enumerate() {
         let i = (start + j) as i64;
         list.insert_item(i, &annotations.title_for(a), None);
@@ -3401,7 +3407,7 @@ fn insert_article_rows(
             let cell = if col.key == "media" {
                 annotations.media_for(a)
             } else {
-                article_cell(a, &col.key, feed_titles)
+                article_cell(a, &col.key, feed_titles, date_clock)
             };
             list.set_item_text_by_column(i, col_idx as i32, &cell);
         }
@@ -5687,6 +5693,7 @@ fn main() {
                         blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
                     let layout = blindrss_core::article_columns::layout_from_config(&cfg);
                     let visible = blindrss_core::article_columns::visible_columns(&layout);
+                    let date_clock = (now_unix(), local_utc_offset_secs());
                     let titles: std::collections::HashMap<&str, &str> = titles_f
                         .iter()
                         .map(|(k, v)| (k.as_str(), v.as_str()))
@@ -5698,7 +5705,7 @@ fn main() {
                         row.title = deleted_display_title(a);
                         lc.insert_item(i as i64, &row.title, None);
                         for (col_idx, col) in visible.iter().enumerate().skip(1) {
-                            let cell = article_cell(&row, &col.key, &titles);
+                            let cell = article_cell(&row, &col.key, &titles, date_clock);
                             lc.set_item_text_by_column(i as i64, col_idx as i32, &cell);
                         }
                     }
@@ -12133,6 +12140,30 @@ mod ui_parity_tests {
             is_read: false,
             is_favorite: false,
         }
+    }
+
+    #[test]
+    fn article_list_dates_use_relative_age_and_half_hour_local_time() {
+        let mut row = article("https://example.com/post", None);
+        let feeds = std::collections::HashMap::new();
+        let stamp = "2026-11-09T19:36:26+00:00";
+        let instant = 1_794_252_986;
+        row.date = Some(stamp.into());
+        assert_eq!(
+            article_cell(&row, "date", &feeds, (instant + 51 * 60, 12_600)),
+            "51 minutes ago"
+        );
+        assert_eq!(
+            article_cell(&row, "date", &feeds, (instant + 90_000, 12_600)),
+            "2026-11-09 23:06"
+        );
+        row.date = Some("2026-11-09T23:06:26+03:30".into());
+        assert_eq!(
+            article_cell(&row, "date", &feeds, (instant + 51 * 60, 12_600)),
+            "51 minutes ago"
+        );
+        row.date = None;
+        assert_eq!(article_cell(&row, "date", &feeds, (instant, 12_600)), "");
     }
 
     #[test]

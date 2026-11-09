@@ -1779,14 +1779,13 @@ pub fn html_to_text_opts(html: &str, keep_alt: bool) -> String {
 
 fn html_to_text_raw(html: &str, keep_alt: bool) -> String {
     let mut out = String::with_capacity(html.len());
-    let lower = html.to_lowercase();
+    let lower = html.to_ascii_lowercase();
     let bytes = html.as_bytes();
     let mut i = 0usize;
     let mut skipping: Option<&'static str> = None;
     while i < bytes.len() {
         if let Some(close) = skipping {
-            if lower[i..].starts_with(close) {
-                i += close.len();
+            if lower.as_bytes()[i..].starts_with(close.as_bytes()) {
                 skipping = None;
             } else {
                 i += 1;

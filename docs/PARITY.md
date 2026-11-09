@@ -8481,3 +8481,33 @@ providers); forum sources (§2) are partial (Groups/
 Groups.io subscriptions ported, Reddit/Lemmy shaping via
 discovery transforms, dedicated enumeration still open).
 Each row now carries its evidence.
+
+
+## Article-list dates and titleless feeds (v0.1.83, 2026-11-09)
+
+Python `core/utils.py::humanize_article_date` and the article-list call in
+`gui/mainframe.py::_insert_article_row` use relative ages through 24 hours,
+then local `YYYY-MM-DD HH:MM`. Rust's list cell previously returned the raw
+stored UTC timestamp even though its reader already used the humanizer.
+The list now shares that formatter, with one clock/offset snapshot per
+row batch. Regression coverage includes 51 minutes, GMT+3:30, equivalent
+UTC/offset timestamps, and missing dates; sorting still uses stored dates.
+
+The supplied Bluesky feed (`bsky.app/profile/did:plc:l7mwn6iba72xsiayiac5222p/rss`)
+was fetched directly on 2026-11-09: its entries contain descriptions and
+omit titles. Python `providers/local.py::_plain_text_preview` supplies an
+83-character plain-text title, truncating at 80 characters plus `...`.
+Rust now applies that fallback at local ingest and when loading cached
+placeholder titles, before row insertion. Genuine titles and stored user
+read/favorite state are preserved. The offline regression feeds reproduce
+missing titles and HTML descriptions; cached placeholder recovery uses the
+same row decoder for article lists and reader lookup.
+
+The preview uses the existing dom_smoothie HTML parser directly, with
+text-node separation and without the reader's configurable structure
+annotations. Review also exposed an existing UTF-8 panic when the reader
+skipped script/style text: byte scanning now compares byte slices and uses
+ASCII-only case folding, preserving the original byte offsets. A regression
+covers non-ASCII script text. Python's absolute-date formatter uses the
+current system offset (`datetime.now().astimezone().tzinfo`), as Rust does;
+the historical DST-deviation note above incorrectly described that comparison.

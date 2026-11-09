@@ -46,8 +46,8 @@ stated here and in `docs/PARITY.md`.
   `crates/core` for `x86_64-pc-windows-gnu` when `cfg(windows)` code was
   touched), `cargo test --workspace` fully green, `cargo build -p
   blindrss`.
-- Ship a release (Forgejo era, since v0.1.78 — GitHub is suspended,
-  there is no CI, and `.github/workflows/` is dormant):
+- Ship a release (Forgejo era, since v0.1.78 — GitHub is suspended;
+  Windows/Linux ship locally, and macOS uses the Forgejo Mac runner):
   1. Bump `version` in `app/Cargo.toml` to the next number above the
      latest PUBLISHED Forgejo release AND the latest tag. Never reuse or
      re-tag an older version, even one whose release failed.
@@ -63,8 +63,12 @@ stated here and in `docs/PARITY.md`.
      `release.yml` does (VLC bundle, `bin/` tools, packaged smoke
      test, archive at root): Windows locally (`cargo build --release
      --locked -p blindrss`), Linux on the VPS (`ssh
-     root@serrebiradio.com`). There is no macOS builder while the
-     GitHub runners are gone: ship Windows+Linux and say so.
+     root@serrebiradio.com`). For macOS, create the draft release and
+     dispatch `macos-release.yml` on Forgejo with `release_tag=vX.Y.Z`;
+     the active `mac-mini-arm64` user runner builds, signs and attaches
+     the DMG and signature. Read its job result and verify both assets.
+     The legacy all-platform tag workflow has no Windows runner: cancel
+     that run rather than leaving duplicate builds queued.
   5. Sign every package with `cargo xtask sign` and `cargo xtask
      verify` each one (see **Release signing** for the key).
   6. Publish from the VPS (the Forgejo token never leaves
@@ -81,14 +85,16 @@ stated here and in `docs/PARITY.md`.
   BlindRadio's scheme, replacing the old versioned names):
   `BlindRSS.zip` (Windows), `BlindRSS.tar.gz` (Linux), `BlindRSS.dmg`
   (macOS), each with its `.minisig`, plus `SHA256SUMS` — 7 assets when
-  all three legs build. A leg with no builder is omitted (no macOS leg
-  while the GitHub runners are gone); the publish step refuses to
-  proceed when a promised asset or signature is missing.
+  all three legs build. A leg with no builder is omitted; check runner
+  availability through the Forgejo API before making that decision.
+  The publish step refuses to proceed when a promised asset or signature
+  is missing.
   Archive contents sit at the root (no wrapping folder): ship-shape's
   Portable apply extracts over the app folder without stripping one.
-- There is no CI: `.github/workflows/` is dormant while GitHub is
-  suspended. Never edit it without the owner's direct OK, and never
-  claim a CI result.
+- Forgejo Actions reads `.github/workflows/` when `.forgejo/workflows/`
+  is absent. The Mac release workflow is available there (2026-11-09);
+  the local gate remains mandatory. Never edit workflows without the
+  owner's direct OK, and claim a job result only after reading it.
 - Signing: releases use the previous (unsigned/development) method until
   the owner says otherwise. SignPath scope, when it lands, is BlindPilot
   and BlindTerm only — not this app.
@@ -488,7 +494,7 @@ must stay compatible with):
   suite green — all three, every time, before a release tag. A local
   failure waved off as "pre-existing/environment" does not clear a
   release; reproduce it on the base commit and fix the cause instead —
-  there is no CI to appeal to.
+  the local release gate must pass.
 
 ## Blunt Things To Remember
 - BlindRSS is accessibility-first. A fix that works visually but

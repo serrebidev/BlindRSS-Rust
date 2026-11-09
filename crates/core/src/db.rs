@@ -427,7 +427,7 @@ pub type CachedFeed = (Option<String>, Option<String>, Vec<u8>);
 /// is_read, is_favorite, media_url, media_type). `content` may be
 /// SQL NULL in the light list variants, hence the Option field.
 fn article_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Article> {
-    Ok(Article {
+    let mut article = Article {
         id: r.get(0)?,
         feed_id: r.get(1)?,
         title: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
@@ -440,7 +440,17 @@ fn article_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Article> {
         is_favorite: r.get::<_, i64>(9)? != 0,
         media_url: r.get(10)?,
         media_type: r.get(11)?,
-    })
+    };
+    article.title = crate::feeds::article_title(
+        &article.title,
+        article
+            .content
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .or(article.description.as_deref())
+            .unwrap_or(""),
+    );
+    Ok(article)
 }
 
 impl Db {
@@ -1215,22 +1225,7 @@ impl Db {
              is_read, is_favorite, media_url, media_type \
              FROM articles WHERE id = ?1",
         )?;
-        let mut rows = stmt.query_map(params![article_id], |row| {
-            Ok(Article {
-                id: row.get(0)?,
-                feed_id: row.get(1)?,
-                title: row.get(2)?,
-                url: row.get(3)?,
-                content: row.get(4)?,
-                description: row.get(5)?,
-                date: row.get(6)?,
-                author: row.get(7)?,
-                is_read: row.get::<_, i64>(8)? != 0,
-                is_favorite: row.get::<_, i64>(9)? != 0,
-                media_url: row.get(10)?,
-                media_type: row.get(11)?,
-            })
-        })?;
+        let mut rows = stmt.query_map(params![article_id], article_row)?;
         match rows.next() {
             Some(r) => Ok(Some(r?)),
             None => Ok(None),
