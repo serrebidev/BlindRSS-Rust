@@ -156,7 +156,10 @@ pub fn stream_url_with(
             "--format".into(),
             crate::ytdlp_recovery::vlc_audio_format(&phase.target_url).to_string(),
             "--extractor-args".into(),
-            crate::ytdlp_recovery::youtube_player_client_arg(phase.clients, None),
+            crate::ytdlp_recovery::youtube_player_client_arg(
+                phase.clients,
+                phase.visitor_data.as_deref(),
+            ),
             "--quiet".into(),
             "--no-warnings".into(),
             "--no-progress".into(),
@@ -164,7 +167,13 @@ pub fn stream_url_with(
             "--color".into(),
             "never".into(),
             "--user-agent".into(),
-            crate::http::user_agent(),
+            // The bootstrap phase carries the browser UA the
+            // cookie jar was warmed with; every other phase
+            // keeps the shared fetch identity.
+            phase
+                .browser_user_agent
+                .clone()
+                .unwrap_or_else(crate::http::user_agent),
             "--referer".into(),
             phase.target_url.clone(),
         ];

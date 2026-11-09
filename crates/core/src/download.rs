@@ -620,7 +620,10 @@ pub fn download_with_ytdlp_using(
                 "--no-color".into(),
                 "--geo-bypass".into(),
                 "--extractor-args".into(),
-                crate::ytdlp_recovery::youtube_player_client_arg(phase.clients, None),
+                crate::ytdlp_recovery::youtube_player_client_arg(
+                    phase.clients,
+                    phase.visitor_data.as_deref(),
+                ),
             ];
             args.extend(ytdlp_format_args_with_merge(format_id, merge));
             args.push("--print".into());
@@ -631,7 +634,10 @@ pub fn download_with_ytdlp_using(
                 args.push("--ffmpeg-location".into());
                 args.push(ffmpeg.to_string_lossy().to_string());
             }
-            if let Some(ua) = &user_agent {
+            // The bootstrap phase carries the browser UA the
+            // cookie jar was warmed with; every other phase keeps
+            // the configured fetch identity.
+            if let Some(ua) = phase.browser_user_agent.as_ref().or(user_agent.as_ref()) {
                 args.push("--user-agent".into());
                 args.push(ua.clone());
             }

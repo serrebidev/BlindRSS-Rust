@@ -1411,6 +1411,148 @@ pub fn fetch_page(
     fetch_page_with_options(url, timeout.as_secs_f64(), false, "", cancel)
 }
 
+/// Anonymous YouTube identity minted by the hidden browser
+/// (Python `youtube_browser_session._page_identity` plus the
+/// session cookies): visitor data, playability status, title,
+/// the browser's real UA, and raw CDP cookie records.
+pub struct YouTubeIdentity {
+    pub visitor_data: String,
+    pub status: String,
+    pub title: String,
+    pub user_agent: String,
+    pub cookies: Vec<Value>,
+}
+
+const YOUTUBE_IDENTITY_JS: &str = "JSON.stringify({visitor:(window.ytcfg?.get('VISITOR_DATA')||''),status:(window.ytInitialPlayerResponse?.playabilityStatus?.status||''),title:(window.ytInitialPlayerResponse?.videoDetails?.title||''),ua:navigator.userAgent})";
+
+/// Read the identity script's value: (visitor, status, title, UA).
+fn identity_values(value: &Value) -> (String, String, String, String) {
+    let field = |key: &str| {
+        value
+            .get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string()
+    };
+    (
+        field("visitor"),
+        field("status"),
+        field("title"),
+        field("ua"),
+    )
+}
+
+fn identity_attempt(
+    session: Option<WarmSession>,
+    root: &std::path::Path,
+    url: &str,
+    timeout_s: f64,
+) -> (Option<WarmSession>, Result<Option<YouTubeIdentity>, String>) {
+    let options = FetchOptions {
+        proxy: String::new(),
+    };
+    let mut session = session;
+    if session.as_ref().is_some_and(|s| s.options != options)
+        && let Some(old) = session.take()
+    {
+        old.close();
+    }
+    if session.is_none() {
+        let deadline = Instant::now() + Duration::from_secs_f64(LAUNCH_STARTUP_MAX_SECONDS);
+        match launch_session(root, &options, deadline, None) {
+            Ok(launched) => session = Some(launched),
+            Err(LaunchError::Unavailable(message)) => {
+                mark_runtime_unavailable();
+                return (None, Err(message));
+            }
+            Err(LaunchError::Failed(message)) => return (None, Err(message)),
+        }
+    }
+    let mut session = session.expect("session present");
+    session.expires_at = Instant::now() + Duration::from_secs_f64(SESSION_IDLE_SECONDS);
+    start_reaper_once();
+    let deadline = Instant::now() + Duration::from_secs_f64(timeout_s);
+    if let Err(message) = session
+        .cdp
+        .call("Page.navigate", json!({"url": url}), deadline)
+    {
+        session.close();
+        return (None, Err(message));
+    }
+    let mut found: Option<(String, String, String, String)> = None;
+    while Instant::now() < deadline {
+        let value = session
+            .cdp
+            .eval(YOUTUBE_IDENTITY_JS, deadline)
+            .unwrap_or(Value::Null);
+        let parsed = value
+            .as_str()
+            .and_then(|raw| serde_json::from_str::<Value>(raw).ok());
+        let current = identity_values(parsed.as_ref().unwrap_or(&value));
+        if !current.0.is_empty() && !current.1.is_empty() {
+            found = Some(current);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let Some((visitor_data, status, title, user_agent)) = found else {
+        return (Some(session), Ok(None));
+    };
+    let cookies = session
+        .cdp
+        .call("Network.getCookies", json!({"urls": [url]}), deadline)
+        .ok()
+        .and_then(|v| v.get("cookies").and_then(|c| c.as_array()).cloned())
+        .unwrap_or_default();
+    (
+        Some(session),
+        Ok(Some(YouTubeIdentity {
+            visitor_data,
+            status,
+            title,
+            user_agent,
+            cookies,
+        })),
+    )
+}
+
+/// Mint an anonymous YouTube identity through the warm browser
+/// (Python `bootstrap_youtube_session`'s browser half): shares
+/// the fetch lock and the warm session with the feed fallback,
+/// retries a dead reused session once from scratch, and keeps
+/// the session warm for the next caller. None on any failure —
+/// no runtime, no playable identity, no cookies needed.
+pub fn youtube_identity(url: &str, timeout_s: f64) -> Option<YouTubeIdentity> {
+    let target = url::Url::parse(url.trim()).ok()?;
+    if !matches!(target.scheme(), "http" | "https") || target.host_str().is_none() {
+        return None;
+    }
+    if runtime_unavailable() {
+        return None;
+    }
+    let timeout_s = if timeout_s.is_finite() {
+        timeout_s.clamp(15.0, 90.0)
+    } else {
+        45.0
+    };
+    let _guard = acquire_fetch_lock(timeout_s, None)?;
+    let (root, _, _) = context()?;
+    // A warm session can have been killed off-process; that
+    // only shows up on use, so a transport failure on a REUSED
+    // session earns one retry from scratch.
+    let had_session = SESSION.lock().unwrap_or_else(|p| p.into_inner()).is_some();
+    let session = SESSION.lock().unwrap_or_else(|p| p.into_inner()).take();
+    let (kept, outcome) = identity_attempt(session, &root, url.trim(), timeout_s);
+    let (kept, outcome) = match outcome {
+        Err(_) if had_session => identity_attempt(None, &root, url.trim(), timeout_s),
+        outcome => (kept, outcome),
+    };
+    if let Some(session) = kept {
+        *SESSION.lock().unwrap_or_else(|p| p.into_inner()) = Some(session);
+    }
+    outcome.unwrap_or(None)
+}
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;

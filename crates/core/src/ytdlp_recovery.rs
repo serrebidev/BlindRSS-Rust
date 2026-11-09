@@ -11,11 +11,12 @@
 //! recovery-URL phases with impersonation, and Python's error
 //! choice (the anonymous attempt's error is the one reported).
 //!
-//! Deliberate non-ports, recorded in docs/PARITY.md: Python's
-//! final pytubefix phase and its hidden-browser visitor-data
-//! bootstrap have no Rust analogue; the phases here end at the
-//! impersonated recovery-URL phase. yt-dlp itself stays a
-//! wrapped executable run through `dependency::run_tool`.
+//! Deliberate non-port, recorded in docs/PARITY.md: the final
+//! pytubefix phase has no Rust analogue (it resolves direct
+//! streams through a Python media library). The hidden-browser
+//! visitor-data bootstrap below runs last, exactly as Python
+//! orders it. yt-dlp itself stays a wrapped executable run
+//! through `dependency::run_tool`.
 //!
 //! Nothing in this module logs cookie contents, cookie file
 //! paths' contents, or signed URLs.
@@ -444,6 +445,9 @@ pub struct Phase {
     pub clients: &'static [&'static str],
     pub fallback_attempts: bool,
     pub impersonate: bool,
+    pub browser_bootstrap: bool,
+    pub visitor_data: Option<String>,
+    pub browser_user_agent: Option<String>,
 }
 
 /// The phase list for a target (`recovery_phases` in the Python
@@ -455,6 +459,9 @@ pub fn recovery_phases(url: &str) -> Vec<Phase> {
     let target = normalize_ytdlp_single_item_url(url);
     let mut phases = vec![Phase {
         target_url: target.clone(),
+        browser_bootstrap: false,
+        visitor_data: None,
+        browser_user_agent: None,
         clients: &YOUTUBE_PLAYER_CLIENTS,
         fallback_attempts: false,
         impersonate: false,
@@ -462,6 +469,9 @@ pub fn recovery_phases(url: &str) -> Vec<Phase> {
     if is_youtube_page_url(&target) {
         phases.push(Phase {
             target_url: target.clone(),
+            browser_bootstrap: false,
+            visitor_data: None,
+            browser_user_agent: None,
             clients: &YOUTUBE_PLAYER_CLIENTS_FALLBACK,
             fallback_attempts: true,
             impersonate: false,
@@ -469,6 +479,25 @@ pub fn recovery_phases(url: &str) -> Vec<Phase> {
         for recovery in youtube_single_item_recovery_urls(&target) {
             phases.push(Phase {
                 target_url: recovery,
+                browser_bootstrap: false,
+                visitor_data: None,
+                browser_user_agent: None,
+                clients: &YOUTUBE_PLAYER_CLIENTS_FALLBACK,
+                fallback_attempts: true,
+                impersonate: true,
+            });
+        }
+        // Python's browser_bootstrap phase (last, player.py): one
+        // warm-browser identity, then a single cookie-jar attempt
+        // with visitor data and the browser UA. Gated on the
+        // single-item recovery list being non-empty, exactly as
+        // in the Python recovery phase builder.
+        if !youtube_single_item_recovery_urls(&target).is_empty() {
+            phases.push(Phase {
+                target_url: target,
+                browser_bootstrap: true,
+                visitor_data: None,
+                browser_user_agent: None,
                 clients: &YOUTUBE_PLAYER_CLIENTS_FALLBACK,
                 fallback_attempts: true,
                 impersonate: true,
@@ -519,6 +548,29 @@ pub fn run_recovery<T>(
         last_err: String::new(),
     };
     for (index, phase) in phases.iter().enumerate() {
+        // Python's browser_bootstrap arm (last phase): one
+        // warm-browser identity, then a single cookie-jar attempt
+        // with visitor data and the browser UA. A failed or
+        // disabled bootstrap skips the phase silently — it is
+        // the final fallback, so there is nothing after it to
+        // protect with an error.
+        if phase.browser_bootstrap {
+            let Some(session) =
+                crate::youtube_session::bootstrap_youtube_session(&phase.target_url, 45.0)
+            else {
+                continue;
+            };
+            let mut phase = phase.clone();
+            phase.visitor_data = Some(session.visitor_data);
+            phase.browser_user_agent = Some(session.user_agent);
+            let boot = CookieAttempt::CookieFile(session.cookie_file.to_string_lossy().to_string());
+            if let Some(done) =
+                handle_outcome(&mut state, &boot, attempt(&phase, &boot), index, url)
+            {
+                return done;
+            }
+            continue;
+        }
         let attempts = if phase.fallback_attempts {
             fallback_cookie_attempts(cookie_file)
         } else if index == 0 {
@@ -535,27 +587,44 @@ pub fn run_recovery<T>(
                     continue;
                 }
             }
-            match attempt(phase, att) {
-                AttemptOutcome::Success(value) => return Ok(value),
-                AttemptOutcome::Failed { error, fatal } => {
-                    if att.is_browser() && is_dpapi_cookie_error(&error) {
-                        state.dpapi_seen = true;
-                    }
-                    if matches!(att, CookieAttempt::Base) && state.base_err.is_empty() {
-                        if index == 0 && is_uncookieable_error(&error, url) {
-                            state.skip_browser_cookies = true;
-                        }
-                        state.base_err = error.clone();
-                    }
-                    state.last_err = error;
-                    if fatal {
-                        return Err(final_error(&state));
-                    }
-                }
+            if let Some(done) = handle_outcome(&mut state, att, attempt(phase, att), index, url) {
+                return done;
             }
         }
     }
     Err(final_error(&state))
+}
+
+/// Fold one attempt outcome into the recovery state. Returns
+/// `Some` when the run is decided (success or a fatal failure),
+/// `None` to continue with the next attempt.
+fn handle_outcome<T>(
+    state: &mut RecoveryState,
+    att: &CookieAttempt,
+    outcome: AttemptOutcome<T>,
+    index: usize,
+    url: &str,
+) -> Option<Result<T, String>> {
+    match outcome {
+        AttemptOutcome::Success(value) => Some(Ok(value)),
+        AttemptOutcome::Failed { error, fatal } => {
+            if att.is_browser() && is_dpapi_cookie_error(&error) {
+                state.dpapi_seen = true;
+            }
+            if matches!(att, CookieAttempt::Base) && state.base_err.is_empty() {
+                if index == 0 && is_uncookieable_error(&error, url) {
+                    state.skip_browser_cookies = true;
+                }
+                state.base_err = error.clone();
+            }
+            state.last_err = error;
+            if fatal {
+                Some(Err(final_error(state)))
+            } else {
+                None
+            }
+        }
+    }
 }
 
 fn final_error(state: &RecoveryState) -> String {

@@ -1041,6 +1041,7 @@ fn apply_http_config() {
     blindrss_core::feeds::configure_cookies(&config_path());
     blindrss_core::extract::configure_cookies(&config_path());
     blindrss_core::browser::configure(&cfg, &config_path());
+    blindrss_core::youtube_session::configure(&config_path());
     blindrss_core::dependency::init_tool_paths_from_config(&cfg);
     blindrss_core::dependency::set_managed_ytdlp_dir(&data_dir());
     blindrss_core::source_feeds::configure(&config_path());

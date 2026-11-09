@@ -331,16 +331,49 @@ fn ytdlp_recovery_policy_helpers_match_python() {
 
     // Phase shape for a YouTube target: primary pool with the
     // full attempt list, fallback pool with base+cookiefile,
-    // then one impersonated phase per recovery URL.
+    // one impersonated phase per recovery URL, then Python's
+    // browser_bootstrap phase last (player.py order).
     let phases = recovery_phases("https://www.youtube.com/watch?v=dQw4w9WgXcQ");
-    assert_eq!(phases.len(), 4);
+    assert_eq!(phases.len(), 5);
     assert!(!phases[0].fallback_attempts && !phases[0].impersonate);
     assert!(phases[1].fallback_attempts && !phases[1].impersonate);
     assert!(phases[2].impersonate && phases[3].impersonate);
     assert!(phases[2].target_url.contains("music.youtube.com"));
     assert!(phases[3].target_url.contains("youtube-nocookie.com"));
+    assert!(phases[4].browser_bootstrap && phases[4].impersonate);
+    assert!(phases[4].target_url.contains("youtube.com/watch"));
+    assert!(phases[4].visitor_data.is_none());
+    assert!(phases[..4].iter().all(|p| !p.browser_bootstrap));
     // Non-YouTube targets get the single primary phase.
     assert_eq!(recovery_phases("https://vimeo.com/12345").len(), 1);
+}
+
+#[test]
+fn bootstrap_phase_skips_silently_without_session() {
+    // The bootstrap phase needs a warm-browser session; with
+    // youtube_session unconfigured it must skip without reaching
+    // the attempt runner (no network, no error), while the
+    // earlier phases still run.
+    use blindrss_core::ytdlp_recovery::{AttemptOutcome, run_recovery};
+    let mut bootstrap_seen = 0;
+    let mut phases_seen = 0;
+    let result: Result<String, String> = run_recovery(
+        "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+        None,
+        |phase, _attempt| {
+            phases_seen += 1;
+            if phase.browser_bootstrap {
+                bootstrap_seen += 1;
+            }
+            AttemptOutcome::Failed {
+                error: "ERROR: Video unavailable".to_string(),
+                fatal: false,
+            }
+        },
+    );
+    assert!(result.is_err());
+    assert!(phases_seen > 0);
+    assert_eq!(bootstrap_seen, 0);
 }
 
 #[cfg(unix)]

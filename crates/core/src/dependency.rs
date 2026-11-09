@@ -277,7 +277,6 @@ pub fn run_tool_full_output(
     run_tool_impl(exe, args, timeout, usize::MAX)
 }
 
-
 // ---------------------------------------------------------------------------
 // PyInstaller one-file-aware process end (Python #150)
 // ---------------------------------------------------------------------------
@@ -478,10 +477,7 @@ fn run_tool_impl(
             Ok(Some(status)) => break status,
             Ok(None) => {
                 if std::time::Instant::now() >= deadline {
-                    let exe_name = exe
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("");
+                    let exe_name = exe.file_name().and_then(|n| n.to_str()).unwrap_or("");
                     end_tool_tree(&mut child, exe_name);
                     if let Some(h) = out_reader {
                         let _ = h.join();
@@ -498,10 +494,7 @@ fn run_tool_impl(
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
             Err(e) => {
-                let exe_name = exe
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("");
+                let exe_name = exe.file_name().and_then(|n| n.to_str()).unwrap_or("");
                 end_tool_tree(&mut child, exe_name);
                 return Err(format!("{} wait failed: {e}", exe.display()));
             }

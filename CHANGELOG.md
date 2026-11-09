@@ -6,6 +6,13 @@ as `0.1.2-0.1.3`. Each release's section below is its Forgejo release note,
 taken from this file by the release workflow. The in-app updater shows the
 same text.
 
+## 0.1.82
+
+- YouTube playback and downloads survive more of YouTube's blocking. When every normal route fails, the app now makes one last attempt with a fresh anonymous browser session (the Python version's final retry), then gives up quietly when no browser session is available.
+- Announcement speech no longer needs a screen reader running. On Windows it falls back to the built-in Windows voice when neither NVDA nor JAWS is speaking; on Linux it uses Speech Dispatcher.
+- Miniflux users: feed fetches that the server blocks now recover through the browser fallback instead of failing outright.
+- Stopping a frozen (single-file) yt-dlp no longer leaves orphaned worker processes and temp folders behind.
+
 ## 0.1.81
 
 - Fixed the "Refresh complete" count missing most new articles. Only feeds that finished on the very last tick were counted, so a 54-feed refresh could report a handful of new articles while the list showed many more. The count now covers the whole refresh.

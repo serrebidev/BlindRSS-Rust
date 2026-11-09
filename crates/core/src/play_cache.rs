@@ -210,7 +210,10 @@ pub fn fetch_youtube_audio_using(
             "--no-color".into(),
             "--geo-bypass".into(),
             "--extractor-args".into(),
-            crate::ytdlp_recovery::youtube_player_client_arg(phase.clients, None),
+            crate::ytdlp_recovery::youtube_player_client_arg(
+                phase.clients,
+                phase.visitor_data.as_deref(),
+            ),
             "-f".into(),
             crate::ytdlp_recovery::vlc_audio_format(&phase.target_url).to_string(),
         ];
@@ -222,7 +225,10 @@ pub fn fetch_youtube_audio_using(
         args.push("after_move:filepath".into());
         args.push("-o".into());
         args.push(template.clone());
-        if let Some(ua) = &user_agent {
+        // The bootstrap phase carries the browser UA the
+        // cookie jar was warmed with; every other phase keeps
+        // the configured fetch identity.
+        if let Some(ua) = phase.browser_user_agent.as_ref().or(user_agent.as_ref()) {
             args.push("--user-agent".into());
             args.push(ua.clone());
         }

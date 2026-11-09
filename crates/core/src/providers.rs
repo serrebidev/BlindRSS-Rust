@@ -1590,9 +1590,8 @@ impl MinifluxClient {
                     true,
                 ) {
                     let fid = value.get("feed_id").and_then(|v| {
-                        v.as_i64().or_else(|| {
-                            v.as_str().and_then(|s| s.trim().parse::<i64>().ok())
-                        })
+                        v.as_i64()
+                            .or_else(|| v.as_str().and_then(|s| s.trim().parse::<i64>().ok()))
                     });
                     if let Some(fid) = fid {
                         return Ok(fid);
@@ -2036,7 +2035,8 @@ impl MinifluxClient {
                 return None;
             }
         }
-        let endpoint = browser_fallback_endpoint(&self.base_url, &self.browser_fallback_path(), action)?;
+        let endpoint =
+            browser_fallback_endpoint(&self.base_url, &self.browser_fallback_path(), action)?;
         let timeout_s = browser_fallback_timeout(
             wait,
             self.refresh_config
@@ -2091,8 +2091,8 @@ impl MinifluxClient {
 
 #[cfg(test)]
 mod miniflux_fallback_tests {
-    use crate::config::Config;
     use super::*;
+    use crate::config::Config;
     use std::io::{Read, Write};
 
     #[test]
@@ -2106,10 +2106,7 @@ mod miniflux_fallback_tests {
             "bot challenge issued",
             "cf-mitigated: challenge",
         ] {
-            assert!(
-                looks_like_browser_challenge_error(hit),
-                "missed: {hit}"
-            );
+            assert!(looks_like_browser_challenge_error(hit), "missed: {hit}");
         }
         for miss in ["HTTP 500", "connection timed out", "", "not found"] {
             assert!(
@@ -2163,24 +2160,39 @@ mod miniflux_fallback_tests {
                 let mut chunk = [0u8; 1024];
                 while !req.windows(4).any(|w| w == b"\r\n\r\n") {
                     let n = stream.read(&mut chunk).unwrap_or(0);
-                    if n == 0 { break; }
+                    if n == 0 {
+                        break;
+                    }
                     req.extend_from_slice(&chunk[..n]);
                 }
                 // Drain the declared body too: closing with an
                 // unread request body resets the connection and
                 // the client loses the response body.
-                let head_end = req.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4).unwrap_or(req.len());
+                let head_end = req
+                    .windows(4)
+                    .position(|w| w == b"\r\n\r\n")
+                    .map(|i| i + 4)
+                    .unwrap_or(req.len());
                 let want: usize = String::from_utf8_lossy(&req[..head_end])
                     .lines()
-                    .find_map(|l| l.strip_prefix("Content-Length:").or_else(|| l.strip_prefix("content-length:")))
+                    .find_map(|l| {
+                        l.strip_prefix("Content-Length:")
+                            .or_else(|| l.strip_prefix("content-length:"))
+                    })
                     .and_then(|v| v.trim().parse().ok())
                     .unwrap_or(0);
                 while req.len() < head_end + want {
                     let n = stream.read(&mut chunk).unwrap_or(0);
-                    if n == 0 { break; }
+                    if n == 0 {
+                        break;
+                    }
                     req.extend_from_slice(&chunk[..n]);
                 }
-                let body = if status == 200 { r#"{"ok":true}"# } else { "{}" };
+                let body = if status == 200 {
+                    r#"{"ok":true}"#
+                } else {
+                    "{}"
+                };
                 let head = format!(
                     "HTTP/1.1 {status} x\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     body.len()
@@ -2197,10 +2209,16 @@ mod miniflux_fallback_tests {
     fn fallback_404_disables_further_probing() {
         let (base, hits) = serve_statuses(vec![404]);
         let client = MinifluxClient::new(&base, "token").with_refresh_config(&Config::default());
-        assert_eq!(client.browser_feed_fallback_request("recover", serde_json::json!({}), false), None);
+        assert_eq!(
+            client.browser_feed_fallback_request("recover", serde_json::json!({}), false),
+            None
+        );
         assert_eq!(*hits.lock().unwrap(), 1);
         // Second call skips the network entirely.
-        assert_eq!(client.browser_feed_fallback_request("recover", serde_json::json!({}), false), None);
+        assert_eq!(
+            client.browser_feed_fallback_request("recover", serde_json::json!({}), false),
+            None
+        );
         assert_eq!(*hits.lock().unwrap(), 1);
     }
 
@@ -2208,7 +2226,8 @@ mod miniflux_fallback_tests {
     fn fallback_200_returns_object_and_stays_enabled() {
         let (base, hits) = serve_statuses(vec![200, 200]);
         let client = MinifluxClient::new(&base, "token").with_refresh_config(&Config::default());
-        let value = client.browser_feed_fallback_request("add", serde_json::json!({"feed_url": "x"}), true);
+        let value =
+            client.browser_feed_fallback_request("add", serde_json::json!({"feed_url": "x"}), true);
         assert_eq!(value, Some(serde_json::json!({"ok": true})));
         assert_eq!(*hits.lock().unwrap(), 1);
         let _ = client.browser_feed_fallback_request("recover", serde_json::json!({}), false);
@@ -2221,7 +2240,10 @@ mod miniflux_fallback_tests {
         let mut cfg = Config::default();
         cfg.set_path("browser_feed_fallback_enabled", serde_json::json!(false));
         let client = MinifluxClient::new(&base, "token").with_refresh_config(&cfg);
-        assert_eq!(client.browser_feed_fallback_request("recover", serde_json::json!({}), false), None);
+        assert_eq!(
+            client.browser_feed_fallback_request("recover", serde_json::json!({}), false),
+            None
+        );
         assert_eq!(*hits.lock().unwrap(), 0);
     }
 }
