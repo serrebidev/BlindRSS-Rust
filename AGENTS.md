@@ -98,6 +98,17 @@ stated here and in `docs/PARITY.md`.
   LNK1104. The workflows carry a guard step that cleans `wxdragon-sys`
   and `wxdragon` when the lib is missing after cache restore, plus
   `cache-on-failure: false`. Do not remove either.
+- Debug wx link gotcha (2026-11-09): `target/debug/wxdragon_sys_cmake_build`
+  and `target/debug/wxwidgets_cmake_build` are shared by every feature set in
+  the profile, and CMake keeps cached `wxUSE_*=OFF` values across
+  reconfigures. Building `cargo xtask` (ship-shape's smaller wxdragon
+  features) reconfigures the cache without printing, and the next app build
+  then fails to link with unresolved `wxd_Print*` symbols. Fix: delete both
+  cmake build dirs, `cargo clean -p wxdragon-sys -p wxdragon`, and rebuild
+  via a workspace command (unified features) — never `cargo xtask` or `-p`
+  first. A fresh configure also needs Ninja on PATH. Deleting the cmake dirs
+  alone is not enough: cargo keeps the sys fingerprint fresh and never
+  reruns CMake, which surfaces as LNK1104 on `WebView2LoaderStatic.lib`.
 - Updater visibility: the in-app self-update reads only the latest
   published Forgejo release (`https://git.serrebiradio.com/api/v1`, no
   GitHub fallback). A release that stays a draft, or is not Latest,

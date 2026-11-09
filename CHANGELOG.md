@@ -6,6 +6,11 @@ as `0.1.2-0.1.3`. Each release's section below is its Forgejo release note,
 taken from this file by the release workflow. The in-app updater shows the
 same text.
 
+## 0.1.80
+
+- New articles now appear while a refresh is still running. Before, the article list and unread counts only updated when the last feed finished; now each feed's articles show up as that feed completes, the way the Python version behaves. Your place in the list and your keyboard focus stay put while the rows arrive.
+- Removed the main window's two rows of toolbar buttons. They trapped keyboard focus after Alt+Tab — once focus landed on a button there was no way back to the feed tree or the article list except restarting. Every action they offered is still available in the menus, the feed-tree and article-list context menus, or keyboard shortcuts; only the search field and its Search button remain. Deleted Articles is now also listed in the article list's context menu when the list is empty.
+
 ## 0.1.79
 
 - Fixed the article text jumping back to the first line when you Tab away and back. The earlier attempt at this fix never ran in the main window: its focus handler was bound before another one that took the event first. There is now a single focus handler that restores your reading place, with a deferred restore for the way screen readers move focus, and your position is also tracked as you arrow through the text. A new article still starts at the top.

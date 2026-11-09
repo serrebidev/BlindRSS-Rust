@@ -2240,7 +2240,8 @@ const M_REFRESH_FEED: i32 = 2120;
 const M_SYNC: i32 = 2112;
 const M_REMOVE_FEED: i32 = 2113;
 const M_EDIT_FEED: i32 = 2114;
-const M_RENAME_CAT: i32 = 2115;
+// M_RENAME_CAT (2115) retired with the button panel,
+// 2026-11-09 — Edit Category covers the rename.
 const M_SET_CAT: i32 = 2116;
 const M_NEW_SF: i32 = 2117;
 const M_DEL_SF: i32 = 2118;
@@ -2621,6 +2622,34 @@ fn selected_category(st: &State) -> Option<String> {
         .as_deref()
         .and_then(|f| f.strip_prefix("cat:"))
         .map(str::to_string)
+}
+
+/// True when newly stored articles from one feed can appear in
+/// the current view, so a feed finishing mid-refresh refills the
+/// article list at once (Brandon's report, 2026-11-09: Python
+/// shows each feed's articles as it finishes; the port held
+/// everything until AllDone). Fresh rows are never favorites and
+/// never YouTube recommendations; a category view takes the feed
+/// under the same predicate as `feeds_in_category`.
+fn feed_affects_view(selected: Option<&str>, feed_id: &str, category: Option<&str>) -> bool {
+    match selected {
+        None => true,
+        Some("favorites:all") => false,
+        Some(view) if view == blindrss_core::youtube_account::RECOMMENDATIONS_FEED_ID => false,
+        Some(view) => {
+            if let Some(path) = view.strip_prefix("cat:") {
+                if is_uncategorized_cat(Some(path)) {
+                    return is_uncategorized_cat(category);
+                }
+                let prefix = format!("{path}{}", blindrss_core::CATEGORY_PATH_SEP);
+                category == Some(path) || category.is_some_and(|c| c.starts_with(&prefix))
+            } else if view.starts_with("smart:") {
+                true
+            } else {
+                view == feed_id
+            }
+        }
+    }
 }
 
 /// Feeds inside a category path, subcategories included.
@@ -3097,6 +3126,31 @@ fn rebuild_tree(state: &mut State, tree: &TreeCtrl) {
     let (struct_sig, counts_sig) = tree_signatures(&feeds, db);
     state.tree_struct_sig = struct_sig;
     state.tree_counts_sig = counts_sig;
+}
+
+/// Tree gate shared by the per-feed live update and the AllDone
+/// completion (Python's fast paths): a no-change batch skips the
+/// rebuild entirely — a full rebuild disturbs screen-reader
+/// focus — and a counts-only change patches the labels in place.
+/// Anything structural rebuilds. Callers reload `state.feeds`
+/// first so the signatures compare against current data.
+fn refresh_tree_gate(state: &mut State, tree: &TreeCtrl) {
+    let gate = match state.db.as_ref() {
+        Some(db) => Some(tree_signatures(&state.feeds, db)),
+        None => None,
+    };
+    match gate {
+        Some((struct_now, counts_now))
+            if struct_now == state.tree_struct_sig && counts_now == state.tree_counts_sig => {}
+        Some((struct_now, counts_now))
+            if struct_now == state.tree_struct_sig && patch_tree_labels(state, tree) =>
+        {
+            state.tree_counts_sig = counts_now;
+        }
+        _ => {
+            rebuild_tree(state, tree);
+        }
+    }
 }
 
 /// (Re)build the article list's columns from a layout
@@ -4144,7 +4198,6 @@ fn main() {
         apply_http_config();
         startup_maintenance();
         let language = ui_language();
-        let refresh_label = t("Refresh All Feeds");
         let frame = Frame::builder()
             .with_title("BlindRSS")
             .with_size(Size::new(1100, 700))
@@ -4328,74 +4381,25 @@ fn main() {
         }
         let tray = Rc::new(tray);
 
-        // The button rows and search box live on their own
-        // panel, not directly on the frame: a wxPanel is the
-        // tab-navigation container, and buttons parented
-        // straight to the frame could trap keyboard focus
-        // (Tab/Shift+Tab stopped leaving the Add Feed button
-        // after Alt+Tab; only a restart recovered it). Same
-        // controls, same order, same labels — only the parent
-        // changes.
-        let btn_panel = Panel::builder(&frame).build();
-        let add_btn = Button::builder(&btn_panel)
-            .with_label("Add Feed...")
-            .build();
-        let remove_btn = Button::builder(&btn_panel)
-            .with_label("Remove Feed")
-            .build();
-        let import_btn = Button::builder(&btn_panel)
-            .with_label("Import OPML...")
-            .build();
-        let export_btn = Button::builder(&btn_panel)
-            .with_label("Export OPML...")
-            .build();
-        let delete_btn = Button::builder(&btn_panel)
-            .with_label("Delete Article")
-            .build();
-        let fav_btn = Button::builder(&btn_panel)
-            .with_label("Toggle Favorite")
-            .build();
-        let markall_btn = Button::builder(&btn_panel)
-            .with_label("Mark All Read")
-            .build();
-        let deleted_btn = Button::builder(&btn_panel).with_label("Deleted...").build();
-        let search_box = TextCtrl::builder(&btn_panel)
+        // Search row on its own panel (Brandon's report,
+        // 2026-11-09): the old two-row button panel (Add
+        // Feed, Remove Feed, Download, ... — twenty buttons
+        // in the tab order) trapped keyboard focus after
+        // Alt+Tab: once focus landed on a button there was
+        // no Tab path back to the feed tree or article
+        // list, and only a restart recovered it. Reparenting
+        // the buttons onto a panel did not fix it, so the
+        // buttons are gone instead — every one of those
+        // actions already lives in the menus, the tree and
+        // article context menus, or the shortcut registry.
+        // Only the in-view search field and its Search
+        // button remain, which have no menu equivalent.
+        let search_panel = Panel::builder(&frame).build();
+        let search_box = TextCtrl::builder(&search_panel)
             .with_style(TextCtrlStyle::ProcessEnter)
             .build();
         msaa_names::set_name(&search_box, &t("Search"));
-        let search_btn = Button::builder(&btn_panel).with_label("Search").build();
-        let fulltext_btn = Button::builder(&btn_panel)
-            .with_label("Read Full Text")
-            .build();
-        let toggle_read_btn = Button::builder(&btn_panel)
-            .with_label("Toggle Read")
-            .build();
-        let edit_feed_btn = Button::builder(&btn_panel).with_label("Edit Feed").build();
-        let rename_cat_btn = Button::builder(&btn_panel)
-            .with_label("Rename Category")
-            .build();
-        let set_cat_btn = Button::builder(&btn_panel)
-            .with_label("Set Feed Category")
-            .build();
-        let play_btn = Button::builder(&btn_panel).with_label("Play Media").build();
-        let new_sf_btn = Button::builder(&btn_panel)
-            .with_label("New Smart Folder")
-            .build();
-        let del_sf_btn = Button::builder(&btn_panel)
-            .with_label("Delete Smart Folder")
-            .build();
-        let download_btn = Button::builder(&btn_panel).with_label("Download").build();
-        let cast_btn = Button::builder(&btn_panel).with_label("Cast").build();
-        let settings_btn = Button::builder(&btn_panel)
-            .with_label("Settings...")
-            .build();
-        let refresh_btn = Button::builder(&btn_panel)
-            .with_label(&refresh_label)
-            .build();
-        let help_btn = Button::builder(&btn_panel).with_label("Help").build();
-        let keys_btn = Button::builder(&btn_panel)
-            .with_label("Shortcuts...")
-            .build();
+        let search_btn = Button::builder(&search_panel).with_label("Search").build();
 
         let (tx, rx): (Sender<RefreshMsg>, Receiver<RefreshMsg>) = channel();
         let splitter = SplitterWindow::builder(&frame).build();
@@ -4480,37 +4484,11 @@ fn main() {
         splitter.split_vertically(&tree, &right, 280);
 
         let sizer = BoxSizer::builder(Orientation::Vertical).build();
-        let btn_row = BoxSizer::builder(Orientation::Horizontal).build();
-        btn_row.add(&refresh_btn, 0, SizerFlag::All, 4);
-        btn_row.add(&add_btn, 0, SizerFlag::All, 4);
-        btn_row.add(&remove_btn, 0, SizerFlag::All, 4);
-        btn_row.add(&import_btn, 0, SizerFlag::All, 4);
-        btn_row.add(&export_btn, 0, SizerFlag::All, 4);
-        btn_row.add(&fulltext_btn, 0, SizerFlag::All, 4);
-        btn_row.add(&toggle_read_btn, 0, SizerFlag::All, 4);
-        btn_row.add(&edit_feed_btn, 0, SizerFlag::All, 4);
-        btn_row.add(&rename_cat_btn, 0, SizerFlag::All, 4);
-        btn_row.add(&set_cat_btn, 0, SizerFlag::All, 4);
-        btn_row.add(&play_btn, 0, SizerFlag::All, 4);
-        btn_row.add(&new_sf_btn, 0, SizerFlag::All, 4);
-        btn_row.add(&del_sf_btn, 0, SizerFlag::All, 4);
-        btn_row.add(&download_btn, 0, SizerFlag::All, 4);
-        btn_row.add(&cast_btn, 0, SizerFlag::All, 4);
-        btn_row.add(&settings_btn, 0, SizerFlag::All, 4);
-        btn_row.add(&help_btn, 0, SizerFlag::All, 4);
-        btn_row.add(&keys_btn, 0, SizerFlag::All, 4);
-        let btn_row2 = BoxSizer::builder(Orientation::Horizontal).build();
-        btn_row2.add(&delete_btn, 0, SizerFlag::All, 4);
-        btn_row2.add(&fav_btn, 0, SizerFlag::All, 4);
-        btn_row2.add(&markall_btn, 0, SizerFlag::All, 4);
-        btn_row2.add(&deleted_btn, 0, SizerFlag::All, 4);
-        btn_row2.add(&search_box, 1, SizerFlag::All, 4);
-        btn_row2.add(&search_btn, 0, SizerFlag::All, 4);
-        let panel_sizer = BoxSizer::builder(Orientation::Vertical).build();
-        panel_sizer.add_sizer(&btn_row, 0, SizerFlag::All, 0);
-        panel_sizer.add_sizer(&btn_row2, 0, SizerFlag::All, 0);
-        btn_panel.set_sizer(panel_sizer, true);
-        sizer.add(&btn_panel, 0, SizerFlag::Expand | SizerFlag::All, 0);
+        let search_row = BoxSizer::builder(Orientation::Horizontal).build();
+        search_row.add(&search_box, 1, SizerFlag::All, 4);
+        search_row.add(&search_btn, 0, SizerFlag::All, 4);
+        search_panel.set_sizer(search_row, true);
+        sizer.add(&search_panel, 0, SizerFlag::Expand | SizerFlag::All, 0);
         sizer.add(&splitter, 1, SizerFlag::Expand | SizerFlag::All, 0);
         frame.set_sizer(sizer, true);
         {
@@ -5296,10 +5274,6 @@ fn main() {
             announce("start_update", "Refresh Feeds");
             spawn_refresh(feeds, tx_refresh.clone(), cancel, stopped, force_full);
         });
-        {
-            let a = act_refresh.clone();
-            refresh_btn.on_click(move |_| a());
-        }
         *tray_refresh_slot.borrow_mut() = Some(act_refresh.clone());
 
         // Scheduled refresh of a feed subset (Audit 8 G08):
@@ -5523,10 +5497,6 @@ fn main() {
                 0,
             );
         });
-        {
-            let a = act_delete.clone();
-            delete_btn.on_click(move |_| a());
-        }
 
         let state_fav = state.clone();
         let frame_fav = frame;
@@ -5571,10 +5541,6 @@ fn main() {
                 },
             );
         });
-        {
-            let a = act_fav.clone();
-            fav_btn.on_click(move |_| a());
-        }
 
         let state_ma = state.clone();
         let frame_ma = frame;
@@ -5606,10 +5572,6 @@ fn main() {
             }
             run_mark_all(&state_mc, &frame_mc, &tx_mc, view);
         });
-        {
-            let a = act_markall.clone();
-            markall_btn.on_click(move |_| a());
-        }
 
         let state_s = state.clone();
         let frame_s = frame;
@@ -5913,10 +5875,6 @@ fn main() {
             dlg.destroy();
             restore_focus(&state_deleted.borrow(), &tree, &list);
         });
-        {
-            let a = act_deleted.clone();
-            deleted_btn.on_click(move |_| a());
-        }
 
         // Sync Providers: for each hosted provider configured in
         // config.json, run its sync on a worker thread with its own
@@ -6279,10 +6237,6 @@ fn main() {
                 spawn_rich_fetch(&tx_ft, &article);
             }
         });
-        {
-            let a = act_fulltext.clone();
-            fulltext_btn.on_click(move |_| a());
-        }
 
         // Translate Article: send the reader's text (or the
         // article body) to the configured LLM provider on a
@@ -6399,10 +6353,6 @@ fn main() {
                 propagate_read_state(&article, new_state);
             }
         });
-        {
-            let a = act_toggle_read.clone();
-            toggle_read_btn.on_click(move |_| a());
-        }
 
         // Edit Feed: title + URL prompts for the tree-selected feed.
         let state_ef = state.clone();
@@ -6489,96 +6439,10 @@ fn main() {
             refill_articles(&mut st, &list_ef);
             frame_ef.set_status_text("Feed updated", 0);
         });
-        {
-            let a = act_edit_feed.clone();
-            edit_feed_btn.on_click(move |_| a());
-        }
 
-        // Rename Category: renames the selected feed's category
-        // everywhere (category row + all feeds in it).
-        let state_rc = state.clone();
-        let frame_rc = frame;
-        let tree_rc = tree;
-        let list_rc = list;
-        let tx_rc = tx.clone();
-        let act_rename_cat: Rc<dyn Fn()> = Rc::new(move || {
-            let (category, db_ok) = {
-                let st = state_rc.borrow();
-                (selected_category(&st), st.db.is_some())
-            };
-            let Some(category) = category else {
-                frame_rc.set_status_text("Selected feed has no category", 0);
-                return;
-            };
-            if is_protected_uncategorized(Some(&category)) {
-                frame_rc.set_status_text("The Uncategorized folder cannot be renamed.", 0);
-                return;
-            }
-            if !db_ok {
-                return;
-            }
-            // Python's rename prompt edits the LEAF only; the
-            // node keeps its parent (Db::rename_category takes
-            // the new leaf, like Python's provider method).
-            let leaf = blindrss_core::category_display_leaf(&category);
-            let Some(new_name) = prompt_focus(
-                &frame_rc,
-                "New category name:",
-                "Rename Category",
-                &leaf,
-                &state_rc.borrow(),
-                &tree_rc,
-                &list_rc,
-            ) else {
-                return;
-            };
-            let new_leaf = blindrss_core::sanitize_category_leaf(&new_name);
-            if new_leaf.is_empty() || new_leaf == leaf {
-                return;
-            }
-            let new_path = blindrss_core::make_category_path(
-                blindrss_core::category_parent_path(&category).as_deref(),
-                &new_leaf,
-            );
-            let mapping = {
-                let st = state_rc.borrow();
-                st.db
-                    .as_ref()
-                    .and_then(|db| db.categories().ok())
-                    .map(|cats| {
-                        blindrss_core::category_subtree_mapping(
-                            &cats.into_iter().map(|c| c.title).collect::<Vec<_>>(),
-                            &category,
-                            &new_path,
-                        )
-                    })
-                    .unwrap_or_default()
-            };
-            let mut st = state_rc.borrow_mut();
-            let renamed = match &st.db {
-                Some(db) => db.rename_category(&category, &new_leaf),
-                None => Ok(false),
-            };
-            if let Some(db) = &st.db {
-                st.feeds = db.feeds().unwrap_or_default();
-            }
-            drop(st);
-            if !matches!(renamed, Ok(true)) {
-                frame_rc.set_status_text("Category not renamed (missing, or the name is taken)", 0);
-                return;
-            }
-            remap_global_delete_behavior(&mapping);
-            mirror_hosted_category(&tx_rc, Some((category.clone(), new_path)), None);
-            let mut st = state_rc.borrow_mut();
-            rebuild_tree(&mut st, &tree_rc);
-            refill_articles(&mut st, &list_rc);
-            frame_rc.set_status_text("Category renamed", 0);
-        });
-        {
-            let a = act_rename_cat.clone();
-            rename_cat_btn.on_click(move |_| a());
-        }
-
+        // (Rename Category went away with the button panel,
+        // 2026-11-09: it was button-only, and Edit Category
+        // below covers the rename.)
         // Edit Category (tree context / feeds.edit_selected):
         // Python's CategoryPropertiesDialog (Batch 41a) — rename
         // the leaf and/or move under another category, applied
@@ -6727,10 +6591,6 @@ fn main() {
             refill_articles(&mut st, &list_sc);
             frame_sc.set_status_text("Feed category set", 0);
         });
-        {
-            let a = act_set_cat.clone();
-            set_cat_btn.on_click(move |_| a());
-        }
 
         // Resolve media and its request headers on a worker.
         // `play_article` is the parameterized core (Audit 8
@@ -6816,10 +6676,6 @@ fn main() {
                 play_article(article);
             })
         };
-        {
-            let a = act_play.clone();
-            play_btn.on_click(move |_| a());
-        }
         *tray_play_slot.borrow_mut() = Some(act_play.clone());
 
         // Article activation (Enter or double-click in the
@@ -6968,10 +6824,6 @@ fn main() {
             frame_nsf.set_status_text("Smart folder created", 0);
             restore_focus(&st, &tree_nsf, &list_nsf);
         });
-        {
-            let a = act_new_sf.clone();
-            new_sf_btn.on_click(move |_| a());
-        }
 
         // Edit Smart Folder: the same editor over the selected
         // smart folder's stored rule.
@@ -7650,10 +7502,6 @@ fn main() {
             refill_articles(&mut st, &list_dsf);
             frame_dsf.set_status_text("Smart folder deleted", 0);
         });
-        {
-            let a = act_del_sf.clone();
-            del_sf_btn.on_click(move |_| a());
-        }
 
         // Download: the selected article's media (direct) or page
         // (yt-dlp) into the configured download directory.
@@ -7789,10 +7637,6 @@ fn main() {
         };
         let act_download = download_action(false);
         let act_download_as = download_action(true);
-        {
-            let a = act_download.clone();
-            download_btn.on_click(move |_| a());
-        }
 
         // Import YouTube Takeout (Python's `on_import_
         // youtube_takeout` flow, Audit 8 Task 27, F11/F03):
@@ -7943,10 +7787,6 @@ fn main() {
                 }
             });
         });
-        {
-            let a = act_cast.clone();
-            cast_btn.on_click(move |_| a());
-        }
 
         // Stop AirPlay Cast: ends the RAOP stream (the other
         // protocols play autonomously on the device).
@@ -8263,10 +8103,6 @@ fn main() {
                 action();
             }
         });
-        {
-            let a = act_settings.clone();
-            settings_btn.on_click(move |_| a());
-        }
 
         // The live shortcut map for the frame char hook; the
         // shortcuts dialog refreshes it when it closes.
@@ -8283,10 +8119,7 @@ fn main() {
             help::show_help(&frame_help, &language_help);
             restore_focus(&state_help.borrow(), &tree_help, &list_help);
         });
-        {
-            let a = act_help.clone();
-            help_btn.on_click(move |_| a());
-        }
+
         let frame_keys = frame;
         let state_keys = state.clone();
         let tree_keys = tree;
@@ -8301,10 +8134,6 @@ fn main() {
             refresh_shortcut_menu_labels(&frame_keys, &mut state_keys.borrow_mut());
             restore_focus(&state_keys.borrow(), &tree_keys, &list_keys);
         });
-        {
-            let a = act_keys.clone();
-            keys_btn.on_click(move |_| a());
-        }
 
         // Add Feed: prompt for a URL, fetch it on a worker thread to
         // learn its title, then subscribe + store its current articles.
@@ -8349,10 +8178,6 @@ fn main() {
             // (Audit 8 G09).
             spawn_subscribe(&tx_add, &url, Some(category));
         });
-        {
-            let a = act_add.clone();
-            add_btn.on_click(move |_| a());
-        }
 
         // Remove Feed: removes the feed selected in the tree, after a
         // confirmation (it also deletes that feed's stored articles).
@@ -8409,10 +8234,6 @@ fn main() {
             refill_articles(&mut st, &list);
             frame_rm.set_status_text(&format!("Removed {}", feed.title), 0);
         });
-        {
-            let a = act_remove.clone();
-            remove_btn.on_click(move |_| a());
-        }
 
         // OPML import/export. Import routes through the
         // ACTIVE provider on a worker (Audit 8 Task 27,
@@ -8445,10 +8266,6 @@ fn main() {
                 ));
             });
         });
-        {
-            let a = act_import.clone();
-            import_btn.on_click(move |_| a());
-        }
 
         let state_exp = state.clone();
         let frame_exp = frame;
@@ -8474,10 +8291,6 @@ fn main() {
                 Err(e) => frame_exp.set_status_text(&format!("Export failed: {e}"), 0),
             }
         });
-        {
-            let a = act_export.clone();
-            export_btn.on_click(move |_| a());
-        }
 
         // Menu bar (PARITY Audit 2, 5C/5F.1): every item invokes the
         // same Rc action as its button, so menus and buttons can
@@ -10093,7 +9906,6 @@ fn main() {
             (M_SYNC, act_sync.clone()),
             (M_REMOVE_FEED, act_remove.clone()),
             (M_EDIT_FEED, act_edit_feed.clone()),
-            (M_RENAME_CAT, act_rename_cat.clone()),
             (M_SET_CAT, act_set_cat.clone()),
             (M_NEW_SF, act_new_sf.clone()),
             (M_DEL_SF, act_del_sf.clone()),
@@ -10490,7 +10302,12 @@ fn main() {
                 menu.append(M_DELETED, "De&leted Articles...", "", ItemKind::Normal);
             } else {
                 // Python keeps the article actions visible but
-                // disabled with no target article.
+                // disabled with no target article. Deleted
+                // Articles needs no selection, so it stays
+                // available here — after the button panel went
+                // away (2026-11-09) this is its surface for an
+                // empty list.
+                menu.append(M_DELETED, "De&leted Articles...", "", ItemKind::Normal);
                 for id in [
                     M_ACTIVATE,
                     M_OPEN_BROWSER,
@@ -10980,6 +10797,10 @@ fn main() {
             }
             let mut new_total = 0usize;
             let mut finished = false;
+            // Feeds that finished this tick: (feed id, rows
+            // stored). The live update below refreshes the
+            // tree and the article list from them.
+            let mut incremental_feeds: Vec<(String, usize)> = Vec::new();
             loop {
                 let msg = rx_tick.borrow().try_recv();
                 match msg {
@@ -10995,6 +10816,7 @@ fn main() {
                         // rule-removed and notification-suppressed
                         // articles do not count (Audit 8 D13).
                         new_total += outcome.notify_count;
+                        incremental_feeds.push((feed.id.clone(), outcome.inserted));
                         if outcome.notify_count > 0 {
                             st.refresh_new.push(blindrss_core::notify::FeedBatch {
                                 feed_id: feed.id.clone(),
@@ -11954,6 +11776,47 @@ fn main() {
                     Err(_) => break,
                 }
             }
+            if !finished && incremental_feeds.iter().any(|(_, n)| *n > 0) {
+                // Live update (Brandon's report, 2026-11-09):
+                // Python shows each feed's articles as it
+                // finishes instead of holding everything
+                // until the last feed. At most one tree +
+                // list pass per tick, through the same gate
+                // the completion uses and the same
+                // focus-preserving refill — the unread
+                // counts move and the new rows appear while
+                // the refresh still runs, and the completion
+                // below only tops up what landed after the
+                // last tick. A tick that also carries
+                // AllDone skips this: the completion covers
+                // it.
+                let mut st = state_tick.borrow_mut();
+                if let Some(db) = st.db.as_ref()
+                    && let Ok(feeds) = db.feeds()
+                {
+                    st.feeds = feeds;
+                }
+                refresh_tree_gate(&mut st, &tree);
+                let relevant = {
+                    let selected = st.selected_feed.as_deref();
+                    incremental_feeds.iter().any(|(id, n)| {
+                        if *n == 0 {
+                            return false;
+                        }
+                        match st.feeds.iter().find(|f| &f.id == id) {
+                            Some(f) => {
+                                feed_affects_view(selected, id, f.category.as_deref())
+                            }
+                            // A feed that vanished mid-refresh
+                            // still changed the All view.
+                            None => true,
+                        }
+                    })
+                };
+                if relevant {
+                    refill_articles(&mut st, &list);
+                }
+            }
             if finished {
                 // Focus guard (Brandon's report, 2026-11-09): a
                 // refresh completing while he works the article
@@ -11987,29 +11850,9 @@ fn main() {
                 {
                     st.feeds = feeds;
                 }
-                // Tree gate (Python's fast paths): a no-change
-                // batch skips the rebuild entirely — a full
-                // rebuild disturbs screen-reader focus — and
-                // a counts-only change patches the labels in
-                // place. Anything structural rebuilds.
-                let gate = match st.db.as_ref() {
-                    Some(db) => Some(tree_signatures(&st.feeds, db)),
-                    None => None,
-                };
-                match gate {
-                    Some((struct_now, counts_now))
-                        if struct_now == st.tree_struct_sig
-                            && counts_now == st.tree_counts_sig => {}
-                    Some((struct_now, counts_now))
-                        if struct_now == st.tree_struct_sig
-                            && patch_tree_labels(&st, &tree) =>
-                    {
-                        st.tree_counts_sig = counts_now;
-                    }
-                    _ => {
-                        rebuild_tree(&mut st, &tree);
-                    }
-                }
+                // Tree gate (Python's fast paths), shared with
+                // the per-feed live update above.
+                refresh_tree_gate(&mut st, &tree);
                 refill_articles(&mut st, &list);
                 if stopped {
                     frame_tick.set_status_text("Refresh stopped", 0);
@@ -12932,8 +12775,9 @@ mod ui_parity_tests {
         for needle in [
             "fn tree_signatures",
             "fn patch_tree_labels",
+            "fn refresh_tree_gate",
             "tree_struct_sig",
-            "patch_tree_labels(&st, &tree)",
+            "refresh_tree_gate(&mut st, &tree)",
         ] {
             assert!(
                 impl_src.contains(needle),
@@ -13078,15 +12922,27 @@ mod ui_parity_tests {
     }
 
     #[test]
-    fn toolbar_buttons_live_on_their_own_panel() {
-        // Issue 4: buttons parented straight to the frame
-        // could trap keyboard focus. They live on a dedicated
-        // panel now; keep them there.
+    fn main_window_keeps_only_the_search_row() {
+        // Brandon's report, 2026-11-09: the old
+        // twenty-button panel trapped keyboard focus
+        // after Alt+Tab — once focus landed on a button
+        // there was no Tab path back to the feed tree or
+        // article list, and only a restart recovered it.
+        // The buttons are gone (every action lives in the
+        // menus, the tree/article context menus or the
+        // shortcut registry); only the in-view search
+        // field and its Search button remain.
         let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let main = std::fs::read_to_string(src_dir.join("main.rs")).unwrap();
-        assert!(main.contains("let btn_panel = Panel::builder(&frame)"));
-        let on_panel = main.matches("Button::builder(&btn_panel)").count();
-        assert!(on_panel >= 20, "only {on_panel} buttons on the panel");
+        let impl_src = main.split("mod ui_parity_tests").next().unwrap();
+        assert!(impl_src.contains("let search_panel = Panel::builder(&frame)"));
+        let on_panel = impl_src.matches("Button::builder(&search_panel)").count();
+        assert_eq!(on_panel, 1, "{on_panel} buttons on the search panel");
+        assert!(impl_src.contains("TextCtrl::builder(&search_panel)"));
+        assert!(
+            !impl_src.contains("btn_panel"),
+            "the button panel must stay gone"
+        );
     }
 
     #[test]
@@ -13408,6 +13264,61 @@ mod ui_parity_tests {
         assert_eq!(deleted_display_title(&bare), "(deleted article)");
         bare.url = "https://example.com/x".into();
         assert_eq!(deleted_display_title(&bare), "https://example.com/x");
+    }
+
+    #[test]
+    fn finished_feed_refills_only_views_it_can_appear_in() {
+        // Live refresh (Brandon's report, 2026-11-09):
+        // each finished feed refills the article list at
+        // once when its rows can appear in the current
+        // view — never only at AllDone.
+        assert!(feed_affects_view(None, "f1", Some("News")));
+        assert!(feed_affects_view(Some("f1"), "f1", Some("News")));
+        assert!(!feed_affects_view(Some("f2"), "f1", Some("News")));
+        assert!(feed_affects_view(Some("cat:News"), "f1", Some("News")));
+        assert!(feed_affects_view(
+            Some("cat:News"),
+            "f1",
+            Some("News / Tech")
+        ));
+        assert!(!feed_affects_view(Some("cat:News"), "f1", Some("Sports")));
+        assert!(!feed_affects_view(
+            Some("cat:News / Tech"),
+            "f1",
+            Some("News")
+        ));
+        assert!(!feed_affects_view(Some("cat:News"), "f1", Some("Newsroom")));
+        assert!(feed_affects_view(Some("cat:Uncategorized"), "f1", None));
+        assert!(feed_affects_view(Some("cat:Uncategorized"), "f1", Some("")));
+        assert!(!feed_affects_view(
+            Some("cat:Uncategorized"),
+            "f1",
+            Some("News")
+        ));
+        assert!(!feed_affects_view(
+            Some("favorites:all"),
+            "f1",
+            Some("News")
+        ));
+        assert!(!feed_affects_view(
+            Some(blindrss_core::youtube_account::RECOMMENDATIONS_FEED_ID),
+            "f1",
+            Some("News")
+        ));
+        assert!(feed_affects_view(Some("smart:3"), "f1", Some("News")));
+    }
+
+    #[test]
+    fn refresh_drain_updates_views_per_feed() {
+        // The drain must keep its per-feed live update:
+        // finished feeds collect for the tick, the tree
+        // gate runs before AllDone, and the refill is
+        // scoped to views the feed can appear in.
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let main = std::fs::read_to_string(src_dir.join("main.rs")).unwrap();
+        assert!(main.contains("fn feed_affects_view"));
+        assert!(main.contains("fn refresh_tree_gate"));
+        assert!(main.contains("incremental_feeds"));
     }
 
     #[test]
