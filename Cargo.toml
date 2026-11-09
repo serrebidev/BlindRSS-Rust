@@ -9,3 +9,8 @@ repository = "https://github.com/serrebidev/BlindRSS-Rust"
 
 [profile.release]
 opt-level = 2
+
+[patch.crates-io]
+# ship-shape fork: configurable API base URL for
+# Forgejo-hosted releases (upstream: accessware/ship-shape).
+ship-shape = { git = "https://git.serrebiradio.com/serrebi/ship-shape", rev = "cff6bdb5596676723b3a0890b1b030c8edac0d28" }

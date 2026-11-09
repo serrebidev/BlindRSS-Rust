@@ -2,9 +2,14 @@
 
 Readable release history for BlindRSS, newest first. When adjacent releases
 were part of the same fix stream, they are combined with a version range such
-as `0.1.2-0.1.3`. Each release's section below is its GitHub release note,
+as `0.1.2-0.1.3`. Each release's section below is its Forgejo release note,
 taken from this file by the release workflow. The in-app updater shows the
 same text.
+
+## 0.1.78
+
+- The in-app updater now checks this repository's Forgejo releases instead of GitHub Releases. There is no GitHub fallback: Check for Updates looks only at the Forgejo host, and downloads still verify against the release signing key before anything installs.
+- Release signing moved to the per-product key (key ID FC1444911E7601CC). The old shared key no longer verifies anything.
 
 ## 0.1.77
 

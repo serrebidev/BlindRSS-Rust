@@ -9594,7 +9594,7 @@ fn main() {
             .append_item(
                 M_UPDATE,
                 "Check for &Updates...",
-                "Check GitHub for a newer release",
+                "Check Forgejo for a newer release",
             )
             .append_item(
                 M_ANNOUNCE_VERSION,

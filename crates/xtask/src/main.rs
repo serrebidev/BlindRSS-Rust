@@ -13,6 +13,14 @@
 //! (the built `blindrss` executable plus the release support
 //! files), with the bundle metadata of the Python app's
 //! `portable.spec` BUNDLE step (Audit 8 B14).
+//!
+//! `cargo xtask verify <file>...` checks each `<file>.minisig`
+//! against the public key the app ships, exactly as the updater
+//! will.
+//!
+//! `cargo xtask update-check <version>` asks Forgejo what a copy
+//! running `version` would be offered, downloads that asset and
+//! verifies it, exactly as the app does.
 
 use std::path::Path;
 
@@ -21,8 +29,10 @@ fn main() {
     let result = match args.first().map(String::as_str) {
         Some("sign") => sign_assets(&args[1..]),
         Some("bundle-app") => bundle_app(&args[1..]),
+        Some("verify") => verify_assets(&args[1..]),
+        Some("update-check") => update_check(&args[1..]),
         _ => Err(
-            "usage: cargo xtask sign <file>... | cargo xtask bundle-app <staging> <out_dir> <version>"
+            "usage: cargo xtask sign <file>... | cargo xtask bundle-app <staging> <out_dir> <version> | cargo xtask verify <file>... | cargo xtask update-check <version>"
                 .to_string(),
         ),
     };
@@ -225,6 +235,88 @@ pub fn info_plist(version: &str) -> String {
          </dict>\n\
          </plist>\n"
     )
+}
+
+/// The workspace root (xtask lives in `crates/`).
+fn root() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("xtask lives in crates/")
+        .parent()
+        .expect("xtask lives in crates/")
+        .to_path_buf()
+}
+
+/// The base64 key line of the release-signing public key the app
+/// ships (`crates/core/assets/minisign.pub`).
+fn shipped_public_key() -> Result<String, String> {
+    let text = std::fs::read_to_string(root().join("crates/core/assets/minisign.pub"))
+        .map_err(|e| format!("minisign.pub: {e}"))?;
+    Ok(text.lines().nth(1).unwrap_or_default().trim().to_owned())
+}
+
+/// `cargo xtask verify <file>...`: checks each `<file>.minisig`
+/// against the shipped public key, exactly as the updater will.
+fn verify_assets(args: &[String]) -> Result<(), String> {
+    if args.is_empty() {
+        return Err("verify needs at least one file".to_string());
+    }
+    let public = minisign_verify::PublicKey::from_base64(&shipped_public_key()?)
+        .map_err(|e| format!("public key: {e}"))?;
+    for file in args {
+        let signature = std::fs::read_to_string(format!("{file}.minisig"))
+            .map_err(|e| format!("{file}.minisig: {e}"))?;
+        let signature = minisign_verify::Signature::decode(&signature)
+            .map_err(|e| format!("{file}.minisig: {e}"))?;
+        let bytes = std::fs::read(file).map_err(|e| format!("{file}: {e}"))?;
+        public
+            .verify(&bytes, &signature, false)
+            .map_err(|e| format!("{file}: {e}"))?;
+        println!("xtask: verified {file}");
+    }
+    Ok(())
+}
+
+/// `cargo xtask update-check <version>`: asks Forgejo what a copy
+/// running `version` would be offered, downloads that asset and
+/// verifies it, exactly as the app does.
+fn update_check(args: &[String]) -> Result<(), String> {
+    let Some(current) = args.first() else {
+        return Err("usage: cargo xtask update-check <version>".to_string());
+    };
+    let config = ship_shape::UpdaterConfig::new(
+        "serrebi/BlindRSS-Rust",
+        "BlindRSS",
+        "BlindRSS",
+        shipped_public_key()?,
+        current.trim_start_matches('v'),
+    )
+    .with_install_kind(ship_shape::InstallKind::Portable)
+    .with_api_base_url("https://git.serrebiradio.com/api/v1");
+    let update = match ship_shape::check_for_updates(&config, ship_shape::UpdateChannel::Stable)
+        .map_err(|e| format!("check: {e}"))?
+    {
+        ship_shape::UpdateCheckOutcome::UpToDate(version) => {
+            println!("xtask: up to date at {version}");
+            return Ok(());
+        }
+        ship_shape::UpdateCheckOutcome::UpdateAvailable(update) => update,
+    };
+    println!(
+        "xtask: {} would be offered {} from {}",
+        config.current_version, update.latest_version, update.download_url
+    );
+    let cancelled = std::sync::atomic::AtomicBool::new(false);
+    let path = ship_shape::download_update_file(
+        &config,
+        &update.download_url,
+        &update.signature_url,
+        &cancelled,
+        |_, _| {},
+    )
+    .map_err(|e| format!("download: {e}"))?;
+    println!("xtask: verified and saved to {}", path.display());
+    Ok(())
 }
 
 #[cfg(test)]

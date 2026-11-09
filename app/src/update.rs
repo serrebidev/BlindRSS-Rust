@@ -1,17 +1,22 @@
-//! Updates: ship-shape against this repository's GitHub Releases,
+//! Updates: ship-shape against this repository's Forgejo releases,
 //! verified with minisign (the shipfitter scheme, as in BlindRadio
 //! and the Rust IPTV client).
 //!
 //! The public key is the second line of
-//! `crates/core/assets/minisign.pub` — the BlindRadio keypair
-//! (key ID 151E848B8939A63F); its secret half signs every release
-//! asset and lives only in the `MINISIGN_KEY` repository secret,
+//! `crates/core/assets/minisign.pub` — the per-product keypair
+//! (key ID FC1444911E7601CC); its secret half signs every release
+//! asset and lives only in the offline signing store,
 //! never in git. ship-shape does the whole flow: version-ordered
 //! check, update dialog, streamed download with progress and
 //! cancellation, fail-closed signature verification before any
 //! install, and a checked swap/restart through its platform
 //! helper. Audit 8 O03/O04/O05/O17 were findings against the
 //! hand-rolled staging updater this replaced; see docs/PARITY.md.
+//!
+//! ship-shape looks at api.github.com by default; the fork pinned
+//! in the workspace Cargo.toml ([patch.crates-io]) adds a
+//! configurable API base URL, pointed here at this Forgejo host.
+//! There is no GitHub fallback.
 
 use std::sync::Arc;
 
@@ -31,7 +36,7 @@ fn public_key() -> &'static str {
 pub fn config() -> Arc<UpdaterConfig> {
     Arc::new(
         UpdaterConfig::new(
-            "serrebidev/BlindRSS-Rust",
+            "serrebi/BlindRSS-Rust",
             "BlindRSS",
             "BlindRSS",
             public_key(),
@@ -39,7 +44,8 @@ pub fn config() -> Arc<UpdaterConfig> {
         )
         // BlindRSS ships portable zips on every platform; there is
         // no installer build for ship-shape to drive instead.
-        .with_install_kind(InstallKind::Portable),
+        .with_install_kind(InstallKind::Portable)
+        .with_api_base_url("https://git.serrebiradio.com/api/v1"),
     )
 }
 
@@ -58,14 +64,15 @@ mod tests {
     use std::io::{Read, Write};
     use std::sync::atomic::AtomicBool;
 
-    /// The BlindRadio keypair's public half, as committed in
+    /// The per-product keypair's public half, as committed in
     /// `crates/core/assets/minisign.pub` (public release data).
-    const EXPECTED_KEY: &str = "RWQ/pjmJi4QeFQf1jrQjt0KxMJgPAQo7rTMwLgyhNqdRjZtQnN9PLx3O";
+    const EXPECTED_KEY: &str = "RWTMAXYekUQU/JW7m2Oh/mqDvubzzbE9q5ou8syfkW1LTsxsid30UAwO";
 
     #[test]
     fn config_names_the_release_and_embeds_the_release_key() {
         let config = config();
-        assert_eq!(config.github_repo, "serrebidev/BlindRSS-Rust");
+        assert_eq!(config.github_repo, "serrebi/BlindRSS-Rust");
+        assert_eq!(config.api_base_url, "https://git.serrebiradio.com/api/v1");
         assert_eq!(config.app_name, "BlindRSS");
         assert_eq!(config.app_display_name, "BlindRSS");
         assert_eq!(config.current_version, env!("CARGO_PKG_VERSION"));
@@ -98,10 +105,11 @@ mod tests {
         format!("http://127.0.0.1:{port}{path}")
     }
 
-    /// A real signature made by the release key (BlindRadio
-    /// v0.2.45's BlindRadio.tar.gz.minisig, public release data;
-    /// same key ID as the embedded public key) — but over OTHER
-    /// bytes, so verification must fail.
+    /// A real signature made by the previous release key
+    /// (BlindRadio v0.2.45's BlindRadio.tar.gz.minisig, public
+    /// release data; its key ID no longer matches the embedded
+    /// per-product key) — and over OTHER bytes, so verification
+    /// must fail either way.
     const REAL_SIG: &str = concat!(
         "untrusted comment: signature from rsign secret key\n",
         "RUQ/pjmJi4QeFfDwFtbcmjzYhf6KKpipIoYxMcM1FwDONDjm+kZ8AOuBUR4GqZi+vg0tVeJMlwW7pf/A9o/7TAgr9TWhfNIOUw4=\n",
@@ -114,8 +122,9 @@ mod tests {
         // ship-shape's download is the install gate: it fetches the
         // .minisig first, streams the asset, and only renames the
         // temp file into place after the signature verifies. The
-        // key ID here matches the embedded key, so this exercises
-        // the Ed25519 check itself through the production config.
+        // key ID here belongs to the previous release key and the
+        // bytes differ too, so this exercises the fail-closed path
+        // through the production config.
         let payload_url = serve_once("/BlindRSS.tar.gz", b"not the signed archive".to_vec());
         let sig_url = serve_once("/BlindRSS.tar.gz.minisig", REAL_SIG.as_bytes().to_vec());
         let cancelled = AtomicBool::new(false);

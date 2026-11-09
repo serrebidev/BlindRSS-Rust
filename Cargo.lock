@@ -204,7 +204,7 @@ checksum = "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06"
 
 [[package]]
 name = "blindrss"
-version = "0.1.77"
+version = "0.1.78"
 dependencies = [
  "blindrss-core",
  "libloading",
@@ -745,7 +745,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -857,7 +857,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2828,7 +2828,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3065,8 +3065,7 @@ dependencies = [
 [[package]]
 name = "ship-shape"
 version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6ce8fbe060ee50d27fa6ecbe67a266e79a547257c5452ac87dbb6382d5d98e51"
+source = "git+https://git.serrebiradio.com/serrebi/ship-shape?rev=cff6bdb5596676723b3a0890b1b030c8edac0d28#cff6bdb5596676723b3a0890b1b030c8edac0d28"
 dependencies = [
  "homeport",
  "minisign-verify",
@@ -3361,7 +3360,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4327,6 +4326,7 @@ version = "0.1.0"
 dependencies = [
  "minisign",
  "minisign-verify",
+ "ship-shape",
 ]
 
 [[package]]
