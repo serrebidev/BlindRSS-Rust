@@ -277,6 +277,192 @@ pub fn run_tool_full_output(
     run_tool_impl(exe, args, timeout, usize::MAX)
 }
 
+
+// ---------------------------------------------------------------------------
+// PyInstaller one-file-aware process end (Python #150)
+// ---------------------------------------------------------------------------
+
+/// True when `exe_name` is a yt-dlp binary: the only tool we run
+/// that is a PyInstaller one-file executable (a bootloader that
+/// unpacks ~30 MB to %TEMP%\_MEI* and runs the worker as its
+/// child). Everything else kills and reaps directly.
+fn is_onefile_tool(exe_name: &str) -> bool {
+    let base = exe_name.rsplit(['/', '\\']).next().unwrap_or(exe_name);
+    let stem = base.strip_suffix(".exe").unwrap_or(base);
+    let stem = stem.strip_suffix(".EXE").unwrap_or(stem);
+    let lower = stem.to_ascii_lowercase();
+    lower == "yt-dlp" || lower.starts_with("yt-dlp_")
+}
+
+/// Children of `pid` running the same executable: one-file
+/// workers (Python `_windows_onefile_workers`). `entries` is
+/// (pid, parent pid, lowercase exe name); matching the name
+/// skips conhost.exe and reused-pid lookalikes.
+fn onefile_child_pids(entries: &[(u32, u32, String)], pid: u32) -> Vec<u32> {
+    let own = entries
+        .iter()
+        .find(|(p, _, _)| *p == pid)
+        .map(|(_, _, name)| name.as_str());
+    let Some(own) = own else {
+        return Vec::new();
+    };
+    entries
+        .iter()
+        .filter(|(p, parent, name)| *parent == pid && *p != pid && name == own)
+        .map(|(p, _, _)| *p)
+        .collect()
+}
+
+#[cfg(windows)]
+mod onefile_win {
+    type Handle = usize;
+
+    #[repr(C)]
+    struct ProcessEntry32W {
+        size: u32,
+        cnt_usage: u32,
+        process_id: u32,
+        default_heap_id: usize,
+        module_id: u32,
+        cnt_threads: u32,
+        parent_process_id: u32,
+        pri_class_base: i32,
+        flags: u32,
+        exe_file: [u16; 260],
+    }
+
+    // Dynamic kernel32, mirroring chromium_v20 (no link dependency).
+    unsafe extern "system" {
+        fn LoadLibraryW(name: *const u16) -> usize;
+        fn GetProcAddress(module: usize, name: *const u8) -> usize;
+    }
+
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    fn library(name: &str) -> Option<usize> {
+        let addr = unsafe { LoadLibraryW(wide(name).as_ptr()) };
+        if addr == 0 { None } else { Some(addr) }
+    }
+
+    fn proc<T>(module: usize, name: &str) -> Option<T> {
+        let mut buf = name.as_bytes().to_vec();
+        buf.push(0);
+        let addr = unsafe { GetProcAddress(module, buf.as_ptr()) };
+        if addr == 0 {
+            None
+        } else {
+            Some(unsafe { std::mem::transmute_copy(&addr) })
+        }
+    }
+
+    /// Every process as (pid, parent pid, lowercase exe name)
+    /// through a Toolhelp32 snapshot.
+    pub(super) fn snapshot_processes() -> Option<Vec<(u32, u32, String)>> {
+        const TH32CS_SNAPPROCESS: u32 = 0x2;
+        let kernel32 = library("kernel32.dll")?;
+        let create_snapshot: unsafe extern "system" fn(u32, u32) -> Handle =
+            proc(kernel32, "CreateToolhelp32Snapshot")?;
+        let first: unsafe extern "system" fn(Handle, *mut ProcessEntry32W) -> i32 =
+            proc(kernel32, "Process32FirstW")?;
+        let next: unsafe extern "system" fn(Handle, *mut ProcessEntry32W) -> i32 =
+            proc(kernel32, "Process32NextW")?;
+        let close: unsafe extern "system" fn(Handle) -> i32 = proc(kernel32, "CloseHandle")?;
+        let snapshot = unsafe { create_snapshot(TH32CS_SNAPPROCESS, 0) };
+        if snapshot == usize::MAX {
+            return None;
+        }
+        let mut entries = Vec::new();
+        unsafe {
+            let mut entry: ProcessEntry32W = std::mem::zeroed();
+            entry.size = std::mem::size_of::<ProcessEntry32W>() as u32;
+            let mut more = first(snapshot, &mut entry);
+            while more != 0 {
+                let len = entry
+                    .exe_file
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(entry.exe_file.len());
+                let name = String::from_utf16_lossy(&entry.exe_file[..len]).to_lowercase();
+                entries.push((entry.process_id, entry.parent_process_id, name));
+                more = next(snapshot, &mut entry);
+            }
+            close(snapshot);
+        }
+        Some(entries)
+    }
+
+    /// Hidden `taskkill /F /T`, Python `_taskkill_tree`.
+    pub(super) fn taskkill_tree(pid: u32) {
+        use std::os::windows::process::CommandExt;
+        let _ = std::process::Command::new("taskkill")
+            .args(["/F", "/T", "/PID", &pid.to_string()])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .creation_flags(0x0800_0000)
+            .output();
+    }
+}
+
+/// End a timed-out tool process (Python #150 `_end_onefile_tree`):
+/// force-killing a yt-dlp bootloader orphans its unpack folder,
+/// so on Windows the worker's tree (deno included) is ended
+/// first and the bootloader gets a 3 s grace to clean up and
+/// exit — extended by 1 s when a worker is found late — and is
+/// force-killed only if it is still running after that. The
+/// process is always reaped before this returns.
+pub(crate) fn end_tool_tree(child: &mut std::process::Child, exe_name: &str) {
+    #[cfg(windows)]
+    {
+        if is_onefile_tool(exe_name) {
+            end_onefile_tree(child);
+            return;
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = exe_name;
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[cfg(windows)]
+fn end_onefile_tree(child: &mut std::process::Child) {
+    use std::time::{Duration, Instant};
+    let pid = child.id();
+    let mut deadline = Instant::now() + Duration::from_secs(3);
+    let mut ended: Vec<u32> = Vec::new();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => break,
+            Ok(None) => {}
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        let workers: Vec<u32> = onefile_win::snapshot_processes()
+            .map(|entries| onefile_child_pids(&entries, pid))
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|p| !ended.contains(p))
+            .collect();
+        for worker in &workers {
+            onefile_win::taskkill_tree(*worker);
+        }
+        if !workers.is_empty() {
+            ended.extend(workers);
+            deadline = deadline.max(Instant::now() + Duration::from_secs(1));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    if matches!(child.try_wait(), Ok(None)) {
+        onefile_win::taskkill_tree(pid);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 fn run_tool_impl(
     exe: &std::path::Path,
     args: &[&str],
@@ -292,8 +478,11 @@ fn run_tool_impl(
             Ok(Some(status)) => break status,
             Ok(None) => {
                 if std::time::Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    let exe_name = exe
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("");
+                    end_tool_tree(&mut child, exe_name);
                     if let Some(h) = out_reader {
                         let _ = h.join();
                     }
@@ -309,8 +498,11 @@ fn run_tool_impl(
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
             Err(e) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                let exe_name = exe
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("");
+                end_tool_tree(&mut child, exe_name);
                 return Err(format!("{} wait failed: {e}", exe.display()));
             }
         }
@@ -1367,5 +1559,36 @@ mod download_tests {
         download_to_file(&url, &dest).expect("download over the old limit succeeds");
         assert_eq!(std::fs::metadata(&dest).unwrap().len() as usize, size);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod onefile_tests {
+    use super::*;
+
+    #[test]
+    fn onefile_worker_is_a_same_exe_child() {
+        // Python #150: the worker is a child running the same
+        // executable as the bootloader; conhost and reused-pid
+        // lookalikes never match.
+        let entries = [
+            (100u32, 1u32, "yt-dlp.exe".to_string()),
+            (101, 100, "yt-dlp.exe".to_string()),
+            (102, 100, "conhost.exe".to_string()),
+            (103, 100, "deno.exe".to_string()),
+        ];
+        assert_eq!(onefile_child_pids(&entries, 100), vec![101]);
+        assert!(onefile_child_pids(&entries, 999).is_empty());
+        assert!(onefile_child_pids(&[], 100).is_empty());
+    }
+
+    #[test]
+    fn only_ytdlp_takes_the_onefile_kill_path() {
+        assert!(is_onefile_tool("yt-dlp.exe"));
+        assert!(is_onefile_tool("YT-DLP"));
+        assert!(is_onefile_tool("/usr/local/bin/yt-dlp_linux"));
+        assert!(!is_onefile_tool("ffmpeg.exe"));
+        assert!(!is_onefile_tool("deno"));
+        assert!(!is_onefile_tool("ffprobe"));
     }
 }

@@ -388,7 +388,12 @@ mod backend {
         }
         // Python's order: NVDA first, JAWS second (speech only —
         // JAWS has no comparable simple Braille entry point).
-        jaws::speak(text)
+        // accessible_output2 second half: SAPI last, so a
+        // machine with no screen reader still speaks.
+        if jaws::speak(text) {
+            return true;
+        }
+        sapi::speak(text)
     }
 
     pub fn braille(text: &str) -> bool {
@@ -686,6 +691,282 @@ mod backend {
             }
         }
     }
+
+    /// Last-resort speech through SAPI (accessible_output2's
+    /// Windows role): when neither NVDA nor JAWS is available,
+    /// speak through the system voice instead of staying
+    /// silent. Same hand-rolled COM discipline as `jaws`, kept
+    /// separate so the primary reader paths are untouched.
+    pub(crate) mod sapi {
+        use std::ffi::c_void;
+        use std::sync::OnceLock;
+
+        unsafe extern "system" {
+            fn LoadLibraryW(name: *const u16) -> usize;
+            fn GetProcAddress(module: usize, name: *const u8) -> usize;
+        }
+
+        type CoInitializeEx = unsafe extern "system" fn(*const c_void, u32) -> i32;
+        type CoUninitialize = unsafe extern "system" fn();
+        type ClsidFromProgId = unsafe extern "system" fn(*const u16, *mut Guid) -> i32;
+        type CoCreateInstance = unsafe extern "system" fn(
+            *const Guid,
+            *const c_void,
+            u32,
+            *const Guid,
+            *mut *mut c_void,
+        ) -> i32;
+        type SysAllocString = unsafe extern "system" fn(*const u16) -> *mut u16;
+        type SysFreeString = unsafe extern "system" fn(*mut u16);
+
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct Guid {
+            a: u32,
+            b: u16,
+            c: u16,
+            d: [u8; 8],
+        }
+
+        const IID_NULL: Guid = Guid {
+            a: 0,
+            b: 0,
+            c: 0,
+            d: [0; 8],
+        };
+        const IID_IDISPATCH: Guid = Guid {
+            a: 0x0002_0400,
+            b: 0,
+            c: 0,
+            d: [0xC0, 0, 0, 0, 0, 0, 0, 0x46],
+        };
+
+        #[repr(C)]
+        struct Variant {
+            vt: u16,
+            r1: u16,
+            r2: u16,
+            r3: u16,
+            data: usize,
+            extra: usize,
+        }
+
+        #[repr(C)]
+        struct DispParams {
+            args: *const Variant,
+            named_args: *const i32,
+            arg_count: u32,
+            named_count: u32,
+        }
+
+        type GetIdsOfNames = unsafe extern "system" fn(
+            *mut c_void,
+            *const Guid,
+            *const *const u16,
+            u32,
+            u32,
+            *mut i32,
+        ) -> i32;
+        type Invoke = unsafe extern "system" fn(
+            *mut c_void,
+            i32,
+            *const Guid,
+            u32,
+            u16,
+            *const DispParams,
+            *mut Variant,
+            *const c_void,
+            *const c_void,
+        ) -> i32;
+        type Release = unsafe extern "system" fn(*mut c_void) -> u32;
+
+        fn wide(s: &str) -> Vec<u16> {
+            s.encode_utf16().chain(std::iter::once(0)).collect()
+        }
+
+        fn ole_proc<T>(name: &str) -> Option<T> {
+            static OLE32: OnceLock<usize> = OnceLock::new();
+            let module = *OLE32.get_or_init(|| unsafe { LoadLibraryW(wide("ole32.dll").as_ptr()) });
+            if module == 0 {
+                return None;
+            }
+            let mut buf = name.as_bytes().to_vec();
+            buf.push(0);
+            let addr = unsafe { GetProcAddress(module, buf.as_ptr()) };
+            if addr == 0 {
+                None
+            } else {
+                Some(unsafe { std::mem::transmute_copy(&addr) })
+            }
+        }
+
+        fn with_com<T>(work: impl FnOnce() -> T, fallback: T) -> T {
+            unsafe {
+                let Some(co_init) = ole_proc::<CoInitializeEx>("CoInitializeEx") else {
+                    return fallback;
+                };
+                // COINIT_APARTMENTTHREADED; RPC_E_CHANGED_MODE (-2)
+                // means COM is already up in another mode — proceed.
+                let hr = co_init(std::ptr::null(), 2);
+                let initialized = hr >= 0;
+                let out = work();
+                if initialized && let Some(co_uninit) = ole_proc::<CoUninitialize>("CoUninitialize")
+                {
+                    co_uninit();
+                }
+                out
+            }
+        }
+
+        fn voice() -> Option<(*mut c_void, Invoke, Release)> {
+            unsafe {
+                let clsid_from = ole_proc::<ClsidFromProgId>("CLSIDFromProgID")?;
+                let create = ole_proc::<CoCreateInstance>("CoCreateInstance")?;
+                let mut clsid = IID_NULL;
+                if clsid_from(wide("SAPI.SpVoice").as_ptr(), &mut clsid) < 0 {
+                    return None;
+                }
+                let mut obj: *mut c_void = std::ptr::null_mut();
+                // CLSCTX_ALL = 0x17.
+                if create(&clsid, std::ptr::null(), 0x17, &IID_IDISPATCH, &mut obj) < 0
+                    || obj.is_null()
+                {
+                    return None;
+                }
+                let vtable = *(obj as *const *const usize);
+                let invoke: Invoke = std::mem::transmute_copy(&*vtable.add(6));
+                let release: Release = std::mem::transmute_copy(&*vtable.add(2));
+                Some((obj, invoke, release))
+            }
+        }
+
+        fn speak_dispid(obj: *mut c_void) -> Option<i32> {
+            unsafe {
+                let vtable = *(obj as *const *const usize);
+                let get_ids: GetIdsOfNames = std::mem::transmute_copy(&*vtable.add(5));
+                let mut dispid = 0i32;
+                let name = wide("Speak");
+                let names = [name.as_ptr()];
+                if get_ids(obj, &IID_NULL, names.as_ptr(), 1, 0x0400, &mut dispid) >= 0 {
+                    Some(dispid)
+                } else {
+                    None
+                }
+            }
+        }
+
+        fn alloc_bstr(text: &str) -> Option<(*mut u16, SysFreeString)> {
+            unsafe {
+                static AUT32: OnceLock<usize> = OnceLock::new();
+                let module = *AUT32.get_or_init(|| LoadLibraryW(wide("oleaut32.dll").as_ptr()));
+                if module == 0 {
+                    return None;
+                }
+                let mut buf = b"SysAllocString\0".to_vec();
+                let alloc_addr = GetProcAddress(module, buf.as_mut_ptr());
+                buf = b"SysFreeString\0".to_vec();
+                let free_addr = GetProcAddress(module, buf.as_mut_ptr());
+                if alloc_addr == 0 || free_addr == 0 {
+                    return None;
+                }
+                let alloc: SysAllocString = std::mem::transmute_copy(&alloc_addr);
+                let free_str: SysFreeString = std::mem::transmute_copy(&free_addr);
+                let bstr = alloc(wide(text).as_ptr());
+                if bstr.is_null() {
+                    return None;
+                }
+                Some((bstr, free_str))
+            }
+        }
+
+        /// Resolve a voice and its Speak entry point without
+        /// uttering anything (the silent live-test probe).
+        #[cfg(test)]
+        pub(crate) fn dry_run() -> bool {
+            with_com(
+                || unsafe {
+                    let Some((obj, _, release)) = voice() else {
+                        return false;
+                    };
+                    let ok = speak_dispid(obj).is_some();
+                    release(obj);
+                    ok
+                },
+                false,
+            )
+        }
+
+        pub fn speak(text: &str) -> bool {
+            with_com(
+                || unsafe {
+                    let Some((obj, invoke, release)) = voice() else {
+                        return false;
+                    };
+                    let Some(dispid) = speak_dispid(obj) else {
+                        release(obj);
+                        return false;
+                    };
+                    let Some((bstr, free_str)) = alloc_bstr(text) else {
+                        release(obj);
+                        return false;
+                    };
+                    // IDispatch arguments are passed in reverse
+                    // order: Speak(text, flags) -> [flags, text].
+                    // SVSFlagsAsync (1) returns at once;
+                    // SVSFPurgeBeforeSpeak (2) interrupts, as the
+                    // NVDA path cancels before every announcement.
+                    let args = [
+                        Variant {
+                            vt: 3, // VT_I4
+                            r1: 0,
+                            r2: 0,
+                            r3: 0,
+                            data: 3,
+                            extra: 0,
+                        },
+                        Variant {
+                            vt: 8, // VT_BSTR
+                            r1: 0,
+                            r2: 0,
+                            r3: 0,
+                            data: bstr as usize,
+                            extra: 0,
+                        },
+                    ];
+                    let params = DispParams {
+                        args: args.as_ptr(),
+                        named_args: std::ptr::null(),
+                        arg_count: 2,
+                        named_count: 0,
+                    };
+                    let mut out = Variant {
+                        vt: 0,
+                        r1: 0,
+                        r2: 0,
+                        r3: 0,
+                        data: 0,
+                        extra: 0,
+                    };
+                    // DISPATCH_METHOD = 1, LOCALE_USER_DEFAULT = 0x0400.
+                    let hr = invoke(
+                        obj,
+                        dispid,
+                        &IID_NULL,
+                        0x0400,
+                        1,
+                        &params,
+                        &mut out,
+                        std::ptr::null(),
+                        std::ptr::null(),
+                    );
+                    free_str(bstr);
+                    release(obj);
+                    hr >= 0
+                },
+                false,
+            )
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -727,9 +1008,63 @@ mod backend {
 
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
 mod backend {
-    pub fn speak(_text: &str) -> bool {
-        false
+    use std::process::{Child, Command, Stdio};
+    use std::sync::{Mutex, OnceLock};
+
+    static PREV: Mutex<Option<Child>> = Mutex::new(None);
+
+    /// speech-dispatcher presence probe (silent: --version
+    /// prints, never speaks).
+    pub(crate) fn speech_dispatcher_available() -> bool {
+        static AVAIL: OnceLock<bool> = OnceLock::new();
+        *AVAIL.get_or_init(|| {
+            Command::new("spd-say")
+                .arg("--version")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
+        })
     }
+
+    /// speech-dispatcher speech (accessible_output2 Linux
+    /// role). The previous announcement is cancelled first
+    /// (Python interrupt=True); fail closed without speechd.
+    pub fn speak(text: &str) -> bool {
+        if !speech_dispatcher_available() {
+            return false;
+        }
+        let Ok(mut prev) = PREV.lock() else {
+            return false;
+        };
+        let _ = Command::new("spd-say")
+            .arg("--cancel")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        if let Some(mut child) = prev.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        match Command::new("spd-say")
+            .arg("--wait")
+            .arg("--")
+            .arg(text)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => {
+                *prev = Some(child);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
     pub fn braille(_text: &str) -> bool {
         false
     }
@@ -782,5 +1117,27 @@ mod hidden_announcer_tests {
         assert!(!a.should_speak("Loading media...", false));
         assert!(!a.should_speak("Playing", false));
         assert!(a.should_speak("Failed to load media", false));
+    }
+}
+
+#[cfg(test)]
+mod fallback_speech_tests {
+    /// SAPI resolves a voice and a Speak dispid without uttering
+    /// a sound (live Windows only; the ignored live-environment
+    /// pattern this repo uses for VLC/Chromium).
+    #[test]
+    #[ignore]
+    #[cfg(target_os = "windows")]
+    fn sapi_voice_resolves_without_speaking() {
+        assert!(super::backend::sapi::dry_run());
+    }
+
+    /// speech-dispatcher probe is stable and silent (never
+    /// speaks, never panics, never blocks the caller).
+    #[test]
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    fn speech_dispatcher_probe_is_stable_and_silent() {
+        let first = super::backend::speech_dispatcher_available();
+        assert_eq!(first, super::backend::speech_dispatcher_available());
     }
 }

@@ -1025,6 +1025,7 @@ struct MinifluxRefreshState {
     failures: std::collections::HashMap<i64, (u32, std::time::Instant)>,
     cooldown_until: Option<std::time::Instant>,
     in_flight: std::collections::HashSet<i64>,
+    browser_fallback_available: Option<bool>,
 }
 
 type MinifluxRefreshStates =
@@ -1048,6 +1049,8 @@ pub struct MfFeed {
     category: Option<MfCategory>,
     #[serde(default)]
     parsing_error_count: i64,
+    #[serde(default)]
+    parsing_error_message: String,
     #[serde(default)]
     checked_at: Option<String>,
 }
@@ -1191,7 +1194,9 @@ impl MinifluxClient {
         let client = self.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(client.run_refresh_pool(ids));
+            let result = client.run_refresh_pool(ids);
+            client.queue_browser_feed_recovery(&[]);
+            let _ = tx.send(result);
         });
         if deadline == 0.0 {
             rx.recv()
@@ -1575,7 +1580,26 @@ impl MinifluxClient {
                     .map(|f| f.id)
                     .ok_or_else(|| "create feed failed: HTTP 400".to_string());
             }
-            Err(e) => return Err(format!("create feed failed: {e}")),
+            Err(e) => {
+                // Companion fallback (Python add_feed): the server may sit
+                // behind a browser gate, so ask it to solve the challenge
+                // from its own IP and create the feed through the API.
+                if let Some(value) = self.browser_feed_fallback_request(
+                    "add",
+                    serde_json::json!({"feed_url": feed_url, "category_id": category_id}),
+                    true,
+                ) {
+                    let fid = value.get("feed_id").and_then(|v| {
+                        v.as_i64().or_else(|| {
+                            v.as_str().and_then(|s| s.trim().parse::<i64>().ok())
+                        })
+                    });
+                    if let Some(fid) = fid {
+                        return Ok(fid);
+                    }
+                }
+                return Err(format!("create feed failed: {e}"));
+            }
         };
         let text = resp
             .body_mut()
@@ -1741,7 +1765,18 @@ impl MinifluxClient {
     /// refresh for hosted feeds). Returns how many were new.
     pub fn refresh_feed(&self, db: &Db, mf_id: i64) -> Result<usize, String> {
         self.request_feed_refreshes(&[mf_id], true)?;
-        self.sync_feed_entries(db, mf_id)
+        let synced = self.sync_feed_entries(db, mf_id)?;
+        // Companion recovery (Python refresh_feed): a stored
+        // challenge-looking error queues this feed for the
+        // server-side browser gate solver.
+        if let Ok(feeds) = self.feeds()
+            && let Some(target) = feeds.iter().find(|f| f.id == mf_id)
+            && target.parsing_error_count > 0
+            && looks_like_browser_challenge_error(&target.parsing_error_message)
+        {
+            self.queue_browser_feed_recovery(&[mf_id]);
+        }
+        Ok(synced)
     }
 
     fn sync_feed_entries(&self, db: &Db, mf_id: i64) -> Result<usize, String> {
@@ -1910,5 +1945,283 @@ impl MinifluxClient {
                 .map_err(|e| format!("category reconcile failed: {e}"))?;
         }
         Ok((feeds.len(), new_articles))
+    }
+}
+/// Challenge markers (Python `_looks_like_browser_challenge_error`).
+fn looks_like_browser_challenge_error(value: &str) -> bool {
+    let text = value.to_lowercase();
+    [
+        "status code: 403",
+        "status code 403",
+        "http 403",
+        "forbidden",
+        "cloudflare",
+        "browser verification",
+        "bot challenge",
+        "cf-mitigated",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker))
+}
+
+/// Companion endpoint (Python `_browser_feed_fallback_request`):
+/// base + configured path + action, slashes normalized. None
+/// when the base URL or the path is empty.
+fn browser_fallback_endpoint(base_url: &str, path_conf: &str, action: &str) -> Option<String> {
+    let base = base_url.trim().trim_end_matches('/');
+    if base.is_empty() {
+        return None;
+    }
+    let mut path = path_conf.trim().to_string();
+    if path.is_empty() {
+        return None;
+    }
+    if !path.starts_with('/') {
+        path.insert(0, '/');
+    }
+    let action = action.trim().trim_matches('/');
+    let path = path.trim_end_matches('/');
+    Some(format!("{base}{path}/{action}"))
+}
+
+/// Companion timeout (Python `_browser_feed_fallback_request`):
+/// 12 s fire-and-forget, or clamp(config, 45..180) + 30 when
+/// waiting on the clearance round-trip.
+fn browser_fallback_timeout(wait: bool, cfg_seconds: f64) -> u64 {
+    if !wait {
+        return 12;
+    }
+    let cfg = if cfg_seconds.is_finite() {
+        cfg_seconds
+    } else {
+        90.0
+    };
+    (cfg.clamp(45.0, 180.0) as u64) + 30
+}
+
+impl MinifluxClient {
+    fn browser_fallback_path(&self) -> String {
+        self.refresh_config
+            .raw()
+            .get("providers")
+            .and_then(|p| p.get("miniflux"))
+            .and_then(|m| m.get("browser_feed_fallback_path"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("/blindrss-browser-feed/v1")
+            .to_string()
+    }
+
+    /// Call the optional same-origin companion that solves
+    /// browser-verification challenges from the Miniflux host's
+    /// own IP (Python `_browser_feed_fallback_request`). The API
+    /// token is forwarded only to the configured origin; a 404
+    /// disables probing for the rest of the process, every other
+    /// failure returns None, and nothing is ever sent when the
+    /// `browser_feed_fallback_enabled` gate is off.
+    pub fn browser_feed_fallback_request(
+        &self,
+        action: &str,
+        payload: serde_json::Value,
+        wait: bool,
+    ) -> Option<serde_json::Value> {
+        if !self
+            .refresh_config
+            .get_bool("browser_feed_fallback_enabled", true)
+        {
+            return None;
+        }
+        {
+            let state = self.refresh_state.lock().unwrap_or_else(|p| p.into_inner());
+            if state.browser_fallback_available == Some(false) {
+                return None;
+            }
+        }
+        let endpoint = browser_fallback_endpoint(&self.base_url, &self.browser_fallback_path(), action)?;
+        let timeout_s = browser_fallback_timeout(
+            wait,
+            self.refresh_config
+                .get_i64("browser_feed_fallback_timeout_seconds", 90) as f64,
+        );
+        let config = ureq::Agent::config_builder()
+            .user_agent(crate::http::user_agent())
+            .timeout_connect(Some(std::time::Duration::from_secs(3)))
+            .timeout_global(Some(std::time::Duration::from_secs(timeout_s)))
+            .http_status_as_error(false)
+            .build();
+        let mut resp = ureq::Agent::new_with_config(config)
+            .post(&endpoint)
+            .header("X-Auth-Token", &self.api_key)
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .send(payload.to_string())
+            .ok()?;
+        let status = resp.status().as_u16();
+        if status == 404 {
+            self.refresh_state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .browser_fallback_available = Some(false);
+            return None;
+        }
+        if !(200..=202).contains(&status) {
+            return None;
+        }
+        self.refresh_state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .browser_fallback_available = Some(true);
+        let text = resp.body_mut().read_to_string().unwrap_or_default();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+        if value.is_object() {
+            Some(value)
+        } else {
+            Some(serde_json::json!({}))
+        }
+    }
+
+    /// Fire a "recover" companion request (Python
+    /// `_queue_browser_feed_recovery`). An empty id list asks
+    /// the server to filter by its own latest error text.
+    pub fn queue_browser_feed_recovery(&self, feed_ids: &[i64]) -> bool {
+        let ids: Vec<String> = feed_ids.iter().map(|id| id.to_string()).collect();
+        self.browser_feed_fallback_request("recover", serde_json::json!({"feed_ids": ids}), false)
+            .is_some()
+    }
+}
+
+#[cfg(test)]
+mod miniflux_fallback_tests {
+    use crate::config::Config;
+    use super::*;
+    use std::io::{Read, Write};
+
+    #[test]
+    fn challenge_markers_match_python() {
+        for hit in [
+            "Error, status code: 403",
+            "HTTP 403 Forbidden",
+            "forbidden by policy",
+            "Cloudflare challenge",
+            "browser verification required",
+            "bot challenge issued",
+            "cf-mitigated: challenge",
+        ] {
+            assert!(
+                looks_like_browser_challenge_error(hit),
+                "missed: {hit}"
+            );
+        }
+        for miss in ["HTTP 500", "connection timed out", "", "not found"] {
+            assert!(
+                !looks_like_browser_challenge_error(miss),
+                "false hit: {miss}"
+            );
+        }
+    }
+
+    #[test]
+    fn fallback_endpoint_shape_matches_python() {
+        assert_eq!(
+            browser_fallback_endpoint("https://mf.example", "/blindrss-browser-feed/v1", "recover"),
+            Some("https://mf.example/blindrss-browser-feed/v1/recover".to_string())
+        );
+        // Missing leading slash and trailing slashes are normalized.
+        assert_eq!(
+            browser_fallback_endpoint("https://mf.example/", "companion/", "/add/"),
+            Some("https://mf.example/companion/add".to_string())
+        );
+        assert_eq!(browser_fallback_endpoint("", "/x", "recover"), None);
+        assert_eq!(
+            browser_fallback_endpoint("https://mf.example", "   ", "recover"),
+            None
+        );
+    }
+
+    #[test]
+    fn fallback_timeout_matches_python_clamp() {
+        assert_eq!(browser_fallback_timeout(false, 90.0), 12);
+        // wait: clamp(config, 45..180) as int, plus 30.
+        assert_eq!(browser_fallback_timeout(true, 90.0), 120);
+        assert_eq!(browser_fallback_timeout(true, 1.0), 75);
+        assert_eq!(browser_fallback_timeout(true, 999.0), 210);
+    }
+
+    /// Serve scripted statuses over loopback; returns the base
+    /// URL and a hit counter.
+    fn serve_statuses(statuses: Vec<u16>) -> (String, std::sync::Arc<std::sync::Mutex<usize>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+        let hits2 = hits.clone();
+        std::thread::spawn(move || {
+            for status in statuses {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                *hits2.lock().unwrap() += 1;
+                let mut req = Vec::new();
+                let mut chunk = [0u8; 1024];
+                while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let n = stream.read(&mut chunk).unwrap_or(0);
+                    if n == 0 { break; }
+                    req.extend_from_slice(&chunk[..n]);
+                }
+                // Drain the declared body too: closing with an
+                // unread request body resets the connection and
+                // the client loses the response body.
+                let head_end = req.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4).unwrap_or(req.len());
+                let want: usize = String::from_utf8_lossy(&req[..head_end])
+                    .lines()
+                    .find_map(|l| l.strip_prefix("Content-Length:").or_else(|| l.strip_prefix("content-length:")))
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(0);
+                while req.len() < head_end + want {
+                    let n = stream.read(&mut chunk).unwrap_or(0);
+                    if n == 0 { break; }
+                    req.extend_from_slice(&chunk[..n]);
+                }
+                let body = if status == 200 { r#"{"ok":true}"# } else { "{}" };
+                let head = format!(
+                    "HTTP/1.1 {status} x\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(body.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        (format!("http://{addr}"), hits)
+    }
+
+    #[test]
+    fn fallback_404_disables_further_probing() {
+        let (base, hits) = serve_statuses(vec![404]);
+        let client = MinifluxClient::new(&base, "token").with_refresh_config(&Config::default());
+        assert_eq!(client.browser_feed_fallback_request("recover", serde_json::json!({}), false), None);
+        assert_eq!(*hits.lock().unwrap(), 1);
+        // Second call skips the network entirely.
+        assert_eq!(client.browser_feed_fallback_request("recover", serde_json::json!({}), false), None);
+        assert_eq!(*hits.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn fallback_200_returns_object_and_stays_enabled() {
+        let (base, hits) = serve_statuses(vec![200, 200]);
+        let client = MinifluxClient::new(&base, "token").with_refresh_config(&Config::default());
+        let value = client.browser_feed_fallback_request("add", serde_json::json!({"feed_url": "x"}), true);
+        assert_eq!(value, Some(serde_json::json!({"ok": true})));
+        assert_eq!(*hits.lock().unwrap(), 1);
+        let _ = client.browser_feed_fallback_request("recover", serde_json::json!({}), false);
+        assert_eq!(*hits.lock().unwrap(), 2);
+    }
+
+    #[test]
+    fn fallback_respects_the_settings_gate() {
+        let (base, hits) = serve_statuses(vec![200]);
+        let mut cfg = Config::default();
+        cfg.set_path("browser_feed_fallback_enabled", serde_json::json!(false));
+        let client = MinifluxClient::new(&base, "token").with_refresh_config(&cfg);
+        assert_eq!(client.browser_feed_fallback_request("recover", serde_json::json!({}), false), None);
+        assert_eq!(*hits.lock().unwrap(), 0);
     }
 }
