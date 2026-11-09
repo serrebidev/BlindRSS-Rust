@@ -390,17 +390,9 @@ pub(crate) fn ytdlp_json(target: &str, limit: usize) -> Result<Value, String> {
                 std::thread::sleep(Duration::from_millis(25))
             }
             _ => {
-                #[cfg(windows)]
-                {
-                    let mut kill = std::process::Command::new("taskkill");
-                    use std::os::windows::process::CommandExt;
-                    let _ = kill
-                        .args(["/PID", &child.id().to_string(), "/T", "/F"])
-                        .creation_flags(0x0800_0000)
-                        .output();
-                }
-                let _ = child.kill();
-                let _ = child.wait();
+                // Onefile-aware end (Python #150): a bare tree-kill
+                // orphans the bootloader's %TEMP%\_MEI* unpack folder.
+                crate::dependency::end_tool_tree(&mut child, "yt-dlp");
                 return Err("Source listing timed out".into());
             }
         }

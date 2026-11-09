@@ -1656,8 +1656,8 @@ fn youtube_dump(target: &str, limit: usize) -> Result<String, String> {
                 std::thread::sleep(std::time::Duration::from_millis(50))
             }
             _ => {
-                let _ = child.kill();
-                let _ = child.wait();
+                // Onefile-aware end (Python #150).
+                crate::dependency::end_tool_tree(&mut child, "yt-dlp");
                 let _ = reader.join();
                 return Err("YouTube search timed out".into());
             }
