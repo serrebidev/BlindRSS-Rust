@@ -635,6 +635,41 @@ fn macrumors_glued_footer_is_cut_at_its_anchors() {
 }
 
 #[test]
+fn macrumors_footer_anchors_cut_across_line_breaks() {
+    // Brandon's report (2026-11-09, on v0.1.78): the footer
+    // still trailed the body. Extraction emits block
+    // fragments on separate lines, so at strip time the
+    // anchors are split over lines ("To Subscribe or\n
+    // Unsubscribe") and only glue into the verbatim
+    // sentences when the reader text collapses. The page
+    // also uses a curly apostrophe in "Apple's". The
+    // anchors match across whitespace runs either way.
+    let body = "The new display looks as good as you would expect from a laptop at this price, with true blacks and no bloom around bright highlights on dark scenes. ".repeat(3);
+    let url = "https://www.macrumors.com/how-to/turn-glowing-apple-logo-macbook-pro/";
+    // Split subscribe + support anchors.
+    let split = format!(
+        "{body}Some trailing body words.\nTo Subscribe or\nUnsubscribeVideosGuidesOur comprehensive guide.\nIf you have any questions or problems,\nemail support@macrumors.com.Other Stories1 day ago by Joe Rossignol"
+    );
+    let out = pp(&split, url);
+    assert!(out.contains("trailing body words"), "body lost: {out}");
+    assert!(!out.contains("Unsubscribe"), "split tail survived: {out}");
+    assert!(
+        !out.contains("support@macrumors.com"),
+        "split support survived: {out}"
+    );
+    // Curly apostrophe + heading split from the pitch.
+    let curly = format!(
+        "{body}Some trailing body words.\nPush\nNotificationsApple\u{2019}s Safari browser includes\na feature that allows users to subscribe."
+    );
+    let out2 = pp(&curly, url);
+    assert!(out2.contains("trailing body words"), "body lost: {out2}");
+    assert!(
+        !out2.contains("Notifications"),
+        "curly push block survived: {out2}"
+    );
+}
+
+#[test]
 fn windowslatest_caption_credit_and_syndication_line_are_dropped() {
     // Captions (with "Credit: Windows Latest") come from
     // figcaptions and die with them; the trailing "The post

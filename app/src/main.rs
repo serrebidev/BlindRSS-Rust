@@ -415,6 +415,7 @@ fn auto_translate_text(text: String) -> String {
 fn arbitrate_full_text(
     outcome: blindrss_core::extract::ExtractOutcome,
     article_id: &str,
+    article_url: &str,
 ) -> blindrss_core::extract::ExtractOutcome {
     use blindrss_core::extract::ExtractOutcome as EO;
     let Some(entry) = article_id
@@ -453,6 +454,14 @@ fn arbitrate_full_text(
     };
     let remote_text =
         blindrss_core::extract::html_to_text_opts(&html, cfg.get_bool("show_image_alt", false));
+    // The server scrape is extraction output, so it runs the
+    // same site postprocess as the local cascade before the
+    // length comparison: page chrome must count toward
+    // neither "more complete" nor the adopted text
+    // (MacRumors footer/rail surviving arbitration,
+    // Brandon's report, 2026-11-09).
+    let remote_text =
+        blindrss_core::postprocess::postprocess_extracted_text(&remote_text, article_url, "");
     let local_len = match &outcome {
         EO::Article { text, .. } => text.chars().count(),
         _ => 0,
@@ -1125,6 +1134,71 @@ fn local_utc_offset_secs() -> i64 {
     (offset / 60).clamp(-14 * 60, 14 * 60) * 60
 }
 
+/// Miniflux stored bodies are server content: when the
+/// server scrapes full article text ("fetch original
+/// content"), page chrome lands in the stored body — 17 of
+/// 25 stored MacRumors bodies carry the "Popular Stories"
+/// rail (2026-11-09) — and the extraction postprocess never
+/// sees stored bodies. Run the evidenced site strip here at
+/// display time; the database keeps the raw server text.
+/// Local publisher bodies are untouched, and only MacRumors
+/// is gated: other hosts stay raw until a report evidences
+/// their server chrome.
+pub(crate) fn hosted_body_for_display(feed_id: &str, article_url: &str, body_text: &str) -> String {
+    if feed_id.starts_with("miniflux:") && article_url.contains("macrumors.com") {
+        blindrss_core::postprocess::strip_macrumors_boilerplate(body_text)
+    } else {
+        body_text.to_string()
+    }
+}
+
+/// The reader's last-known reading place: the text the
+/// caret/selection belongs to, the caret, the selection,
+/// and a placement sequence bumped by every programmatic
+/// write (set_value, Find placement) so a deferred
+/// focus-restore never clobbers a newer placement. Lives in
+/// `State` so every reader writer shares it.
+#[derive(Clone, Default)]
+struct ReaderPlace {
+    text: String,
+    pos: i64,
+    from: i64,
+    to: i64,
+    seq: u64,
+}
+
+/// Restore a reading place into the reader: the selection
+/// when one was kept, else the caret.
+fn apply_reader_place(reader: &TextCtrl, place: &ReaderPlace) {
+    if place.from != place.to {
+        reader.set_selection(place.from, place.to);
+    } else if place.pos > 0 {
+        reader.set_insertion_point(place.pos);
+    }
+}
+
+/// Write reader text unless the identical text is already
+/// displayed (Python `_set_article_reader_text`'s memo): a
+/// redundant write resets the caret to 0 for no reason. A
+/// real write resets the tracked place to the top of the
+/// new document and bumps the placement sequence. Returns
+/// true when the control was written.
+fn set_reader_text(reader: &TextCtrl, place: &mut ReaderPlace, text: &str) -> bool {
+    if place.text == text && reader.get_value() == text {
+        return false;
+    }
+    reader.set_value(text);
+    let seq = place.seq.wrapping_add(1);
+    *place = ReaderPlace {
+        text: text.to_string(),
+        pos: 0,
+        from: 0,
+        to: 0,
+        seq,
+    };
+    true
+}
+
 /// The plain reader text for a selected article (Python
 /// `_update_content_view`'s plain path): the title, a
 /// Date/Author/Link header with the humanized date, a rule of
@@ -1605,7 +1679,12 @@ fn rerender_current_article(
         .or_else(|| a.description.clone())
         .unwrap_or_else(|| "(no stored text)".to_string());
     let body = blindrss_core::extract::html_to_text_opts(&raw_body, keep_alt);
-    reader.set_value(&selection_reader_text(&a, &body));
+    let body = hosted_body_for_display(&a.feed_id, &a.url, &body);
+    set_reader_text(
+        reader,
+        &mut st.reader_place,
+        &selection_reader_text(&a, &body),
+    );
     if cfg.get_bool("full_text_rich_view", false)
         && let Some(wv) = rich_view.as_ref()
     {
@@ -2004,6 +2083,27 @@ struct State {
     /// the playing row's Media cell without rebuilding the
     /// layout per poll.
     media_column: Option<usize>,
+    /// The reader's last-known reading place (caret +
+    /// selection + the text they belong to), tracked across
+    /// focus changes so Tab away and back keeps the reading
+    /// position. Updated by caret moves (key/mouse),
+    /// focus-out, and every programmatic reader write.
+    reader_place: ReaderPlace,
+    /// A focus-gain caret restore waiting on the deferred
+    /// one-shot timer: the place snapshot to re-apply after
+    /// native focus handling settles, dropped when a newer
+    /// placement lands first.
+    pending_restore: Option<ReaderPlace>,
+    /// What the tree currently shows (Python
+    /// `_tree_content_signatures`): the node structure
+    /// (feeds, categories, smart folders, recommendations
+    /// presence) and the unread counts, recorded by every
+    /// rebuild. A refresh completion skips the rebuild when
+    /// both match — a full rebuild disturbs screen-reader
+    /// focus — and patches labels in place when only the
+    /// counts moved.
+    tree_struct_sig: String,
+    tree_counts_sig: String,
 }
 
 /// Registry dispatch shared by the main frame's char hook and
@@ -2564,6 +2664,213 @@ fn feed_label(counts: &std::collections::HashMap<String, i64>, feed: &Feed) -> S
     }
 }
 
+/// Unread total of every feed in a category scope: feeds
+/// filed exactly at `cur` plus feeds in paths below it.
+fn category_unread_total(
+    feeds: &[Feed],
+    counts: &std::collections::HashMap<String, i64>,
+    cur: &str,
+) -> i64 {
+    let prefix = format!("{cur}{}", blindrss_core::CATEGORY_PATH_SEP);
+    feeds
+        .iter()
+        .filter(|f| {
+            f.category.as_deref() == Some(cur)
+                || f.category
+                    .as_deref()
+                    .is_some_and(|c| c.starts_with(&prefix))
+        })
+        .map(|f| counts.get(&f.id).copied().unwrap_or(0))
+        .sum()
+}
+
+/// Category node label: leaf name plus the unread total,
+/// Python-style.
+fn category_node_label(seg: &str, unread: i64) -> String {
+    if unread > 0 {
+        format!("{seg} ({unread})")
+    } else {
+        seg.to_string()
+    }
+}
+
+/// Unread total of the uncategorized feeds (None when there
+/// are no uncategorized feeds at all — the node is absent
+/// then, not zero-labelled).
+fn uncategorized_unread(
+    feeds: &[Feed],
+    counts: &std::collections::HashMap<String, i64>,
+) -> Option<i64> {
+    let mut any = false;
+    let mut unread = 0;
+    for f in feeds {
+        if is_uncategorized_cat(f.category.as_deref()) {
+            any = true;
+            unread += counts.get(&f.id).copied().unwrap_or(0);
+        }
+    }
+    any.then_some(unread)
+}
+
+fn uncategorized_node_label(unread: i64) -> String {
+    if unread > 0 {
+        format!("Uncategorized ({unread})")
+    } else {
+        "Uncategorized".to_string()
+    }
+}
+
+/// Whether the YouTube Recommendations node renders: signed
+/// in AND a recommendations snapshot exists (Python's
+/// `_has_snapshot`).
+fn recommendations_node_present(db: &Db) -> bool {
+    let token = blindrss_core::config::Config::load(&config_path())
+        .unwrap_or_default()
+        .get_str("youtube_account_refresh_token", "")
+        .to_string();
+    if token.is_empty() {
+        return false;
+    }
+    let account = blindrss_core::youtube_account::account_key(&token);
+    db.has_recommendation_snapshot(&account).unwrap_or(false)
+}
+
+/// What the tree would show for these feeds (Python
+/// `_tree_content_signatures`): the node structure and the
+/// unread counts, each as one sorted string. Sorted so row
+/// order can never fake a change.
+fn tree_signatures(feeds: &[Feed], db: &Db) -> (String, String) {
+    let mut feed_part: Vec<String> = feeds
+        .iter()
+        .map(|f| {
+            format!(
+                "{}\u{1f}{}\u{1f}{}",
+                f.id,
+                f.title,
+                f.category.as_deref().unwrap_or("")
+            )
+        })
+        .collect();
+    feed_part.sort();
+    let mut paths: Vec<String> = db
+        .categories()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|c| c.title)
+        .filter(|t| !is_uncategorized_cat(Some(t)))
+        .collect();
+    for f in feeds {
+        if let Some(cat) = &f.category
+            && !cat.trim().is_empty()
+            && !is_uncategorized_cat(Some(cat))
+            && !paths.contains(cat)
+        {
+            paths.push(cat.clone());
+        }
+    }
+    paths.sort();
+    let mut smarts: Vec<String> = db
+        .smart_folders()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(id, name, _, _)| format!("{id}\u{1f}{name}"))
+        .collect();
+    smarts.sort();
+    let structural = format!(
+        "f:{}\nc:{}\ns:{}\nr:{}",
+        feed_part.join("\n"),
+        paths.join("\n"),
+        smarts.join("\n"),
+        recommendations_node_present(db)
+    );
+    let mut count_part: Vec<String> = db
+        .unread_counts()
+        .unwrap_or_default()
+        .iter()
+        .map(|(id, n)| format!("{id}:{n}"))
+        .collect();
+    count_part.sort();
+    (structural, count_part.join("\n"))
+}
+
+/// Counts-only tree refresh (Python
+/// `_patch_tree_unread_labels`): rewrite the unread counts
+/// in feed, category and Uncategorized labels in place. No
+/// node is deleted or recreated and no selection event
+/// fires, so the screen reader sits still. Returns false
+/// when any expected node is missing — the caller falls
+/// back to a full rebuild.
+fn patch_tree_labels(state: &State, tree: &TreeCtrl) -> bool {
+    let Some(db) = state.db.as_ref() else {
+        return false;
+    };
+    let Some(root) = tree.get_root_item() else {
+        return false;
+    };
+    let set_label = |tree: &TreeCtrl, data: &str, label: &str| -> bool {
+        let Some(item) = find_item_by_data(tree, &root, data) else {
+            return false;
+        };
+        if tree.get_item_text(&item).as_deref() != Some(label) {
+            tree.set_item_text(&item, label);
+        }
+        true
+    };
+    let counts = db.unread_counts().unwrap_or_default();
+    let feeds = &state.feeds;
+    for f in feeds {
+        if !set_label(tree, &f.id, &feed_label(&counts, f)) {
+            return false;
+        }
+    }
+    let mut paths: Vec<String> = db
+        .categories()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|c| c.title)
+        .filter(|t| !is_uncategorized_cat(Some(t)))
+        .collect();
+    for f in feeds {
+        if let Some(cat) = &f.category
+            && !cat.trim().is_empty()
+            && !is_uncategorized_cat(Some(cat))
+            && !paths.contains(cat)
+        {
+            paths.push(cat.clone());
+        }
+    }
+    paths.sort();
+    let mut patched: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for path in &paths {
+        let mut cur = String::new();
+        for seg in path
+            .split(blindrss_core::CATEGORY_PATH_SEP)
+            .filter(|s| !s.trim().is_empty())
+        {
+            if !cur.is_empty() {
+                cur.push_str(blindrss_core::CATEGORY_PATH_SEP);
+            }
+            cur.push_str(seg.trim());
+            if !patched.insert(cur.clone()) {
+                continue;
+            }
+            let label =
+                category_node_label(seg.trim(), category_unread_total(feeds, &counts, &cur));
+            if !set_label(tree, &format!("cat:{cur}"), &label) {
+                return false;
+            }
+        }
+    }
+    // No uncategorized feeds: with an unchanged
+    // structure the node is absent, nothing to do.
+    if let Some(unread) = uncategorized_unread(feeds, &counts)
+        && !set_label(tree, "cat:Uncategorized", &uncategorized_node_label(unread))
+    {
+        return false;
+    }
+    true
+}
+
 /// Fill a list row's missing article body from the database.
 /// The list loads are light (`Db::articles_light`: no bodies);
 /// anything that actually reads a body resolves it here, once,
@@ -2669,23 +2976,8 @@ fn rebuild_tree(state: &mut State, tree: &TreeCtrl) {
     // Smart Folders root (owner's direction: it belongs at the
     // bottom of the tree, not pinned under Favorites); only its
     // label is computed here.
-    let uncat_feeds: Vec<&Feed> = feeds
-        .iter()
-        .filter(|f| is_uncategorized_cat(f.category.as_deref()))
-        .collect();
-    let uncat_label: Option<String> = if uncat_feeds.is_empty() {
-        None
-    } else {
-        let unread: i64 = uncat_feeds
-            .iter()
-            .map(|f| counts.get(&f.id).copied().unwrap_or(0))
-            .sum();
-        Some(if unread > 0 {
-            format!("Uncategorized ({unread})")
-        } else {
-            "Uncategorized".to_string()
-        })
-    };
+    let uncat_label: Option<String> =
+        uncategorized_unread(&feeds, &counts).map(uncategorized_node_label);
     for path in &paths {
         let mut cur = String::new();
         for seg in path
@@ -2704,22 +2996,10 @@ fn rebuild_tree(state: &mut State, tree: &TreeCtrl) {
             if !cat_items.contains_key(&cur) {
                 // Node label: leaf name plus the unread total of
                 // every feed in scope, Python-style.
-                let prefix = format!("{cur}{}", blindrss_core::CATEGORY_PATH_SEP);
-                let unread: i64 = feeds
-                    .iter()
-                    .filter(|f| {
-                        f.category.as_deref() == Some(cur.as_str())
-                            || f.category
-                                .as_deref()
-                                .is_some_and(|c| c.starts_with(&prefix))
-                    })
-                    .map(|f| counts.get(&f.id).copied().unwrap_or(0))
-                    .sum();
-                let label = if unread > 0 {
-                    format!("{} ({unread})", seg.trim())
-                } else {
-                    seg.trim().to_string()
-                };
+                let label = category_node_label(
+                    seg.trim(),
+                    category_unread_total(&feeds, &counts, cur.as_str()),
+                );
                 if let Some(item) =
                     tree.append_item_with_data(&parent, &label, format!("cat:{cur}"), None, None)
                 {
@@ -2731,21 +3011,14 @@ fn rebuild_tree(state: &mut State, tree: &TreeCtrl) {
     // YouTube Recommendations virtual feed (the account
     // provider wrapper injects it whenever signed in AND a
     // recommendations snapshot exists — Python's _has_snapshot).
-    let yt_token = blindrss_core::config::Config::load(&config_path())
-        .unwrap_or_default()
-        .get_str("youtube_account_refresh_token", "")
-        .to_string();
-    if !yt_token.is_empty() {
-        let account = blindrss_core::youtube_account::account_key(&yt_token);
-        if db.has_recommendation_snapshot(&account).unwrap_or(false) {
-            tree.append_item_with_data(
-                &root,
-                "Recommendations",
-                blindrss_core::youtube_account::RECOMMENDATIONS_FEED_ID.to_string(),
-                None,
-                None,
-            );
-        }
+    if recommendations_node_present(db) {
+        tree.append_item_with_data(
+            &root,
+            "Recommendations",
+            blindrss_core::youtube_account::RECOMMENDATIONS_FEED_ID.to_string(),
+            None,
+            None,
+        );
     }
     // Smart folders: item data is "smart:<id>".
     if let Ok(folders) = db.smart_folders()
@@ -2818,6 +3091,12 @@ fn rebuild_tree(state: &mut State, tree: &TreeCtrl) {
     tree.set_focused_item(&target);
     tree.ensure_visible(&target);
     state.selected_feed = if keep { Some(previous) } else { None };
+    // Record what this build shows so refresh completion can
+    // skip (or patch) instead of rebuilding: computed over
+    // the same feeds the nodes above were filed from.
+    let (struct_sig, counts_sig) = tree_signatures(&feeds, db);
+    state.tree_struct_sig = struct_sig;
+    state.tree_counts_sig = counts_sig;
 }
 
 /// (Re)build the article list's columns from a layout
@@ -4288,6 +4567,10 @@ fn main() {
             deferred_title_row: None,
             live_status_shown: String::new(),
             media_column: None,
+            reader_place: ReaderPlace::default(),
+            pending_restore: None,
+            tree_struct_sig: String::new(),
+            tree_counts_sig: String::new(),
         }));
 
         // A staged restore (Python backup.py semantics) applies
@@ -4368,6 +4651,12 @@ fn main() {
         }
 
         // Tree selection filters the article list.
+        // A borrowed State means this event fired
+        // synchronously from a programmatic rebuild (the
+        // rebuild holds the borrow while select_item runs),
+        // which Python ignores via _updating_tree — skip it
+        // instead of panicking on the RefCell, as every
+        // rebuild in the log used to.
         let state_tree = state.clone();
         tree.on_selection_changed(move |ev| {
             let Some(item) = ev.get_item() else { return };
@@ -4375,7 +4664,9 @@ fn main() {
                 .get_custom_data_direct(&item)
                 .and_then(|d| d.downcast_ref::<String>().cloned())
                 .filter(|s| !s.is_empty());
-            let mut st = state_tree.borrow_mut();
+            let Ok(mut st) = state_tree.try_borrow_mut() else {
+                return;
+            };
             st.reader_generation = st.reader_generation.wrapping_add(1);
             st.pending_fulltext = None;
             st.selected_feed = filter;
@@ -4409,7 +4700,12 @@ fn main() {
                 .and_then(|d| d.downcast_ref::<String>().cloned())
                 .and_then(|d| d.strip_prefix("cat:").map(|s| s.to_string()))
             {
-                let mut st = state_exp.borrow_mut();
+                // try_borrow_mut: rebuild-time expands fire
+                // while the rebuild holds State — user's
+                // explicit choices only (see above).
+                let Ok(mut st) = state_exp.try_borrow_mut() else {
+                    return;
+                };
                 st.collapsed_cats.remove(&path);
                 st.expanded_cats.insert(path);
             }
@@ -4422,7 +4718,9 @@ fn main() {
                 .and_then(|d| d.downcast_ref::<String>().cloned())
                 .and_then(|d| d.strip_prefix("cat:").map(|s| s.to_string()))
             {
-                let mut st = state_col.borrow_mut();
+                let Ok(mut st) = state_col.try_borrow_mut() else {
+                    return;
+                };
                 st.expanded_cats.remove(&path);
                 st.collapsed_cats.insert(path);
             }
@@ -4443,7 +4741,13 @@ fn main() {
             if idx < 0 {
                 return;
             }
-            let mut st = state_list.borrow_mut();
+            // try_borrow_mut: refills re-select the kept row
+            // programmatically while holding State — Python's
+            // _updating_list ignores those; user arrowing never
+            // nests, so it always processes.
+            let Ok(mut st) = state_list.try_borrow_mut() else {
+                return;
+            };
             st.reader_generation = st.reader_generation.wrapping_add(1);
             st.pending_fulltext = None;
             st.selected_article = Some(idx as usize);
@@ -4484,7 +4788,12 @@ fn main() {
                 show_image_alt_for(&cfg, st.db.as_ref(), &a.feed_id)
             };
             let body = blindrss_core::extract::html_to_text_opts(&body, keep_alt);
-            reader.set_value(&selection_reader_text(&a, &body));
+            let body = hosted_body_for_display(&a.feed_id, &a.url, &body);
+            set_reader_text(
+                &reader,
+                &mut st.reader_place,
+                &selection_reader_text(&a, &body),
+            );
             // Rich reader (opt-in, full_text_rich_view): the WebView
             // shows the cleaned feed body now; the full rich article
             // replaces it when the worker returns (RichHtml in the
@@ -4553,12 +4862,44 @@ fn main() {
         });
 
         // Reader focus marks the selected article read +
-        // opened (Python's on_content_focus; Audit 8 G01).
-        // The rich WebView reader carries the same trigger
-        // (Python's _on_rich_view_focus marks identically).
+        // opened (Python's on_content_focus; Audit 8 G01) and
+        // restores the reading place (Brandon's reports,
+        // 2026-11-08/09: Tab/Shift+Tab away and back keeps
+        // the caret instead of returning to the top). ONE
+        // set-focus binding does both: wxDragon dispatches
+        // same-event bindings in CONNECTION order and keeps
+        // going while none vetoes (WxdEventHandler dispatch;
+        // the v0.1.77 comment claiming reverse order was
+        // wrong), so the old two-binding shape ran both
+        // halves anyway — yet the restore never held. The
+        // restore now applies twice: once synchronously, and
+        // once more from a 10 ms one-shot after native focus
+        // handling settles (the focus_timer CallAfter pattern
+        // below), so a native post-focus caret reset cannot
+        // win. The deferred leg is generation-guarded: any
+        // programmatic placement (reader write, Find match)
+        // bumps the sequence and the pending snapshot is
+        // dropped instead of clobbering it.
+        let place_timer: &'static Timer<Frame> = Box::leak(Box::new(Timer::new(&frame)));
+        {
+            let state_pr = state.clone();
+            place_timer.on_tick(move |_| {
+                let snapshot = state_pr.borrow_mut().pending_restore.take();
+                let Some(snapshot) = snapshot else {
+                    return;
+                };
+                let current = state_pr.borrow().reader_place.seq;
+                if current != snapshot.seq {
+                    return;
+                }
+                if !snapshot.text.is_empty() && reader.get_value() == snapshot.text {
+                    apply_reader_place(&reader, &snapshot);
+                }
+            });
+        }
         let state_rf = state.clone();
         let frame_rf = frame;
-        reader.on_set_focus(move |_| {
+        reader.on_set_focus(move |ev| {
             let marked = {
                 let mut st = state_rf.borrow_mut();
                 mark_selected_read_opened(&mut st, &frame_rf)
@@ -4566,6 +4907,15 @@ fn main() {
             if let Some(a) = marked {
                 propagate_read_state(&a, true);
             }
+            {
+                let mut st = state_rf.borrow_mut();
+                if !st.reader_place.text.is_empty() && reader.get_value() == st.reader_place.text {
+                    apply_reader_place(&reader, &st.reader_place);
+                }
+                st.pending_restore = Some(st.reader_place.clone());
+            }
+            place_timer.start(10, true);
+            ev.skip(true);
         });
         if let Some(wv) = rich_view.as_ref() {
             let state_wf = state.clone();
@@ -4581,39 +4931,59 @@ fn main() {
             });
         }
 
-        // Reading place survives Tab away and back
-        // (Brandon's reports, 2026-11-08): capture the caret
-        // on focus-out, restore it on focus-in — but only
-        // while the text is unchanged; a fresh article
-        // replaces the value and resets the place below.
-        // This pair MUST stay bound after the mark-read
-        // handler above: wx's SearchDynamicEventTable runs
-        // dynamically bound handlers for one event in
-        // REVERSE connection order and stops at the first
-        // handler that does not skip (wxWidgets
-        // src/common/event.cpp), and neither handler skips.
-        // In v0.1.75 this pair was bound at the reader's
-        // build site, before the mark-read handler existed,
-        // so on SET_FOCUS the mark-read handler always ran
-        // first and consumed the event — the restore never
-        // ran at all and Tab back still landed at the top.
-        let reader_place = Rc::new(std::cell::Cell::new((String::new(), 0_i64, 0_i64, 0_i64)));
+        // The tracker follows every caret move — key-up and
+        // left-up, like Python's caret record — not just
+        // focus-out: the control is read-only, so key and
+        // mouse moves change only caret/selection, never
+        // text, and the record stays cheap (no text copies
+        // per keystroke; writes re-record the text).
         {
-            let saved = reader_place.clone();
-            reader.on_kill_focus(move |_| {
+            let state_ku = state.clone();
+            reader.on_key_up(move |ev| {
                 let (from, to) = reader.get_selection();
-                saved.set((reader.get_value(), reader.get_insertion_point(), from, to));
+                let mut st = state_ku.borrow_mut();
+                st.reader_place.pos = reader.get_insertion_point();
+                st.reader_place.from = from;
+                st.reader_place.to = to;
+                ev.skip(true);
             });
-            let saved = reader_place.clone();
-            reader.on_set_focus(move |_| {
-                let (text, pos, from, to) = saved.replace((String::new(), 0, 0, 0));
-                if !text.is_empty() && reader.get_value() == text {
-                    if from != to {
-                        reader.set_selection(from, to);
-                    } else if pos > 0 {
-                        reader.set_insertion_point(pos);
-                    }
+            let state_lu = state.clone();
+            reader.on_mouse_left_up(move |ev| {
+                let (from, to) = reader.get_selection();
+                let mut st = state_lu.borrow_mut();
+                st.reader_place.pos = reader.get_insertion_point();
+                st.reader_place.from = from;
+                st.reader_place.to = to;
+                ev.skip(true);
+            });
+            let state_kf = state.clone();
+            reader.on_kill_focus(move |ev| {
+                let (from, to) = reader.get_selection();
+                let text = reader.get_value();
+                let pos = reader.get_insertion_point();
+                let mut st = state_kf.borrow_mut();
+                // A focus-out reading of caret-0 for the SAME
+                // text the tracker already holds mid-article
+                // is a focus-loss artifact, not a genuine
+                // move (a real move to 0 passes through
+                // key-up/left-up first, which records it) —
+                // keep the good record.
+                let seq = st.reader_place.seq;
+                let spurious_zero = pos == 0
+                    && from == 0
+                    && to == 0
+                    && text == st.reader_place.text
+                    && st.reader_place.pos > 0;
+                if !spurious_zero {
+                    st.reader_place = ReaderPlace {
+                        text,
+                        pos,
+                        from,
+                        to,
+                        seq,
+                    };
                 }
+                ev.skip(true);
             });
         }
 
@@ -5798,11 +6168,15 @@ fn main() {
             {
                 st.reader_generation = st.reader_generation.wrapping_add(1);
                 st.pending_fulltext = None;
-                reader.set_value(&fulltext_reader_text(
-                    &article.title,
-                    article.author.as_deref().unwrap_or(""),
-                    &text,
-                ));
+                set_reader_text(
+                    &reader,
+                    &mut st.reader_place,
+                    &fulltext_reader_text(
+                        &article.title,
+                        article.author.as_deref().unwrap_or(""),
+                        &text,
+                    ),
+                );
                 frame_ft.set_status_text(&format!("Full text ({source}, cached)"), 0);
                 if cfg.get_bool("full_text_rich_view", false) && rich_view_ft.as_ref().is_some() {
                     spawn_rich_fetch(&tx_ft, &article);
@@ -5877,7 +6251,7 @@ fn main() {
                     // server-side fetch-content competes with
                     // the local cascade; the more complete
                     // result wins.
-                    let outcome = arbitrate_full_text(outcome, &article_id);
+                    let outcome = arbitrate_full_text(outcome, &article_id, &url);
                     // Automatic translation happens here, on
                     // the worker, before caching — Python's
                     // pipeline translates the rendered text
@@ -8147,6 +8521,8 @@ fn main() {
                                     body,
                                     show_image_alt_for(&cfg, st.db.as_ref(), &article.feed_id),
                                 );
+                                let body =
+                                    hosted_body_for_display(&article.feed_id, &article.url, &body);
                                 format!(
                                     "{}\nDate: {}\nAuthor: {}\nLink: {}\n\n{}",
                                     article.title,
@@ -8711,7 +9087,8 @@ fn main() {
                 let text = if raw.trim().is_empty() {
                     "No feed description is available for this item.".to_string()
                 } else {
-                    blindrss_core::extract::html_to_text_opts(&raw, keep_alt)
+                    let body = blindrss_core::extract::html_to_text_opts(&raw, keep_alt);
+                    hosted_body_for_display(&a.feed_id, &a.url, &body)
                 };
                 dialogs::show_article_window(
                     "Feed Description",
@@ -8914,7 +9291,17 @@ fn main() {
         // Previous starts at the START of the selection,
         // backward, no wrap. Terminal misses announce Python's
         // exact sentences (also mirrored to the status bar).
+        // Searches, places the match and records it as
+        // the reading place; returns true on a land. Focus
+        // stays with the CALLER: set_focus fires the merged
+        // set-focus binding synchronously, and that binding
+        // borrows state — focusing here would nest inside
+        // the caller's place borrow and panic. The caller
+        // focuses after its borrow ends; the binding then
+        // marks read and re-applies the just-recorded match.
+        #[allow(clippy::too_many_arguments)]
         fn run_find(
+            place: &mut ReaderPlace,
             reader: &TextCtrl,
             frame: &Frame,
             query: &str,
@@ -8922,14 +9309,26 @@ fn main() {
             forward: bool,
             wrap: bool,
             fail_message: &str,
-        ) {
+        ) -> bool {
             let text = reader.get_value();
             match blindrss_core::textfind::find_in_text(&text, query, start, forward, wrap) {
                 Some((a, b)) => {
                     let (a, b) = (a as i64, b as i64);
                     reader.set_selection(a, b);
                     reader.set_insertion_point(b);
-                    reader.set_focus();
+                    // The landed match IS the reading place
+                    // now: the focus restore must re-apply the
+                    // match, never a stale caret — and the
+                    // bumped sequence drops any restore that
+                    // predates the match.
+                    let seq = place.seq.wrapping_add(1);
+                    *place = ReaderPlace {
+                        text,
+                        pos: b,
+                        from: a,
+                        to: b,
+                        seq,
+                    };
                     let line = reader
                         .position_to_xy(b)
                         .map(|(_, y)| reader.get_line_text(y))
@@ -8937,10 +9336,12 @@ fn main() {
                     let line = line.trim();
                     frame.set_status_text(&format!("Found: {line}"), 0);
                     announce("general", &format!("Found: {line}"));
+                    true
                 }
                 None => {
                     frame.set_status_text(fail_message, 0);
                     announce("general", fail_message);
+                    false
                 }
             }
         }
@@ -8957,8 +9358,8 @@ fn main() {
                 // searched from position 0 and left him on the
                 // first line, needing an extra F3. Search from
                 // the captured place, and hand focus back to
-                // the reader when a match lands (run_find does
-                // reader.set_focus()).
+                // the reader when a match lands (the caller
+                // focuses after run_find returns).
                 let start = reader.get_insertion_point().max(0) as usize;
                 let query = prompt_focus(
                     &frame_fd,
@@ -8973,7 +9374,8 @@ fn main() {
                     return;
                 };
                 state_fd.borrow_mut().find_query = query.clone();
-                run_find(
+                let landed = run_find(
+                    &mut state_fd.borrow_mut().reader_place,
                     &reader,
                     &frame_fd,
                     &query,
@@ -8982,6 +9384,9 @@ fn main() {
                     true,
                     &format!("\"{query}\" was not found."),
                 );
+                if landed {
+                    reader.set_focus();
+                }
             })
         };
         let act_find_next: Rc<dyn Fn()> = {
@@ -8995,7 +9400,8 @@ fn main() {
                     return;
                 }
                 let (_, end) = reader.get_selection();
-                run_find(
+                let landed = run_find(
+                    &mut state_fn.borrow_mut().reader_place,
                     &reader,
                     &frame_fn,
                     &query,
@@ -9004,6 +9410,9 @@ fn main() {
                     false,
                     &format!("No more occurrences of \"{query}\"."),
                 );
+                if landed {
+                    reader.set_focus();
+                }
             })
         };
         let act_find_prev: Rc<dyn Fn()> = {
@@ -9017,7 +9426,8 @@ fn main() {
                     return;
                 }
                 let (start, _) = reader.get_selection();
-                run_find(
+                let landed = run_find(
+                    &mut state_fp2.borrow_mut().reader_place,
                     &reader,
                     &frame_fp2,
                     &query,
@@ -9031,6 +9441,9 @@ fn main() {
                     // the first match announced nothing.
                     &format!("No more occurrences of \"{query}\"."),
                 );
+                if landed {
+                    reader.set_focus();
+                }
             })
         };
 
@@ -10413,6 +10826,7 @@ fn main() {
         let tray_menu_tick = tray_menu.clone();
         let notify_payload_tick = notify_payload.clone();
         let tray_unread_last = Rc::new(std::cell::Cell::new(tray_unread0));
+        let search_tick = search_box;
         let state_tick = state.clone();
         let frame_tick = frame;
         let rich_view_tick = rich_view.clone();
@@ -10777,22 +11191,29 @@ fn main() {
                             blindrss_core::config::Config::load(&config_path())
                                 .unwrap_or_default();
                         let current_variant = translation_variant(&cfg);
-                        let st = state_tick.borrow();
-                        let selected = st
-                            .selected_article
-                            .and_then(|i| st.articles.get(i))
-                            .cloned();
-                        let current = selected.as_ref().is_some_and(|a| {
-                            request.is_current(st.reader_generation, &a.id, &current_variant)
-                        });
+                        let (selected, current) = {
+                            let st = state_tick.borrow();
+                            let selected = st
+                                .selected_article
+                                .and_then(|i| st.articles.get(i))
+                                .cloned();
+                            let current = selected.as_ref().is_some_and(|a| {
+                                request.is_current(st.reader_generation, &a.id, &current_variant)
+                            });
+                            (selected, current)
+                        };
                         if current && let Some(article) = selected {
                             match result {
                                 Ok(text) => {
-                                    reader.set_value(&fulltext_reader_text(
-                                        &article.title,
-                                        article.author.as_deref().unwrap_or(""),
-                                        &text,
-                                    ));
+                                    set_reader_text(
+                                        &reader,
+                                        &mut state_tick.borrow_mut().reader_place,
+                                        &fulltext_reader_text(
+                                            &article.title,
+                                            article.author.as_deref().unwrap_or(""),
+                                            &text,
+                                        ),
+                                    );
                                     frame_tick.set_status_text("Article translated", 0);
                                     // The rich document is an
                                     // output too: refresh it so
@@ -11167,11 +11588,15 @@ fn main() {
                                     ..
                                 },
                             ) => {
-                                reader.set_value(&fulltext_reader_text(
-                                    &article.title,
-                                    article.author.as_deref().unwrap_or(""),
-                                    &text,
-                                ));
+                                set_reader_text(
+                                    &reader,
+                                    &mut st.reader_place,
+                                    &fulltext_reader_text(
+                                        &article.title,
+                                        article.author.as_deref().unwrap_or(""),
+                                        &text,
+                                    ),
+                                );
                                 frame_tick.set_status_text(&format!("Full text ({source})"), 0);
                             }
                             (_, blindrss_core::extract::ExtractOutcome::Gate { reason }) => {
@@ -11456,13 +11881,14 @@ fn main() {
                             continue;
                         }
                         let title = article.title.clone();
+                        let author = article.author.as_deref().unwrap_or("").to_string();
                         match result {
                             Ok(text) => {
-                                reader.set_value(&fulltext_reader_text(
-                                    &title,
-                                    article.author.as_deref().unwrap_or(""),
-                                    &text,
-                                ));
+                                set_reader_text(
+                                    &reader,
+                                    &mut st.reader_place,
+                                    &fulltext_reader_text(&title, &author, &text),
+                                );
                                 frame_tick.set_status_text("Full text (YouTube)", 0);
                             }
                             Err(e) => frame_tick.set_status_text(&format!("Full text: {e}"), 0),
@@ -11529,6 +11955,18 @@ fn main() {
                 }
             }
             if finished {
+                // Focus guard (Brandon's report, 2026-11-09): a
+                // refresh completing while he works the article
+                // list dropped keyboard focus into the feed
+                // tree. The tree gate below removes the rebuild
+                // in the common no-change case; the
+                // capture/restore covers the rebuilds that
+                // still run. Restored after the borrow drops —
+                // set_focus fires synchronously.
+                let focus_list = list.has_focus();
+                let focus_tree = tree.has_focus();
+                let focus_reader = reader.has_focus();
+                let focus_search = search_tick.has_focus();
                 let mut st = state_tick.borrow_mut();
                 st.refreshing = false;
                 st.last_refresh_end = Some(std::time::Instant::now());
@@ -11539,7 +11977,39 @@ fn main() {
                     .store(false, std::sync::atomic::Ordering::Relaxed);
                 st.cancel_refresh
                     .store(false, std::sync::atomic::Ordering::Relaxed);
-                rebuild_tree(&mut st, &tree);
+                // Fresh feed rows (Python reloads the provider
+                // feeds before its tree pass): titles and
+                // categories the workers updated show up, and
+                // the structure signature below compares
+                // against current data.
+                if let Some(db) = st.db.as_ref()
+                    && let Ok(feeds) = db.feeds()
+                {
+                    st.feeds = feeds;
+                }
+                // Tree gate (Python's fast paths): a no-change
+                // batch skips the rebuild entirely — a full
+                // rebuild disturbs screen-reader focus — and
+                // a counts-only change patches the labels in
+                // place. Anything structural rebuilds.
+                let gate = match st.db.as_ref() {
+                    Some(db) => Some(tree_signatures(&st.feeds, db)),
+                    None => None,
+                };
+                match gate {
+                    Some((struct_now, counts_now))
+                        if struct_now == st.tree_struct_sig
+                            && counts_now == st.tree_counts_sig => {}
+                    Some((struct_now, counts_now))
+                        if struct_now == st.tree_struct_sig
+                            && patch_tree_labels(&st, &tree) =>
+                    {
+                        st.tree_counts_sig = counts_now;
+                    }
+                    _ => {
+                        rebuild_tree(&mut st, &tree);
+                    }
+                }
                 refill_articles(&mut st, &list);
                 if stopped {
                     frame_tick.set_status_text("Refresh stopped", 0);
@@ -11557,6 +12027,18 @@ fn main() {
                 let store_path = st.store_path.clone();
                 let refreshed_feeds = st.feeds.clone();
                 drop(st);
+                // Focus guard, restore leg (see the capture
+                // above): only a surface that held focus and
+                // lost it through the rebuild is restored.
+                if focus_list && !list.has_focus() {
+                    list.set_focus();
+                } else if focus_tree && !tree.has_focus() {
+                    tree.set_focus();
+                } else if focus_reader && !reader.has_focus() {
+                    reader.set_focus();
+                } else if focus_search && !search_tick.has_focus() {
+                    search_tick.set_focus();
+                }
                 refresh_side_effects(&tray, &new_batches, failed, &notify_payload_tick);
                 // Podcast archive (gap 6): every refresh has
                 // committed, so queue the due feeds' archive
@@ -12357,43 +12839,71 @@ mod ui_parity_tests {
 
     #[test]
     fn article_text_keeps_its_place_across_focus_changes() {
-        // Brandon's report (2026-11-08): Tabbing away from
-        // the article text and back put him at the very top
-        // of the article. Every read-only text surface that
-        // holds article text must capture its caret on
-        // focus-out and restore it on focus-in: the main
-        // window's reader pane (guarded by the text being
-        // unchanged, so a new article still starts at the
-        // top) and, via dialogs::keep_text_place, the article
-        // window and the dialogs that reuse it.
+        // Brandon's reports (2026-11-08/09): Tabbing away
+        // from the article text and back put him at the very
+        // top of the article. The main reader tracks its
+        // place in State (caret + selection + text +
+        // placement sequence): key-up/left-up follow every
+        // caret move, focus-out re-records the text, ONE
+        // set-focus binding marks read AND restores (sync
+        // plus a generation-guarded deferred one-shot), and
+        // every programmatic write goes through the
+        // identical-text-skipping set_reader_text. Dialogs
+        // keep the small keep_text_place helper.
         let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let main = std::fs::read_to_string(src_dir.join("main.rs")).unwrap();
-        assert!(
-            main.contains("reader.on_kill_focus"),
-            "main reader lost its caret capture"
-        );
-        // wx runs dynamically bound handlers for one event
-        // in reverse connection order and stops at the
-        // first that does not skip, so the reader's restore
-        // handler must be bound AFTER the mark-read focus
-        // handler (the v0.1.75 build bound it at the build
-        // site, before mark-read existed, and the restore
-        // never ran — Brandon's Tab still landed at the
-        // top). The restore is the LAST reader.on_set_focus
-        // in the file and reads the reader_place capture.
         let impl_src = main.split("mod ui_parity_tests").next().unwrap();
-        let mark_read = impl_src
-            .find("mark_selected_read_opened(&mut st, &frame_rf)")
-            .unwrap();
-        let restore = impl_src.rfind("reader.on_set_focus").unwrap();
-        assert!(
-            restore > mark_read,
-            "main reader caret restore must bind after the mark-read focus handler"
+        // Exactly one main-reader set-focus binding, doing
+        // both halves (the v0.1.77 reverse-order comment was
+        // wrong: wxDragon dispatches in connection order —
+        // but the split still hid the unrestored caret).
+        assert_eq!(
+            impl_src.matches("reader.on_set_focus").count(),
+            1,
+            "main reader must have one merged set-focus binding"
         );
-        let restore_window = &impl_src[restore..(restore + 700).min(impl_src.len())];
+        let focus = impl_src.find("reader.on_set_focus").unwrap();
+        let focus_window = &impl_src[focus..(focus + 1500).min(impl_src.len())];
         assert!(
-            restore_window.contains("reader_place") || restore_window.contains("saved.replace"),
-            "last reader.on_set_focus is not the caret restore"
+            focus_window.contains("mark_selected_read_opened"),
+            "merged focus binding lost mark-read"
+        );
+        assert!(
+            focus_window.contains("apply_reader_place") && focus_window.contains("pending_restore"),
+            "merged focus binding lost the caret restore"
+        );
+        assert!(
+            focus_window.contains("place_timer.start(10, true)"),
+            "merged focus binding lost the deferred restore"
+        );
+        for needle in [
+            "reader.on_kill_focus",
+            "reader.on_key_up",
+            "reader.on_mouse_left_up",
+            "spurious_zero",
+            "fn set_reader_text",
+            "fn apply_reader_place",
+        ] {
+            assert!(
+                impl_src.contains(needle),
+                "main reader lost its place tracking: {needle}"
+            );
+        }
+        // Every main-reader write funnels through the memo:
+        // the only direct set_value left is inside
+        // set_reader_text itself.
+        assert_eq!(
+            impl_src.matches("reader.set_value").count(),
+            1,
+            "a reader write bypasses set_reader_text"
+        );
+        // Find placements join the tracker so focus cannot
+        // restore a stale caret over a landed match.
+        let run_find = impl_src.find("fn run_find(").unwrap();
+        let find_window = &impl_src[run_find..(run_find + 1500).min(impl_src.len())];
+        assert!(
+            find_window.contains("ReaderPlace"),
+            "run_find no longer records the match"
         );
         let dialogs = std::fs::read_to_string(src_dir.join("dialogs.rs")).unwrap();
         assert!(dialogs.contains("pub(crate) fn keep_text_place"));
@@ -12401,6 +12911,99 @@ mod ui_parity_tests {
         assert!(dialogs.contains("on_set_focus"));
         let article_window = std::fs::read_to_string(src_dir.join("article_window.rs")).unwrap();
         assert!(article_window.contains("keep_text_place(&reader)"));
+    }
+
+    #[test]
+    fn refresh_completion_keeps_focus_and_skips_unchanged_tree() {
+        // Brandon's report (2026-11-09): a refresh completing
+        // while he worked the article list moved keyboard
+        // focus into the feed tree. Python rebuilds the tree
+        // only when its content signature changed (a full
+        // rebuild disturbs screen-reader focus), patches
+        // labels in place on a counts-only change, and
+        // ignores the synchronous selection events a rebuild
+        // fires (_updating_tree/_updating_list — the port
+        // skips them via try_borrow_mut). The completion
+        // block must gate the rebuild, and capture/restore
+        // the focused surface around the rebuilds that run.
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let main = std::fs::read_to_string(src_dir.join("main.rs")).unwrap();
+        let impl_src = main.split("mod ui_parity_tests").next().unwrap();
+        for needle in [
+            "fn tree_signatures",
+            "fn patch_tree_labels",
+            "tree_struct_sig",
+            "patch_tree_labels(&st, &tree)",
+        ] {
+            assert!(
+                impl_src.contains(needle),
+                "refresh lost its tree gate: {needle}"
+            );
+        }
+        let all_done = impl_src
+            .find("Ok(RefreshMsg::AllDone(path))")
+            .expect("AllDone drain missing");
+        let done_window = &impl_src[all_done..(all_done + 6000).min(impl_src.len())];
+        for needle in [
+            "list.has_focus()",
+            "focus_list && !list.has_focus()",
+            "list.set_focus()",
+        ] {
+            assert!(
+                done_window.contains(needle),
+                "AllDone lost its focus guard: {needle}"
+            );
+        }
+        // The four selection/expansion handlers skip nested
+        // programmatic events instead of panicking on the
+        // already-borrowed State (every rebuild in the log
+        // used to panic here).
+        assert!(
+            impl_src.matches("try_borrow_mut()").count() >= 4,
+            "selection handlers lost their nested-event guard"
+        );
+    }
+
+    #[test]
+    fn miniflux_server_text_runs_the_site_postprocess() {
+        // Brandon's report (2026-11-09): MacRumors footer and
+        // rail junk survived in the reader. Miniflux server
+        // content (live fetch-content arbitration plus stored
+        // scraped bodies) bypassed the extraction
+        // postprocess, so the site strips never saw it. The
+        // arbitration must strip the server text before
+        // comparing, and stored Miniflux bodies must strip
+        // at display time.
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let main = std::fs::read_to_string(src_dir.join("main.rs")).unwrap();
+        let impl_src = main.split("mod ui_parity_tests").next().unwrap();
+        let arb = impl_src
+            .find("fn arbitrate_full_text(")
+            .expect("arbitration missing");
+        let arb_window = &impl_src[arb..(arb + 2500).min(impl_src.len())];
+        assert!(
+            arb_window.contains("postprocess_extracted_text"),
+            "arbitration no longer strips server text"
+        );
+        assert!(
+            impl_src.contains("fn hosted_body_for_display("),
+            "stored-body display strip missing"
+        );
+        assert!(
+            impl_src.contains("strip_macrumors_boilerplate"),
+            "MacRumors display strip missing"
+        );
+        // Selection, re-render, copy-text and the feed
+        // description window all display stored bodies.
+        assert!(
+            impl_src.matches("hosted_body_for_display(").count() >= 5,
+            "a stored-body surface bypasses the display strip"
+        );
+        let dialogs = std::fs::read_to_string(src_dir.join("dialogs.rs")).unwrap();
+        assert!(
+            dialogs.contains("hosted_body_for_display("),
+            "article history bypasses the display strip"
+        );
     }
 
     #[test]
@@ -12713,6 +13316,10 @@ mod ui_parity_tests {
                 deferred_title_row: None,
                 live_status_shown: String::new(),
                 media_column: None,
+                reader_place: ReaderPlace::default(),
+                pending_restore: None,
+                tree_struct_sig: String::new(),
+                tree_counts_sig: String::new(),
             }
         }
         use blindrss_core::db::ViewScope;

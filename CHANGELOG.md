@@ -6,6 +6,13 @@ as `0.1.2-0.1.3`. Each release's section below is its Forgejo release note,
 taken from this file by the release workflow. The in-app updater shows the
 same text.
 
+## 0.1.79
+
+- Fixed the article text jumping back to the first line when you Tab away and back. The earlier attempt at this fix never ran in the main window: its focus handler was bound before another one that took the event first. There is now a single focus handler that restores your reading place, with a deferred restore for the way screen readers move focus, and your position is also tracked as you arrow through the text. A new article still starts at the top.
+- Fixed a finished refresh yanking focus out of the article list into the Feeds tree. The tree now only rebuilds when its shape actually changed; when only unread counts changed it patches the labels in place, and when nothing changed it does nothing at all — and your focus stays where it was.
+- Fixed GitHub feeds (commit and release feeds) failing with an error. GitHub intermittently answers feed requests that carry stale session cookies with a "try again" page instead of the feed. Such failures are now retried without the site cookies, and the retry is only taken when it actually returns a feed — otherwise you still see the original error.
+- Fixed MacRumors articles still ending with the site's footer (push notifications pitch, Videos and Guides lists, Other Stories) when the extra text comes from the feed server itself rather than the article page. The footer is now cut from server-provided text too; what is stored stays untouched.
+
 ## 0.1.78
 
 - The in-app updater now checks this repository's Forgejo releases instead of GitHub Releases. There is no GitHub fallback: Check for Updates looks only at the Forgejo host, and downloads still verify against the release signing key before anything installs.

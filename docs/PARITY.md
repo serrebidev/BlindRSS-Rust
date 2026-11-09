@@ -7885,6 +7885,126 @@ section. Signature: BlindRSS.tar.gz verifies VALID
 against the compiled-in key, tamper control rejected
 (verify-0176/).
 
+## Caret loss, refresh focus steal, GitHub 504, MacRumors server junk (Brandon's reports, 2026-11-09; v0.1.79)
+
+**Reports (Brandon, 2026-11-09, on v0.1.78), four items:**
+(1) Tab / Shift+Tab still returns to the very top of the
+article, to the first line — the v0.1.75/v0.1.77 place
+fixes did not hold. (2) A feed refresh completing while
+he works the article list moves focus into the Feeds tree.
+(3) GitHub-based feeds fail (e.g.
+https://github.com/nvaccess/nvda/commits/master.atom),
+with and without VPN; they worked on v0.1.75. (4) The
+MacRumors footer/rail junk is still at the bottom of
+articles.
+
+**Item 1 — root cause and fix.** The v0.1.77 diagnosis was
+wrong: wxDragon does not run same-event bindings in
+reverse connection order consuming at the first — its C++
+`WxdEventHandler` dispatches to the Rust closures in
+CONNECTION order, resets Skip(true) before each, and only
+stops when one vetoes, so both focus halves already ran in
+v0.1.75 and v0.1.78 alike, as does default handling. The
+restore ran yet never held. The rewrite stops depending on
+that fragility: the reader's place (text, caret, selection,
+placement sequence) lives in State; ONE set-focus binding
+marks read and restores; key-up/left-up track every caret
+move (the control is read-only, so moves never change
+text); focus-out re-records the text but keeps a
+mid-article record over a spurious caret-0 reading (a real
+move to 0 always passes through key/mouse first); the
+restore applies synchronously AND from a 10 ms one-shot
+past native handling, generation-guarded so a newer
+placement (reader write, Find match) drops a stale
+snapshot; every programmatic write funnels through
+`set_reader_text`, which skips identical text (Python
+`_set_article_reader_text`'s memo — a redundant write
+resets the caret for nothing); Find records the landed
+match as the place and focuses after its borrow ends
+(set_focus fires the binding synchronously, so focusing
+inside the place borrow would panic). Regression test
+`article_text_keeps_its_place_across_focus_changes`
+rewritten for the merged shape (one binding, both halves,
+deferred leg, tracker events, write funnel, Find record).
+
+**Item 2 — root cause and fix.** Three defects shared the
+blame. (a) Refresh completion rebuilt the tree
+unconditionally — Python's own comment says a full rebuild
+"disturbs screen-reader focus", and the port skipped its
+signature gate. The completion block now computes
+`tree_signatures` (node structure + unread counts) over
+fresh feed rows (Python reloads feeds before its tree
+pass), skips the rebuild when both match, patches labels
+in place on a counts-only change (`patch_tree_labels`,
+Python `_patch_tree_unread_labels`), and rebuilds only on
+structural change; every rebuild records the signatures.
+(b) Rebuild-time `select_item`/`set_item_state` fire
+selection events synchronously while State is mutably
+borrowed, so every same-view rebuild/refill panicked with
+"RefCell already borrowed" (caught at the wxDragon
+trampoline, visible all over blindrss.log) and corrupted
+`focus_list` plus the expansion memory. The four
+selection/expansion handlers now `try_borrow_mut` and skip
+when borrowed — exactly Python's `_updating_tree` /
+`_updating_list` semantics. (c) Belt and braces: the
+completion block captures which surface holds focus and
+restores it after the borrow drops, covering the rebuilds
+that still run. Regression test
+`refresh_completion_keeps_focus_and_skips_unchanged_tree`
+holds the gate, the patch, the restore, and the guards.
+Follow-up diagnosed, not fixed: modal dialogs hold `&State`
+across `show_modal` while the 150 ms tick borrows mutably,
+so a tick crossing an open modal still panics (caught;
+one drain delayed). That needs dialogs-signature surgery
+and is separate work.
+
+**Item 3 — root cause and fix.** Not a code regression
+(no fetch-path change between v0.1.75 and v0.1.78):
+Brandon's imported GitHub session cookies went stale, and
+GitHub intermittently answers 504 ("Unicorn!") to the
+stale logged-in session on .atom feeds while the anonymous
+request always succeeds — reproduced live: anonymous 6/6
+success, cookie-carrying flaky 504, identical content when
+it does answer. Both feed fetch paths (`fetch_response`
+for refresh, `fetch_and_parse` for subscribe/discovery)
+now retry once without the jar (keeping validators,
+Referer and per-feed custom headers) when the
+cookie-carrying request draws 413/431 (Python
+`_retry_feed_without_site_cookies`, issue #101) or
+500/502/503/504, and adopt the retry only when it is a
+non-error response — otherwise the ORIGINAL error stands
+(a broken server, or a private feed whose cookies the
+anonymous request correctly lacks). Live-confirmed: 504
+with cookies, clean retry, 20 entries. Unit tests for the
+decision/adoption rules plus a localhost wiring test
+(504-with-Cookie / 200-without) in refresh_slice.rs.
+
+**Item 4 — root cause and fix.** Two bypasses, one harden.
+(a) The footer anchors could split across extraction
+lines ("To Subscribe or\nUnsubscribe") that only glue
+into the verbatim sentences when the reader text
+collapses — after the strip already ran — and the page
+uses a curly apostrophe in "Apple's". The byte-cut anchors
+are now whitespace-tolerant regexes (straight-or-curly
+apostrophe), still case-sensitive and still refusing a
+bare "Push Notifications" (a how-to could bear that
+heading). (b) Proven by Miniflux API reads: 17 of 25
+stored MacRumors bodies carry the "Popular Stories" rail,
+and neither the fetch-content arbitration nor the stored-
+body display ran any postprocess — the strips only ever
+saw local-cascade output. The arbitration now strips the
+server text with the article URL BEFORE the length
+comparison (boilerplate counts toward neither "more
+complete" nor the adopted text), and stored Miniflux
+bodies run the MacRumors strip at display time
+(`hosted_body_for_display`: reader selection + re-render,
+copy-text, feed description, article history; the database
+keeps the raw server text; MacRumors-gated, local
+publisher bodies untouched). Regression tests: split/curly
+anchors in batch25_slice.rs, and the
+`miniflux_server_text_runs_the_site_postprocess` scan for
+both application points.
+
 ## MacRumors credits and glued footer, focus restore, refresh progress (Brandon's reports, 2026-11-08; ships in v0.1.77)
 
 **Reports (Brandon, 2026-11-08, on v0.1.75), four items:**

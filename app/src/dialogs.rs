@@ -1353,6 +1353,8 @@ pub fn show_article_history(frame: &Frame, db: &Db, article: &blindrss_core::Art
     let versions = Rc::new(versions);
     let show_version: Rc<dyn Fn(usize)> = {
         let versions = versions.clone();
+        let history_feed = article.feed_id.clone();
+        let history_url = article.url.clone();
         let keep_alt = {
             let cfg =
                 blindrss_core::config::Config::load(&crate::config_path()).unwrap_or_default();
@@ -1364,6 +1366,7 @@ pub fn show_article_history(frame: &Frame, db: &Db, article: &blindrss_core::Art
         Rc::new(move |idx: usize| {
             if let Some(v) = versions.get(idx) {
                 let body = blindrss_core::extract::html_to_text_opts(&v.content, keep_alt);
+                let body = crate::hosted_body_for_display(&history_feed, &history_url, &body);
                 text.set_value(&format!("{}\n\n{}", v.title, body));
             }
         })

@@ -11,26 +11,106 @@ pub fn configure_cookies(config_path: &std::path::Path) {
     *COOKIE_PATH.lock().unwrap_or_else(|e| e.into_inner()) = Some(config_path.to_owned());
 }
 
-fn request(agent: ureq::Agent, url: &str) -> ureq::RequestBuilder<ureq::typestate::WithoutBody> {
-    let mut request = agent.get(url);
+/// The site-jar attachment for one URL: the Cookie header
+/// value plus the User-Agent identity the cookies were
+/// issued to (None = the caller's default identity). An
+/// empty cookie with no identity is an anonymous request.
+type SiteAttachment = (String, Option<String>);
+
+fn site_attachment(url: &str) -> SiteAttachment {
     let path = COOKIE_PATH
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone();
+    match path {
+        Some(path) => crate::cookies::site_headers_for(&path, url),
+        None => (String::new(), None),
+    }
+}
+
+/// Statuses that earn one anonymous (cookie-free) retry when
+/// the cookie-carrying request fails with them: Python's
+/// 413/431 (`_retry_feed_without_site_cookies`, issue #101 —
+/// the jar outgrew what the server accepts) plus the
+/// stale-session 5xx family. A stale logged-in session can
+/// send the server's request handling into a timeout while
+/// the anonymous request succeeds — GitHub answers 504
+/// ("Unicorn!") to stale session cookies on .atom feeds
+/// (Brandon's report, 2026-11-09; reproduced: anonymous
+/// 6/6 success, cookie-carrying flaky 504).
+const COOKIE_FREE_RETRY_STATUSES: &[u16] = &[413, 431, 500, 502, 503, 504];
+
+fn should_retry_without_cookies(status: u16, cookies_sent: bool) -> bool {
+    cookies_sent && COOKIE_FREE_RETRY_STATUSES.contains(&status)
+}
+
+/// Whether the anonymous retry's result replaces the
+/// cookie-carrying attempt's: only a non-error response
+/// does (`None` = the retry failed at the transport level).
+/// When the retry also errors, the ORIGINAL error is kept —
+/// it names the real failure (a genuinely broken server, or
+/// a private feed whose cookies the anonymous request
+/// correctly lacks).
+fn adopt_cookie_free_retry(retry_status: Option<u16>) -> bool {
+    matches!(retry_status, Some(status) if status < 400)
+}
+
+/// The status carried by a request outcome: the response
+/// status, the failed status code, or None for a
+/// transport-level failure.
+fn outcome_status(outcome: &Result<ureq::http::Response<ureq::Body>, ureq::Error>) -> Option<u16> {
+    match outcome {
+        Ok(response) => Some(response.status().as_u16()),
+        Err(ureq::Error::StatusCode(status)) => Some(*status),
+        Err(_) => None,
+    }
+}
+
+/// One feed request with the anonymous fallback: run
+/// `attempt` with the jar attached; when it draws a
+/// rejection status, run it once more with no cookies and
+/// no pinned identity. The retry keeps everything else the
+/// attempt carries (validators, Referer, custom headers).
+fn with_cookie_free_retry(
+    url: &str,
+    site: &SiteAttachment,
+    attempt: impl Fn(&SiteAttachment) -> Result<ureq::http::Response<ureq::Body>, ureq::Error>,
+) -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
+    let anonymous: SiteAttachment = (String::new(), None);
+    match attempt(site) {
+        Err(ureq::Error::StatusCode(status))
+            if should_retry_without_cookies(status, !site.0.is_empty()) =>
+        {
+            let retry = attempt(&anonymous);
+            if adopt_cookie_free_retry(outcome_status(&retry)) {
+                eprintln!(
+                    "blindrss: retried feed without imported site cookies after HTTP {status}: {url}"
+                );
+                retry
+            } else {
+                Err(ureq::Error::StatusCode(status))
+            }
+        }
+        other => other,
+    }
+}
+
+fn request_with_attachment(
+    agent: ureq::Agent,
+    url: &str,
+    site: &SiteAttachment,
+) -> ureq::RequestBuilder<ureq::typestate::WithoutBody> {
+    let mut request = agent.get(url);
     // Python's shared attachment rule (Audit 8 B05): cookies go
     // out together with the User-Agent they were issued to — the
     // host-pinned UA when one applies, the global UA only beside
     // clearance — and the client hints follow that same identity.
     // URLs with no applicable UA keep the app default untouched.
-    let mut identity: Option<String> = None;
-    if let Some(path) = path {
-        let (cookie, ua) = crate::cookies::site_headers_for(&path, url);
-        if !cookie.is_empty() {
-            request = request.header("Cookie", cookie);
-        }
-        identity = ua;
+    let (cookie, identity) = site;
+    if !cookie.is_empty() {
+        request = request.header("Cookie", cookie.as_str());
     }
-    match &identity {
+    match identity {
         Some(ua) => {
             request = request.header("User-Agent", ua.clone());
             for (key, value) in crate::user_agents::client_hints(ua) {
@@ -173,16 +253,19 @@ pub fn decode_feed_body<'a>(body: &'a [u8], encoding: &str) -> std::borrow::Cow<
 }
 
 /// One conditional request for a feed document: validators from
-/// the cached copy unless `force_full`, with the Python issue #42
-/// SSL fallback on certificate errors.
+/// the cached copy unless `force_full`, with one anonymous
+/// retry when the cookie-carrying request draws a rejection
+/// status, and the Python issue #42 SSL fallback on
+/// certificate errors.
 fn fetch_response(
     url: &str,
     force_full: bool,
     cached: &Option<CachedFeed>,
     overrides: &FeedFetchOverrides,
 ) -> Result<ureq::http::Response<ureq::Body>, String> {
-    let fetch = |agent| {
-        let mut request = request(agent, url);
+    let site = site_attachment(url);
+    let fetch = |agent: ureq::Agent, site: &SiteAttachment| {
+        let mut request = request_with_attachment(agent, url, site);
         if !force_full && let Some((etag, modified, _)) = &cached {
             if let Some(value) = etag {
                 request = request.header("If-None-Match", value);
@@ -207,19 +290,20 @@ fn fetch_response(
         for (name, value) in &overrides.headers {
             request = request.header(name.as_str(), value.as_str());
         }
-        request.call().map_err(|e| format!("fetch failed: {e}"))
+        request.call()
     };
     let (agent, insecure_agent) = if overrides.is_plain() {
         (crate::http::agent(), crate::http::insecure_agent())
     } else {
         (feed_agent(overrides, false)?, feed_agent(overrides, true)?)
     };
-    match fetch(agent) {
+    let response = with_cookie_free_retry(url, &site, |site| fetch(agent.clone(), site));
+    match response.map_err(|e| format!("fetch failed: {e}")) {
         Err(error)
             if crate::http::ssl_fallback_allowed()
                 && crate::http::looks_like_ssl_cert_error(&error) =>
         {
-            fetch(insecure_agent)
+            fetch(insecure_agent, &site).map_err(|e| format!("fetch failed: {e}"))
         }
         result => result,
     }
@@ -864,37 +948,86 @@ pub fn parse_feed(bytes: &[u8]) -> Result<ParsedFeed, String> {
 
 /// Fetch a feed over HTTP and parse it. Used by the refresh path.
 ///
-/// Python issue #42 semantics: when the fetch fails certificate
-/// validation and `ignore_feed_ssl_errors` is on (the default),
-/// retry once with verification disabled — public feeds behind
+/// One anonymous retry precedes the Python issue #42
+/// semantics: when the fetch fails certificate validation
+/// and `ignore_feed_ssl_errors` is on (the default), retry
+/// once with verification disabled — public feeds behind
 /// broken certificates (self-signed, missing intermediates,
 /// expired) still load. Feed retrieval only.
 pub fn fetch_and_parse(url: &str) -> Result<ParsedFeed, String> {
     if let Some(result) = crate::forum_sources::fetch_feed(url) {
         return result;
     }
-    fn fetch(agent: ureq::Agent, url: &str) -> Result<Vec<u8>, String> {
-        let mut resp = request(agent, url)
-            .call()
-            .map_err(|e| format!("fetch failed: {e}"))?;
-        resp.body_mut()
-            .with_config()
-            .limit(10 * 1024 * 1024)
-            .read_to_vec()
-            .map_err(|e| format!("read failed: {e}"))
-    }
-    let bytes = match fetch(crate::http::agent(), url) {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            if crate::http::ssl_fallback_allowed() && crate::http::looks_like_ssl_cert_error(&e) {
+    let site = site_attachment(url);
+    let fetch = |agent: ureq::Agent, site: &SiteAttachment| {
+        request_with_attachment(agent, url, site).call()
+    };
+    let response = with_cookie_free_retry(url, &site, |site| fetch(crate::http::agent(), site));
+    let mut response = match response {
+        Ok(response) => response,
+        Err(error) => {
+            let message = format!("fetch failed: {error}");
+            if crate::http::ssl_fallback_allowed()
+                && crate::http::looks_like_ssl_cert_error(&message)
+            {
                 eprintln!(
-                    "blindrss: SSL certificate problem for {url} ({e}); retrying without certificate verification"
+                    "blindrss: SSL certificate problem for {url} ({message}); retrying without certificate verification"
                 );
-                fetch(crate::http::insecure_agent(), url)?
+                fetch(crate::http::insecure_agent(), &site)
+                    .map_err(|e| format!("fetch failed: {e}"))?
             } else {
-                return Err(e);
+                return Err(message);
             }
         }
     };
+    let bytes = response
+        .body_mut()
+        .with_config()
+        .limit(10 * 1024 * 1024)
+        .read_to_vec()
+        .map_err(|e| format!("read failed: {e}"))?;
     parse_feed(&bytes)
+}
+
+#[cfg(test)]
+mod cookie_free_retry_tests {
+    use super::{adopt_cookie_free_retry, should_retry_without_cookies};
+
+    #[test]
+    fn rejection_statuses_with_cookies_retry_anonymously() {
+        // Python's 413/431 (issue #101) plus the stale-session
+        // 5xx family (GitHub .atom 504, 2026-11-09).
+        for status in [413, 431, 500, 502, 503, 504] {
+            assert!(
+                should_retry_without_cookies(status, true),
+                "status {status} with cookies should retry"
+            );
+        }
+    }
+
+    #[test]
+    fn other_statuses_or_no_cookies_never_retry() {
+        for status in [200, 301, 304, 400, 401, 403, 404, 406, 408, 429] {
+            assert!(
+                !should_retry_without_cookies(status, true),
+                "status {status} with cookies should not retry"
+            );
+        }
+        for status in [413, 431, 500, 502, 503, 504] {
+            assert!(
+                !should_retry_without_cookies(status, false),
+                "status {status} without cookies should not retry"
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_healthy_retry_replaces_the_original_error() {
+        assert!(adopt_cookie_free_retry(Some(200)));
+        assert!(adopt_cookie_free_retry(Some(304)));
+        assert!(!adopt_cookie_free_retry(Some(401)));
+        assert!(!adopt_cookie_free_retry(Some(404)));
+        assert!(!adopt_cookie_free_retry(Some(504)));
+        assert!(!adopt_cookie_free_retry(None));
+    }
 }

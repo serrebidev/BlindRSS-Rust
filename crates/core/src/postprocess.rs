@@ -632,6 +632,30 @@ fn bloomberg_is_end_marker(p: &str) -> bool {
         || p.starts_with("By accepting, you agree to our updated [Terms of Service")
 }
 
+/// Footer anchors for [`strip_macrumors_boilerplate`]:
+/// the same boilerplate sentences, but whitespace-tolerant.
+/// Extraction emits block fragments on separate lines, so at
+/// strip time the anchors may be split across lines ("To
+/// Subscribe or\nUnsubscribe") while the collapsed reader
+/// text glues them into the verbatim sentences — and the
+/// page uses a curly apostrophe in "Apple's" (Brandon's
+/// report, 2026-11-09: the footer survived the strip).
+static MACRUMORS_PUSH_PITCH_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"Push\s*Notifications\s*Apple(?:’|')s\s*Safari\s*browser\s*includes\s*a\s*feature")
+        .unwrap()
+});
+static MACRUMORS_PITCH_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"Apple(?:’|')s\s*Safari\s*browser\s*includes\s*a\s*feature").unwrap()
+});
+static MACRUMORS_SUBSCRIBE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"To\s*Subscribe\s*or\s*Unsubscribe").unwrap());
+static MACRUMORS_SUPPORT_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"If\s*you\s*have\s*any\s*questions\s*or\s*problems,\s*email\s*support@macrumors\.com",
+    )
+    .unwrap()
+});
+
 /// MacRumors (Brandon's report, 2026-11-08): the generic
 /// engines read the whole page, so the "Popular Stories"
 /// rail lands mid-article and the page footer (push
@@ -687,7 +711,10 @@ pub fn strip_macrumors_boilerplate(text: &str) -> String {
     // that allows users to subscribe..."), so no paragraph
     // starts with a marker and the cuts above never fire.
     // Cut at the footer's unambiguous boilerplate anchors
-    // wherever they appear in the text.
+    // wherever they appear in the text. The anchors match
+    // across whitespace runs because extraction may split
+    // them over lines ("To Subscribe or\nUnsubscribe") that
+    // only glue together when the reader text collapses.
     let mut byte_cut: Option<usize> = None;
     let mut note = |idx: usize| {
         byte_cut = Some(match byte_cut {
@@ -695,24 +722,20 @@ pub fn strip_macrumors_boilerplate(text: &str) -> String {
             None => idx,
         });
     };
-    if let Some(pos) = kept.find("Apple's Safari browser includes a feature") {
-        // The "Push Notifications" heading sits immediately
-        // before the pitch sentence (glued or spaced); take
-        // the heading with the tail when it is the suffix of
-        // what precedes.
-        let before = kept[..pos].trim_end();
-        match before.rfind("Push Notifications") {
-            Some(label) if label + "Push Notifications".len() == before.len() => note(label),
-            _ => note(pos),
-        }
+    // The "Push Notifications" heading sits immediately
+    // before the pitch sentence (glued, spaced or split over
+    // lines); prefer the combined match so the heading goes
+    // with the tail, else cut at the pitch alone.
+    if let Some(hit) = MACRUMORS_PUSH_PITCH_RE.find(&kept) {
+        note(hit.start());
+    } else if let Some(hit) = MACRUMORS_PITCH_RE.find(&kept) {
+        note(hit.start());
     }
-    if let Some(pos) = kept.find("To Subscribe or Unsubscribe") {
-        note(pos);
+    if let Some(hit) = MACRUMORS_SUBSCRIBE_RE.find(&kept) {
+        note(hit.start());
     }
-    if let Some(pos) =
-        kept.find("If you have any questions or problems, email support@macrumors.com")
-    {
-        note(pos);
+    if let Some(hit) = MACRUMORS_SUPPORT_RE.find(&kept) {
+        note(hit.start());
     }
     if let Some(c) = byte_cut
         && c > 0

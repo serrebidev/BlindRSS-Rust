@@ -115,3 +115,63 @@ fn refresh_revalidates_cached_feed_and_stores_tags() {
     drop(db);
     std::fs::remove_file(path).unwrap();
 }
+
+#[test]
+fn feed_fetch_retries_without_cookies_after_rejection_status() {
+    // GitHub answers 504 ("Unicorn!") to a stale logged-in
+    // session on .atom feeds while the anonymous request
+    // succeeds (Brandon's report, 2026-11-09). The server
+    // below replays that shape: 504 when the request carries
+    // cookies, the feed when it does not.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let mut requests = Vec::new();
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut bytes = [0; 4096];
+            let size = stream.read(&mut bytes).unwrap();
+            let raw = String::from_utf8_lossy(&bytes[..size]).to_lowercase();
+            let has_cookie = raw.contains("cookie:");
+            requests.push(raw);
+            let reply = if has_cookie {
+                "HTTP/1.1 504 Gateway Timeout\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+                    .to_string()
+            } else {
+                let body = "<rss version='2.0'><channel><title>Feed</title><item><guid>retry-item</guid><title>Retried</title></item></channel></rss>";
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+            };
+            stream.write_all(reply.as_bytes()).unwrap();
+        }
+        requests
+    });
+    // A jar holding one (stale) session cookie for the origin.
+    let dir = std::env::temp_dir().join(format!("blindrss-retry-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let config_path = dir.join("config.json");
+    std::fs::write(
+        dir.join("site_cookies.txt"),
+        "# Netscape HTTP Cookie File\n127.0.0.1\tFALSE\t/\tFALSE\t4102444800\tgh_sess\tstale-token\n",
+    )
+    .unwrap();
+    blindrss_core::feeds::configure_cookies(&config_path);
+    let parsed =
+        blindrss_core::feeds::fetch_and_parse(&format!("http://{address}/commits.atom")).unwrap();
+    assert_eq!(parsed.entries.len(), 1);
+    assert_eq!(parsed.entries[0].title, "Retried");
+    let requests = server.join().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests[0].contains("gh_sess"),
+        "first attempt carries the jar"
+    );
+    assert!(
+        !requests[1].contains("cookie:"),
+        "retry drops the jar: {}",
+        requests[1]
+    );
+    std::fs::remove_dir_all(dir).ok();
+}
