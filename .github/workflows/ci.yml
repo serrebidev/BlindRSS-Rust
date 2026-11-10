@@ -90,7 +90,7 @@ jobs:
       # when disk gets tight (next build is cold once).
       - name: Persistent target folder (Windows host runner)
         if: runner.os == 'Windows'
-        shell: powershell
+        shell: pwsh
         run: |
           $dir = 'C:/forgejo-runner/cargo-target/BlindRSS-Rust'
           New-Item -ItemType Directory -Force $dir | Out-Null
@@ -155,7 +155,7 @@ jobs:
       # before the runner deletes the work folder.
       - name: Unlink persistent target folder (Windows)
         if: always() && runner.os == 'Windows'
-        shell: powershell
+        shell: pwsh
         run: |
           if (Test-Path target) { (Get-Item target).Delete() }
 
