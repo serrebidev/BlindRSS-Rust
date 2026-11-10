@@ -222,6 +222,8 @@ CREATE TABLE IF NOT EXISTS youtube_history_state (
 CREATE TABLE IF NOT EXISTS hosted_article_media (
     cache_key TEXT PRIMARY KEY, media_url TEXT, media_type TEXT,
     checked_at INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS hosted_sync_state (
+    provider TEXT PRIMARY KEY, changed_after INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_articles_feed_id ON articles (feed_id);
 CREATE INDEX IF NOT EXISTS idx_articles_is_read ON articles (is_read);
 CREATE INDEX IF NOT EXISTS idx_articles_date ON articles (date);
@@ -3676,28 +3678,78 @@ impl Db {
 
     /// Sync server-owned article fields without replacing local history, tags, or labels.
     pub fn upsert_hosted_article(&self, a: &Article) -> rusqlite::Result<bool> {
+        Ok(self.upsert_hosted_articles(std::slice::from_ref(a))? == 1)
+    }
+
+    /// `upsert_hosted_article` for a whole sync in ONE transaction; returns how many
+    /// were new. A transaction per article made a 30k-article Miniflux sync spend
+    /// most of its time waiting on commits.
+    pub fn upsert_hosted_articles(&self, articles: &[Article]) -> rusqlite::Result<usize> {
         let tx = rusqlite::Transaction::new_unchecked(
             &self.conn,
             rusqlite::TransactionBehavior::Immediate,
         )?;
-        let changed = tx.execute(
-            "UPDATE articles SET feed_id = ?2, title = ?3, url = ?4, content = ?5, \
-             description = ?6, date = ?7, author = ?8, is_read = ?9, is_favorite = ?10, \
-             media_url = COALESCE(?11, media_url), media_type = COALESCE(?12, media_type) WHERE id = ?1",
-            params![a.id, a.feed_id, a.title, a.url, a.content, a.description, a.date, a.author,
-                a.is_read as i64, a.is_favorite as i64, a.media_url, a.media_type],
-        )?;
-        if changed == 0 {
-            tx.execute(
+        let mut new = 0;
+        {
+            let mut update = tx.prepare_cached(
+                "UPDATE articles SET feed_id = ?2, title = ?3, url = ?4, content = ?5, \
+                 description = ?6, date = ?7, author = ?8, is_read = ?9, is_favorite = ?10, \
+                 media_url = COALESCE(?11, media_url), media_type = COALESCE(?12, media_type) WHERE id = ?1",
+            )?;
+            let mut insert = tx.prepare_cached(
                 "INSERT INTO articles (id, feed_id, title, url, content, description, date, author, \
                  is_read, is_favorite, media_url, media_type) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-                params![a.id, a.feed_id, a.title, a.url, a.content, a.description, a.date, a.author,
-                    a.is_read as i64, a.is_favorite as i64, a.media_url, a.media_type],
             )?;
+            for a in articles {
+                let p = params![
+                    a.id,
+                    a.feed_id,
+                    a.title,
+                    a.url,
+                    a.content,
+                    a.description,
+                    a.date,
+                    a.author,
+                    a.is_read as i64,
+                    a.is_favorite as i64,
+                    a.media_url,
+                    a.media_type
+                ];
+                if update.execute(p)? == 0 {
+                    insert.execute(p)?;
+                    new += 1;
+                }
+                self.record_article_version(&a.id, &a.title, a.content.as_deref())?;
+            }
         }
-        self.record_article_version(&a.id, &a.title, a.content.as_deref())?;
         tx.commit()?;
-        Ok(changed == 0)
+        Ok(new)
+    }
+
+    /// Server-side `changed_after` watermark (Unix seconds) of the last complete
+    /// hosted sync, or None before the first one.
+    pub fn hosted_sync_watermark(&self, provider: &str) -> rusqlite::Result<Option<i64>> {
+        use rusqlite::OptionalExtension;
+        self.conn
+            .query_row(
+                "SELECT changed_after FROM hosted_sync_state WHERE provider = ?1",
+                params![provider],
+                |r| r.get(0),
+            )
+            .optional()
+    }
+
+    pub fn set_hosted_sync_watermark(
+        &self,
+        provider: &str,
+        changed_after: i64,
+    ) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT INTO hosted_sync_state (provider, changed_after) VALUES (?1, ?2) \
+             ON CONFLICT(provider) DO UPDATE SET changed_after = excluded.changed_after",
+            params![provider, changed_after],
+        )?;
+        Ok(())
     }
 
     /// Append a change-history version for an article, deduped

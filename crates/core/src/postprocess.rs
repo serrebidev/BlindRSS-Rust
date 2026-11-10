@@ -438,8 +438,10 @@ pub fn published_date_label(html_text: &str) -> String {
     format!("{day} {} {year}", MONTHS[month - 1])
 }
 
+// The bullet is optional: Python's extractor emits "- Published", the Rust
+// engines a bare "Published" line (BBC's date sits in a <time> they drop).
 static BBC_LEAD_PUBLISHED_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\A\s*-\s*Published\s*\n").unwrap());
+    LazyLock::new(|| Regex::new(r"\A\s*(-\s*)?Published\s*\n").unwrap());
 
 /// Python `_strip_bbc_boilerplate`.
 pub fn strip_bbc_boilerplate(text: &str, published: &str) -> String {
@@ -448,12 +450,14 @@ pub fn strip_bbc_boilerplate(text: &str, published: &str) -> String {
     // Complete the dangling byline with the publish date when the
     // page carried one; drop the line when it did not.
     if BBC_LEAD_PUBLISHED_RE.is_match(&t) {
-        let lead = if published.is_empty() {
-            String::new()
-        } else {
-            format!("- Published {published}\n")
-        };
-        let t2 = BBC_LEAD_PUBLISHED_RE.replacen(&t, 1, |_: &regex::Captures| lead.clone());
+        let t2 = BBC_LEAD_PUBLISHED_RE.replacen(&t, 1, |c: &regex::Captures| {
+            if published.is_empty() {
+                String::new()
+            } else {
+                let bullet = if c.get(1).is_some() { "- " } else { "" };
+                format!("{bullet}Published {published}\n")
+            }
+        });
         return t2.into_owned();
     }
     t.into_owned()

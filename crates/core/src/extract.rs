@@ -2540,9 +2540,17 @@ fn extract_article_impl(
     }
 
     // Second opinion: Readability (dom_smoothie).
+    // Its HTML goes through the same block-aware converter as everything else:
+    // `text_content` is raw DOM text, which runs a byline <div> straight into the
+    // first paragraph ("...by Juli CloverThe iOS 27.2.1...", MacRumors).
     let second = dom_smoothie::Readability::new(html.to_string(), Some(url), None)
         .and_then(|mut r| r.parse())
-        .map(|a| (a.title, a.text_content.trim().to_string()))
+        .map(|a| {
+            (
+                a.title,
+                html_to_text_opts(&a.content, keep_alt).trim().to_string(),
+            )
+        })
         .unwrap_or_default();
     let second_chars = char_count(&second.1);
 

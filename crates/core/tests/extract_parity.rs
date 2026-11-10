@@ -639,3 +639,41 @@ fn cbc_story_extracts_in_full_not_the_feed_lede() {
         text.chars().count()
     );
 }
+
+#[test]
+fn bbc_published_label_carries_its_date() {
+    // BBC's metadata strip is a visually-hidden "Published" plus a <time> the
+    // engines drop; the reader showed a bare "Published" (reported 2026-11-09).
+    let html = include_str!("fixtures/bbc_published_label.html");
+    let (text, _) = article_text(extract_article(
+        html,
+        "https://www.bbc.co.uk/news/articles/cqg7x7dpvym8o?at_medium=RSS&at_campaign=rss",
+        None,
+    ));
+    let first = text.lines().next().unwrap_or("");
+    assert_eq!(first, "Published 9 November 2026", "lead: {:.120}", text);
+}
+
+#[test]
+fn macrumors_byline_is_its_own_paragraph() {
+    // Readability's raw text ran the byline into the first paragraph:
+    // "...3:07 pm PST by Juli CloverThe iOS 27.2.1..." (reported 2026-11-09).
+    let html = include_str!("fixtures/macrumors_byline.html");
+    let (text, _) = article_text(extract_article(
+        html,
+        "https://www.macrumors.com/2026/11/09/ios-27-2-1-security-fixes/",
+        None,
+    ));
+    assert!(!text.contains("Juli CloverThe"), "{:.200}", text);
+    let mut paras = text.split("\n\n");
+    assert_eq!(
+        paras.next(),
+        Some("Monday November 9, 2026 3:07 pm PST by Juli Clover")
+    );
+    assert!(
+        paras
+            .next()
+            .unwrap_or("")
+            .starts_with("The iOS 27.2.1, iPadOS 27.2.1")
+    );
+}

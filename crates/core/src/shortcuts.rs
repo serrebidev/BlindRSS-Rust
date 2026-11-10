@@ -546,7 +546,10 @@ pub fn text_guarded(command_id: &str) -> bool {
 pub fn fixed_key_rows() -> &'static [(&'static str, &'static str)] {
     &[
         ("Enter", "Open or play the selected article"),
-        ("Del", "Delete the selected article"),
+        (
+            "Del",
+            "Delete the selected articles; in the feed tree, remove the selected feed or category",
+        ),
         (
             "Shift+Del",
             "Delete the selected article without confirmation",

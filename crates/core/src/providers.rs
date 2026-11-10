@@ -1357,15 +1357,25 @@ impl MinifluxClient {
         self.get_json("/v1/feeds")
     }
 
-    pub fn entries(&self, feed_id: i64, limit: usize) -> Result<Vec<MfEntry>, String> {
+    /// Every entry of a feed, newest first; with `changed_after` (Unix seconds)
+    /// only those the server created or changed (read, starred, edited) since.
+    pub fn entries(
+        &self,
+        feed_id: i64,
+        limit: usize,
+        changed_after: Option<i64>,
+    ) -> Result<Vec<MfEntry>, String> {
         let limit = limit.clamp(1, 1000);
         let mut entries = Vec::new();
         let mut seen = std::collections::HashSet::new();
         let mut offset = 0;
         loop {
-            let path = format!(
+            let mut path = format!(
                 "/v1/entries?feed_id={feed_id}&order=published_at&direction=desc&limit={limit}&offset={offset}"
             );
+            if let Some(after) = changed_after {
+                path.push_str(&format!("&changed_after={after}"));
+            }
             let resp: MfEntries = self.get_json(&path)?;
             let count = resp.entries.len();
             if count == 0 {
@@ -1779,73 +1789,25 @@ impl MinifluxClient {
     }
 
     fn sync_feed_entries(&self, db: &Db, mf_id: i64) -> Result<usize, String> {
-        let local_id = format!("miniflux:{mf_id}");
-        let tombstones = db.deleted_article_ids().unwrap_or_default();
-        let mut new = 0;
-        for e in self.entries(mf_id, 100)? {
-            let article = Article {
-                id: format!("miniflux-entry:{}", e.id),
-                feed_id: local_id.clone(),
-                title: if e.title.trim().is_empty() {
-                    "No Title".to_string()
-                } else {
-                    e.title
-                },
-                url: e.url,
-                content: Some(e.content.clone()),
-                description: Some(e.content),
-                date: if e.published_at.is_empty() {
-                    None
-                } else {
-                    Some(e.published_at)
-                },
-                author: if e.author.is_empty() {
-                    None
-                } else {
-                    Some(e.author)
-                },
-                is_read: e.status == "read",
-                is_favorite: e.starred,
-                media_url: e
-                    .enclosures
-                    .iter()
-                    .find(|enc| {
-                        enc.mime_type.starts_with("audio/") || enc.mime_type.starts_with("video/")
-                    })
-                    .or_else(|| e.enclosures.first())
-                    .map(|enc| enc.url.clone()),
-                media_type: e
-                    .enclosures
-                    .iter()
-                    .find(|enc| {
-                        enc.mime_type.starts_with("audio/") || enc.mime_type.starts_with("video/")
-                    })
-                    .or_else(|| e.enclosures.first())
-                    .map(|enc| enc.mime_type.clone())
-                    .filter(|t| !t.is_empty()),
-            };
-            if tombstones.contains(&article.id) {
-                continue;
-            }
-            if db
-                .upsert_hosted_article(&article)
-                .map_err(|e| format!("article store failed: {e}"))?
-            {
-                new += 1;
-            }
-        }
-        Ok(new)
+        let since = sync_since(db);
+        let entries = self.entries(mf_id, 100, since)?;
+        store_entries(db, vec![(format!("miniflux:{mf_id}"), entries)])
     }
 
-    /// Sync feeds and all paginated entries, including read history and bookmarks.
+    /// Sync feeds and their entries, including read history and bookmarks.
+    ///
+    /// The first sync of a cache downloads every entry. Later ones ask each feed
+    /// only for entries changed since the last complete sync (`changed_after`,
+    /// which Miniflux also bumps on read/star changes), fetch feeds in parallel,
+    /// and write everything in one transaction once every feed has answered.
+    /// `per_feed_items` is the page size.
     pub fn sync(&self, db: &Db, per_feed_items: usize) -> Result<(usize, usize), String> {
+        let started = unix_now();
+        let since = sync_since(db);
         let feeds = self.feeds()?;
-        let tombstones = db.deleted_article_ids().unwrap_or_default();
-        let mut new_articles = 0;
         for f in &feeds {
-            let local_id = format!("miniflux:{}", f.id);
             db.upsert_hosted_feed(&Feed {
-                id: local_id.clone(),
+                id: format!("miniflux:{}", f.id),
                 url: f.feed_url.clone(),
                 title: f.title.clone(),
                 title_is_custom: false,
@@ -1853,61 +1815,45 @@ impl MinifluxClient {
                 icon_url: None,
             })
             .map_err(|e| format!("feed store failed: {e}"))?;
-            for e in self.entries(f.id, per_feed_items)? {
-                let article = Article {
-                    id: format!("miniflux-entry:{}", e.id),
-                    feed_id: local_id.clone(),
-                    title: if e.title.trim().is_empty() {
-                        "No Title".to_string()
-                    } else {
-                        e.title
-                    },
-                    url: e.url,
-                    content: Some(e.content.clone()),
-                    description: Some(e.content),
-                    date: if e.published_at.is_empty() {
-                        None
-                    } else {
-                        Some(e.published_at)
-                    },
-                    author: if e.author.is_empty() {
-                        None
-                    } else {
-                        Some(e.author)
-                    },
-                    is_read: e.status == "read",
-                    is_favorite: e.starred,
-                    media_url: e
-                        .enclosures
-                        .iter()
-                        .find(|enc| {
-                            enc.mime_type.starts_with("audio/")
-                                || enc.mime_type.starts_with("video/")
-                        })
-                        .or_else(|| e.enclosures.first())
-                        .map(|enc| enc.url.clone()),
-                    media_type: e
-                        .enclosures
-                        .iter()
-                        .find(|enc| {
-                            enc.mime_type.starts_with("audio/")
-                                || enc.mime_type.starts_with("video/")
-                        })
-                        .or_else(|| e.enclosures.first())
-                        .map(|enc| enc.mime_type.clone())
-                        .filter(|t| !t.is_empty()),
-                };
-                if tombstones.contains(&article.id) {
-                    continue;
-                }
-                if db
-                    .upsert_hosted_article(&article)
-                    .map_err(|e| format!("article store failed: {e}"))?
-                {
-                    new_articles += 1;
-                }
-            }
         }
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let fetched = std::sync::Mutex::new(Vec::with_capacity(feeds.len()));
+        let failure = std::sync::Mutex::new(None::<String>);
+        std::thread::scope(|scope| {
+            for _ in 0..SYNC_WORKERS.min(feeds.len().max(1)) {
+                scope.spawn(|| {
+                    loop {
+                        if failure.lock().unwrap_or_else(|p| p.into_inner()).is_some() {
+                            return;
+                        }
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(f) = feeds.get(i) else { return };
+                        match self.entries(f.id, per_feed_items, since) {
+                            Ok(entries) => fetched
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .push((format!("miniflux:{}", f.id), entries)),
+                            Err(e) => {
+                                failure
+                                    .lock()
+                                    .unwrap_or_else(|p| p.into_inner())
+                                    .get_or_insert(e);
+                                return;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        if let Some(e) = failure.into_inner().unwrap_or_else(|p| p.into_inner()) {
+            return Err(e);
+        }
+        let new_articles =
+            store_entries(db, fetched.into_inner().unwrap_or_else(|p| p.into_inner()))?;
+        // Advance only after a complete sync; the margin absorbs clock skew between
+        // this machine and the server and entries changed while we were fetching.
+        db.set_hosted_sync_watermark("miniflux", started - SYNC_WATERMARK_MARGIN_S)
+            .map_err(|e| format!("sync state store failed: {e}"))?;
         // Reconcile only after every feed and entry page
         // succeeded (Audit 8 D09): a feed the server no
         // longer carries leaves the cache, with its entries;
@@ -1946,6 +1892,75 @@ impl MinifluxClient {
         Ok((feeds.len(), new_articles))
     }
 }
+/// Feeds fetched at once during a Miniflux sync.
+const SYNC_WORKERS: usize = 8;
+/// Seconds subtracted from a sync's start time before it becomes the next
+/// `changed_after`, so skew and mid-sync changes are fetched again, not lost.
+const SYNC_WATERMARK_MARGIN_S: i64 = 600;
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// The `changed_after` for this sync: None (full download) for a fresh cache.
+fn sync_since(db: &Db) -> Option<i64> {
+    db.hosted_sync_watermark("miniflux").ok().flatten()
+}
+
+fn mf_article(e: MfEntry, feed_id: &str) -> Article {
+    let media = e
+        .enclosures
+        .iter()
+        .find(|enc| enc.mime_type.starts_with("audio/") || enc.mime_type.starts_with("video/"))
+        .or_else(|| e.enclosures.first());
+    let media_url = media.map(|enc| enc.url.clone());
+    let media_type = media
+        .map(|enc| enc.mime_type.clone())
+        .filter(|t| !t.is_empty());
+    Article {
+        id: format!("miniflux-entry:{}", e.id),
+        feed_id: feed_id.to_string(),
+        title: if e.title.trim().is_empty() {
+            "No Title".to_string()
+        } else {
+            e.title
+        },
+        url: e.url,
+        content: Some(e.content.clone()),
+        description: Some(e.content),
+        date: if e.published_at.is_empty() {
+            None
+        } else {
+            Some(e.published_at)
+        },
+        author: if e.author.is_empty() {
+            None
+        } else {
+            Some(e.author)
+        },
+        is_read: e.status == "read",
+        is_favorite: e.starred,
+        media_url,
+        media_type,
+    }
+}
+
+/// Write fetched entries, skipping deleted ones, in one transaction; returns
+/// how many were new to the cache.
+fn store_entries(db: &Db, fetched: Vec<(String, Vec<MfEntry>)>) -> Result<usize, String> {
+    let tombstones = db.deleted_article_ids().unwrap_or_default();
+    let articles: Vec<Article> = fetched
+        .into_iter()
+        .flat_map(|(feed_id, entries)| entries.into_iter().map(move |e| mf_article(e, &feed_id)))
+        .filter(|a| !tombstones.contains(&a.id))
+        .collect();
+    db.upsert_hosted_articles(&articles)
+        .map_err(|e| format!("article store failed: {e}"))
+}
+
 /// Challenge markers (Python `_looks_like_browser_challenge_error`).
 fn looks_like_browser_challenge_error(value: &str) -> bool {
     let text = value.to_lowercase();

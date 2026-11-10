@@ -1168,6 +1168,23 @@ struct ReaderPlace {
     seq: u64,
 }
 
+/// Status field showing the reading position (Python's field 3).
+const READING_STATUS_FIELD: i32 = 3;
+
+/// Python `_update_reading_position`: "Line N of M" for the reader on
+/// status field 3. Lines are the control's display lines, the ones
+/// Up/Down move through; wx's PositionToXY gives (column, line).
+fn update_reading_position(frame: &Frame, reader: &TextCtrl) {
+    let total = reader.get_number_of_lines();
+    if total <= 0 {
+        return;
+    }
+    if let Some((_column, line)) = reader.position_to_xy(reader.get_insertion_point()) {
+        let line = (line + 1).min(i64::from(total));
+        frame.set_status_text(&format!("Line {line} of {total}"), READING_STATUS_FIELD);
+    }
+}
+
 /// Restore a reading place into the reader: the selection
 /// when one was kept, else the caret.
 fn apply_reader_place(reader: &TextCtrl, place: &ReaderPlace) {
@@ -2025,6 +2042,12 @@ struct State {
     /// runs it once for the node the user lands on instead of
     /// refilling for every node arrowed past.
     refill_pending: bool,
+    /// The view whose rows the article list shows, and each left
+    /// view's place (Python's per-view state): returning to All
+    /// Articles restores ITS place, not the article another folder
+    /// was on.
+    shown_view: Option<Option<String>>,
+    view_places: std::collections::HashMap<Option<String>, ListPlace>,
     /// Base labels of registry-backed menu items, captured at
     /// menu build so shortcut suffixes can be re-rendered when
     /// bindings change (Python `_refresh_shortcut_menu_labels`).
@@ -3669,10 +3692,26 @@ fn merge_recommendations(mut base: Vec<Article>, extra: Vec<Article>) -> Vec<Art
 /// `_capture_list_view_state`): the selected article, the
 /// focused article, and whether the focus sat on the paging
 /// placeholder row (which has no article).
+#[derive(Clone)]
 struct ListPlace {
     selected_id: Option<String>,
     focused_id: Option<String>,
     on_placeholder: bool,
+    /// Unvisited top: row 0 focused with nothing selected. It anchors no
+    /// article, so the newest article (the new row 0) takes the focus.
+    follow_top: bool,
+}
+
+impl ListPlace {
+    /// A view entered for the first time: its top row, nothing selected.
+    fn unvisited() -> Self {
+        ListPlace {
+            selected_id: None,
+            focused_id: None,
+            on_placeholder: false,
+            follow_top: true,
+        }
+    }
 }
 
 fn capture_list_place(state: &State, list: &ListCtrl) -> ListPlace {
@@ -3688,15 +3727,26 @@ fn capture_list_place(state: &State, list: &ListCtrl) -> ListPlace {
         wxdragon::prelude::ListNextItemFlag::All,
         wxdragon::prelude::ListItemState::Focused,
     );
+    let selected_id = id_at(list.get_first_selected_item() as i64).or_else(|| {
+        state
+            .selected_article
+            .and_then(|i| state.articles.get(i))
+            .map(|a| a.id.clone())
+    });
+    // Python `_user_focused_row`: the row-0 placeholder focus is not a
+    // place the user picked. Anchoring it held focus on the old top
+    // article while a refresh added newer ones above it (reported
+    // 2026-11-09: Python's focus follows the newest article).
+    let follow_top = focused_idx == 0 && selected_id.is_none();
     ListPlace {
-        selected_id: id_at(list.get_first_selected_item() as i64).or_else(|| {
-            state
-                .selected_article
-                .and_then(|i| state.articles.get(i))
-                .map(|a| a.id.clone())
-        }),
-        focused_id: id_at(focused_idx as i64),
+        focused_id: if follow_top {
+            None
+        } else {
+            id_at(focused_idx as i64)
+        },
+        selected_id,
         on_placeholder: focused_idx >= 0 && focused_idx as usize == state.articles.len(),
+        follow_top,
     }
 }
 
@@ -3740,7 +3790,57 @@ fn restore_list_place(state: &mut State, list: &ListCtrl, place: &ListPlace) {
             wxdragon::prelude::ListItemState::Focused,
         );
         list.ensure_visible(idx as i64);
+    } else if place.follow_top && !state.articles.is_empty() {
+        // Unvisited top: focus follows the newest article, also while the
+        // list has keyboard focus (the screen reader then reads it).
+        list.set_item_state(
+            0,
+            wxdragon::prelude::ListItemState::Focused,
+            wxdragon::prelude::ListItemState::Focused,
+        );
+        list.ensure_visible(0);
     }
+}
+
+/// The place to restore after a refill of `state.selected_feed`. Same
+/// view: the place just captured. A different view: the captured place
+/// belongs to the view being LEFT (its rows are still on screen), so it
+/// is kept for that view and the new one starts at its own remembered
+/// place. Capturing across views moved All Articles to whatever article
+/// another folder was on (reported 2026-11-09; Python keeps a place per
+/// view).
+fn place_for_view(state: &mut State, captured: ListPlace) -> ListPlace {
+    let view = state.selected_feed.clone();
+    let (place, switched) = switch_view_place(
+        &mut state.shown_view,
+        &mut state.view_places,
+        view,
+        captured,
+    );
+    if switched {
+        // The old index points into the previous view's rows.
+        state.selected_article = None;
+    }
+    place
+}
+
+fn switch_view_place(
+    shown: &mut Option<Option<String>>,
+    places: &mut std::collections::HashMap<Option<String>, ListPlace>,
+    view: Option<String>,
+    captured: ListPlace,
+) -> (ListPlace, bool) {
+    if shown.as_ref() == Some(&view) {
+        return (captured, false);
+    }
+    if let Some(left) = shown.replace(view.clone()) {
+        places.insert(left, captured);
+    }
+    let place = places
+        .get(&view)
+        .cloned()
+        .unwrap_or_else(ListPlace::unvisited);
+    (place, true)
 }
 
 fn refill_articles(state: &mut State, list: &ListCtrl) {
@@ -3752,7 +3852,8 @@ fn refill_articles(state: &mut State, list: &ListCtrl) {
     // port's refill did neither. Capture/restore here, in the
     // one funnel every rebuild goes through, so refresh
     // completions (and every other refill) keep the place.
-    let place = capture_list_place(state, list);
+    let captured = capture_list_place(state, list);
+    let place = place_for_view(state, captured);
     state.reader_generation = state.reader_generation.wrapping_add(1);
     state.pending_fulltext = None;
     // Freeze/Thaw around the whole fill: without it every
@@ -4550,6 +4651,8 @@ fn main() {
             collapsed_cats: std::collections::HashSet::new(),
             cols_sig: String::new(),
             refill_pending: false,
+            shown_view: None,
+            view_places: std::collections::HashMap::new(),
             menu_label_bases: std::collections::HashMap::new(),
             reader_cache: blindrss_core::reader_cache::ReaderCache::default(),
             reader_generation: 0,
@@ -4887,6 +4990,7 @@ fn main() {
                 if !snapshot.text.is_empty() && reader.get_value() == snapshot.text {
                     apply_reader_place(&reader, &snapshot);
                 }
+                update_reading_position(&frame, &reader);
             });
         }
         let state_rf = state.clone();
@@ -4906,6 +5010,7 @@ fn main() {
                 }
                 st.pending_restore = Some(st.reader_place.clone());
             }
+            update_reading_position(&frame_rf, &reader);
             place_timer.start(10, true);
             ev.skip(true);
         });
@@ -4933,23 +5038,30 @@ fn main() {
             let state_ku = state.clone();
             reader.on_key_up(move |ev| {
                 let (from, to) = reader.get_selection();
-                let mut st = state_ku.borrow_mut();
-                st.reader_place.pos = reader.get_insertion_point();
-                st.reader_place.from = from;
-                st.reader_place.to = to;
+                {
+                    let mut st = state_ku.borrow_mut();
+                    st.reader_place.pos = reader.get_insertion_point();
+                    st.reader_place.from = from;
+                    st.reader_place.to = to;
+                }
+                update_reading_position(&frame, &reader);
                 ev.skip(true);
             });
             let state_lu = state.clone();
             reader.on_mouse_left_up(move |ev| {
                 let (from, to) = reader.get_selection();
-                let mut st = state_lu.borrow_mut();
-                st.reader_place.pos = reader.get_insertion_point();
-                st.reader_place.from = from;
-                st.reader_place.to = to;
+                {
+                    let mut st = state_lu.borrow_mut();
+                    st.reader_place.pos = reader.get_insertion_point();
+                    st.reader_place.from = from;
+                    st.reader_place.to = to;
+                }
+                update_reading_position(&frame, &reader);
                 ev.skip(true);
             });
             let state_kf = state.clone();
             reader.on_kill_focus(move |ev| {
+                frame.set_status_text("", READING_STATUS_FIELD);
                 let (from, to) = reader.get_selection();
                 let text = reader.get_value();
                 let pos = reader.get_insertion_point();
@@ -5445,7 +5557,8 @@ fn main() {
         // read, restore-deleted dialog, and search.
         let state_del = state.clone();
         let frame_del = frame;
-        let act_delete: Rc<dyn Fn()> = Rc::new(move || {
+        // `confirm: false` is Shift+Del (Python on_delete_article(confirm=False)).
+        let delete_articles: Rc<dyn Fn(bool)> = Rc::new(move |confirm: bool| {
             let articles: Vec<Article> = {
                 let st = state_del.borrow();
                 selected_article_indices(&list, &st)
@@ -5458,7 +5571,7 @@ fn main() {
                 return;
             }
             let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
-            if cfg.get_bool("confirm_article_delete", true) {
+            if confirm && cfg.get_bool("confirm_article_delete", true) {
                 let prompt = if articles.len() == 1 {
                     format!("Delete '{}'?", articles[0].title)
                 } else {
@@ -5513,6 +5626,10 @@ fn main() {
                 0,
             );
         });
+        let act_delete: Rc<dyn Fn()> = {
+            let delete = delete_articles.clone();
+            Rc::new(move || delete(true))
+        };
 
         let state_fav = state.clone();
         let frame_fav = frame;
@@ -10450,6 +10567,9 @@ fn main() {
             let dispatch_hook = dispatch_accel.clone();
             let h_toggle_read = act_toggle_read.clone();
             let h_activate = act_activate.clone();
+            let h_delete_articles = delete_articles.clone();
+            let h_remove_feed = act_remove.clone();
+            let h_delete_category = act_delete_category.clone();
             let h_find = act_find.clone();
             let h_find_next = act_find_next.clone();
             let h_find_prev = act_find_prev.clone();
@@ -10548,6 +10668,52 @@ fn main() {
                     } else {
                         ev.skip(true);
                     }
+                    return;
+                }
+                // Delete (Python's _is_delete_key: Delete, keypad
+                // Delete, keypad decimal). Article list: delete
+                // the selection with the menu's confirmation,
+                // Shift+Delete without. Feed tree: remove the
+                // selected feed or category, each through its
+                // menu action and dialog. Anywhere else (search
+                // box, reader) the key is the control's own.
+                if matches!(code, 127 | 385 | 391) && !(mods.ctrl || mods.alt || mods.cmd) {
+                    let focused = ev
+                        .get_event_object()
+                        .map(|w| w.get_handle() as usize)
+                        .unwrap_or(0);
+                    // selected_feed also names categories ("cat:...") and
+                    // views ("smart:7", favorites...): only a real feed
+                    // row removes a feed.
+                    let (in_list, feed_selected, category_selected) = {
+                        let st = state_hook.borrow();
+                        let category = selected_category(&st).is_some();
+                        let feed = !category
+                            && st
+                                .selected_feed
+                                .as_deref()
+                                .is_some_and(|id| st.feeds.iter().any(|f| f.id == id));
+                        (
+                            st.focus_list && !st.search_focused && focused != f1_tree,
+                            feed,
+                            category,
+                        )
+                    };
+                    if in_list {
+                        h_delete_articles(!mods.shift);
+                        ev.skip(false);
+                        return;
+                    }
+                    if focused == f1_tree && !mods.shift {
+                        if feed_selected {
+                            h_remove_feed();
+                        } else if category_selected {
+                            h_delete_category();
+                        }
+                        ev.skip(false);
+                        return;
+                    }
+                    ev.skip(true);
                     return;
                 }
                 // Media arrows (Python's main-frame key
@@ -13167,6 +13333,39 @@ mod ui_parity_tests {
     }
 
     #[test]
+    fn each_view_keeps_its_own_list_place() {
+        // Reported 2026-11-09: visiting a folder and returning moved All
+        // Articles to the article that folder was on.
+        let at = |id: &str| ListPlace {
+            selected_id: Some(id.to_string()),
+            focused_id: Some(id.to_string()),
+            on_placeholder: false,
+            follow_top: false,
+        };
+        let mut shown = None;
+        let mut places = std::collections::HashMap::new();
+        let all: Option<String> = None;
+        let folder = Some("cat:Tech".to_string());
+        // First fill of All Articles: unvisited top.
+        let (p, switched) = switch_view_place(&mut shown, &mut places, all.clone(), at("x"));
+        assert!(switched && p.follow_top && p.focused_id.is_none());
+        // Refill of the same view keeps what was captured.
+        let (p, switched) = switch_view_place(&mut shown, &mut places, all.clone(), at("a7"));
+        assert!(!switched && p.focused_id.as_deref() == Some("a7"));
+        // To a folder: All Articles' place is kept, the folder starts fresh.
+        let (p, _) = switch_view_place(&mut shown, &mut places, folder.clone(), at("a7"));
+        assert!(p.follow_top && p.selected_id.is_none());
+        // Land on b3 in the folder, go back: All Articles is on a7, not b3.
+        let (p, switched) = switch_view_place(&mut shown, &mut places, all.clone(), at("b3"));
+        assert!(switched);
+        assert_eq!(p.focused_id.as_deref(), Some("a7"));
+        assert_eq!(p.selected_id.as_deref(), Some("a7"));
+        // And the folder remembers b3.
+        let (p, _) = switch_view_place(&mut shown, &mut places, folder, at("a7"));
+        assert_eq!(p.focused_id.as_deref(), Some("b3"));
+    }
+
+    #[test]
     fn view_query_maps_tree_values_to_scopes() {
         // Audit 8 G03/G04: the tree's data values become core
         // scopes, and the filter/sort/search state rides along.
@@ -13200,6 +13399,8 @@ mod ui_parity_tests {
                 collapsed_cats: std::collections::HashSet::new(),
                 cols_sig: String::new(),
                 refill_pending: false,
+                shown_view: None,
+                view_places: std::collections::HashMap::new(),
                 menu_label_bases: std::collections::HashMap::new(),
                 refresh_new: Vec::new(),
                 refresh_new_total: 0,

@@ -6,6 +6,17 @@ as `0.1.2-0.1.3`. Each release's section below is its Forgejo release note,
 taken from this file by the release workflow. The in-app updater shows the
 same text.
 
+## 0.1.85
+
+- Miniflux refresh is much faster. After the first sync, BlindRSS asks the server only for articles added or changed since the last complete sync (new posts, read and starred changes) instead of downloading every feed's whole history each time, fetches feeds in parallel, and saves everything in one database write. The first refresh after updating still downloads everything once.
+- A Miniflux refresh that fails part-way no longer leaves a half-updated article list.
+- The Delete key works again. In the article list it deletes the selected articles, with the same confirmation as the context menu; Shift+Delete deletes without asking. In the feed tree it removes the selected feed or category, with its confirmation.
+- Each folder keeps its own place in the article list. Visiting another folder and coming back to All Articles no longer moves you to the article you were on in that other folder.
+- Until you pick an article, focus stays on the newest one: as a refresh brings in new articles, focus moves to them, like the Python app.
+- While reading an article, the status bar shows your position as "Line 3 of 64", updated as you move, like the Python app.
+- BBC articles show their publish date ("Published 9 November 2026") instead of a bare "Published".
+- MacRumors articles keep the date and author line separate from the first paragraph.
+
 ## 0.1.84
 
 - Article-list dates now match the Python app: recent articles say "51 minutes ago" or "2 hours ago"; articles older than 24 hours show local date and time without seconds or a timezone suffix. Half-hour timezones, including GMT+3:30, are supported.
