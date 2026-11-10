@@ -27,6 +27,11 @@ jobs:
     name: Package (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
+    env:
+      # Linux: wxdragon-sys's GStreamer media backend calls gst_player_* without
+      # linking gstplayer-1.0. app/build.rs adds it for blindrss only, so the
+      # workspace test build of xtask fails to link. Give every Linux link it.
+      RUSTFLAGS: ${{ matrix.os == 'ubuntu-latest' && '-C link-arg=-lgstplayer-1.0' || '' }}
     strategy:
       fail-fast: false
       matrix:
