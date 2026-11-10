@@ -1797,11 +1797,21 @@ fn prompt_text(
 /// or the article list by context whenever a panel/dialog closes;
 /// without this the screen reader lands nowhere useful.
 fn restore_focus(state: &State, tree: &TreeCtrl, list: &ListCtrl) {
-    if state.focus_list {
+    if state.focus_reader
+        && let Some(reader) = MAIN_READER.with(|r| r.get())
+    {
+        reader.set_focus();
+    } else if state.focus_list {
         list.set_focus();
     } else {
         tree.set_focus();
     }
+}
+
+thread_local! {
+    /// The main window's reader pane, for restore_focus (its
+    /// ~40 dialog call sites hold only the tree and list).
+    static MAIN_READER: std::cell::Cell<Option<TextCtrl>> = const { std::cell::Cell::new(None) };
 }
 
 /// Working surface that held keyboard focus before a background
@@ -2033,6 +2043,11 @@ struct State {
     /// Surface the user is working in: false = feed tree,
     /// true = article list. Modal dialogs restore focus to it.
     focus_list: bool,
+    /// The reader pane had focus last (set on reader focus,
+    /// cleared when the tree, list or search box take it):
+    /// modal dialogs opened while reading return to the reader,
+    /// as wx's own focus restore does in the Python app.
+    focus_reader: bool,
     /// Config opt-in: persist/reopen the last selected feed.
     remember_last_feed: bool,
     /// Cooperative refresh cancellation, shared with the refresh
@@ -4677,6 +4692,7 @@ fn main() {
             selected_article: None,
             refreshing: false,
             focus_list: false,
+            focus_reader: false,
             remember_last_feed: false,
             cancel_refresh: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             refresh_stopped: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -4791,7 +4807,9 @@ fn main() {
         {
             let state_sf = state.clone();
             search_box.on_set_focus(move |_| {
-                state_sf.borrow_mut().search_focused = true;
+                let mut st = state_sf.borrow_mut();
+                st.search_focused = true;
+                st.focus_reader = false;
             });
             let state_kf = state.clone();
             search_box.on_kill_focus(move |_| {
@@ -5047,11 +5065,42 @@ fn main() {
                 update_reading_position(&frame, &reader);
             });
         }
+        MAIN_READER.with(|r| r.set(Some(reader)));
+        // Leaving the reader for the tree or list clears the
+        // reader as the dialog-restore target (restore_focus).
+        {
+            let state_tf = state.clone();
+            tree.on_set_focus(move |ev| {
+                if let Ok(mut st) = state_tf.try_borrow_mut() {
+                    st.focus_reader = false;
+                }
+                ev.skip(true);
+            });
+            // ponytail: wxDragon's ListCtrl has no generic
+            // set-focus event, so the list clears the flag on its
+            // first key or item focus instead. Tab into the list
+            // then a dialog shortcut with no key between still
+            // returns to the reader; bind SET_FOCUS if wxDragon
+            // adds WindowEvents for ListCtrl.
+            let state_lk = state.clone();
+            list.on_key_down(move |_| {
+                if let Ok(mut st) = state_lk.try_borrow_mut() {
+                    st.focus_reader = false;
+                }
+            });
+            let state_li = state.clone();
+            list.on_item_focused(move |_| {
+                if let Ok(mut st) = state_li.try_borrow_mut() {
+                    st.focus_reader = false;
+                }
+            });
+        }
         let state_rf = state.clone();
         let frame_rf = frame;
         reader.on_set_focus(move |ev| {
             let marked = {
                 let mut st = state_rf.borrow_mut();
+                st.focus_reader = true;
                 mark_selected_read_opened(&mut st, &frame_rf)
             };
             if let Some(a) = marked {
@@ -13024,6 +13073,37 @@ mod ui_parity_tests {
     }
 
     #[test]
+    fn dialogs_opened_from_the_reader_return_to_the_reader() {
+        // Focus audit (2026-11-10): restore_focus only knew the
+        // tree and list, so closing any dialog opened while
+        // reading dropped focus into the article list. Python
+        // gets wx's native restore back to the reader.
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let main = std::fs::read_to_string(src_dir.join("main.rs")).unwrap();
+        let impl_src = main.split("mod ui_parity_tests").next().unwrap();
+        let restore = impl_src.find("fn restore_focus(").unwrap();
+        let body = &impl_src[restore..restore + 400];
+        assert!(body.contains("state.focus_reader") && body.contains("MAIN_READER"));
+        assert!(impl_src.contains("MAIN_READER.with(|r| r.set(Some(reader)))"));
+        let reader_focus = impl_src.find("reader.on_set_focus").unwrap();
+        assert!(impl_src[reader_focus..reader_focus + 300].contains("st.focus_reader = true"));
+        for clear in [
+            "tree.on_set_focus",
+            "list.on_key_down",
+            "list.on_item_focused",
+            "search_box.on_set_focus",
+        ] {
+            let at = impl_src
+                .find(clear)
+                .unwrap_or_else(|| panic!("{clear} missing"));
+            assert!(
+                impl_src[at..at + 300].contains("focus_reader = false"),
+                "{clear} no longer clears the reader restore target"
+            );
+        }
+    }
+
+    #[test]
     fn refresh_completion_keeps_focus_and_skips_unchanged_tree() {
         // Brandon's report (2026-11-09): a refresh completing
         // while he worked the article list moved keyboard
@@ -13458,6 +13538,7 @@ mod ui_parity_tests {
                 selected_article: None,
                 refreshing: false,
                 focus_list: false,
+                focus_reader: false,
                 remember_last_feed: false,
                 cancel_refresh: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 refresh_stopped: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
