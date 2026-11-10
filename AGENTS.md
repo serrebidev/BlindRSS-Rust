@@ -104,6 +104,18 @@ stated here and in `docs/PARITY.md`.
   LNK1104. The workflows carry a guard step that cleans `wxdragon-sys`
   and `wxdragon` when the lib is missing after cache restore, plus
   `cache-on-failure: false`. Do not remove either.
+- Host-runner target folder (2026-11-10, owner-approved): the macOS and
+  Windows runners give every job a fresh, randomly named work folder,
+  and rust-cache's version hashes the absolute target path, so it never
+  matched there ("No cache found", full wxWidgets rebuilds, ~70 min
+  Windows legs). Both workflows now link `target/` to a fixed per-repo
+  folder (`C:/forgejo-runner/cargo-target/BlindRSS-Rust` as a junction,
+  `~/forgejo-runner/cargo-target/BlindRSS-Rust` as a symlink) and run
+  rust-cache on Linux only. An `always()` step removes just the link
+  before the runner deletes the work folder. The WebView2 guard uses
+  `find -H` so it looks through the link. The folder only grows:
+  delete it on the runner when disk gets tight. Tag pushes no longer
+  run `ci.yml` (`tags-ignore`): `release.yml` gates each leg itself.
 - Debug wx link gotcha (2026-11-09): `target/debug/wxdragon_sys_cmake_build`
   and `target/debug/wxwidgets_cmake_build` are shared by every feature set in
   the profile, and CMake keeps cached `wxUSE_*=OFF` values across

@@ -77,7 +77,38 @@ jobs:
         shell: bash
         run: echo "${RUNNER_TEMP}\\msys64\\usr\\bin" >> "$GITHUB_PATH"
 
+      # Host runners (macOS, Windows) start every job in a fresh,
+      # randomly named work folder, so rust-cache never matched
+      # there: its cache version hashes the absolute target path
+      # ("No cache found" on every v0.1.86 leg, full wxWidgets
+      # rebuilds). target/ points at a fixed per-repo folder on
+      # the runner instead and builds reuse the previous run
+      # directly. Each runner takes one job at a time, so two runs
+      # never share the folder at once. Owner-approved 2026-11-10.
+      # ponytail: the folder only grows; delete it on the runner
+      # when disk gets tight (next build is cold once).
+      - name: Persistent target folder (Windows host runner)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $dir = 'C:/forgejo-runner/cargo-target/BlindRSS-Rust'
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          if (Test-Path target) { cmd /c rmdir /s /q target }
+          New-Item -ItemType Junction -Path target -Target $dir | Out-Null
+
+      - name: Persistent target folder (macOS host runner)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          dir="$HOME/forgejo-runner/cargo-target/BlindRSS-Rust"
+          mkdir -p "$dir"
+          rm -rf target
+          ln -s "$dir" target
+
+      # Linux runs in a container with a stable path: rust-cache
+      # works there (full hits) and stays the only cache.
       - uses: Swatinem/rust-cache@v2
+        if: runner.os == 'Linux'
         with:
           shared-key: package
           cache-on-failure: false
@@ -88,7 +119,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: bash
         run: |
-          if ! find target -name 'WebView2LoaderStatic.lib' 2>/dev/null | grep -q .; then
+          if ! find -H target -name 'WebView2LoaderStatic.lib' 2>/dev/null | grep -q .; then
             echo "WebView2LoaderStatic.lib missing; cleaning wxdragon-sys to re-run its build script"
             cargo clean -p wxdragon-sys || true
             cargo clean -p wxdragon || true
@@ -269,6 +300,19 @@ jobs:
             dist/BlindRSS.tar.gz.minisig
             dist/BlindRSS.dmg
             dist/BlindRSS.dmg.minisig
+
+      # Drop only the link, never the shared folder behind it,
+      # before the runner deletes the work folder.
+      - name: Unlink persistent target folder (Windows)
+        if: always() && runner.os == 'Windows'
+        shell: powershell
+        run: |
+          if (Test-Path target) { (Get-Item target).Delete() }
+
+      - name: Unlink persistent target folder (macOS)
+        if: always() && runner.os == 'macOS'
+        shell: bash
+        run: rm -f target
 
   publish:
     name: Publish release
