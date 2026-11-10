@@ -111,7 +111,12 @@ stated here and in `docs/PARITY.md`.
   Windows legs). Both workflows now link `target/` to a fixed per-repo
   folder (`C:/forgejo-runner/cargo-target/BlindRSS-Rust` as a junction,
   `~/forgejo-runner/cargo-target/BlindRSS-Rust` as a symlink) and run
-  rust-cache on Linux only. An `always()` step removes just the link
+  rust-cache on Linux only. `CARGO_TARGET_DIR` is set to the folder's
+  real path: CMake caches absolute paths, and building through the link
+  (a new path every job) fails the next run with "CMakeCache.txt
+  directory ... is different". The link only keeps the workflows'
+  `target/...` references working. Two jobs on one folder take turns
+  on cargo's target lock. An `always()` step removes just the link
   before the runner deletes the work folder. The WebView2 guard uses
   `find -H` so it looks through the link. The folder only grows:
   delete it on the runner when disk gets tight. Tag pushes no longer

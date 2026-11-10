@@ -84,8 +84,7 @@ jobs:
       # ("No cache found" on every v0.1.86 leg, full wxWidgets
       # rebuilds). target/ points at a fixed per-repo folder on
       # the runner instead and builds reuse the previous run
-      # directly. Each runner takes one job at a time, so two runs
-      # never share the folder at once. Owner-approved 2026-11-10.
+      # directly. Two jobs on one folder take turns: cargo locks it. Owner-approved 2026-11-10.
       # CARGO_TARGET_DIR is the folder's real path: CMake caches
       # absolute paths, and the path through the link changes
       # with every work folder ("CMakeCache.txt directory ... is
