@@ -79,6 +79,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
+          shared-key: package
           cache-on-failure: false
 
       # Same guard as ci.yml: a restored cache can lack the
@@ -100,8 +101,9 @@ jobs:
           cargo clippy --locked --workspace --all-targets -- -D warnings
           cargo test --locked --workspace
 
-      - name: Build release binary
-        run: cargo build --release --locked -p blindrss
+      # Build the signing/bundling tool with the app so wxWidgets uses one feature set.
+      - name: Build release binaries
+        run: cargo build --release --locked --workspace
 
       # Bundle libVLC in the layout the loader searches
       # (app/src/media_backend/vlc.rs, mirroring Python's
@@ -235,7 +237,7 @@ jobs:
             # the bundle folder, so the .app sits at the dmg
             # root and the fixed asset name holds.
             VERSION="${TAG#v}"
-            cargo xtask bundle-app BlindRSS bundle "$VERSION"
+            ../target/release/xtask bundle-app BlindRSS bundle "$VERSION"
             hdiutil create -volname BlindRSS -srcfolder bundle -ov -format UDZO BlindRSS.dmg
           fi
 
@@ -252,7 +254,9 @@ jobs:
         run: |
           files=$(ls dist/BlindRSS.zip dist/BlindRSS.tar.gz dist/BlindRSS.dmg 2>/dev/null || true)
           test -n "$files"
-          echo "$files" | xargs cargo xtask sign
+          xtask=./target/release/xtask
+          if [ "$RUNNER_OS" = "Windows" ]; then xtask="$xtask.exe"; fi
+          echo "$files" | xargs "$xtask" sign
 
       - name: Upload artifacts
         uses: https://code.forgejo.org/forgejo/upload-artifact@v4

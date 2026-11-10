@@ -73,6 +73,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
+          shared-key: package
           cache-on-failure: false
 
       # A restored rust-cache tree can lack the WebView2 SDK lib
