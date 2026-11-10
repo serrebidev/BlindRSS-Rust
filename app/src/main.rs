@@ -1804,6 +1804,60 @@ fn restore_focus(state: &State, tree: &TreeCtrl, list: &ListCtrl) {
     }
 }
 
+/// Working surface that held keyboard focus before a background
+/// tree/list rebuild (refresh completion, hosted sync, live
+/// per-feed updates).
+#[derive(Clone, Copy)]
+enum FocusedSurface {
+    List,
+    Tree,
+    Reader,
+    Search,
+}
+
+/// Capture leg of the background-rebuild focus guard. A rebuild
+/// on wxMSW drops focus into the feed tree (Brandon's NVDA logs,
+/// 2026-11-09 list, 2026-11-10 reader during a Miniflux sync):
+/// every drain path that rebuilds the tree or list captures
+/// before and restores after.
+fn focused_surface(
+    tree: &TreeCtrl,
+    list: &ListCtrl,
+    reader: &TextCtrl,
+    search: &TextCtrl,
+) -> Option<FocusedSurface> {
+    if list.has_focus() {
+        Some(FocusedSurface::List)
+    } else if tree.has_focus() {
+        Some(FocusedSurface::Tree)
+    } else if reader.has_focus() {
+        Some(FocusedSurface::Reader)
+    } else if search.has_focus() {
+        Some(FocusedSurface::Search)
+    } else {
+        None
+    }
+}
+
+/// Restore leg: only a surface that held focus and lost it is
+/// refocused. Call after the State borrow drops — set_focus
+/// fires focus handlers synchronously.
+fn restore_surface(
+    was: Option<FocusedSurface>,
+    tree: &TreeCtrl,
+    list: &ListCtrl,
+    reader: &TextCtrl,
+    search: &TextCtrl,
+) {
+    match was {
+        Some(FocusedSurface::List) if !list.has_focus() => list.set_focus(),
+        Some(FocusedSurface::Tree) if !tree.has_focus() => tree.set_focus(),
+        Some(FocusedSurface::Reader) if !reader.has_focus() => reader.set_focus(),
+        Some(FocusedSurface::Search) if !search.has_focus() => search.set_focus(),
+        _ => {}
+    }
+}
+
 /// prompt_text + focus restore to the working surface.
 fn prompt_focus(
     parent: &impl WxWidget,
@@ -11237,6 +11291,12 @@ fn main() {
                         }
                     }
                     Ok(RefreshMsg::ProviderAction(result)) => {
+                        // Hosted sync completion ("163 feeds, 8 new
+                        // article(s)"). Same tree gate + focus guard as
+                        // the local AllDone path: the unconditional
+                        // rebuild here threw a reader-pane user into
+                        // the feed tree (NVDA log, 2026-11-10).
+                        let focused = focused_surface(&tree, &list, &reader, &search_tick);
                         let mut st = state_tick.borrow_mut();
                         st.refreshing = false;
                         st.last_refresh_end = Some(std::time::Instant::now());
@@ -11245,13 +11305,14 @@ fn main() {
                             .as_ref()
                             .and_then(|db| db.feeds().ok())
                             .unwrap_or_default();
-                        rebuild_tree(&mut st, &tree);
+                        refresh_tree_gate(&mut st, &tree);
                         refill_articles(&mut st, &list);
+                        drop(st);
+                        restore_surface(focused, &tree, &list, &reader, &search_tick);
                         match result {
                             Ok(msg) => {
                                 frame_tick.set_status_text(&msg, 0);
                                 announce("general", &msg);
-                                drop(st);
                                 refresh_side_effects(&tray, &[], false, &notify_payload_tick);
                             }
                             Err(e) => frame_tick.set_status_text(&format!("Provider: {e}"), 0),
@@ -11517,6 +11578,7 @@ fn main() {
                         }
                     }
                     Ok(RefreshMsg::ProviderDone(name, result)) => {
+                        let focused = focused_surface(&tree, &list, &reader, &search_tick);
                         let mut st = state_tick.borrow_mut();
                         match result {
                             Ok((feeds, new)) => {
@@ -11525,8 +11587,10 @@ fn main() {
                                     .as_ref()
                                     .and_then(|db| db.feeds().ok())
                                     .unwrap_or_default();
-                                rebuild_tree(&mut st, &tree);
+                                refresh_tree_gate(&mut st, &tree);
                                 refill_articles(&mut st, &list);
+                                drop(st);
+                                restore_surface(focused, &tree, &list, &reader, &search_tick);
                                 frame_tick.set_status_text(
                                     &format!("{name}: {feeds} feeds, {new} new articles"),
                                     0,
@@ -11972,7 +12036,9 @@ fn main() {
                 // below only tops up what landed after the
                 // last tick. A tick that also carries
                 // AllDone skips this: the completion covers
-                // it.
+                // it. Focus guard as in the completion below:
+                // the gate can still rebuild.
+                let focused = focused_surface(&tree, &list, &reader, &search_tick);
                 let mut st = state_tick.borrow_mut();
                 if let Some(db) = st.db.as_ref()
                     && let Ok(feeds) = db.feeds()
@@ -11999,6 +12065,8 @@ fn main() {
                 if relevant {
                     refill_articles(&mut st, &list);
                 }
+                drop(st);
+                restore_surface(focused, &tree, &list, &reader, &search_tick);
             }
             if finished {
                 // Focus guard (Brandon's report, 2026-11-09): a
@@ -12009,10 +12077,7 @@ fn main() {
                 // capture/restore covers the rebuilds that
                 // still run. Restored after the borrow drops —
                 // set_focus fires synchronously.
-                let focus_list = list.has_focus();
-                let focus_tree = tree.has_focus();
-                let focus_reader = reader.has_focus();
-                let focus_search = search_tick.has_focus();
+                let focused = focused_surface(&tree, &list, &reader, &search_tick);
                 let mut st = state_tick.borrow_mut();
                 st.refreshing = false;
                 st.last_refresh_end = Some(std::time::Instant::now());
@@ -12059,15 +12124,7 @@ fn main() {
                 // Focus guard, restore leg (see the capture
                 // above): only a surface that held focus and
                 // lost it through the rebuild is restored.
-                if focus_list && !list.has_focus() {
-                    list.set_focus();
-                } else if focus_tree && !tree.has_focus() {
-                    tree.set_focus();
-                } else if focus_reader && !reader.has_focus() {
-                    reader.set_focus();
-                } else if focus_search && !search_tick.has_focus() {
-                    search_tick.set_focus();
-                }
+                restore_surface(focused, &tree, &list, &reader, &search_tick);
                 refresh_side_effects(&tray, &new_batches, failed, &notify_payload_tick);
                 // Podcast archive (gap 6): every refresh has
                 // committed, so queue the due feeds' archive
@@ -12994,20 +13051,42 @@ mod ui_parity_tests {
                 "refresh lost its tree gate: {needle}"
             );
         }
-        let all_done = impl_src
-            .find("Ok(RefreshMsg::AllDone(path))")
-            .expect("AllDone drain missing");
-        let done_window = &impl_src[all_done..(all_done + 6000).min(impl_src.len())];
-        for needle in [
-            "list.has_focus()",
-            "focus_list && !list.has_focus()",
-            "list.set_focus()",
+        // Every drain arm that rebuilds the tree/list in the
+        // background keeps the focus guard and the tree gate
+        // (hosted sync dropped a reader-pane user into the tree,
+        // NVDA log 2026-11-10).
+        for arm in [
+            "Ok(RefreshMsg::AllDone(path))",
+            "Ok(RefreshMsg::ProviderAction(result))",
+            "Ok(RefreshMsg::ProviderDone(name, result))",
         ] {
+            let start = impl_src.find(arm).expect("drain arm missing");
+            let window = &impl_src[start..(start + 6000).min(impl_src.len())];
+            // Arm body: up to the next drain arm (AllDone is last,
+            // its completion block follows the match).
+            let body = &window[..window[arm.len()..]
+                .find("Ok(RefreshMsg::")
+                .map_or(window.len(), |i| i + arm.len())];
+            for needle in [
+                "focused_surface(&tree, &list, &reader, &search_tick)",
+                "restore_surface(focused, &tree, &list, &reader, &search_tick)",
+                "refresh_tree_gate(&mut st, &tree)",
+            ] {
+                assert!(body.contains(needle), "{arm} lost {needle}");
+            }
             assert!(
-                done_window.contains(needle),
-                "AllDone lost its focus guard: {needle}"
+                !body.contains("rebuild_tree(&mut st, &tree)"),
+                "{arm} rebuilds the tree unconditionally"
             );
         }
+        let live = impl_src
+            .find("if !finished && incremental_feeds")
+            .expect("live update missing");
+        assert!(
+            impl_src[live..(live + 3000).min(impl_src.len())]
+                .contains("restore_surface(focused, &tree, &list, &reader, &search_tick)"),
+            "live update lost its focus guard"
+        );
         // The four selection/expansion handlers skip nested
         // programmatic events instead of panicking on the
         // already-borrowed State (every rebuild in the log

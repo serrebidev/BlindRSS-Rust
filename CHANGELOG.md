@@ -6,6 +6,11 @@ as `0.1.2-0.1.3`. Each release's section below is its Forgejo release note,
 taken from this file by the release workflow. The in-app updater shows the
 same text.
 
+## 0.1.86
+
+- A Miniflux (or other hosted account) sync finishing in the background no longer moves keyboard focus. Reading an article, browsing the list or typing in search, focus stays where it was instead of jumping to the feed tree. The tree is also left alone when the sync changed nothing in it, which removes the short freeze and the double "All Articles" announcement.
+- The same focus protection now covers the live updates shown while a local refresh is still running.
+
 ## 0.1.85
 
 - Miniflux refresh is much faster. After the first sync, BlindRSS asks the server only for articles added or changed since the last complete sync (new posts, read and starred changes) instead of downloading every feed's whole history each time, fetches feeds in parallel, and saves everything in one database write. The first refresh after updating still downloads everything once.
