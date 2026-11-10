@@ -285,6 +285,7 @@ pub fn run_tool_full_output(
 /// that is a PyInstaller one-file executable (a bootloader that
 /// unpacks ~30 MB to %TEMP%\_MEI* and runs the worker as its
 /// child). Everything else kills and reaps directly.
+#[cfg(any(windows, test))]
 fn is_onefile_tool(exe_name: &str) -> bool {
     let base = exe_name.rsplit(['/', '\\']).next().unwrap_or(exe_name);
     let stem = base.strip_suffix(".exe").unwrap_or(base);
@@ -297,6 +298,7 @@ fn is_onefile_tool(exe_name: &str) -> bool {
 /// workers (Python `_windows_onefile_workers`). `entries` is
 /// (pid, parent pid, lowercase exe name); matching the name
 /// skips conhost.exe and reused-pid lookalikes.
+#[cfg(any(windows, test))]
 fn onefile_child_pids(entries: &[(u32, u32, String)], pid: u32) -> Vec<u32> {
     let own = entries
         .iter()

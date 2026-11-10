@@ -8483,7 +8483,7 @@ discovery transforms, dedicated enumeration still open).
 Each row now carries its evidence.
 
 
-## Article-list dates and titleless feeds (v0.1.83, 2026-11-09)
+## Article-list dates and titleless feeds (v0.1.84, 2026-11-09)
 
 Python `core/utils.py::humanize_article_date` and the article-list call in
 `gui/mainframe.py::_insert_article_row` use relative ages through 24 hours,
@@ -8511,3 +8511,8 @@ ASCII-only case folding, preserving the original byte offsets. A regression
 covers non-ASCII script text. Python's absolute-date formatter uses the
 current system offset (`datetime.now().astimezone().tzinfo`), as Rust does;
 the historical DST-deviation note above incorrectly described that comparison.
+
+The first candidate tag, v0.1.83, was left unpublished after the Linux build
+exposed two Windows-only process helpers compiled unused on Linux. v0.1.84
+restricts those helpers to Windows, retaining the tested child-selection
+helper in test builds. The Windows process behavior is unchanged.

@@ -3,6 +3,13 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  # Rebuild an existing tag (all three legs) and publish it.
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing tag to build and publish, e.g. v0.1.84
+        required: true
+        type: string
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -10,6 +17,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  TAG: ${{ inputs.release_tag || github.ref_name }}
 
 permissions:
   contents: write
@@ -25,6 +33,8 @@ jobs:
         os: [windows-latest, ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -224,7 +234,7 @@ jobs:
             # from the staging folder and build the dmg from
             # the bundle folder, so the .app sits at the dmg
             # root and the fixed asset name holds.
-            VERSION="${GITHUB_REF_NAME#v}"
+            VERSION="${TAG#v}"
             cargo xtask bundle-app BlindRSS bundle "$VERSION"
             hdiutil create -volname BlindRSS -srcfolder bundle -ov -format UDZO BlindRSS.dmg
           fi
@@ -245,9 +255,9 @@ jobs:
           echo "$files" | xargs cargo xtask sign
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: https://code.forgejo.org/forgejo/upload-artifact@v4
         with:
-          name: BlindRSS-${{ github.ref_name }}-${{ runner.os }}
+          name: BlindRSS-${{ env.TAG }}-${{ runner.os }}
           path: |
             dist/BlindRSS.zip
             dist/BlindRSS.zip.minisig
@@ -263,8 +273,10 @@ jobs:
     steps:
       # CHANGELOG.md at the tag supplies the release notes.
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
 
-      - uses: actions/download-artifact@v4
+      - uses: https://code.forgejo.org/forgejo/download-artifact@v4
         with:
           path: artifacts
           merge-multiple: true
@@ -287,8 +299,6 @@ jobs:
       # compare link as the notes.
       - name: Extract release notes from CHANGELOG.md
         shell: bash
-        env:
-          TAG: ${{ github.ref_name }}
         run: |
           python3 - "$TAG" <<'PY'
           import os, sys
@@ -311,13 +321,36 @@ jobs:
               f.write(notes + "\n")
           PY
 
-      - name: Create GitHub release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            artifacts/*.zip
-            artifacts/*.tar.gz
-            artifacts/*.dmg
-            artifacts/*.minisig
-            artifacts/SHA256SUMS
-          body_path: ${{ runner.temp }}/notes.md
+      # Forgejo has no softprops action: reuse the tag's draft (or create
+      # one), replace same-named assets, then publish it.
+      - name: Publish the Forgejo release
+        shell: bash
+        env:
+          FORGEJO_TOKEN: ${{ secrets.FORGEJO_TOKEN }}
+        run: |
+          set -euo pipefail
+          api="$GITHUB_SERVER_URL/api/v1/repos/$GITHUB_REPOSITORY"
+          h="Authorization: token $FORGEJO_TOKEN"
+          notes="$RUNNER_TEMP/notes.md"
+          if release="$(curl -sf -H "$h" "$api/releases/tags/$TAG")"; then
+            id="$(echo "$release" | jq -r .id)"
+            jq -n --rawfile body "$notes" --arg name "BlindRSS $TAG" '{name: $name, body: $body}' |
+              curl -sf -o /dev/null -X PATCH -H "$h" -H 'Content-Type: application/json' -d @- "$api/releases/$id"
+          else
+            release="$(jq -n --rawfile body "$notes" --arg tag "$TAG" --arg name "BlindRSS $TAG" \
+              '{tag_name: $tag, name: $name, body: $body, draft: true}' |
+              curl -sf -H "$h" -H 'Content-Type: application/json' -d @- "$api/releases")"
+            id="$(echo "$release" | jq -r .id)"
+          fi
+          for file in artifacts/*.zip artifacts/*.tar.gz artifacts/*.dmg artifacts/*.minisig artifacts/SHA256SUMS; do
+            name="$(basename "$file")"
+            old="$(echo "$release" | jq -r --arg n "$name" '.assets[]? | select(.name == $n) | .id')"
+            [ -z "$old" ] || curl -sf -X DELETE -H "$h" "$api/releases/$id/assets/$old"
+            curl -sf -o /dev/null -H "$h" -F "attachment=@$file" "$api/releases/$id/assets?name=$name"
+            echo "Attached $name"
+          done
+          curl -sf -o /dev/null -X PATCH -H "$h" -H 'Content-Type: application/json' \
+            -d '{"draft": false, "prerelease": false}' "$api/releases/$id"
+          latest="$(curl -sf "$api/releases/latest" | jq -r .tag_name)"
+          echo "/releases/latest is $latest"
+          [ "$latest" = "$TAG" ]

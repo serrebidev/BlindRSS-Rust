@@ -6,7 +6,7 @@ as `0.1.2-0.1.3`. Each release's section below is its Forgejo release note,
 taken from this file by the release workflow. The in-app updater shows the
 same text.
 
-## 0.1.83
+## 0.1.84
 
 - Article-list dates now match the Python app: recent articles say "51 minutes ago" or "2 hours ago"; articles older than 24 hours show local date and time without seconds or a timezone suffix. Half-hour timezones, including GMT+3:30, are supported.
 - Bluesky and other feeds with missing article titles now use a short preview of the post text, like the Python app. Already-cached "No Title" articles also show their available description text without losing read or favorite status.

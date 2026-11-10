@@ -59,23 +59,23 @@ stated here and in `docs/PARITY.md`.
      the user temp dir.
   3. Push to `main` on the `forgejo` remote, tag `vX.Y.Z` on the green
      commit, push the tag.
-  4. Build each leg from the tag, staging `dist/BlindRSS` exactly as
-     `release.yml` does (VLC bundle, `bin/` tools, packaged smoke
-     test, archive at root): Windows locally (`cargo build --release
-     --locked -p blindrss`), Linux on the VPS (`ssh
-     root@serrebiradio.com`). For macOS, create the draft release and
-     dispatch `macos-release.yml` on Forgejo with `release_tag=vX.Y.Z`;
-     the active `mac-mini-arm64` user runner builds, signs and attaches
-     the DMG and signature. Read its job result and verify both assets.
-     The legacy all-platform tag workflow has no Windows runner: cancel
-     that run rather than leaving duplicate builds queued.
-  5. Sign every package with `cargo xtask sign` and `cargo xtask
-     verify` each one (see **Release signing** for the key).
-  6. Publish from the VPS (the Forgejo token never leaves
-     `/root/forgejo-muse-token.txt`): `SHA256SUMS` over the packages
-     and signatures, create the release as a draft with the tag's
-     CHANGELOG section as notes, upload attachments (the multipart
-     field MUST be `attachment`), flip `draft=false`.
+  4. The tag push runs `release.yml` on Forgejo (since v0.1.84): Windows
+     on `desknasbox-windows-x64` (this PC, user `build`), Linux on the
+     server runner, macOS on `mac-mini-arm64`. Each leg gates, builds,
+     stages `dist/BlindRSS`, smoke-tests and signs with the
+     MINISIGN_KEY/MINISIGN_PASSWORD repo secrets. The publish job checks
+     all 7 assets, writes `SHA256SUMS`, fills the tag's draft (or creates
+     it) with the CHANGELOG section, uploads and flips `draft=false`.
+     Rebuild an existing tag: dispatch `release.yml` with
+     `release_tag=vX.Y.Z`. `macos-release.yml` attaches only the macOS
+     leg to an existing release.
+  5. Fallback without runners: build legs by hand (Windows locally, Linux
+     on `ssh root@serrebiradio.com`), sign with `cargo xtask sign`, verify
+     with `cargo xtask verify`.
+  6. Fallback publish from the VPS (token in
+     `/root/forgejo-muse-token.txt`): `SHA256SUMS`, draft with the
+     CHANGELOG section, upload attachments (the multipart field MUST be
+     `attachment`), flip `draft=false`.
   7. Verify by direct Forgejo API read: the release exists,
      `draft=false`, every asset is present, and `/releases/latest`
      returns the new tag — then `cargo xtask update-check <previous>`
