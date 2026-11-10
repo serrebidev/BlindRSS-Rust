@@ -51,7 +51,7 @@ jobs:
             libgstreamer-plugins-bad1.0-dev libwebkit2gtk-4.1-dev \
             libsecret-1-dev libnotify-dev libsdl2-dev \
             gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-libav gstreamer1.0-x \
-            vlc ffmpeg
+            vlc ffmpeg cmake ninja-build
 
       # Same patois/gettext requirement as ci.yml: without
       # msgfmt the release binary ships no translations.
