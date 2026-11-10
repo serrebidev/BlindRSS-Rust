@@ -6,9 +6,10 @@ as `0.1.2-0.1.3`. Each release's section below is its Forgejo release note,
 taken from this file by the release workflow. The in-app updater shows the
 same text.
 
-## 0.1.87
+## 0.1.88
 
 - Closing a dialog you opened while reading an article now puts you back in the article text, where you were, instead of in the article list.
+- On a busy Mac, BlindRSS no longer mistakes the bundled yt-dlp for a broken copy and tries to replace it. yt-dlp can take a few seconds to start there, so a slow first start now gets one more try.
 
 ## 0.1.86
 

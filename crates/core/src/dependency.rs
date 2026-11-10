@@ -531,7 +531,15 @@ pub fn validate_executable_with_timeout(
     if !path.is_file() {
         return false;
     }
+    // One retry when the RUNNER fails (spawn error or timeout), as
+    // probe_version does: the macOS yt-dlp nightly is a self-
+    // unpacking build that takes ~4 s per launch even idle, so a
+    // loaded machine overruns the budget once (v0.1.87 macOS
+    // release self-test: "bundled tool does not run: yt-dlp"). A
+    // tool that runs and fails is NOT retried — that verdict is
+    // real, and a broken tool must still count as missing.
     run_tool(path, &[version_arg_for_tool(tool)], timeout)
+        .or_else(|_| run_tool(path, &[version_arg_for_tool(tool)], timeout))
         .map(|r| r.success)
         .unwrap_or(false)
 }

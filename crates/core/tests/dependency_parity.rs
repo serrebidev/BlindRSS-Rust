@@ -89,6 +89,38 @@ fn probe_rejects_broken_executable() {
 
 #[cfg(unix)]
 #[test]
+fn validation_retries_a_launch_that_overran_its_budget() {
+    // v0.1.87 macOS release: the self-unpacking yt-dlp nightly
+    // overran the 6 s budget on a loaded runner and the packaged
+    // self-test called a healthy tool broken. The first launch
+    // here overruns (as the slow unpack did); the retry answers.
+    let dir = unique_dir("slowfirst");
+    let marker = dir.join("launched-once");
+    let ytdlp = write_exe(
+        &dir,
+        "yt-dlp",
+        &format!(
+            "#!/bin/sh\nif [ -f '{m}' ]; then echo 2026.11.04; exit 0; fi\ntouch '{m}'\nexec sleep 30\n",
+            m = marker.display()
+        ),
+    );
+    assert!(validate_executable_with_timeout(
+        &ytdlp,
+        "yt-dlp",
+        Duration::from_millis(800)
+    ));
+    // A tool that runs and fails is still broken: no retry turns
+    // that verdict around.
+    let broken = write_exe(&dir, "ffmpeg", "#!/bin/sh\nexit 3\n");
+    assert!(!validate_executable_with_timeout(
+        &broken,
+        "ffmpeg",
+        Duration::from_millis(800)
+    ));
+}
+
+#[cfg(unix)]
+#[test]
 fn probe_of_hanging_executable_times_out() {
     let dir = unique_dir("hang");
     let ffmpeg = write_exe(&dir, "ffmpeg", "#!/bin/sh\nexec sleep 60\n");
