@@ -2,6 +2,10 @@ name: CI
 
 on:
   push:
+    # A release tag points at a commit main's push already built;
+    # release.yml gates every leg itself. Tag CI only held the
+    # runners the release needed (v0.1.86).
+    tags-ignore: ['**']
   pull_request:
 
 # A superseded run is wasted wxWidgets build time, so cancel it.
