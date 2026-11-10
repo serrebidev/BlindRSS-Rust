@@ -70,7 +70,7 @@ stated here and in `docs/PARITY.md`.
      `release_tag=vX.Y.Z`. `macos-release.yml` attaches only the macOS
      leg to an existing release.
   5. Fallback without runners: build legs by hand (Windows locally, Linux
-     on `ssh root@serrebiradio.com`), sign with `cargo xtask sign`, verify
+     on `ssh wsl-build`, local WSL; use a debian:trixie container so glibc stays 2.41), sign with `cargo xtask sign`, verify
      with `cargo xtask verify`.
   6. Fallback publish from the VPS (token in
      `/root/forgejo-muse-token.txt`): `SHA256SUMS`, draft with the
