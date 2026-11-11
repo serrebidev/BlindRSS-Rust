@@ -6,6 +6,10 @@
 //! old common controls.
 
 fn main() {
+    // The changelog ships embedded in the binary so Help >
+    // View Changelog reads the full history offline (the
+    // BlindRadio pattern); app/src/help.rs includes it.
+    println!("cargo:rerun-if-changed=../CHANGELOG.md");
     // Compile the gettext catalogs (po/*.po) into locale/ for
     // patois::embed_domain! to embed. Without the gettext
     // tools on PATH this warns and builds without translations

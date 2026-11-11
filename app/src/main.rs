@@ -2369,6 +2369,7 @@ const M_KEYS: i32 = 2142;
 const M_PRUNE: i32 = 2143;
 const M_UPDATE: i32 = 2144;
 const M_HELP: i32 = 2151;
+const M_CHANGELOG: i32 = 2251;
 const M_COPY_URL: i32 = 2152;
 const M_COPY_MEDIA: i32 = 2153;
 const M_COPY_FEED_URL: i32 = 2154;
@@ -2520,6 +2521,7 @@ fn shortcut_menu_id(command: &str) -> Option<i32> {
         "tools.youtube_account" => M_YOUTUBE_ACCOUNT,
         "player.equalizer" => M_EQUALIZER,
         "help.user_guide" => M_HELP,
+        "help.view_changelog" => M_CHANGELOG,
         _ => return None,
     })
 }
@@ -8358,6 +8360,17 @@ fn main() {
             restore_focus(&state_help.borrow(), &tree_help, &list_help);
         });
 
+        // Help > View Changelog: the full release history in
+        // the changelog viewer (Brandon's request, 2026-11-10).
+        let frame_changelog = frame;
+        let state_changelog = state.clone();
+        let tree_changelog = tree;
+        let list_changelog = list;
+        let act_changelog: Rc<dyn Fn()> = Rc::new(move || {
+            help::show_changelog(&frame_changelog);
+            restore_focus(&state_changelog.borrow(), &tree_changelog, &list_changelog);
+        });
+
         let frame_keys = frame;
         let state_keys = state.clone();
         let tree_keys = tree;
@@ -10054,6 +10067,11 @@ fn main() {
             .build();
         let help_menu = Menu::builder()
             .append_item(M_HELP, "&User Guide", "Open the BlindRSS user guide")
+            .append_item(
+                M_CHANGELOG,
+                "View &Changelog",
+                "Read the release history for every version",
+            )
             .append_separator()
             .append_item(
                 M_UPDATE,
@@ -10167,6 +10185,7 @@ fn main() {
             (M_PRUNE, act_prune.clone()),
             (M_UPDATE, act_update.clone()),
             (M_HELP, act_help.clone()),
+            (M_CHANGELOG, act_changelog.clone()),
             (M_FILTER_ALL, act_filter_all.clone()),
             (M_FILTER_UNREAD, act_filter_unread.clone()),
             (M_FILTER_READ, act_filter_read.clone()),
@@ -13758,9 +13777,40 @@ mod ui_parity_tests {
             "feeds.edit_selected",
             "tools.settings",
             "help.user_guide",
+            "help.view_changelog",
         ] {
             assert!(shortcut_menu_id(id).is_some(), "missing route: {id}");
         }
         assert_eq!(shortcut_menu_id("not.a.command"), None);
+    }
+
+    #[test]
+    fn help_menu_offers_the_full_changelog() {
+        // Brandon's request, 2026-11-10: Help > View
+        // Changelog, like BlindRadio — the whole release
+        // history, including versions an update skipped.
+        // Guard the menu item, its handler, and the embedded
+        // changelog include against silent removal.
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let main = std::fs::read_to_string(src_dir.join("main.rs")).unwrap();
+        let impl_src = main.split("mod ui_parity_tests").next().unwrap();
+        assert!(impl_src.contains("View &Changelog"), "menu item missing");
+        assert!(
+            impl_src.contains("(M_CHANGELOG, act_changelog.clone())"),
+            "menu handler not registered"
+        );
+        assert!(
+            impl_src.contains("help::show_changelog(&frame_changelog)"),
+            "handler does not open the changelog viewer"
+        );
+        let help = std::fs::read_to_string(src_dir.join("help.rs")).unwrap();
+        assert!(
+            help.contains("include_str!(\"../../CHANGELOG.md\")"),
+            "the changelog is not embedded"
+        );
+        assert!(
+            help.contains("pub fn show_changelog"),
+            "the changelog viewer is missing"
+        );
     }
 }

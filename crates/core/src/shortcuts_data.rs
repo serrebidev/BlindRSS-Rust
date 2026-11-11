@@ -202,4 +202,5 @@ pub const COMMANDS: &[(&str, &str, &str, &str)] = &[
         "Ctrl+Shift+A",
     ),
     ("help.user_guide", "Help", "User Guide", "F1"),
+    ("help.view_changelog", "Help", "View Changelog", ""),
 ];

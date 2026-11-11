@@ -6,6 +6,11 @@ as `0.1.2-0.1.3`. Each release's section below is its Forgejo release note,
 taken from this file by the release workflow. The in-app updater shows the
 same text.
 
+## 0.1.89
+
+- New: Help > View Changelog. The whole release history is built into the app and reads offline: pick a version from the list to jump straight to it, or just read through, and Find works the same as in the user guide. Handy when an update skips versions — upgrading from 0.1.85 to 0.1.88, for instance, you can now read what 0.1.86 and 0.1.87 changed.
+- Fixed a gap in the release history itself: 0.1.87 never got its own release page. Its change (dialogs opened from the reader return to the reader) shipped inside 0.1.88 and is in the changelog there.
+
 ## 0.1.88
 
 - Closing a dialog you opened while reading an article now puts you back in the article text, where you were, instead of in the article list.

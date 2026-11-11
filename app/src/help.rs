@@ -31,6 +31,225 @@ pub fn show_help(frame: &Frame, locale: &str) {
     show_help_topic(frame, locale, None);
 }
 
+/// The changelog embedded in the binary (app/build.rs points
+/// cargo at the repo-root CHANGELOG.md), so Help > View
+/// Changelog works fully offline — the BlindRadio pattern,
+/// adapted to BlindRSS's native text viewer.
+const CHANGELOG_MD: &str = include_str!("../../CHANGELOG.md");
+
+/// Help > View Changelog (Brandon's request, 2026-11-10):
+/// the FULL release history — every version, including the
+/// ones an update skipped over — in the same viewer shape
+/// as the guide: a versions list that jumps the reader,
+/// Find with wrapping, Escape to close.
+pub fn show_changelog(frame: &Frame) {
+    let sections = blindrss_core::changelog::parse_changelog(CHANGELOG_MD);
+    let text = blindrss_core::changelog::render_changelog_text(&sections);
+    let versions: Vec<String> = sections
+        .iter()
+        .map(|s| format!("BlindRSS version {}", s.version))
+        .collect();
+    // Character offset where each version's heading starts
+    // in the rendered text; the versions list jumps by these.
+    let offsets: Vec<usize> = {
+        let mut starts = Vec::with_capacity(versions.len());
+        let mut from = 0usize;
+        for heading in &versions {
+            match text[from..].find(heading.as_str()) {
+                Some(at) => {
+                    starts.push(from + at);
+                    from += at + heading.len();
+                }
+                None => starts.push(from),
+            }
+        }
+        starts
+    };
+    show_text_viewer(
+        frame,
+        &t("BlindRSS Changelog"),
+        &text,
+        &versions,
+        &offsets,
+        &t("Changelog versions"),
+        &t("Changelog text"),
+        &t("Wrapped to the start of the changelog."),
+        &t("Wrapped to the end of the changelog."),
+    );
+}
+
+/// The shared read-only text viewer behind the guide and
+/// the changelog: Find row, a jump list beside the reader,
+/// Close. `list_labels` and `offsets` are parallel: choosing
+/// a list entry moves the reader caret to that character
+/// offset. Extracted from the guide's builder unchanged in
+/// behaviour (Audit 8 S07/S08 shape).
+#[allow(clippy::too_many_arguments)]
+fn show_text_viewer(
+    frame: &Frame,
+    title: &str,
+    text: &str,
+    list_labels: &[String],
+    offsets: &[usize],
+    list_name: &str,
+    reader_name: &str,
+    wrap_start_msg: &str,
+    wrap_end_msg: &str,
+) {
+    let text: Rc<String> = Rc::new(text.to_string());
+    let dialog = Dialog::builder(frame, title).build();
+    dialog.set_escape_id(5101);
+    let sizer = BoxSizer::builder(Orientation::Vertical).build();
+    // Find row (Python's order: find controls above the body).
+    let find_row = BoxSizer::builder(Orientation::Horizontal).build();
+    let find_label = StaticText::builder(&dialog).with_label(&t("Find:")).build();
+    let find_ctrl = TextCtrl::builder(&dialog)
+        .with_style(TextCtrlStyle::ProcessEnter)
+        .build();
+    crate::msaa_names::set_name(&find_ctrl, &t("Find in text"));
+    let find_next_btn = Button::builder(&dialog).with_label(&t("Find Next")).build();
+    let find_prev_btn = Button::builder(&dialog)
+        .with_label(&t("Find Previous"))
+        .build();
+    find_row.add(&find_label, 0, SizerFlag::All, 4);
+    find_row.add(&find_ctrl, 1, SizerFlag::Expand | SizerFlag::All, 4);
+    find_row.add(&find_next_btn, 0, SizerFlag::All, 4);
+    find_row.add(&find_prev_btn, 0, SizerFlag::All, 4);
+    sizer.add_sizer(&find_row, 0, SizerFlag::Expand | SizerFlag::All, 2);
+
+    let row = BoxSizer::builder(Orientation::Horizontal).build();
+    let list = ListBox::builder(&dialog).build();
+    crate::msaa_names::set_name(&list, list_name);
+    for label in list_labels {
+        list.append(label);
+    }
+    let reader = TextCtrl::builder(&dialog)
+        .with_style(TextCtrlStyle::MultiLine | TextCtrlStyle::ReadOnly | TextCtrlStyle::Rich2)
+        .build();
+    crate::msaa_names::set_name(&reader, reader_name);
+    if text.is_empty() {
+        reader.set_value(&t("The text could not be loaded."));
+    } else {
+        reader.set_value(&text);
+    }
+    row.add(&list, 1, SizerFlag::Expand | SizerFlag::All, 4);
+    row.add(&reader, 2, SizerFlag::Expand | SizerFlag::All, 4);
+    sizer.add_sizer(&row, 1, SizerFlag::Expand | SizerFlag::All, 2);
+    let close_btn = Button::builder(&dialog).with_label(&t("Close")).build();
+    sizer.add(&close_btn, 0, SizerFlag::All, 4);
+    dialog.set_sizer(sizer, true);
+    dialog.set_size(Size::new(760, 520));
+
+    // The reader opens at the top; the first list entry is
+    // the matching position.
+    reader.set_insertion_point(0);
+    if !list_labels.is_empty() {
+        list.set_selection(0, true);
+    }
+
+    // List selection jumps the reader to the entry's offset.
+    // No announcement: the reader's new position speaks for
+    // itself (Python parity).
+    {
+        let offsets: Vec<i64> = offsets.iter().map(|&o| o as i64).collect();
+        list.on_selection_changed(move |e| {
+            if let Some(sel) = e.get_selection()
+                && let Some(&offset) = offsets.get(sel as usize)
+            {
+                reader.set_insertion_point(offset);
+                reader.set_focus();
+            }
+        });
+    }
+
+    // Find over the whole text (core textfind holds the
+    // policy; Python gui/help_viewer.py:220): forward from
+    // just after the caret, backward to the last match ending
+    // at or before it, wrapping once; the match is selected,
+    // focus returns to the text, and wraps / misses are
+    // announced.
+    let search_text = Rc::new(text.to_lowercase());
+    let wrap_start = wrap_start_msg.to_string();
+    let wrap_end = wrap_end_msg.to_string();
+    let do_find: Rc<dyn Fn(bool)> = {
+        let search_text = search_text.clone();
+        Rc::new(move |forward: bool| {
+            let term = find_ctrl.get_value();
+            let term = term.trim().to_lowercase();
+            if term.is_empty() {
+                find_ctrl.set_focus();
+                return;
+            }
+            let caret = reader.get_insertion_point().max(0) as usize;
+            match blindrss_core::textfind::find_in_guide(&search_text, &term, caret, forward) {
+                Some((start, wrapped)) => {
+                    let end = start + term.chars().count();
+                    reader.set_selection(start as i64, end as i64);
+                    reader.set_insertion_point(end as i64);
+                    reader.set_focus();
+                    if wrapped {
+                        crate::announce("general", if forward { &wrap_start } else { &wrap_end });
+                    }
+                }
+                None => {
+                    crate::announce("general", &format!("Not found: {term}"));
+                }
+            }
+        })
+    };
+    {
+        let find = do_find.clone();
+        find_next_btn.on_click(move |_| find(true));
+    }
+    {
+        let find = do_find.clone();
+        find_prev_btn.on_click(move |_| find(false));
+    }
+    {
+        let find = do_find.clone();
+        find_ctrl.on_text_enter(move |_| find(true));
+    }
+    // Ctrl+F focuses the find box with its text selected; F3 /
+    // Shift+F3 repeat the search; Escape closes (Python binds
+    // the same keys on its help window).
+    dialog.bind_internal(EventType::CHAR_HOOK, move |ev| {
+        let code = ev.get_key_code().unwrap_or(0);
+        if code == 27 {
+            dialog.end_modal(5100);
+            ev.skip(false);
+            return;
+        }
+        let mods = blindrss_core::shortcuts::KeyModifiers {
+            ctrl: ev.control_down(),
+            alt: ev.alt_down(),
+            shift: ev.shift_down(),
+            cmd: ev.meta_down(),
+        };
+        match blindrss_core::shortcuts::event_accel(code, mods, true).as_deref() {
+            Some("Ctrl+F") => {
+                find_ctrl.set_focus();
+                find_ctrl.select_all();
+                ev.skip(false);
+            }
+            Some("F3") => {
+                do_find(true);
+                ev.skip(false);
+            }
+            Some("Shift+F3") => {
+                do_find(false);
+                ev.skip(false);
+            }
+            _ => ev.skip(true),
+        }
+    });
+    let dialog_close = dialog;
+    close_btn.on_click(move |_| {
+        dialog_close.end_modal(5100);
+    });
+    dialog.show_modal();
+    dialog.destroy();
+}
+
 /// Help opened at a specific guide section (F1 context help):
 /// the topic anchor's line when known, else the default
 /// topic's line, else the top.
@@ -73,6 +292,10 @@ pub fn show_help_topic(frame: &Frame, locale: &str, topic_id: Option<&str>) {
         sizer.add(&notice, 0, SizerFlag::All, 4);
     }
     // Find row (Python's order: find controls above the body).
+    // NOTE: show_text_viewer below carries this same layout for
+    // the changelog; the guide keeps its own builder because its
+    // position starts mid-document at a topic line, which the
+    // shared shape does not express.
     let find_row = BoxSizer::builder(Orientation::Horizontal).build();
     let find_label = StaticText::builder(&dialog).with_label(&t("Find:")).build();
     let find_ctrl = TextCtrl::builder(&dialog)

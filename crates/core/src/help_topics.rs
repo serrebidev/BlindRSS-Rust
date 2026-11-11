@@ -129,6 +129,7 @@ pub const COMMAND_TOPIC_PAIRS: &[(&str, &str)] = &[
     ("filter.read_read", "article-filter"),
     ("filter.read_unread", "article-filter"),
     ("help.user_guide", "user-guide"),
+    ("help.view_changelog", "user-guide"),
     ("media.open_url", "open-media-url"),
     ("player.chapters", "chapters"),
     ("player.equalizer", "equalizer"),

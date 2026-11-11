@@ -18,6 +18,7 @@ pub mod castmedia;
 pub mod castsession;
 pub mod castupnp;
 pub mod castwire;
+pub mod changelog;
 pub mod chapters;
 pub mod chromium;
 pub mod chromium_v20;
