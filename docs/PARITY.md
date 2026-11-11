@@ -8516,3 +8516,56 @@ The first candidate tag, v0.1.83, was left unpublished after the Linux build
 exposed two Windows-only process helpers compiled unused on Linux. v0.1.84
 restricts those helpers to Windows, retaining the tested child-selection
 helper in test builds. The Windows process behavior is unchanged.
+
+## View Changelog in Help (Brandon's request, 2026-11-10; ships in v0.1.89)
+
+**Request (Brandon, 2026-11-10, on v0.1.88):** add Help > View Changelog
+to BlindRSS Rust, like BlindRadio — "super-useful". His case: upgrading
+from 0.1.85 to 0.1.88, the update showed only 0.1.88's notes; the 0.1.86
+and 0.1.87 changes were not findable anywhere. Second ask in the same
+message: release notes shown when an update is found, like BlindRadio.
+
+**Diagnosis (verified by direct reads, 2026-11-10):** three separate
+gaps, only one of them in this app.
+(1) No View Changelog existed here at all. BlindRadio embeds
+CHANGELOG.md at build time (build.rs converts it to HTML) and opens it
+in the browser from Help > View Changelog; BlindRSS had no equivalent.
+(2) The Forgejo release for v0.1.87 does not exist — the API returns
+404 for it. Its tag (0325ad2) and its change ("dialogs opened from the
+reader return to the reader") are real, but no release was ever
+published for it, and CHANGELOG.md has no `## 0.1.87` section: the
+change shipped folded into 0.1.88's section (whose first bullet is
+exactly that fix). So 0.1.87's notes were missing from every surface.
+(3) Update-time notes: ship-shape's stable check reads ONLY the latest
+release's body (`check_stable` in the pinned fork, rev cff6bdb) and the
+update dialog shows that body. BlindRadio uses the same ship-shape
+flow, so it behaves identically — neither app combines the notes of
+skipped versions. Making the update prompt itself show combined notes
+is a ship-shape change (the dev channel already aggregates commit
+lines; the stable channel does not), shared by every app on the
+scheme; it is NOT done in this batch and waits on Brandon's word,
+because it changes update behaviour for BlindRadio and the IPTV
+client too. Core grows `changelog::notes_between` (below) so the
+machinery exists and is tested when that decision lands.
+
+**Fix in this batch:** Help > View Changelog. CHANGELOG.md is embedded
+in the binary (app/build.rs rerun-if-changed; `include_str!` in
+app/src/help.rs) and shown in a native viewer with the guide's shape:
+a versions list that jumps the reader to the chosen version, Find with
+wrapping (core textfind), Escape/Close to dismiss, focus restored to
+where it was on close (the v0.1.87 behaviour). The parsing/rendering
+policy lives in core (`crates/core/src/changelog.rs`): sections headed
+`## X.Y.Z` including range headings (`## 0.1.2-0.1.3`), rendered as
+"BlindRSS version X" blocks of continuous text. `notes_between`
+returns the rendered notes for every version in a skipped range
+(Brandon's exact 0.1.85 → 0.1.88 case is a regression test). The menu
+item sits under User Guide in Help; the shortcut registry gains
+`help.view_changelog` (Help category, no default key, rebindable like
+every other entry). BlindRadio opens its changelog as a browser page;
+BlindRSS keeps its own established pattern — the native text viewer,
+same as its user guide — which is the deviation from BlindRadio's
+surface, chosen because BlindRSS's Help has never sent the user to a
+browser.
+
+**Release-history repair:** the v0.1.89 CHANGELOG section names the
+0.1.87 gap plainly, so the history itself records it.
