@@ -6,6 +6,11 @@ as `0.1.2-0.1.3`. Each release's section below is its Forgejo release note,
 taken from this file by the release workflow. The in-app updater shows the
 same text.
 
+## 0.1.90
+
+- Fixed keyboard focus getting trapped between the Search field and Search button after switching back with Alt+Tab. Tab from the Search button, Shift+Tab from the field, and Escape from either control now return to the feed/category tree.
+- Turning off Search in the View menu now hides both the field and button, including at startup. The search shortcut shows the row before focusing it.
+
 ## 0.1.89
 
 - New: Help > View Changelog. The whole release history is built into the app and reads offline: pick a version from the list to jump straight to it, or just read through, and Find works the same as in the user guide. Handy when an update skips versions — upgrading from 0.1.85 to 0.1.88, for instance, you can now read what 0.1.86 and 0.1.87 changed.

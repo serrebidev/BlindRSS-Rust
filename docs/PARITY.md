@@ -8569,3 +8569,24 @@ browser.
 
 **Release-history repair:** the v0.1.89 CHANGELOG section names the
 0.1.87 gap plainly, so the history itself records it.
+
+
+## Search-panel focus recovery (v0.1.90)
+
+The repeated Alt+Tab report exposed the remaining boundary from the removed
+button panel: search still occupies its own native panel, whose default tab
+navigation can cycle inside it. Python's `_bind_search_tab_escape` explicitly
+handles search navigation, and `_set_search_visible` moves focus out when
+hiding search. Rust now bridges Shift+Tab from the edit and Tab from the
+Search button to the feed/category tree; Escape from either control returns
+to that tree without clearing the query or changing the active filter. Tab
+between the edit and button remains native. This is a deliberate explicit
+boundary because relying on wx navigation across the frame's splitter left
+the reported trap in place.
+
+Both startup visibility and the View toggle now hide the whole search panel,
+including its button. Hiding a focused search control first moves focus to
+the tree. The focus-search shortcut reveals a hidden row through the same
+View action before focusing the edit, keeping config and menu state aligned.
+Source regression coverage checks both visibility paths and the keyboard
+bridge; real NVDA behavior remains the owner's manual acceptance gate.

@@ -149,6 +149,19 @@ fn config_path() -> PathBuf {
         .unwrap_or_else(|_| data_dir().join("config.json"))
 }
 
+/// Native search-panel traversal needs an explicit exit across the splitter.
+fn search_leaves_panel(
+    code: i32,
+    mods: blindrss_core::shortcuts::KeyModifiers,
+    edit_focused: bool,
+    button_focused: bool,
+) -> bool {
+    !(mods.ctrl || mods.alt || mods.cmd)
+        && (edit_focused || button_focused)
+        && (code == 27
+            || (code == 9 && ((mods.shift && edit_focused) || (!mods.shift && button_focused))))
+}
+
 /// Map a stored `last_selected_feed` value (shared Python format,
 /// Audit 8 G20) to the startup state: the Rust tree selection and
 /// the read filter. Favorites has a real tree node (Audit 8
@@ -4681,7 +4694,7 @@ fn main() {
             // default shown).
             let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
             if !cfg.get_bool("show_search_field", true) {
-                search_box.show(false);
+                search_panel.show(false);
             }
         }
 
@@ -9058,7 +9071,10 @@ fn main() {
                 let show = !cfg.get_bool("show_search_field", true);
                 cfg.set_path("show_search_field", serde_json::json!(show));
                 let _ = cfg.save(&config_path());
-                search_box.show(show);
+                if !show && (search_box.has_focus() || search_btn.has_focus()) {
+                    tree.set_focus();
+                }
+                search_panel.show(show);
                 frame_ts.layout();
                 if let Some(bar) = frame_ts.get_menu_bar() {
                     bar.check_item(M_TOGGLE_SEARCH, show);
@@ -10629,6 +10645,7 @@ fn main() {
             let state_d = state.clone();
             let frame_d = frame;
             let search_d = search_box;
+            let toggle_search_d = act_toggle_search.clone();
             let play_d = act_play.clone();
             std::rc::Rc::new(move |accel: &str, apply_text_guard: bool| -> bool {
                 let cmd = keymap_d.borrow().get(accel).cloned();
@@ -10646,6 +10663,9 @@ fn main() {
                 }
                 match command {
                     "view.focus_search" => {
+                        if !search_panel.is_shown() {
+                            toggle_search_d();
+                        }
                         search_d.set_focus();
                         true
                     }
@@ -10715,6 +10735,13 @@ fn main() {
                     shift: ev.shift_down(),
                     cmd: ev.meta_down(),
                 };
+                // Search is a separate native navigation panel. Bridge its
+                // boundary explicitly so Alt+Tab restoration cannot trap focus.
+                if search_leaves_panel(code, mods, search_box.has_focus(), search_btn.has_focus()) {
+                    tree.set_focus();
+                    ev.skip(false);
+                    return;
+                }
                 let accel = blindrss_core::shortcuts::event_accel(code, mods, true);
                 // Context help for the control that has focus
                 // (Python's help_topics resolution, main-window
@@ -13333,6 +13360,52 @@ mod ui_parity_tests {
         );
     }
 
+    #[test]
+    fn search_row_has_keyboard_exit_and_hides_as_a_unit() {
+        let main = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs"),
+        )
+        .unwrap();
+        let src = main.split("mod ui_parity_tests").next().unwrap();
+        assert!(src.contains("search_panel.show(false)"));
+        assert!(src.contains("search_panel.show(show)"));
+        assert!(!src.contains("search_box.show(show)"));
+        assert!(src.contains("search_box.has_focus() || search_btn.has_focus()"));
+        assert!(src.contains("code == 27"));
+        assert!(src.contains("code == 9"));
+        assert!(src.contains("if search_leaves_panel("));
+    }
+
+    #[test]
+    fn search_keyboard_boundary_preserves_internal_traversal_and_modified_keys() {
+        use blindrss_core::shortcuts::KeyModifiers;
+        let plain = KeyModifiers::default();
+        let shift = KeyModifiers {
+            shift: true,
+            ..plain
+        };
+        assert!(!search_leaves_panel(9, plain, true, false));
+        assert!(search_leaves_panel(9, plain, false, true));
+        assert!(search_leaves_panel(9, shift, true, false));
+        assert!(!search_leaves_panel(9, shift, false, true));
+        for (edit, button) in [(true, false), (false, true)] {
+            assert!(search_leaves_panel(27, plain, edit, button));
+            assert!(!search_leaves_panel(13, plain, edit, button));
+            for mods in [
+                KeyModifiers {
+                    ctrl: true,
+                    ..plain
+                },
+                KeyModifiers { alt: true, ..plain },
+                KeyModifiers { cmd: true, ..plain },
+            ] {
+                assert!(!search_leaves_panel(9, mods, edit, button));
+                assert!(!search_leaves_panel(27, mods, edit, button));
+            }
+        }
+        assert!(!search_leaves_panel(27, plain, false, false));
+        assert!(!search_leaves_panel(9, shift, false, false));
+    }
     #[test]
     fn main_frame_routes_ctrl_arrows_to_the_player() {
         // Issue 9: during playback, Ctrl+Left/Right (seek)
