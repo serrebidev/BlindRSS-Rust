@@ -28,7 +28,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: [wsl-linux, windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@v5
 
@@ -111,13 +111,32 @@ jobs:
           ln -s "$dir" target
           echo "CARGO_TARGET_DIR=$dir" >> "$GITHUB_ENV"
 
-      # Linux runs in a container with a stable path: rust-cache
-      # works there (full hits) and stays the only cache.
-      - uses: Swatinem/rust-cache@v2
+      # Linux builds run on desknasbox's WSL (the wsl-linux-x64
+      # runner, a host runner inside the PC's WSL2 Ubuntu —
+      # owner's standing build routing). Like the other host
+      # runners it starts each job in a fresh work folder, so
+      # rust-cache never matched there either; same treatment
+      # (owner-approved 2026-11-10): target/ points at a fixed
+      # per-repo folder on the runner and builds reuse the
+      # previous run directly. CARGO_TARGET_DIR is the folder's
+      # real path: CMake caches absolute paths, and the path
+      # through the link changes with every work folder. The
+      # link keeps target/... references working. Builds still
+      # happen inside the release containers per the routing
+      # rules where a script provides them; this job's direct
+      # cargo steps run on the WSL host like the other host
+      # runners' jobs. ponytail: the folder only grows; delete
+      # it on the runner when disk gets tight (next build is
+      # cold once).
+      - name: Persistent target folder (Linux host runner)
         if: runner.os == 'Linux'
-        with:
-          shared-key: package
-          cache-on-failure: false
+        shell: bash
+        run: |
+          dir="$HOME/forgejo-runner/cargo-target/BlindRSS-Rust"
+          mkdir -p "$dir"
+          rm -rf target
+          ln -s "$dir" target
+          echo "CARGO_TARGET_DIR=$dir" >> "$GITHUB_ENV"
 
       # A restored rust-cache tree can lack the WebView2 SDK lib
       # (its download lives in the wx cmake tree, which the cache
@@ -166,5 +185,10 @@ jobs:
 
       - name: Unlink persistent target folder (macOS)
         if: always() && runner.os == 'macOS'
+        shell: bash
+        run: rm -f target
+
+      - name: Unlink persistent target folder (Linux)
+        if: always() && runner.os == 'Linux'
         shell: bash
         run: rm -f target
