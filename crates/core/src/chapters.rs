@@ -548,75 +548,123 @@ pub fn article_chapter_links(article_url: &str, chapters: &[Chapter]) -> Vec<Cha
 /// Chapters from an MP4/M4A/M4B file's `chpl` atom — the
 /// Nero chapter list mutagen's `MP4.chapters` reads (the
 /// only MP4 chapter source Python exposes; QuickTime
-/// chapter tracks are not read by mutagen either). Walks
-/// the box tree (moov and its container descendants) for
-/// `chpl`, then parses its entries: version/flags, a
-/// reserved u32 + u8, a u32 count, and per chapter a u64
-/// start in 100-ns units and a length-prefixed title —
-/// the layout ffmpeg's mov demuxer reads too.
+/// chapter tracks are not read by mutagen either). This
+/// mirrors mutagen exactly: it supports ONE location,
+/// `moov/udta/chpl` (a `chpl` anywhere else is invisible
+/// to it), takes the LAST such atom when several exist,
+/// and reads chapters only when the movie header carries
+/// a nonzero timescale. The payload is version/flags, a
+/// reserved u32, a ONE-BYTE chapter count, and per
+/// chapter a u64 start in 100-ns units and a
+/// length-prefixed title — the layout ffmpeg's mov
+/// demuxer reads too. Malformed payloads (truncation, a
+/// title that is not valid UTF-8) make mutagen raise,
+/// which Python's fetch turns into "no chapters"; the
+/// parse here is strict the same way.
 pub fn mp4_chapters(path: &str) -> Vec<Chapter> {
     let Ok(data) = std::fs::read(path) else {
         return Vec::new();
     };
-    let Some(chpl) = find_box(&data, 0, data.len(), b"chpl") else {
+    let Some(chpl) = find_chpl(&data) else {
         return Vec::new();
     };
-    parse_chpl(&data[chpl.0..chpl.1])
+    parse_chpl(chpl)
 }
 
-/// (content_start, content_end) of the first `target` box
-/// within data[start..end], descending into the container
-/// boxes MP4 chapters can live under.
-fn find_box(data: &[u8], start: usize, end: usize, target: &[u8; 4]) -> Option<(usize, usize)> {
-    const CONTAINERS: [&[u8; 4]; 6] = [b"moov", b"udta", b"trak", b"mdia", b"minf", b"stbl"];
+/// The content spans of the boxes directly inside
+/// data[start..end], in file order. Stops at the first
+/// malformed box, like mutagen's atom walk.
+fn box_spans(data: &[u8], start: usize, end: usize) -> Vec<(usize, usize, [u8; 4])> {
+    let mut out = Vec::new();
     let mut pos = start;
     while pos + 8 <= end {
-        let size32 = u32::from_be_bytes(data[pos..pos + 4].try_into().ok()?) as usize;
-        let kind: &[u8; 4] = data[pos + 4..pos + 8].try_into().ok()?;
+        let size32 = u32::from_be_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+        let kind: [u8; 4] = data[pos + 4..pos + 8].try_into().unwrap();
         let (header, size) = match size32 {
             1 if pos + 16 <= end => (
                 16,
-                u64::from_be_bytes(data[pos + 8..pos + 16].try_into().ok()?) as usize,
+                u64::from_be_bytes(data[pos + 8..pos + 16].try_into().unwrap()) as usize,
             ),
             0 => (8, end - pos),
             _ => (8, size32),
         };
         if size < header || pos + size > end {
-            return None;
+            break;
         }
-        if kind == target {
-            return Some((pos + header, pos + size));
-        }
-        if CONTAINERS.contains(&kind)
-            && let Some(found) = find_box(data, pos + header, pos + size, target)
-        {
-            return Some(found);
-        }
+        out.push((pos + header, pos + size, kind));
         pos += size;
     }
-    None
+    out
+}
+
+/// Mutagen's movie-header gate: chapters load only when
+/// an `mvhd` exists and its timescale is nonzero.
+fn mvhd_timescale_ok(data: &[u8], start: usize, end: usize) -> bool {
+    // version (1) + flags (3) + created/modified (8 or 16)
+    // + timescale u32.
+    if end - start < 20 {
+        return false;
+    }
+    let offset = match data[start] {
+        0 => start + 12,
+        1 if end - start >= 28 => start + 20,
+        _ => return false,
+    };
+    u32::from_be_bytes(data[offset..offset + 4].try_into().unwrap()) != 0
+}
+
+/// The payload of the LAST `moov/udta/chpl` atom in the
+/// file (mutagen's `atoms.path(...) [-1]`), or None when
+/// there is none or the movie-header gate fails.
+fn find_chpl(data: &[u8]) -> Option<&[u8]> {
+    let mut found = None;
+    for (mstart, mend, kind) in box_spans(data, 0, data.len()) {
+        if &kind != b"moov" {
+            continue;
+        }
+        let children = box_spans(data, mstart, mend);
+        let gated = children
+            .iter()
+            .any(|(cs, ce, k)| k == b"mvhd" && mvhd_timescale_ok(data, *cs, *ce));
+        if !gated {
+            continue;
+        }
+        for (ustart, uend, ukind) in &children {
+            if ukind != b"udta" {
+                continue;
+            }
+            for (cstart, cend, ckind) in box_spans(data, *ustart, *uend) {
+                if &ckind == b"chpl" {
+                    found = Some(&data[cstart..cend]);
+                }
+            }
+        }
+    }
+    found
 }
 
 fn parse_chpl(data: &[u8]) -> Vec<Chapter> {
-    // version/flags (4) + reserved u32 (4) + reserved u8 (1)
-    // + count u32 (4).
-    if data.len() < 13 {
+    // version/flags (4) + reserved u32 (4) + count u8 (1).
+    if data.len() < 9 {
         return Vec::new();
     }
-    let count = u32::from_be_bytes(data[9..13].try_into().unwrap()) as usize;
-    let mut pos = 13;
+    let count = data[8] as usize;
+    let mut pos = 9;
     let mut out = Vec::new();
     for _ in 0..count {
         if pos + 9 > data.len() {
-            break;
+            return Vec::new();
         }
         let start_100ns = u64::from_be_bytes(data[pos..pos + 8].try_into().unwrap());
         let title_len = data[pos + 8] as usize;
         pos += 9;
         if pos + title_len > data.len() {
-            break;
+            return Vec::new();
         }
-        let title = String::from_utf8_lossy(&data[pos..pos + title_len]).into_owned();
+        let Ok(title) = std::str::from_utf8(&data[pos..pos + title_len]) else {
+            return Vec::new();
+        };
+        let title = title.to_owned();
         pos += title_len;
         out.push(Chapter {
             start: start_100ns as f64 / 10_000_000.0,
@@ -654,7 +702,15 @@ pub fn embedded_media_chapters(media_url: &str, media_type: Option<&str>) -> Vec
         if [".m4a", ".m4b", ".mp4"].contains(&suffix.as_str())
             || ["audio/mp4", "video/mp4", "audio/x-m4a"].contains(&media_type.as_str())
         {
-            return mp4_chapters(local_path);
+            // Python passes mutagen's list through
+            // `_normalize_chapters` (sort by start, equal
+            // starts merged) before it is stored or shown.
+            return normalize_triples(
+                mp4_chapters(local_path)
+                    .into_iter()
+                    .map(|c| (c.start, c.title.unwrap_or_default(), c.href))
+                    .collect(),
+            );
         }
         return Vec::new();
     }

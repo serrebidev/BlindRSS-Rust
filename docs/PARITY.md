@@ -6582,8 +6582,12 @@ are not plain "fixed":
   order.
 - Task 20 deviation: SUPERSEDED — local MP4/M4A/M4B
   embedded chapters were ported in Audit 9 and shipped
-  v0.1.63 (see the Audit 9 section). ID3, Podcasting 2.0
-  and YouTube chapters were already ported.
+  v0.1.63 (see the Audit 9 section; the parser was
+  corrected against mutagen's real layout and location
+  rules on 2026-11-10 — see the Audit 9 verification
+  addendum — and the correction rides the next release).
+  ID3, Podcasting 2.0 and YouTube chapters were already
+  ported.
 - O17 (update download cancellation/retry): superseded —
   the hand-rolled updater it cited was deleted by Task 6;
   updates are ship-shape's, whose behavior owns this now.
@@ -6694,6 +6698,38 @@ are dispositioned with fresh evidence.
    exactly (MP3/ID3 first, then the MP4 suffix/type set;
    remote MP4 still not downloaded, Python's rule).
    Tests: crates/core/tests/mp4_chapters.rs (4).
+   **Verification addendum (2026-11-10): item reopened and
+   re-closed on real-file evidence.** Reading mutagen's
+   own source and testing against real files showed the
+   original port parsed a `chpl` layout that exists
+   nowhere in the wild, so it extracted nothing from
+   genuine files: the count is a ONE-BYTE field at
+   payload offset 8 with entries starting at offset 9
+   (the port read a u32 count at offset 13), and mutagen
+   supports exactly one location, `moov/udta/chpl`, gated
+   on an `mvhd` with a nonzero timescale, taking the last
+   such atom — the port searched the whole box tree. The
+   MP4 branch also skipped the `_normalize_chapters` step
+   Python applies to mutagen's list. All three defects
+   are fixed in `chapters.rs`: `mp4_chapters` is now a
+   strict mutagen mirror (location, last-atom rule, mvhd
+   gate, 1-byte count, strict UTF-8 titles, truncation
+   yields no chapters — mutagen raises and Python's fetch
+   converts that to an empty result), and
+   `embedded_media_chapters` normalizes the MP4 result
+   like Python. Evidence: real ffmpeg-written M4B, M4A
+   and MP4 files (12 s AAC, full atom trees) carrying
+   known chapters (Intro 0 s, Middle 5 s, End 10 s) in
+   `moov/udta/chpl` were read identically by mutagen, by
+   Python's own `_embedded_media_chapters`, and by the
+   Rust pipeline; `crates/core/tests/mp4_chapters.rs`
+   now carries 10 tests (suffix routing for all three
+   formats, the file:// form, moov-level `chpl`
+   invisibility, truncation and non-UTF-8 strictness,
+   Python normalization of out-of-order/duplicate
+   entries, and a pipeline test proving fetch → store →
+   active-chapter/Previous/Next navigation over the
+   stored rows). Item CLOSED on this evidence.
 2. **YouTube watch-next chapters + the chapter memo**
    (was: Task 20 deviation (3) + Task 23 adjacent find (3)).
    `ytfull::extract_chapters` now ports Python's
