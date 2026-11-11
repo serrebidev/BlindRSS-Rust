@@ -6,6 +6,11 @@ as `0.1.2-0.1.3`. Each release's section below is its Forgejo release note,
 taken from this file by the release workflow. The in-app updater shows the
 same text.
 
+## 0.1.91
+
+- BlindRSS uses much less CPU while it sits idle. The tray's Unread count was recounted against the whole database about seven times a second; it now updates every two seconds, which removes most of the background load on large libraries.
+- Chapters embedded in local MP4, M4A and M4B files now load. Earlier versions looked for them in the wrong place and found none, so audiobooks and podcasts with real chapters showed no chapter list.
+
 ## 0.1.90
 
 - Fixed keyboard focus getting trapped between the Search field and Search button after switching back with Alt+Tab. Tab from the Search button, Shift+Tab from the field, and Escape from either control now return to the feed/category tree.

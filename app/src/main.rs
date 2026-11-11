@@ -10976,6 +10976,7 @@ fn main() {
         let tray_menu_tick = tray_menu.clone();
         let notify_payload_tick = notify_payload.clone();
         let tray_unread_last = Rc::new(std::cell::Cell::new(tray_unread0));
+        let tray_unread_ticks = std::cell::Cell::new(0u32);
         let search_tick = search_box;
         let state_tick = state.clone();
         let frame_tick = frame;
@@ -11113,8 +11114,13 @@ fn main() {
                 }
             }
             // Tray "Unread: {count}" label (Batch 41a): refresh
-            // when the total changes.
-            {
+            // when the total changes. The COUNT(*) costs ~1 ms on
+            // a 30k-article database, which every 150 ms tick was
+            // most of the idle CPU; ~2 s staleness on a tray label
+            // nobody reads mid-tick is free.
+            let unread_ticks = tray_unread_ticks.get().wrapping_add(1);
+            tray_unread_ticks.set(unread_ticks);
+            if unread_ticks % 14 == 1 {
                 let total = state_tick
                     .borrow()
                     .db
