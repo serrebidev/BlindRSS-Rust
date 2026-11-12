@@ -30,6 +30,12 @@ fn serve_signal_round_trip_token_gate_and_stale_replacement() {
     // set before any state_path() call and never changed.
     unsafe {
         std::env::set_var("XDG_RUNTIME_DIR", &dir);
+        // Windows ignores XDG_RUNTIME_DIR; isolate its state from the running app too.
+        #[cfg(target_os = "windows")]
+        {
+            std::env::set_var("TEMP", &dir);
+            std::env::set_var("TMP", &dir);
+        }
     }
     // The expected path follows Python `_state_path`'s own
     // platform rule, which state_path() mirrors: Windows

@@ -8626,3 +8626,20 @@ the tree. The focus-search shortcut reveals a hidden row through the same
 View action before focusing the edit, keeping config and menu state aligned.
 Source regression coverage checks both visibility paths and the keyboard
 bridge; real NVDA behavior remains the owner's manual acceptance gate.
+
+## NPR summaries without transcripts (2026-11-11)
+
+The reported Kennedy lawsuit story has a complete one-paragraph body in NPR's
+text edition. Generic extraction rejected that edition as a link list and fell
+back to the main page, where player controls, escaped embed HTML and NPR's
+anti-fraud notice outweighed the short story. Python's `core/npr.py` establishes
+the text edition and its `paragraphs-container` as the preferred source.
+
+Rust now reads that explicit container, or the main page's `storytext` fallback,
+before generic extraction for validated NPR story URLs. This deliberately accepts
+short complete summaries without a transcript or minimum-length requirement.
+Player/embed elements, advertisements and the anti-fraud container are excluded;
+paragraph order, transcript text and image-alt preferences remain intact. Fuller
+feed content still wins, and empty or missing containers retain the normal
+fallback chain. Offline regression tests cover the captured text edition, main
+page furniture, transcripts, fuller feeds, empty shells and host scoping.

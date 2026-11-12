@@ -6,6 +6,10 @@ as `0.1.2-0.1.3`. Each release's section below is its Forgejo release note,
 taken from this file by the release workflow. The in-app updater shows the
 same text.
 
+## 0.1.92
+
+- NPR stories without transcripts now show their short article text cleanly, without player controls, embed code or NPR's anti-fraud notice. Full transcripts and fuller feed text remain preserved.
+
 ## 0.1.91
 
 - BlindRSS uses much less CPU while it sits idle. The tray's Unread count was recounted against the whole database about seven times a second; it now updates every two seconds, which removes most of the background load on large libraries.

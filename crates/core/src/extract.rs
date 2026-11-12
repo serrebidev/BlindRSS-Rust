@@ -2432,6 +2432,43 @@ pub fn extract_article_opts(
     // outside any figcaption) go too.
     let figcaption_stripped = drop_image_credits(&drop_pswp_captions(&drop_figcaptions(html_in)));
     let html_in = &figcaption_stripped;
+    // NPR's complete body may be only a summary; generic engines reject it
+    // as navigation and then pick player chrome from the main-site fallback.
+    if crate::sources::npr_story_id(url).is_some() {
+        let body = find_elements(html_in, Some("div"), &|tag| {
+            has_class(tag, "paragraphs-container")
+        })
+        .into_iter()
+        .next()
+        .or_else(|| {
+            find_elements(html_in, Some("div"), &|tag| {
+                attr_value(tag, "id").as_deref() == Some("storytext")
+            })
+            .into_iter()
+            .next()
+        });
+        if let Some(body) = body {
+            let (body, _) =
+                remove_elements(&html_in[body.inner_start..body.inner_end], &|name, tag| {
+                    matches!(name, "aside" | "textarea" | "iframe")
+                        || has_class(tag, "anti-fraud-message")
+                        || has_class(tag, "audio-module")
+                });
+            let text = html_to_text_opts(&body, keep_alt);
+            if !text.trim().is_empty() {
+                let feed = feed_text.map(|feed| html_to_text_opts(feed, keep_alt));
+                let (text, source) = match feed {
+                    Some(feed) if char_count(&feed) > char_count(&text) => (feed, "feed"),
+                    _ => (text, "npr"),
+                };
+                return ExtractOutcome::Article {
+                    title: page_title(html_in),
+                    text: crate::postprocess::postprocess_extracted_text(&text, url, ""),
+                    source,
+                };
+            }
+        }
+    }
     // GSMArena's battery table arrives in the wrong order
     // (its sorter is a script we do not run); normalize first.
     let gsm_normalized;
