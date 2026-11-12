@@ -1961,6 +1961,23 @@ fn strip_tags(html: &str) -> String {
     out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Move a whitespace-only gap after a run of closing inline tags
+/// to before the run, into the preceding text. rust-trafilatura
+/// 2.2.8 drops an inline wrapper with no text of its own
+/// (`<em><strong>x</strong></em>`) when its tail is only
+/// whitespace, and the space goes with it (Wired: "Will
+/// Knight’sAI Lab", "newslettershere"); Python's trafilatura
+/// keeps it. Text order is unchanged, so this is safe on any page.
+pub fn keep_inline_gaps(html: &str) -> std::borrow::Cow<'_, str> {
+    static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r"(?i)((?:</(?:a|abbr|b|cite|code|del|dfn|em|i|ins|kbd|mark|q|s|samp|small|span|strong|sub|sup|u|var)\s*>)+)(\s+)<",
+        )
+        .unwrap()
+    });
+    RE.replace_all(html, "${2}${1}<")
+}
+
 /// One rust-trafilatura pass with an explicit focus.
 pub(crate) fn extract_focus(
     html: &str,
@@ -1970,6 +1987,7 @@ pub(crate) fn extract_focus(
         focus,
         ..Default::default()
     };
+    let html = keep_inline_gaps(html);
     rust_trafilatura::extract(html.as_bytes(), &opts)
         .ok()
         .map(|r| (r.metadata.title.clone(), r.content_text.trim().to_string()))

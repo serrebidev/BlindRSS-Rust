@@ -8643,3 +8643,23 @@ paragraph order, transcript text and image-alt preferences remain intact. Fuller
 feed content still wins, and empty or missing containers retain the normal
 fallback chain. Offline regression tests cover the captured text edition, main
 page furniture, transcripts, fuller feeds, empty shells and host scoping.
+
+## Wired subscription pitch and lost inline spaces (2026-11-11)
+
+Every Wired commerce story ended with "Power up with unlimited access to
+WIRED. Get best-in-class reporting and exclusive subscriber content that's too
+important to ignore. Subscribe Today." Python's extractor keeps it too (checked
+on the reported walking-pad page), so this is a fix beyond parity. The pitch is
+a `<p class="paywall">`, the same class Wired puts on the paywalled body, and
+the JSON-LD articleBody repeats it, so it cannot be dropped by class. Rust cuts
+it in the wired.com host strip (`strip_wired_boilerplate`), which every
+extraction path runs through; other hosts keep the sentence.
+
+The same pages showed lost spaces ("Will Knight’sAI Lab", "newslettershere",
+"WIRED.Get"). rust-trafilatura 2.2.8 drops an inline wrapper with no text of
+its own (`<em><strong>x</strong></em>`) when its tail is only whitespace, and
+the space goes with it; Python's trafilatura 2.3.1 keeps it. `keep_inline_gaps`
+moves such a gap into the preceding text before every trafilatura pass. Text
+order is unchanged, so the rewrite is safe on any page. Remove it once the
+crate keeps the tail. Python also drops Wired's link-only deal lists under
+"More ... Deals" (trafilatura link-density pruning); Rust matches that.

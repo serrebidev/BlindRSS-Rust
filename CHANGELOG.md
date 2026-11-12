@@ -6,6 +6,11 @@ as `0.1.2-0.1.3`. Each release's section below is its Forgejo release note,
 taken from this file by the release workflow. The in-app updater shows the
 same text.
 
+## 0.1.93
+
+- Wired articles no longer end with the "Power up with unlimited access to WIRED ... Subscribe Today" sales pitch in full text.
+- Fixed missing spaces between words in full text where a page puts a link or bold text inside italics, for example "Will Knight’sAI Lab" on Wired. These now read "Will Knight’s AI Lab".
+
 ## 0.1.92
 
 - NPR stories without transcripts now show their short article text cleanly, without player controls, embed code or NPR's anti-fraud notice. Full transcripts and fuller feed text remain preserved.

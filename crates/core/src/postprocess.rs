@@ -779,6 +779,32 @@ pub fn strip_windowslatest_boilerplate(text: &str) -> String {
     }
 }
 
+/// Wired (Brandon's report, 2026-11-11): commerce stories end with
+/// the subscription pitch "Power up with unlimited access to
+/// WIRED. Get best-in-class reporting ... Subscribe Today." It is
+/// a `<p class="paywall">` like the paywalled body, and the
+/// JSON-LD articleBody carries it too, so it is cut from the text.
+pub fn strip_wired_boilerplate(text: &str) -> String {
+    let paras = split_paragraphs(text);
+    let total = paras.len();
+    let kept: Vec<String> = paras
+        .into_iter()
+        .filter(|p| {
+            let lower = p.to_lowercase();
+            !(lower.starts_with("power up with unlimited access to wired")
+                || lower.contains("best-in-class reporting and exclusive subscriber content"))
+        })
+        .collect();
+    if kept.is_empty() || kept.len() == total {
+        return text.to_string();
+    }
+    kept.join(
+        "
+
+",
+    )
+}
+
 /// Python `_strip_bloomberg_boilerplate`.
 pub fn strip_bloomberg_boilerplate(text: &str) -> String {
     let original = normalize_whitespace(text);
@@ -1185,6 +1211,8 @@ pub fn postprocess_extracted_text(text: &str, url: &str, published: &str) -> Str
         strip_macrumors_boilerplate(&t)
     } else if netloc.contains("windowslatest.com") {
         strip_windowslatest_boilerplate(&t)
+    } else if host_matches(url, "wired.com") {
+        strip_wired_boilerplate(&t)
     } else if host_matches(url, "news.sky.com") {
         strip_sky_related_sections(&t)
     } else if netloc.ends_with(".ning.com") || netloc == "ning.com" {

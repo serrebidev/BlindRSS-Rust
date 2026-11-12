@@ -693,6 +693,80 @@ fn windowslatest_caption_credit_and_syndication_line_are_dropped() {
 }
 
 #[test]
+fn wired_subscribe_promo_is_dropped() {
+    // Brandon's report, 2026-11-11: every Wired commerce story
+    // ended with the in-body subscription pitch. It sits in a
+    // `<p class="paywall">` like the paywalled body itself, so
+    // the site strip removes it from the text, wherever it lands.
+    let body = "The WalkingPad C2 Foldable Walking Treadmill track is compact when folded, making it a great option for storage in small spaces and apartments. ".repeat(3);
+    let page = format!(
+        "<html><body><article><div class=\"body__inner-container\"><p>{body}</p><h2 class=\"paywall\">More Walking Pad Treadmill Deals</h2><p class=\"paywall\">Here are some more early Black Friday discounts on walking pads and treadmills I have tested and recommend.</p><hr class=\"paywall\"/><p class=\"paywall\"><strong><a href=\"https://www.wired.com/v2/offers/wir_generic_ctrl\"><em>Power up with unlimited access to</em> WIRED<em>.</em> <em>Get best-in-class reporting and exclusive subscriber content that's too important to ignore. </em><em><a href=\"https://www.wired.com/v2/offers/wir_generic_ctrl\">Subscribe Today</a></em><em>.</em></a></strong></p></div></article></body></html>"
+    );
+    let url = "https://www.wired.com/story/best-black-friday-walking-pad-treadmill-deals-11-11-26/";
+    let text = article_text(&page, url);
+    assert!(
+        text.contains("great option for storage"),
+        "body lost: {text}"
+    );
+    assert!(
+        text.contains("tested and recommend"),
+        "paywall body lost: {text}"
+    );
+    assert!(!text.contains("Power up"), "promo survived: {text}");
+    assert!(!text.contains("Subscribe Today"), "promo survived: {text}");
+    // Any engine's spacing of the pitch, and its JSON-LD twin.
+    for promo in [
+        "Power up with unlimited access to WIRED.Get best-in-class reporting and exclusive subscriber content that's too important to ignore. Subscribe Today.",
+        "Power up with unlimited access to WIRED. Get best-in-class reporting and exclusive subscriber content that\u{2019}s too important to ignore. Subscribe Today.",
+    ] {
+        let out = pp(&format!("{body}\n\n{promo}"), url);
+        assert!(out.contains("great option for storage"));
+        assert!(!out.contains("Power up"), "promo survived: {out}");
+    }
+    // Other hosts keep the sentence: it is only Wired's chrome.
+    let other = pp(
+        &format!("{body}\n\nPower up with unlimited access to WIRED. Subscribe Today."),
+        "https://example.com/story/1",
+    );
+    assert!(other.contains("Power up"));
+}
+
+#[test]
+fn nested_inline_wrapper_keeps_following_space() {
+    // rust-trafilatura drops an inline wrapper with no text of its
+    // own (`<em><strong>x</strong></em>`) when its tail is only
+    // whitespace, and the space goes with it: Wired printed
+    // "Will Knight’sAI Lab" and "newslettershere". Python's
+    // trafilatura keeps the space; keep_inline_gaps moves the gap
+    // into the preceding text before every trafilatura pass.
+    use blindrss_core::extract::keep_inline_gaps;
+    let body = "Much like vibe coding a few years ago, we may well see breakthroughs in vibe robotics as hobbyists and engineers realize how easy it is. ".repeat(3);
+    let page = format!(
+        "<html><body><article><p>{body}</p><p>{body}</p><p><em>This is an edition of</em> <a href=\"/author/will-knight/\"><em><strong>Will Knight's</strong></em></a> <em><a href=\"/newsletter\"><strong>AI Lab newsletter</strong></a>. Read previous newsletters</em> <a href=\"/tag/ai-lab/\"><em><strong>here.</strong></em></a></p></article></body></html>"
+    );
+    let prepped = keep_inline_gaps(&page);
+    assert!(prepped.contains("Will Knight's </strong></em></a><em>"));
+    let opts = rust_trafilatura::Options {
+        focus: rust_trafilatura::ExtractionFocus::FavorPrecision,
+        ..Default::default()
+    };
+    let text = rust_trafilatura::extract(prepped.as_bytes(), &opts)
+        .unwrap()
+        .content_text;
+    assert!(
+        text.contains(
+            "This is an edition of Will Knight's AI Lab newsletter. Read previous newsletters here."
+        ),
+        "space lost: {text}"
+    );
+    // Gaps before text, and gaps outside inline runs, are untouched.
+    assert_eq!(
+        keep_inline_gaps("<p>a</em> b</p> <p>c</p>"),
+        "<p>a</em> b</p> <p>c</p>"
+    );
+}
+
+#[test]
 fn reuters_paragraph_nodes_only() {
     let html = r#"<html><body><div data-testid="ArticleBody">
 <div data-testid="paragraph-0">Oct 31 - The first body paragraph of the Reuters story carries enough text to matter here, opens new tab</div>
