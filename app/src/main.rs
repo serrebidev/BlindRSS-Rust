@@ -13412,6 +13412,153 @@ mod ui_parity_tests {
         assert!(!search_leaves_panel(27, plain, false, false));
         assert!(!search_leaves_panel(9, shift, false, false));
     }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "opens native windows; run explicitly with --test-threads=1"]
+    fn native_activation_preserves_focused_descendant() {
+        unsafe extern "system" {
+            fn SendMessageW(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> isize;
+        }
+        let failures = Rc::new(RefCell::new(Vec::new()));
+        let result = failures.clone();
+        wxdragon::main(move |_| {
+            let frame = Frame::builder()
+                .with_title("BlindRSS focus regression")
+                .build();
+            let panel = Panel::builder(&frame).build();
+            let tree = TreeCtrl::builder(&panel).build();
+            let root = tree.add_root("All Articles", None, None).unwrap();
+            tree.select_item(&root);
+            let list = ListCtrl::builder(&panel)
+                .with_style(ListCtrlStyle::Report)
+                .build();
+            list.insert_column(0, "Article", ListColumnFormat::Left, 200);
+            list.insert_item(0, "Test article", None);
+            let reader = TextCtrl::builder(&panel)
+                .with_style(TextCtrlStyle::MultiLine | TextCtrlStyle::ReadOnly)
+                .build();
+            reader.set_value("First paragraph. Second paragraph.");
+            let sizer = BoxSizer::builder(Orientation::Vertical).build();
+            sizer.add(&tree, 1, SizerFlag::Expand, 0);
+            sizer.add(&list, 1, SizerFlag::Expand, 0);
+            sizer.add(&reader, 1, SizerFlag::Expand, 0);
+            panel.set_sizer(sizer, true);
+            frame.set_size(Size::new(600, 400));
+            let other = Frame::builder().with_title("Focus regression peer").build();
+            let other_text = TextCtrl::builder(&other).build();
+            let (tx, _rx) = channel();
+            hotkey::install(frame.get_handle() as isize, tx);
+            // Inject the reported activation fallback, after wx has received
+            // activation but before the native subclass returns to Windows.
+            frame.on_activate(move |event| {
+                if let wxdragon::event::WindowEventData::Activate(activation) = &event
+                    && activation.is_active()
+                {
+                    tree.set_focus();
+                }
+                event.skip(true);
+            });
+            let timer: &'static Timer<Frame> = Box::leak(Box::new(Timer::new(&frame)));
+            let phase = std::cell::Cell::new(0);
+            timer.on_tick(move |_| {
+                let step = phase.get();
+                phase.set(step + 1);
+                match step {
+                    0 => {
+                        frame.show(true);
+                        hotkey::set_foreground(frame.get_handle() as isize);
+                        list.set_focus();
+                    }
+                    1 | 4 => {
+                        if !hotkey::foreground_is(frame.get_handle() as isize) {
+                            failures.borrow_mut().push("main was not foreground");
+                        }
+                        other.show(true);
+                        hotkey::set_foreground(other.get_handle() as isize);
+                        other_text.set_focus();
+                    }
+                    2 | 5 => {
+                        if !hotkey::foreground_is(other.get_handle() as isize) {
+                            failures.borrow_mut().push("peer was not foreground");
+                        }
+                        hotkey::set_foreground(frame.get_handle() as isize);
+                    }
+                    3 => {
+                        if !list.has_focus() {
+                            failures.borrow_mut().push("list fell back to All Articles");
+                        }
+                        reader.set_focus();
+                        reader.set_selection(6, 15);
+                    }
+                    6 => {
+                        if !reader.has_focus() {
+                            failures
+                                .borrow_mut()
+                                .push("reader fell back to All Articles");
+                        }
+                        if reader.get_selection() != (6, 15) {
+                            failures.borrow_mut().push("reader selection moved");
+                        }
+                        list.set_focus();
+                    }
+                    7 => {
+                        hotkey::set_foreground(other.get_handle() as isize);
+                        other_text.set_focus();
+                    }
+                    8 => hotkey::set_foreground(frame.get_handle() as isize),
+                    9 => {
+                        reader.set_focus();
+                        reader.set_selection(6, 15);
+                        // User minimize arrives before focus is cleared;
+                        // its later WM_ACTIVATE may no longer have a child.
+                        unsafe {
+                            SendMessageW(frame.get_handle() as isize, 0x0112, 0xf020, 0);
+                        }
+                    }
+                    10 => unsafe {
+                        SendMessageW(frame.get_handle() as isize, 0x0112, 0xf120, 0);
+                        SendMessageW(frame.get_handle() as isize, 0x0006, 1, 0);
+                    },
+                    11 => {
+                        if !reader.has_focus() || reader.get_selection() != (6, 15) {
+                            failures.borrow_mut().push("minimize lost the reader place");
+                        }
+                        unsafe {
+                            SendMessageW(frame.get_handle() as isize, 0x0006, 2, 0);
+                        }
+                        if !tree.has_focus() {
+                            failures
+                                .borrow_mut()
+                                .push("mouse activation target overridden");
+                        }
+                        reader.show(false);
+                        unsafe {
+                            SendMessageW(frame.get_handle() as isize, 0x0006, 1, 0);
+                        }
+                        if !tree.has_focus() {
+                            failures.borrow_mut().push("hidden reader stole focus");
+                        }
+                        reader.destroy();
+                        unsafe {
+                            SendMessageW(frame.get_handle() as isize, 0x0006, 1, 0);
+                        }
+                        if !tree.has_focus() {
+                            failures.borrow_mut().push("destroyed reader stole focus");
+                        }
+                        timer.stop();
+                        other.destroy();
+                        frame.destroy();
+                    }
+                    _ => unreachable!(),
+                }
+            });
+            timer.start(150, false);
+        })
+        .unwrap();
+        assert!(result.borrow().is_empty(), "{:?}", result.borrow());
+    }
+
     #[test]
     fn main_frame_routes_ctrl_arrows_to_the_player() {
         // Issue 9: during playback, Ctrl+Left/Right (seek)

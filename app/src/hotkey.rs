@@ -10,6 +10,9 @@ mod imp {
     use std::sync::{Mutex, OnceLock};
 
     pub const HOTKEY_ID: i32 = 0xB001;
+    const WM_ACTIVATE: u32 = 0x0006;
+    const WM_SYSCOMMAND: u32 = 0x0112;
+    const SC_MINIMIZE: usize = 0xf020;
     const WM_HOTKEY: u32 = 0x0312;
     const GWLP_WNDPROC: i32 = -4;
     const MOD_NOREPEAT: u32 = 0x4000;
@@ -26,6 +29,10 @@ mod imp {
     type DefWindowProcWFn = unsafe extern "system" fn(isize, u32, usize, isize) -> isize;
     type GetForegroundWindowFn = unsafe extern "system" fn() -> isize;
     type SetForegroundWindowFn = unsafe extern "system" fn(isize) -> i32;
+    type GetFocusFn = unsafe extern "system" fn() -> isize;
+    type SetFocusFn = unsafe extern "system" fn(isize) -> isize;
+    type IsChildFn = unsafe extern "system" fn(isize, isize) -> i32;
+    type WindowBoolFn = unsafe extern "system" fn(isize) -> i32;
 
     fn wide(s: &str) -> Vec<u16> {
         s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -48,9 +55,54 @@ mod imp {
     }
 
     static OLD_PROC: AtomicUsize = AtomicUsize::new(0);
+    static LAST_FOCUS: AtomicUsize = AtomicUsize::new(0);
     static SENDER: OnceLock<Mutex<Option<std::sync::mpsc::Sender<crate::RefreshMsg>>>> =
         OnceLock::new();
     static APPLIED: Mutex<Option<(u32, u32)>> = Mutex::new(None);
+
+    fn keyboard_activation(wparam: usize) -> bool {
+        wparam & 0xffff == 1 && (wparam >> 16) & 0xffff == 0
+    }
+
+    fn remember_focus(hwnd: isize) {
+        if let (Some(get), Some(child)) = (
+            user32::<GetFocusFn>("GetFocus"),
+            user32::<IsChildFn>("IsChild"),
+        ) {
+            let focused = unsafe { get() };
+            if focused != 0 && unsafe { child(hwnd, focused) } != 0 {
+                LAST_FOCUS.store(focused as usize, Ordering::SeqCst);
+            }
+        }
+    }
+
+    fn restore_activation_focus(hwnd: isize, focused: isize) {
+        if focused == 0 || !foreground_is(hwnd) {
+            return;
+        }
+        if let (Some(get), Some(set), Some(child), Some(visible), Some(enabled), Some(iconic)) = (
+            user32::<GetFocusFn>("GetFocus"),
+            user32::<SetFocusFn>("SetFocus"),
+            user32::<IsChildFn>("IsChild"),
+            user32::<WindowBoolFn>("IsWindowVisible"),
+            user32::<WindowBoolFn>("IsWindowEnabled"),
+            user32::<WindowBoolFn>("IsIconic"),
+        ) {
+            // Validate again after wx activation: a modal, layout change or
+            // destroyed/hidden reader must not receive stale keyboard focus.
+            unsafe {
+                if enabled(hwnd) != 0
+                    && iconic(hwnd) == 0
+                    && child(hwnd, focused) != 0
+                    && visible(focused) != 0
+                    && enabled(focused) != 0
+                    && get() != focused
+                {
+                    set(focused);
+                }
+            }
+        }
+    }
 
     unsafe extern "system" fn subclass_proc(
         hwnd: isize,
@@ -58,6 +110,18 @@ mod imp {
         wparam: usize,
         lparam: isize,
     ) -> isize {
+        // Save the exact native descendant before wx deactivation can lose it.
+        // Restore only keyboard activation; mouse clicks choose their own target.
+        if (msg == WM_ACTIVATE && wparam & 0xffff == 0)
+            || (msg == WM_SYSCOMMAND && wparam & 0xfff0 == SC_MINIMIZE)
+        {
+            remember_focus(hwnd);
+        }
+        let restore_to = if msg == WM_ACTIVATE && keyboard_activation(wparam) {
+            LAST_FOCUS.load(Ordering::SeqCst) as isize
+        } else {
+            0
+        };
         if msg == WM_HOTKEY
             && wparam as i32 == HOTKEY_ID
             && let Some(sender) = SENDER.get()
@@ -70,7 +134,11 @@ mod imp {
         if old != 0
             && let Some(call) = user32::<CallWindowProcWFn>("CallWindowProcW")
         {
-            return unsafe { call(old as isize, hwnd, msg, wparam, lparam) };
+            let result = unsafe { call(old as isize, hwnd, msg, wparam, lparam) };
+            if restore_to != 0 {
+                restore_activation_focus(hwnd, restore_to);
+            }
+            return result;
         }
         // The original procedure was never captured (SetWindowLongPtrW
         // reported failure after installing us, or the export is
@@ -162,6 +230,19 @@ mod imp {
         if let Some(f) = user32::<SetForegroundWindowFn>("SetForegroundWindow") {
             unsafe {
                 f(hwnd);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::keyboard_activation;
+
+        #[test]
+        fn activation_preserves_mouse_targets_and_skips_minimized_windows() {
+            assert!(keyboard_activation(1));
+            for message in [0, 2, 1 | (1 << 16), 2 | (1 << 16), 0xffff] {
+                assert!(!keyboard_activation(message));
             }
         }
     }

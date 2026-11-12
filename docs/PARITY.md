@@ -8663,3 +8663,29 @@ moves such a gap into the preceding text before every trafilatura pass. Text
 order is unchanged, so the rewrite is safe on any page. Remove it once the
 crate keeps the tail. Python also drops Wired's link-only deal lists under
 "More ... Deals" (trafilatura link-density pruning); Rust matches that.
+
+## Windows activation focus preservation (2026-11-12)
+
+The reported intermittent Alt+Tab jump to All Articles is an activation-focus
+failure, separate from the existing guards around refresh rebuilds. Python's
+`gui/mainframe.py::on_activate` delegates focus restoration to wxWidgets. Native
+wxMSW saves its last focused child on deactivation and can fall back to the first
+focusable child when that restoration is unavailable. The supplied NVDA capture
+shows successful article-list restoration and no reader-control announcement on
+the reader return; it does not capture the original jump to All Articles.
+
+The Rust window subclass now retains the exact focused native descendant before
+deactivation and restores it after keyboard activation. It validates the live
+child, visibility, enabled state, foreground window and minimized state before
+restoring. Mouse activation keeps its normal click target. The guard uses native
+handles rather than view-selection flags, so it also covers search controls and
+native descendants of the rich reader without changing article selection.
+
+The explicit Windows regression injects the reported tree-focus fallback into
+native activation and checks real foreground transitions, list focus, reader
+focus and reader selection. It fails without the guard and passes with it. This
+is a deterministic reproduction of the fallback, not proof of the original
+intermittent trigger. It is ignored in normal offline suites because it opens
+windows; run `cargo test -p blindrss native_activation_preserves_focused_descendant
+-- --ignored --test-threads=1`. The normal suite covers keyboard versus mouse and
+minimized activation flags. Real NVDA acceptance remains the owner's gate.

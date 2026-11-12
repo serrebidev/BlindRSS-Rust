@@ -6,6 +6,10 @@ as `0.1.2-0.1.3`. Each release's section below is its Forgejo release note,
 taken from this file by the release workflow. The in-app updater shows the
 same text.
 
+## 0.1.94
+
+- Switching back to BlindRSS with Alt+Tab now restores the control you were using when Windows activation falls back to the feed tree. Article-list focus, article-text selection, and other native controls are preserved. Clicking a different control still follows the mouse.
+
 ## 0.1.93
 
 - Wired articles no longer end with the "Power up with unlimited access to WIRED ... Subscribe Today" sales pitch in full text.
