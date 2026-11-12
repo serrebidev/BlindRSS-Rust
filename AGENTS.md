@@ -121,6 +121,17 @@ stated here and in `docs/PARITY.md`.
   `find -H` so it looks through the link. The folder only grows:
   delete it on the runner when disk gets tight. Tag pushes no longer
   run `ci.yml` (`tags-ignore`): `release.yml` gates each leg itself.
+- Linux WSL runner (2026-11-11, owner request: Linux as fast as the
+  other legs): `wsl-linux` jobs run in a job container, so a folder in
+  `$HOME` died with it and every Linux leg rebuilt wxWidgets and every
+  crate. The runner (`/opt/forgejo-runner/config.yml` in desknasbox's
+  WSL) now mounts volumes `wsl-ci-cargo-target` at
+  `/root/forgejo-runner/cargo-target` plus cargo's registry and git
+  caches, and its labels use local images built by
+  `/opt/forgejo-runner/image/build.sh` (apt packages and Rust baked in;
+  `wsl-linux-22.04` keeps glibc 2.35). Rebuild images only while the
+  runner is idle: retagging an image under a running job broke the
+  v0.1.93 Linux leg (node missing mid-job).
 - Debug wx link gotcha (2026-11-09): `target/debug/wxdragon_sys_cmake_build`
   and `target/debug/wxwidgets_cmake_build` are shared by every feature set in
   the profile, and CMake keeps cached `wxUSE_*=OFF` values across
