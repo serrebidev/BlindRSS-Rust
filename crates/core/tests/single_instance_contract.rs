@@ -7,8 +7,8 @@
 //! and a stale state file is replaced by a fresh serve.
 
 use blindrss_core::single_instance;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
+use std::time::Duration;
 
 fn scratch_dir(tag: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!(
@@ -61,10 +61,12 @@ fn serve_signal_round_trip_token_gate_and_stale_replacement() {
     )
     .unwrap();
 
-    let hits = Arc::new(AtomicUsize::new(0));
-    let counter = hits.clone();
+    // The listener acks before it runs the callback (Python's
+    // order), so the test waits for the callback rather than
+    // reading a counter right after the ack (v0.1.94 Linux leg).
+    let (hit_tx, hits) = mpsc::channel::<()>();
     assert!(single_instance::serve(move || {
-        counter.fetch_add(1, Ordering::SeqCst);
+        let _ = hit_tx.send(());
     }));
 
     // The state file is now a real, private file (B11).
@@ -82,14 +84,15 @@ fn serve_signal_round_trip_token_gate_and_stale_replacement() {
 
     // Valid token: activation lands (B10's signal path).
     assert!(single_instance::signal_existing());
-    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    hits.recv_timeout(Duration::from_secs(10))
+        .expect("activation callback ran");
 
     // Invalid token: rejected, no activation, no ack.
     let mut forged = recorded.clone();
     forged["token"] = serde_json::json!("wrong-token");
     std::fs::write(&path, forged.to_string()).unwrap();
     assert!(!single_instance::signal_existing());
-    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    assert!(hits.recv_timeout(Duration::from_millis(300)).is_err());
 
     // Garbage state: treated as "no instance".
     std::fs::write(&path, "not json").unwrap();

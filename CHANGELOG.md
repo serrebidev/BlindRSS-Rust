@@ -6,7 +6,7 @@ as `0.1.2-0.1.3`. Each release's section below is its Forgejo release note,
 taken from this file by the release workflow. The in-app updater shows the
 same text.
 
-## 0.1.94
+## 0.1.95
 
 - Switching back to BlindRSS with Alt+Tab now restores the control you were using when Windows activation falls back to the feed tree. Article-list focus, article-text selection, and other native controls are preserved. Clicking a different control still follows the mouse.
 
