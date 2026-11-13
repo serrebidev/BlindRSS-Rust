@@ -1506,7 +1506,11 @@ pub(crate) fn rich_document(fragment: &str) -> String {
 /// - Shift+F6 -> focus the category tree
 /// - Shift+Tab at the top of the article -> focus the article list
 /// - Ctrl+Shift+H -> toggle the rich view
-/// - bare ALT / F10 -> open the native menu bar
+/// - bare ALT / F10 -> swallowed, nothing happens (Brandon's
+///   report, 2026-11-13): opening the native menu bar while the
+///   WebView owns focus leaves NVDA silent until the menu is
+///   closed, so the stranded user never reaches the menus anyway —
+///   they get there through Escape / F6 back to the list.
 const RICH_VIEW_KEYS_JS: &str = r"
 (function(){
   if(window.__blindrssKeys) return;
@@ -1515,12 +1519,12 @@ const RICH_VIEW_KEYS_JS: &str = r"
   function post(t){ try{ if(window.blindrssKeyBridge && window.blindrssKeyBridge.postMessage){ window.blindrssKeyBridge.postMessage(t); } }catch(e){} }
   var altAlone = false;
   window.addEventListener('keyup', function(e){
-    if(e.key==='Alt'){ if(altAlone){ e.stopPropagation(); e.preventDefault(); post('__menu'); } altAlone=false; }
+    if(e.key==='Alt'){ if(altAlone){ e.stopPropagation(); e.preventDefault(); } altAlone=false; }
   }, true);
   window.addEventListener('keydown', function(e){
-    if(e.key==='Alt' && !e.ctrlKey && !e.shiftKey && !e.metaKey){ altAlone=true; return; }
+    if(e.key==='Alt' && !e.ctrlKey && !e.shiftKey && !e.metaKey){ altAlone=true; e.stopPropagation(); e.preventDefault(); return; }
     altAlone = false;
-    if(e.key==='F10' && !e.ctrlKey && !e.altKey && !e.shiftKey && !e.metaKey){ e.stopPropagation(); e.preventDefault(); post('__menu'); return; }
+    if(e.key==='F10' && !e.ctrlKey && !e.altKey && !e.shiftKey && !e.metaKey){ e.stopPropagation(); e.preventDefault(); return; }
     if(e.key==='F6' && e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey){ e.stopPropagation(); e.preventDefault(); post('__focus_tree'); return; }
     if(e.key==='F6' && !e.ctrlKey && !e.altKey && !e.shiftKey && !e.metaKey){ e.stopPropagation(); e.preventDefault(); post('__focus_list'); return; }
     if((e.key==='H'||e.key==='h'||e.code==='KeyH') && (e.ctrlKey||e.metaKey) && !(e.ctrlKey&&e.metaKey) && e.shiftKey && !e.altKey){ e.stopPropagation(); e.preventDefault(); post('__toggle_rich'); return; }
@@ -1534,28 +1538,6 @@ const RICH_VIEW_KEYS_JS: &str = r"
   }, true);
 })();
 ";
-
-/// Open the native menu bar from the focused WebView (ALT / F10,
-/// Python `_open_menu_bar_from_rich_view`): posts WM_SYSCOMMAND /
-/// SC_KEYMENU to the frame, entering the native menu-bar keyboard
-/// loop. No-op off Windows (other WebView backends route ALT natively).
-#[cfg(target_os = "windows")]
-fn open_menu_bar_from_rich_view(frame: &Frame) {
-    unsafe extern "system" {
-        fn PostMessageW(h: isize, m: u32, w: usize, l: isize) -> i32;
-    }
-    let hwnd = frame.get_handle() as isize;
-    if hwnd != 0 {
-        unsafe {
-            PostMessageW(hwnd, 0x0112, 0xF100, 0);
-        }
-    }
-}
-
-#[cfg(not(target_os = "windows"))]
-fn open_menu_bar_from_rich_view(frame: &Frame) {
-    frame.set_focus();
-}
 
 /// Python rich_view_links.external_url: a plain HTTP(S) URL safe to
 /// hand to the OS (host present, no credentials, no whitespace,
@@ -4724,9 +4706,6 @@ fn main() {
                     }
                     "__toggle_rich" => {
                         frame_keys.process_menu_command(M_RICH_VIEW);
-                    }
-                    "__menu" => {
-                        open_menu_bar_from_rich_view(&frame_keys);
                     }
                     _ => {}
                 }
@@ -13332,6 +13311,32 @@ mod ui_parity_tests {
             impl_src.matches("try_borrow_mut()").count() >= 4,
             "selection handlers lost their nested-event guard"
         );
+    }
+
+    #[test]
+    fn rich_view_alt_and_f10_open_no_menu() {
+        // Brandon's report (2026-11-13): pressing Alt while the
+        // rich (WebView) view has focus opens the native menu loop,
+        // but NVDA stays silent in it until the menu is closed, so
+        // the user can never reach the menus that way. The key
+        // bridge must swallow bare Alt / F10 in the view without
+        // posting anything, and no menu-open message may survive.
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let main = std::fs::read_to_string(src_dir.join("main.rs")).unwrap();
+        let impl_src = main.split("mod ui_parity_tests").next().unwrap();
+        for forbidden in ["__menu", "SC_KEYMENU", "open_menu_bar_from_rich_view"] {
+            assert!(
+                !impl_src.contains(forbidden),
+                "rich view must not open a menu: found {forbidden}"
+            );
+        }
+        // The other escape keys still work: they stay posted.
+        for needed in ["__focus_list", "__focus_tree", "__toggle_rich"] {
+            assert!(
+                impl_src.contains(needed),
+                "rich view lost its escape key: {needed}"
+            );
+        }
     }
 
     #[test]

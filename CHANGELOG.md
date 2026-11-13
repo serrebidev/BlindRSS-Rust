@@ -19,6 +19,10 @@ same text.
 - The article right-click menu now says Add to Favorites or Remove from Favorites, matching what will actually happen.
 - Playback now honours the playback_resolve_timeout_s setting for redirect lookups and yt-dlp timeouts.
 
+## 0.1.102
+
+- In the Rich Full-Text View, pressing Alt (or F10) no longer opens the menu silently. It does nothing there now, so NVDA keeps speaking. Escape or F6 returns to the article list, where Alt works as usual.
+
 ## 0.1.100
 
 - The Rich Full-Text View no longer shows video cards with "Watch on YouTube" links, "Related Roundup" footer lines, "[Read: ...]" and "[Watch: ...]" recommendation cards, newsletter promos, or Axios photo captions mid-article. Videos now show as a single playable embed.

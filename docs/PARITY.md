@@ -8875,8 +8875,11 @@ fixing (MacRumors `iphone-duo-fold-testing`, The Atlantic
   script-message handler plus a document-start user script —
   Shift+Tab at the top returns focus to the article list,
   Shift+F6 to the tree, F6/Escape to the list, Ctrl+Shift+H toggles
-  the view, and ALT/F10 posts `WM_SYSCOMMAND`/`SC_KEYMENU` to the
-  frame. The reader document now wraps its fragment in
+  the view. ALT/F10 deliberately do nothing in the view (2026-11-13
+  follow-up): posting `WM_SYSCOMMAND`/`SC_KEYMENU` opened the native
+  menu loop while the WebView owned focus, which left NVDA silent
+  until the menu was closed, so the user could never reach the menus
+  that way. The reader document now wraps its fragment in
   `<div id="content" tabindex="-1">` so the "at the top" check
   works. Live key behaviour still needs a manual NVDA pass (Stage
   0/6 acceptance); the wiring is compile-verified only.
