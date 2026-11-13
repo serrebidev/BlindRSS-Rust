@@ -19,6 +19,11 @@ same text.
 - The article right-click menu now says Add to Favorites or Remove from Favorites, matching what will actually happen.
 - Playback now honours the playback_resolve_timeout_s setting for redirect lookups and yt-dlp timeouts.
 
+## 0.1.103
+
+- Detect Feeds on Page (Feeds menu) works again. It silently did nothing because its menu command shared an ID with Stop AirPlay Cast, so choosing it ran that instead — and with no cast running, nothing happened at all.
+- Escape now closes the Add Feed dialog, like it does elsewhere. Before, cancelling out of Add Feed meant pressing the Cancel button.
+
 ## 0.1.102
 
 - In the Rich Full-Text View, pressing Alt (or F10) no longer opens the menu silently. It does nothing there now, so NVDA keeps speaking. Escape or F6 returns to the article list, where Alt works as usual.

@@ -1658,6 +1658,24 @@ pub fn show_add_feed(
     let dialog = Dialog::builder(frame, "Add Feed").build();
     dialog.set_escape_id(5101);
     bind_f1(frame, &dialog, "AddFeedDialog");
+    // Escape must close the dialog from every control
+    // (Brandon's report, 2026-11-13): with focus in the URL
+    // field or the category combo the escape-id mapping does
+    // not reach the dialog on wxMSW, and cancelling took a
+    // trip to the Cancel button. Wire Escape explicitly, the
+    // way the modeless windows do; F1 still goes through
+    // bind_f1's hook above, which skips other keys.
+    {
+        let d = dialog;
+        dialog.bind_internal(EventType::CHAR_HOOK, move |ev| {
+            if ev.get_key_code().unwrap_or(0) == 27 {
+                d.end_modal(5101);
+                ev.skip(false);
+            } else {
+                ev.skip(true);
+            }
+        });
+    }
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let url_ctrl = name_row(&dialog, &sizer, "Feed or Media URL:", initial_url);
     url_ctrl.set_name("Feed or Media URL");

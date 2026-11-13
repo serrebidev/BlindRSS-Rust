@@ -2453,7 +2453,12 @@ const M_QUEUE_NEXT: i32 = 2201;
 const M_QUEUE_PREV: i32 = 2202;
 const M_FEED_SEARCH: i32 = 2203;
 const M_TRANSLATE: i32 = 2204;
-const M_DETECT_PAGE: i32 = 2207;
+// 2222, not 2207: 2207 is M_STOP_CAST, and the frame's menu
+// handler dispatches by first match — the collision made
+// Feeds > Detect Feeds on Page run Stop AirPlay Cast (a
+// silent no-op with no cast running), so the feature looked
+// dead (Brandon's report, 2026-11-13).
+const M_DETECT_PAGE: i32 = 2222;
 const M_FILTER_ALL: i32 = 2170;
 const M_FILTER_UNREAD: i32 = 2171;
 const M_FILTER_READ: i32 = 2172;
@@ -14160,6 +14165,66 @@ mod ui_parity_tests {
         assert!(
             help.contains("pub fn show_changelog"),
             "the changelog viewer is missing"
+        );
+    }
+
+    #[test]
+    fn menu_command_ids_are_unique() {
+        // Brandon's report, 2026-11-13: Feeds > Detect Feeds
+        // on Page did nothing at all. M_DETECT_PAGE and
+        // M_STOP_CAST were both 2207, and the frame's menu
+        // handler dispatches by first match, so the item ran
+        // Stop AirPlay Cast — a silent no-op with no cast
+        // running. Every M_* command id must be unique, or
+        // one menu item silently becomes another.
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let main = std::fs::read_to_string(src_dir.join("main.rs")).unwrap();
+        let impl_src = main.split("mod ui_parity_tests").next().unwrap();
+        let mut seen: std::collections::HashMap<i64, String> = std::collections::HashMap::new();
+        for line in impl_src.lines() {
+            let line = line.trim();
+            let Some(rest) = line.strip_prefix("const M_") else {
+                continue;
+            };
+            let Some((name, value)) = rest.split_once(": i32 = ") else {
+                continue;
+            };
+            let Ok(id) = value.trim_end_matches(';').trim().parse::<i64>() else {
+                continue;
+            };
+            if let Some(other) = seen.insert(id, name.to_string()) {
+                panic!("menu id {id} is used by both M_{other} and M_{name}");
+            }
+        }
+        assert!(seen.len() > 50, "the scan found too few menu ids");
+    }
+
+    #[test]
+    fn add_feed_dialog_wires_escape_explicitly() {
+        // Brandon's report, 2026-11-13: Escape did not close
+        // the Add Feed dialog; cancelling took a trip to the
+        // Cancel button. The dialog now binds CHAR_HOOK and
+        // ends the modal with the cancel code on Escape,
+        // like the modeless windows do.
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let dialogs = std::fs::read_to_string(src_dir.join("dialogs.rs")).unwrap();
+        let start = dialogs.find("pub fn show_add_feed").unwrap();
+        let end = dialogs[start..]
+            .find("pub fn show_detected_feed_choice")
+            .map(|i| start + i)
+            .unwrap();
+        let body = &dialogs[start..end];
+        assert!(
+            body.contains("EventType::CHAR_HOOK"),
+            "show_add_feed has no CHAR_HOOK binding"
+        );
+        assert!(
+            body.contains("get_key_code().unwrap_or(0) == 27"),
+            "show_add_feed does not check for Escape"
+        );
+        assert!(
+            body.contains("d.end_modal(5101)"),
+            "show_add_feed's Escape path does not end the modal as cancel"
         );
     }
 
