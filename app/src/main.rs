@@ -14141,30 +14141,44 @@ mod ui_parity_tests {
     #[test]
     fn help_menu_offers_the_full_changelog() {
         // Brandon's request, 2026-11-10: Help > View
-        // Changelog, like BlindRadio — the whole release
-        // history, including versions an update skipped.
-        // Guard the menu item, its handler, and the embedded
-        // changelog include against silent removal.
+        // Changelog covers EVERY version — and his call on
+        // 2026-11-13: show it the BlindRadio way, as one
+        // HTML page in the default browser, not in an
+        // in-app two-pane viewer. app/build.rs converts the
+        // repo's own CHANGELOG.md (never a per-app copy)
+        // into a deflated page embedded in the binary;
+        // help::show_changelog writes it to the temp folder
+        // and launches the default application on it.
         let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let main = std::fs::read_to_string(src_dir.join("main.rs")).unwrap();
-        let impl_src = main.split("mod ui_parity_tests").next().unwrap();
-        assert!(impl_src.contains("View &Changelog"), "menu item missing");
-        assert!(
-            impl_src.contains("(M_CHANGELOG, act_changelog.clone())"),
-            "menu handler not registered"
-        );
-        assert!(
-            impl_src.contains("help::show_changelog(&frame_changelog)"),
-            "handler does not open the changelog viewer"
-        );
         let help = std::fs::read_to_string(src_dir.join("help.rs")).unwrap();
+        let build = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("build.rs"),
+        )
+        .unwrap();
         assert!(
-            help.contains("include_str!(\"../../CHANGELOG.md\")"),
-            "the changelog is not embedded"
+            main.contains("\"View &Changelog\""),
+            "the Help menu lost View Changelog"
         );
         assert!(
-            help.contains("pub fn show_changelog"),
-            "the changelog viewer is missing"
+            main.contains("help::show_changelog(&frame_changelog)"),
+            "View Changelog is not dispatched"
+        );
+        assert!(
+            build.contains("convert_deflated") && build.contains("\"../CHANGELOG.md\""),
+            "build.rs does not convert the repo CHANGELOG.md"
+        );
+        assert!(
+            help.contains("OUT_DIR") && help.contains("changelog.html"),
+            "help.rs does not embed the converted page"
+        );
+        assert!(
+            help.contains("launch_default_application"),
+            "the changelog page is not opened in the default browser"
+        );
+        assert!(
+            !help.contains("render_changelog_text"),
+            "the in-app changelog viewer is back"
         );
     }
 

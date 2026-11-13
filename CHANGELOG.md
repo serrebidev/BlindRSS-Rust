@@ -19,6 +19,10 @@ same text.
 - The article right-click menu now says Add to Favorites or Remove from Favorites, matching what will actually happen.
 - Playback now honours the playback_resolve_timeout_s setting for redirect lookups and yt-dlp timeouts.
 
+## 0.1.104
+
+- View Changelog now opens the whole release history as one page in your default web browser, the way BlindRadio does it — faster and more comfortable than the in-app viewer it replaces, which is gone.
+
 ## 0.1.103
 
 - Detect Feeds on Page (Feeds menu) works again. It silently did nothing because its menu command shared an ID with Stop AirPlay Cast, so choosing it ran that instead — and with no cast running, nothing happened at all.

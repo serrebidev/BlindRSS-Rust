@@ -10,6 +10,23 @@ fn main() {
     // View Changelog reads the full history offline (the
     // BlindRadio pattern); app/src/help.rs includes it.
     println!("cargo:rerun-if-changed=../CHANGELOG.md");
+    // The changelog as an HTML page, converted once here and
+    // inflated at run time (the BlindRadio pattern): Help >
+    // View Changelog writes it to the temp folder and opens
+    // it in the default browser. No table of contents: one
+    // entry per release would bury the newest under a long
+    // list.
+    let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
+    shipfitter::docs::convert_deflated(
+        std::path::Path::new("../CHANGELOG.md"),
+        &out_dir.join("changelog.html"),
+        &shipfitter::docs::Page {
+            title: "BlindRSS Changelog",
+            toc_depth: 0,
+            ..Default::default()
+        },
+    )
+    .expect("the changelog converts");
     // Compile the gettext catalogs (po/*.po) into locale/ for
     // patois::embed_domain! to embed. Without the gettext
     // tools on PATH this warns and builds without translations
