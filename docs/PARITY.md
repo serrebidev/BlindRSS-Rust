@@ -8749,7 +8749,7 @@ Python changes since Audit 8:
 - `portable.spec` VLC-plugin fix, release/CI commits: packaging only,
   not applicable.
 
-Open findings (to port, in this order):
+Findings (all 12 ported in v0.1.101 — resolutions after the list):
 
 - **A11-01 — P2: YouTube Account dialog is sign-in only.** Python
   `gui/dialogs.py:9050` `YouTubeAccountDialog`: read-only status text
@@ -8885,3 +8885,115 @@ Tests: `crates/core/tests/rich_junk_parity.rs` (MacRumors facade +
 linkback -> iframe + no junk anchors; Atlantic standalone and glued
 cards plus newsletter promo; Axios `__NEXT_DATA__` captions; Axios
 rich promo). Full workspace suite green; clippy zero.
+Resolutions (v0.1.101, 2026-11-13):
+
+- **A11-01 resolved.** `show_youtube_signin` in
+  `app/src/dialogs.rs` is now the full YouTube Account dialog:
+  read-only status text named "YouTube account status", Sign
+  In..., Open Sign-in Page and Copy Code (shown only while a
+  device code is waiting), Sign Out (clears
+  `youtube_account_refresh_token`, status "Signed out. Feeds
+  already added stay in BlindRSS."), the auto-update check box
+  bound to `youtube_account_auto_add` and saved on toggle, the
+  account category with Change Category... (a local picker
+  mirroring Python's ChooseCategoryDialog, with inline New
+  Category...), Update Account Now and Close. Sign-in keeps
+  the device-code worker; a generation counter invalidates an
+  in-flight poll on sign-out or close, the way Python's
+  `_sign_in_token` does. On a successful sign-in the dialog
+  asks for the category before syncing, exactly like Python.
+  The sync itself (`youtube_account_sync`) reuses the main
+  window's provider-sync steps: subscriptions as feeds, then
+  the recommendations snapshot, whose failure does not fail
+  the sync.
+- **A11-02 resolved.** Settings path fields are built by
+  `add_field_browse` in `app/src/settings.rs`: a Browse...
+  button beside the field, opening a folder or file dialog as
+  Python does, with MSAA names "Browse for download folder",
+  "Browse for playback cache folder", "Browse for cookies
+  file", "Browse for automatic backup folder" and "Browse for
+  {tool} executable" for FFmpeg/FFprobe/yt-dlp. Fields keep
+  their existing names and tab positions; the buttons are
+  appended to each row.
+- **A11-03 resolved.** Each media tool path now has a
+  "Detected {tool}: checking…" readout under it
+  (`add_detected_label`). A worker thread resolves all three
+  tools through `dependency::find_tool` plus the same
+  version-check validation the resolver uses, and the dialog
+  timer fills the labels with the resolved path, "not found",
+  or the path with a failed-version-check note. Nothing is
+  probed on the UI thread.
+- **A11-04 resolved.** The YouTube settings page has an
+  "Import from browser..." button opening
+  `show_import_cookies_from_browser`: Python's steps text for
+  the Get cookies.txt LOCALLY extension, Open extension page,
+  "Find my export" (newest YouTube cookie export in the
+  default download folders, 15-minute window), "Choose
+  file..." as the fallback, and Close. A found or chosen file
+  is imported through `cookies_import::import_cookie_file`
+  and the cookies field is set to the imported copy, with
+  Python's "Save settings to start using it." status.
+- **A11-05 resolved.** The global search dialog has a
+  "Filter Results:" choice (MSAA name "Filter results by
+  site") between Search Sites and Sort by. The list now
+  renders a separate displayed vector: the full results are
+  filtered by the chosen site, then sorted; Play, Subscribe
+  and Copy URL index into the displayed rows. Changing the
+  filter only refills the list — no new search runs.
+- **A11-06 resolved.** The About dialog shows Follow me on
+  GitHub (@serrebidev), Visit Repository, View Changelog and
+  Close under the version lines. Visit Repository opens the
+  Forgejo repo (the source of truth); View Changelog reuses
+  `help::show_changelog`.
+- **A11-07 resolved.** `seek_limit` in
+  `crates/core/src/playback.rs` decides when a relative seek
+  cannot move (backward at position 0; forward within the
+  last second, duration − 1000, or duration − 1 for very
+  short tracks), and `announce_seek_limit` in
+  `app/src/player.rs` speaks "Beginning of track" / "End of
+  track" through `crate::announce` at all four relative-seek
+  sites: the Rewind/Forward buttons, the media-arrow
+  shortcuts and the Left/Right arrow keys.
+- **A11-08 resolved.** The exclude-from-notifications dialog
+  now matches Python: the header explains feeds are checked
+  by default, the checked list is named "Feeds (checked feeds
+  send notifications)" and starts checked for every feed NOT
+  in the stored list, Check All / Uncheck All sit above OK /
+  Cancel (disabled when there are no feeds), a status line
+  reports the selected feed and its state, and an empty list
+  reads "No feeds available.". Saving still stores the
+  unchecked feeds' ids in
+  `windows_notifications_excluded_feeds` — the stored shape
+  is unchanged.
+- **A11-09 resolved.** `resolve_quick_url_title` and
+  `supports_quick_url_title` in `crates/core/src/discovery.rs`
+  port Python's quick lookup: YouTube oEmbed, then the Rokfin
+  public API, behind the 4096-entry process cache
+  (`resolve_quick_url_title_cached`), all with finite
+  timeouts. (Python's HTML `<title>` stage is the separate
+  heavy enrichment, not this function.) The global search
+  dialog spawns one worker per URL-only result on a supported
+  host and swaps the real title in when it arrives.
+- **A11-10 resolved.** `probe_rokfin_public_playback` in
+  `crates/core/src/discovery.rs` ports Python's probe:
+  public-API metadata, the anonymous access-state check,
+  the HLS URL from the content URL or the storyboard-derived
+  stream.v.rokfin playlist, and a ranged HLS probe with
+  Python's reasons (auth_required, invalid_playback_id,
+  no_content_url, ...). `media::resolve_for_play_with_config`
+  consults it after yt-dlp fails, before giving up, and
+  surfaces Python's messages for the auth and broken-post
+  cases.
+- **A11-11 resolved.** `playback_resolve_timeout_s` and
+  `ytdlp_cli_timeout` in `crates/core/src/media.rs` read the
+  config key (default 4.0; unparseable or non-positive falls
+  back). The direct-media branch of playback resolution now
+  resolves redirects through `resolve_final_url` with that
+  timeout and the configured redirect cap, and every yt-dlp
+  CLI run in the resolve path takes the derived timeout (8x,
+  clamped 10–120 s) instead of a fixed 30 s.
+- **A11-12 resolved.** The article list context menu names
+  the favorite item by the selected article's state: "Add to
+  Favorites" when it is not a favorite, "Remove from
+  Favorites" when it is. The command id and handler are
+  unchanged.

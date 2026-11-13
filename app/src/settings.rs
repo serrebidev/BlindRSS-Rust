@@ -220,6 +220,98 @@ fn add_sound_row(
     ctrl
 }
 
+/// What a Browse... button beside a path field opens
+/// (Audit 11 A11-02; Python's per-field browse handlers).
+enum BrowseKind {
+    /// A folder picker (wx.DirDialog).
+    Dir,
+    /// A file picker (wx.FileDialog) with this wildcard.
+    File(&'static str),
+}
+
+/// A labeled path field with a Browse... button (Audit 11
+/// A11-02; Python gives every Settings path field one). The
+/// field and the button both carry accessible names — the
+/// field's is Python's `SetName` for that field, the button's
+/// names the folder/file it browses for. The button is
+/// appended after the field in the same row, so no existing
+/// control's tab position moves.
+#[allow(clippy::too_many_arguments)]
+fn add_field_browse(
+    dialog: &Dialog,
+    parent: &impl WxWidget,
+    sizer: &Sizer,
+    label: &str,
+    value: &str,
+    field_name: &str,
+    browse_name: &str,
+    kind: BrowseKind,
+) -> TextCtrl {
+    let row = BoxSizer::builder(Orientation::Horizontal).build();
+    let text = StaticText::builder(parent).with_label(&t(label)).build();
+    let ctrl = TextCtrl::builder(parent).build();
+    ctrl.set_value(value);
+    crate::msaa_names::set_name(&ctrl, &t(field_name));
+    let browse_btn = Button::builder(parent).with_label(&t("Browse...")).build();
+    crate::msaa_names::set_name(&browse_btn, &t(browse_name));
+    row.add(&text, 0, SizerFlag::All, 4);
+    row.add(&ctrl, 1, SizerFlag::Expand | SizerFlag::All, 4);
+    row.add(&browse_btn, 0, SizerFlag::All, 4);
+    sizer.add_sizer(&row, 0, SizerFlag::Expand | SizerFlag::All, 2);
+    let dialog_b = *dialog;
+    let message = t(label.trim_end_matches(':'));
+    browse_btn.on_click(move |_| {
+        let current = ctrl.get_value();
+        match &kind {
+            BrowseKind::Dir => {
+                let dlg = DirDialog::builder(&dialog_b, &message, current.trim()).build();
+                if dlg.show_modal() == 5100
+                    && let Some(path) = dlg.get_path()
+                {
+                    ctrl.set_value(&path);
+                }
+            }
+            BrowseKind::File(wildcard) => {
+                let dlg = FileDialog::builder(&dialog_b)
+                    .with_message(&message)
+                    .with_wildcard(wildcard)
+                    .with_style(FileDialogStyle::Open)
+                    .build();
+                if dlg.show_modal() == 5100
+                    && let Some(path) = dlg.get_path()
+                {
+                    ctrl.set_value(&path);
+                }
+            }
+        }
+    });
+    ctrl
+}
+
+/// The "Detected {tool}: checking…" readout under one media
+/// tool path (Audit 11 A11-03; Python dialogs.py:3212). The
+/// detection worker fills it through the dialog timer below;
+/// it starts with Python's checking… text.
+fn add_detected_label(parent: &impl WxWidget, sizer: &Sizer, tool_label: &str) -> StaticText {
+    let label = StaticText::builder(parent)
+        .with_label(&format!(
+            "{} {}: {}",
+            t("Detected"),
+            tool_label,
+            t("checking…")
+        ))
+        .build();
+    crate::msaa_names::set_name(&label, &format!("{} {}", t("Detected"), tool_label));
+    sizer.add(&label, 0, SizerFlag::All, 4);
+    label
+}
+
+/// The media-tool detection slot: (tool key, display label,
+/// resolved path, runs?) per tool, filled by the worker.
+type ToolDetectSlot = std::sync::Arc<
+    std::sync::Mutex<Option<Vec<(String, String, Option<std::path::PathBuf>, bool)>>>,
+>;
+
 /// One page of the settings notebook: a scrolled window (long
 /// pages stay reachable, the same reason Python's Notifications
 /// page is a ScrolledWindow) plus its vertical sizer.
@@ -466,6 +558,126 @@ fn inoreader_listener_connect(
     dialog2.destroy();
 }
 
+/// The guided cookies.txt import (Audit 11 A11-04; Python
+/// `_on_import_cookies_from_browser`, dialogs.py:2846). We
+/// cannot read Chromium App-Bound-encrypted cookies directly,
+/// so the user exports a cookies.txt with a browser extension
+/// and we detect/import it: steps text, "Open extension page"
+/// for Get cookies.txt LOCALLY, "Find my export" scans the
+/// Downloads folders for the newest export, and "Choose
+/// file..." is the fallback. A successful import fills the
+/// Settings cookies-file field; saving settings starts using
+/// it (Python's flow exactly).
+fn show_import_cookies_from_browser(parent: &Dialog, cookies_field: TextCtrl) {
+    use blindrss_core::cookies_import;
+    let dialog = Dialog::builder(parent, "Import cookies from browser").build();
+    dialog.set_escape_id(5101);
+    let sizer = BoxSizer::builder(Orientation::Vertical).build();
+    let steps = StaticText::builder(&dialog)
+        .with_label(&t(
+            "To use your YouTube login with yt-dlp:\n\n1. Install a cookies.txt exporter extension in your browser, e.g. \"Get cookies.txt LOCALLY\".\n2. Open youtube.com and make sure you are signed in.\n3. Click the extension and Export to download a cookies.txt.\n4. Come back here and choose \"Find my export\".\n\nCookies are only needed for age-restricted, private, or members-only videos. Firefox and LibreWolf do not need this — their cookies are detected automatically.",
+        ))
+        .build();
+    sizer.add(&steps, 0, SizerFlag::All, 8);
+    let status = StaticText::builder(&dialog).with_label("").build();
+    sizer.add(&status, 0, SizerFlag::All, 4);
+    let row = BoxSizer::builder(Orientation::Horizontal).build();
+    let open_btn = Button::builder(&dialog)
+        .with_label(&t("Open extension page"))
+        .build();
+    row.add(&open_btn, 0, SizerFlag::All, 4);
+    let find_btn = Button::builder(&dialog)
+        .with_label(&t("Find my export"))
+        .build();
+    row.add(&find_btn, 0, SizerFlag::All, 4);
+    let choose_btn = Button::builder(&dialog)
+        .with_label(&t("Choose file..."))
+        .build();
+    row.add(&choose_btn, 0, SizerFlag::All, 4);
+    let close_btn = Button::builder(&dialog).with_label(&t("Close")).build();
+    row.add(&close_btn, 0, SizerFlag::All, 4);
+    sizer.add_sizer(&row, 0, SizerFlag::All, 2);
+
+    open_btn.on_click(move |_| {
+        open_url("https://github.com/kairi003/Get-cookies.txt-LOCALLY");
+    });
+    // Import one chosen/found file: validate + copy into the
+    // data dir through core, then fill the field (Python sets
+    // the control and tells the user to save settings).
+    let do_import: std::rc::Rc<dyn Fn(std::path::PathBuf)> = {
+        let status_i = status;
+        std::rc::Rc::new(move |src: std::path::PathBuf| {
+            match cookies_import::import_cookie_file(&src, &crate::data_dir()) {
+                Ok(dest) => {
+                    cookies_field.set_value(&dest.display().to_string());
+                    status_i.set_label(&format!(
+                        "{} {}\n{} {}\n{}",
+                        t("Imported YouTube cookies from:"),
+                        src.display(),
+                        t("Saved as:"),
+                        dest.display(),
+                        t("Save settings to start using it.")
+                    ));
+                }
+                Err(e) => {
+                    status_i.set_label(&format!("{} {e}", t("Import failed:")));
+                }
+            }
+        })
+    };
+    {
+        let do_import = do_import.clone();
+        find_btn.on_click(move |_| {
+            let current = cookies_field.get_value();
+            let current = current.trim();
+            let mut extra: Vec<std::path::PathBuf> = Vec::new();
+            if !current.is_empty()
+                && let Some(dir) = std::path::Path::new(current).parent()
+            {
+                extra.push(dir.to_path_buf());
+            }
+            let dirs = cookies_import::default_download_dirs(&extra);
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(0.0);
+            match cookies_import::find_latest_youtube_cookie_export(
+                &dirs,
+                None,
+                cookies_import::DEFAULT_MAX_AGE_S,
+                now,
+            ) {
+                Some(found) => do_import(found),
+                None => status.set_label(&t(
+                    "No recent YouTube cookies.txt export was found in your Downloads. Export one with the extension first, or choose the file manually.",
+                )),
+            }
+        });
+    }
+    {
+        let do_import = do_import.clone();
+        let dialog_c = dialog;
+        choose_btn.on_click(move |_| {
+            let dlg = FileDialog::builder(&dialog_c)
+                .with_message(&t("Choose exported cookies.txt"))
+                .with_wildcard("Cookies (*.txt)|*.txt|All files (*.*)|*.*")
+                .with_style(FileDialogStyle::Open)
+                .build();
+            if dlg.show_modal() == 5100
+                && let Some(path) = dlg.get_path()
+            {
+                do_import(std::path::PathBuf::from(path));
+            }
+        });
+    }
+    let d = dialog;
+    close_btn.on_click(move |_| d.end_modal(5101));
+    dialog.set_sizer(sizer, true);
+    dialog.set_size(Size::new(640, 380));
+    dialog.show_modal();
+    dialog.destroy();
+}
+
 /// Shows the settings dialog. Returns the name of a maintenance
 /// action the user chose inside the dialog ("backup", "restore",
 /// "takeout", "archive", "sync", "prune", "update", "columns"), or None. The
@@ -701,12 +913,15 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
         "Back up BlindRSS data automatically once a day (keeps the last 7)",
         cfg.get_bool("auto_backup_enabled", false),
     );
-    let auto_backup_dir_field = add_field(
+    let auto_backup_dir_field = add_field_browse(
+        &dialog,
         &general.win,
         &backup_group,
         "Automatic backup folder (blank = Backups beside your data):",
         cfg.get_str("auto_backup_dir", ""),
-        false,
+        "Automatic backup folder",
+        "Browse for automatic backup folder",
+        BrowseKind::Dir,
     );
 
     // Interface language (Audit 8 S09; Python gui/dialogs.py:1640).
@@ -925,13 +1140,24 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
             "Cookies are only needed for age-restricted, private, or members-only content. BlindRSS reads them automatically from your installed browsers (Firefox, Chrome, Edge, Brave, Opera, Vivaldi, Chromium and their beta/nightly variants). A cookies.txt export remains a manual fallback.",
         ),
     );
-    let cookies_file_field = add_field(
+    let cookies_file_field = add_field_browse(
+        &dialog,
         &youtube.win,
         &youtube.sizer,
         "yt-dlp cookies file path",
         cfg.get_str("ytdlp_cookies_file", ""),
-        false,
+        "yt-dlp cookies file path",
+        "Browse for cookies file",
+        BrowseKind::File("Cookies (*.txt)|*.txt|All files (*.*)|*.*"),
     );
+    // Import from browser... (Audit 11 A11-04; Python's
+    // guided cookies.txt export flow, dialogs.py:2846):
+    // appended right after the cookies row on the YouTube
+    // page, before the controls that already follow it.
+    let import_cookies_btn = Button::builder(&youtube.win)
+        .with_label(&t("Import from browser..."))
+        .build();
+    youtube.sizer.add(&import_cookies_btn, 0, SizerFlag::All, 2);
     let browser_cookie_import_cb = add_check(
         &youtube.win,
         &youtube.sizer,
@@ -992,12 +1218,15 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
         "Play YouTube by downloading first (most reliable; slower to start)",
         cfg.get_bool("youtube_play_via_download", false),
     );
-    let play_cache_dir_field = add_field(
+    let play_cache_dir_field = add_field_browse(
+        &dialog,
         &youtube.win,
         &youtube.sizer,
         "YouTube playback cache folder (blank = default, next to your data):",
         cfg.get_str("youtube_play_cache_dir", ""),
-        false,
+        "YouTube playback cache folder",
+        "Browse for playback cache folder",
+        BrowseKind::Dir,
     );
     let play_cache_max_mb_field = add_spin(
         &youtube.win,
@@ -1250,27 +1479,94 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
     // user-chosen executable paths take the highest detection
     // priority (blank = auto-detect).
     let tools_group = media.group(&t("Media tools (ffmpeg, ffprobe, yt-dlp)"));
-    let ffmpeg_path_field = add_field(
+    let ffmpeg_path_field = add_field_browse(
+        &dialog,
         &media.win,
         &tools_group,
         "FFmpeg path:",
         cfg.get_str("custom_ffmpeg_path", ""),
-        false,
+        "FFmpeg executable path override",
+        "Browse for FFmpeg executable",
+        BrowseKind::File("Executables (*.exe)|*.exe|All files (*.*)|*.*"),
     );
-    let ffprobe_path_field = add_field(
+    let ffmpeg_detected = add_detected_label(&media.win, &tools_group, "FFmpeg");
+    let ffprobe_path_field = add_field_browse(
+        &dialog,
         &media.win,
         &tools_group,
         "FFprobe path:",
         cfg.get_str("custom_ffprobe_path", ""),
-        false,
+        "FFprobe executable path override",
+        "Browse for FFprobe executable",
+        BrowseKind::File("Executables (*.exe)|*.exe|All files (*.*)|*.*"),
     );
-    let ytdlp_path_field = add_field(
+    let ffprobe_detected = add_detected_label(&media.win, &tools_group, "FFprobe");
+    let ytdlp_path_field = add_field_browse(
+        &dialog,
         &media.win,
         &tools_group,
         "yt-dlp path:",
         cfg.get_str("custom_ytdlp_path", ""),
-        false,
+        "yt-dlp executable path override",
+        "Browse for yt-dlp executable",
+        BrowseKind::File("Executables (*.exe)|*.exe|All files (*.*)|*.*"),
     );
+    let ytdlp_detected = add_detected_label(&media.win, &tools_group, "yt-dlp");
+    // Media-tool detection (A11-03): find_tool +
+    // validate_executable on a worker (Python's
+    // _detect_media_tools_async) — never on the UI thread —
+    // delivered through a dialog timer like the soundcard
+    // enumeration. Hoisted so the end of show_settings can
+    // stop it before the dialog is destroyed.
+    let detect_timer = &*Box::leak(Box::new(wxdragon::timer::Timer::new(&dialog)));
+    {
+        let slot: ToolDetectSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        {
+            let slot_t = slot.clone();
+            std::thread::spawn(move || {
+                let found: Vec<(String, String, Option<std::path::PathBuf>, bool)> = [
+                    ("ffmpeg", "FFmpeg"),
+                    ("ffprobe", "FFprobe"),
+                    ("yt-dlp", "yt-dlp"),
+                ]
+                .iter()
+                .map(|(key, label)| {
+                    let path = blindrss_core::dependency::find_tool(key);
+                    let valid = path
+                        .as_deref()
+                        .is_some_and(|p| blindrss_core::dependency::validate_executable(p, key));
+                    (key.to_string(), label.to_string(), path, valid)
+                })
+                .collect();
+                *slot_t.lock().unwrap_or_else(|p| p.into_inner()) = Some(found);
+            });
+        }
+        let detect_timer_stop = detect_timer;
+        detect_timer.on_tick(move |_| {
+            let taken = slot.lock().unwrap_or_else(|p| p.into_inner()).take();
+            let Some(found) = taken else { return };
+            detect_timer_stop.stop();
+            for (key, label, path, valid) in &found {
+                let readout = match key.as_str() {
+                    "ffmpeg" => ffmpeg_detected,
+                    "ffprobe" => ffprobe_detected,
+                    _ => ytdlp_detected,
+                };
+                readout.set_label(&match path {
+                    None => format!("{} {}: {}", t("Detected"), label, t("not found")),
+                    Some(p) if !valid => format!(
+                        "{} {}: {} ({})",
+                        t("Detected"),
+                        label,
+                        p.display(),
+                        t("failed version check")
+                    ),
+                    Some(p) => format!("{} {}: {}", t("Detected"), label, p.display()),
+                });
+            }
+        });
+        detect_timer.start(200, false);
+    }
 
     // Downloads group: Python builds the Downloads panel eagerly
     // and shows it inside the Media Player page under this group
@@ -1282,12 +1578,15 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
         "Enable Downloads",
         cfg.get_bool("downloads_enabled", false),
     );
-    let dl_path = add_field(
+    let dl_path = add_field_browse(
+        &dialog,
         &media.win,
         &downloads_group,
         "Download Path:",
         &get_path(&cfg, "download_path"),
-        false,
+        "Download path",
+        "Browse for download folder",
+        BrowseKind::Dir,
     );
     let dl_ret_sel = blindrss_core::retention::RETENTION_CHOICES
         .iter()
@@ -2604,6 +2903,12 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
         });
     }
     {
+        let frame_ic = dialog;
+        import_cookies_btn.on_click(move |_| {
+            show_import_cookies_from_browser(&frame_ic, cookies_file_field);
+        });
+    }
+    {
         // Clear the playback cache (S12; Python
         // _on_clear_play_cache): scoped to the folder in the
         // (possibly unsaved) field, or the resolved default —
@@ -2865,6 +3170,7 @@ pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> 
     // landed (Brandon, 2026-11-07).
     sc_timer.stop();
     or_timer.stop();
+    detect_timer.stop();
     dialog.destroy();
     *intent.borrow()
 }

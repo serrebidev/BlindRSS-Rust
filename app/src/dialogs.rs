@@ -1190,7 +1190,12 @@ pub fn show_feed_properties(frame: &Frame, db: &Db, feed: &blindrss_core::Feed) 
     changed || *reset.borrow()
 }
 
-/// About BlindRSS (Python's AboutDialog content).
+/// About BlindRSS (Python's AboutDialog): version and
+/// copyright lines, then Follow me on GitHub, Visit
+/// Repository, View Changelog and Close (Audit 11 A11-06).
+/// The repository button opens the Forgejo repo — the
+/// code's source of truth — and View Changelog reuses the
+/// Help menu's changelog viewer.
 pub fn show_about(frame: &Frame) {
     let dialog = Dialog::builder(frame, "About BlindRSS").build();
     dialog.set_escape_id(5101);
@@ -1199,18 +1204,42 @@ pub fn show_about(frame: &Frame) {
         format!("BlindRSS {}", env!("CARGO_PKG_VERSION")),
         "Copyright (c) 2024-2026 serrebidev and contributors".to_string(),
         "An accessible RSS reader for blind users.".to_string(),
-        "https://github.com/serrebidev/BlindRSS-Rust".to_string(),
+        "https://git.serrebiradio.com/serrebi/BlindRSS-Rust".to_string(),
     ];
     for line in &lines {
         let t = StaticText::builder(&dialog).with_label(line).build();
         sizer.add(&t, 0, SizerFlag::All, 4);
     }
-    let ok_btn = Button::builder(&dialog).with_label(&t("OK")).build();
-    sizer.add(&ok_btn, 0, SizerFlag::All, 4);
+    let github_btn = Button::builder(&dialog)
+        .with_label(&t("Follow me on GitHub (@serrebidev)"))
+        .build();
+    sizer.add(&github_btn, 0, SizerFlag::All, 4);
+    github_btn.on_click(move |_| {
+        crate::open_in_browser("https://github.com/serrebidev");
+    });
+    let repo_btn = Button::builder(&dialog)
+        .with_label(&t("Visit Repository"))
+        .build();
+    sizer.add(&repo_btn, 0, SizerFlag::All, 4);
+    repo_btn.on_click(move |_| {
+        crate::open_in_browser("https://git.serrebiradio.com/serrebi/BlindRSS-Rust");
+    });
+    let changelog_btn = Button::builder(&dialog)
+        .with_label(&t("View Changelog"))
+        .build();
+    sizer.add(&changelog_btn, 0, SizerFlag::All, 4);
+    {
+        let frame_cl = *frame;
+        changelog_btn.on_click(move |_| {
+            crate::help::show_changelog(&frame_cl);
+        });
+    }
+    let close_btn = Button::builder(&dialog).with_label(&t("Close")).build();
+    sizer.add(&close_btn, 0, SizerFlag::All, 4);
     let d = dialog;
-    ok_btn.on_click(move |_| d.end_modal(5100));
+    close_btn.on_click(move |_| d.end_modal(5101));
     dialog.set_sizer(sizer, true);
-    dialog.set_size(Size::new(480, 260));
+    dialog.set_size(Size::new(480, 340));
     dialog.show_modal();
     dialog.destroy();
 }
@@ -1821,6 +1850,21 @@ pub fn show_video_search(
     }
     scope_choice.set_selection(0);
     opt_row.add(&scope_choice, 1, SizerFlag::All, 4);
+    // "Filter Results" by-site filter between Search Sites
+    // and Sort by (Python dialogs.py:6631; Audit 11 A11-05).
+    // It only narrows what is displayed — the search itself
+    // and the stored results are untouched.
+    let filter_label = StaticText::builder(&dialog)
+        .with_label(&t("Filter Results:"))
+        .build();
+    opt_row.add(&filter_label, 0, SizerFlag::All, 4);
+    let filter_choice = Choice::builder(&dialog).build();
+    crate::msaa_names::set_name(&filter_choice, &t("Filter results by site"));
+    for item in &scope_items {
+        filter_choice.append(item);
+    }
+    filter_choice.set_selection(0);
+    opt_row.add(&filter_choice, 1, SizerFlag::All, 4);
     let sort_label = StaticText::builder(&dialog)
         .with_label(&t("Sort by:"))
         .build();
@@ -1865,6 +1909,16 @@ pub fn show_video_search(
     sizer.add_sizer(&row, 0, SizerFlag::Expand | SizerFlag::All, 2);
 
     let results: Rc<RefCell<Vec<VideoResult>>> = Rc::new(RefCell::new(Vec::new()));
+    // What the list actually shows: `results` after the
+    // Filter Results choice and the sort (A11-05). Pick and
+    // Copy index into this, never into `results` directly.
+    let displayed: Rc<RefCell<Vec<VideoResult>>> = Rc::new(RefCell::new(Vec::new()));
+    // Background title enrichment for URL-only results
+    // (A11-09): (url, resolved title) pairs from workers.
+    let (title_tx, title_rx) = std::sync::mpsc::channel::<(String, String)>();
+    let title_rx = Rc::new(title_rx);
+    let title_pending: Rc<RefCell<std::collections::HashSet<String>>> =
+        Rc::new(RefCell::new(std::collections::HashSet::new()));
     let per_site_limit = Rc::new(std::cell::Cell::new(80usize));
     let expected = Rc::new(std::cell::Cell::new(0usize));
     let completed = Rc::new(std::cell::Cell::new(0usize));
@@ -1874,11 +1928,20 @@ pub fn show_video_search(
     let rx = Rc::new(rx);
     let sites = Rc::new(sites);
 
-    // Refill the list from results, honouring the sort choice.
+    // Refill the list from results, honouring the Filter
+    // Results choice and then the sort choice.
     let refill: Rc<dyn Fn()> = {
         let results = results.clone();
+        let displayed = displayed.clone();
+        let sites = sites.clone();
         Rc::new(move || {
             let mut items = results.borrow().clone();
+            if let Some(f) = filter_choice.get_selection()
+                && f > 0
+                && let Some(site) = sites.get((f - 1) as usize)
+            {
+                items.retain(|r| r.site_id == site.id);
+            }
             match sort_choice.get_selection() {
                 Some(1) => items.sort_by_key(|a| a.title.to_lowercase()),
                 Some(2) => items.sort_by(|a, b| a.site.cmp(&b.site)),
@@ -1906,8 +1969,8 @@ pub fn show_video_search(
                 );
                 list.set_item_text_by_column(i as i64, 4, r.uploader.as_deref().unwrap_or(""));
             }
-            // Keep the visible order as the selection order.
-            *results.borrow_mut() = items;
+            // The visible order is the selection order.
+            *displayed.borrow_mut() = items;
         })
     };
 
@@ -1967,11 +2030,15 @@ pub fn show_video_search(
         let refill = refill.clone();
         sort_choice.on_selection_changed(move |_| refill());
     }
+    {
+        let refill = refill.clone();
+        filter_choice.on_selection_changed(move |_| refill());
+    }
 
     let chosen: Rc<RefCell<Option<(&'static str, VideoResult)>>> = Rc::new(RefCell::new(None));
     let pick = {
         let chosen = chosen.clone();
-        let results = results.clone();
+        let results = displayed.clone();
         let d = dialog;
         move |action: &'static str| {
             let sel = list.get_first_selected_item();
@@ -2004,7 +2071,7 @@ pub fn show_video_search(
         list.on_item_activated(move |_| pick("play"));
     }
     {
-        let results = results.clone();
+        let results = displayed.clone();
         copy_btn.on_click(move |_| {
             let sel = list.get_first_selected_item();
             if sel >= 0
@@ -2027,6 +2094,8 @@ pub fn show_video_search(
         let expected = expected.clone();
         let completed = completed.clone();
         let last_search = last_search.clone();
+        let title_rx = title_rx.clone();
+        let title_pending = title_pending.clone();
         timer.on_tick(move |_| {
             let mut changed = false;
             while let Ok((_idx, result)) = rx.try_recv() {
@@ -2036,6 +2105,40 @@ pub fn show_video_search(
                     let mut all = results.borrow_mut();
                     for r in found {
                         merge_result(&mut all, r);
+                    }
+                }
+            }
+            // Enrich URL-only titles in the background
+            // (A11-09; Python enqueues quick-URL results the
+            // same way). The core resolver has finite
+            // timeouts; each URL is attempted once.
+            {
+                let snapshot = results.borrow().clone();
+                for r in &snapshot {
+                    if r.title_is_fallback
+                        && blindrss_core::discovery::supports_quick_url_title(&r.url)
+                        && title_pending.borrow_mut().insert(r.url.clone())
+                    {
+                        let tx = title_tx.clone();
+                        let url = r.url.clone();
+                        std::thread::spawn(move || {
+                            let title =
+                                blindrss_core::discovery::resolve_quick_url_title_cached(&url);
+                            if !title.is_empty() {
+                                let _ = tx.send((url, title));
+                            }
+                        });
+                    }
+                }
+            }
+            while let Ok((url, title)) = title_rx.try_recv() {
+                title_pending.borrow_mut().remove(&url);
+                let mut all = results.borrow_mut();
+                for r in all.iter_mut() {
+                    if r.url == url && r.title_is_fallback {
+                        r.title = title.clone();
+                        r.title_is_fallback = false;
+                        changed = true;
                     }
                 }
             }
@@ -3868,9 +3971,10 @@ pub fn show_feed_search(frame: &Frame) -> Option<String> {
 
 /// Exclude-notification-feeds picker (Python's
 /// ExcludeNotificationFeedsDialog): every feed with a
-/// checkbox; checked feeds are stored by ID in
-/// windows_notifications_excluded_feeds and get no refresh
-/// notifications.
+/// checkbox; CHECKED feeds send notifications (Python's
+/// semantics, Audit 11 A11-08 — the stored
+/// windows_notifications_excluded_feeds list holds the
+/// UNCHECKED feeds' IDs, the same shape as before).
 pub fn show_exclude_feeds(frame: &impl WxWidget, config_path: &Path) {
     let Ok(db) = Db::open(&crate::db_path()) else {
         return;
@@ -3891,25 +3995,110 @@ pub fn show_exclude_feeds(frame: &impl WxWidget, config_path: &Path) {
     dialog.set_escape_id(5101);
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let label = StaticText::builder(&dialog)
-        .with_label(&t("Checked feeds will not send notifications:"))
+        .with_label(&t(
+            "Feeds are checked by default.\nUncheck feeds that should not send notifications.",
+        ))
         .build();
     sizer.add(&label, 0, SizerFlag::All, 4);
     let list = CheckListBox::builder(&dialog).build();
+    crate::msaa_names::set_name(&list, &t("Feeds (checked feeds send notifications)"));
     for (i, f) in feeds.iter().enumerate() {
         list.append(&f.title);
-        if excluded.contains(&f.id) {
+        if !excluded.contains(&f.id) {
             list.check(i as u32, true);
         }
     }
+    if !feeds.is_empty() {
+        list.set_selection(0, true);
+    }
     sizer.add(&list, 1, SizerFlag::Expand | SizerFlag::All, 4);
+    // Selection status line (Python's _selection_status):
+    // the selected feed and whether it is checked; "No feeds
+    // available." when the list is empty.
+    let status = StaticText::builder(&dialog).with_label("").build();
+    sizer.add(&status, 0, SizerFlag::All, 4);
+    let titles: Rc<Vec<String>> = Rc::new(feeds.iter().map(|f| f.title.clone()).collect());
+    let update_status: Rc<dyn Fn()> = {
+        let titles = titles.clone();
+        Rc::new(move || {
+            if titles.is_empty() {
+                status.set_label(&t("No feeds available."));
+                return;
+            }
+            match list.get_selection() {
+                Some(sel) if (sel as usize) < titles.len() => {
+                    let state = if list.is_checked(sel) {
+                        t("checked")
+                    } else {
+                        t("unchecked")
+                    };
+                    status.set_label(&format!(
+                        "{} {}. {}.",
+                        t("Selected feed:"),
+                        titles[sel as usize],
+                        state
+                    ));
+                }
+                _ => status.set_label(&t("No feed selected.")),
+            }
+        })
+    };
+    update_status();
+    {
+        let update_status = update_status.clone();
+        list.bind_internal(EventType::COMMAND_CHECKLISTBOX_SELECTED, move |_| {
+            update_status()
+        });
+    }
+    {
+        let update_status = update_status.clone();
+        list.bind_internal(EventType::COMMAND_LISTBOX_SELECTED, move |_| {
+            update_status()
+        });
+    }
+    let actions = BoxSizer::builder(Orientation::Horizontal).build();
+    let check_all_btn = Button::builder(&dialog).with_label(&t("Check All")).build();
+    let uncheck_all_btn = Button::builder(&dialog)
+        .with_label(&t("Uncheck All"))
+        .build();
+    actions.add(&check_all_btn, 0, SizerFlag::All, 4);
+    actions.add(&uncheck_all_btn, 0, SizerFlag::All, 4);
+    sizer.add_sizer(&actions, 0, SizerFlag::All, 2);
+    if feeds.is_empty() {
+        check_all_btn.enable(false);
+        uncheck_all_btn.enable(false);
+    }
+    {
+        let update_status = update_status.clone();
+        let count = feeds.len();
+        check_all_btn.on_click(move |_| {
+            for i in 0..count {
+                list.check(i as u32, true);
+            }
+            update_status();
+        });
+    }
+    {
+        let update_status = update_status.clone();
+        let count = feeds.len();
+        uncheck_all_btn.on_click(move |_| {
+            for i in 0..count {
+                list.check(i as u32, false);
+            }
+            update_status();
+        });
+    }
     ok_cancel(&dialog, &sizer);
     dialog.set_sizer(sizer, true);
     dialog.set_size(Size::new(520, 480));
     if dialog.show_modal() == 5100 {
+        // Stored shape unchanged: the excluded list holds
+        // the feeds that will NOT notify — now the unchecked
+        // ones (A11-08).
         let ids: Vec<Value> = feeds
             .iter()
             .enumerate()
-            .filter(|(i, _)| list.is_checked(*i as u32))
+            .filter(|(i, _)| !list.is_checked(*i as u32))
             .map(|(_, f)| json!(f.id))
             .collect();
         let mut cfg = Config::load(config_path).unwrap_or_default();
@@ -3919,10 +4108,135 @@ pub fn show_exclude_feeds(frame: &impl WxWidget, config_path: &Path) {
     dialog.destroy();
 }
 
-/// YouTube account device sign-in (Python's device-code
-/// flow): shows the user code + verification URL, polls on a
-/// worker until Google approves, then stores the refresh
-/// token in config youtube_account_refresh_token.
+/// Run one YouTube account sync the way the main window's
+/// provider sync does (subscriptions as feeds, then the
+/// recommendations snapshot). Blocking — call on a worker.
+fn youtube_account_sync(config_path: &Path) -> Result<String, String> {
+    let db = Db::open(&crate::db_path()).map_err(|e| format!("{e}"))?;
+    let mut cfg = Config::load(config_path).unwrap_or_default();
+    let added = blindrss_core::youtube_account::sync_account(&mut cfg, config_path, &db)?;
+    let token = cfg.get_str("youtube_account_refresh_token", "").to_string();
+    let client_id = {
+        let v = cfg.get_str("youtube_account_client_id", "");
+        if v.is_empty() {
+            blindrss_core::youtube_account::CLIENT_ID
+        } else {
+            v
+        }
+        .to_string()
+    };
+    let secret = cfg.get_str("youtube_account_client_secret", "").to_string();
+    // The recommendations snapshot's failure does not fail
+    // the sync (the main window's rule).
+    if let Ok(videos) =
+        blindrss_core::youtube_account::list_recommendations(&client_id, &secret, &token)
+    {
+        let account = blindrss_core::youtube_account::account_key(&token);
+        let _ = db.save_recommendations(&account, &videos);
+    }
+    Ok(format!(
+        "YouTube account updated. Added {added} new channel{}; recommendations refreshed.",
+        if added == 1 { "" } else { "s" }
+    ))
+}
+
+/// The category picker Python's main window hands the
+/// YouTube Account dialog (ChooseCategoryDialog): existing
+/// categories with "Uncategorized" first, plus New
+/// Category... inline creation. Returns the stored category
+/// id, None when cancelled.
+fn pick_youtube_category(parent: &Dialog, current: &str) -> Option<String> {
+    let dialog = Dialog::builder(parent, "Choose Category").build();
+    dialog.set_escape_id(5101);
+    let sizer = BoxSizer::builder(Orientation::Vertical).build();
+    let label = StaticText::builder(&dialog)
+        .with_label(&t("Category for your YouTube subscriptions:"))
+        .build();
+    sizer.add(&label, 0, SizerFlag::All, 4);
+    let list = ListBox::builder(&dialog).build();
+    crate::msaa_names::set_name(&list, &t("Category for your YouTube subscriptions:"));
+    sizer.add(&list, 1, SizerFlag::Expand | SizerFlag::All, 4);
+    let ids: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new({
+        let mut v = vec!["Uncategorized".to_string()];
+        if let Ok(db) = Db::open(&crate::db_path())
+            && let Ok(cats) = db.categories()
+        {
+            for c in cats {
+                if c.title != "Uncategorized" && !v.contains(&c.title) {
+                    v.push(c.title);
+                }
+            }
+        }
+        v
+    }));
+    let reload: Rc<dyn Fn()> = {
+        let ids = ids.clone();
+        Rc::new(move || {
+            list.clear();
+            for id in ids.borrow().iter() {
+                list.append(id);
+            }
+        })
+    };
+    reload();
+    let initial = ids
+        .borrow()
+        .iter()
+        .position(|id| id == current)
+        .unwrap_or(0);
+    list.set_selection(initial as u32, true);
+    let new_btn = Button::builder(&dialog)
+        .with_label(&t("New Category..."))
+        .build();
+    sizer.add(&new_btn, 0, SizerFlag::All, 4);
+    ok_cancel(&dialog, &sizer);
+    {
+        let ids = ids.clone();
+        let reload = reload.clone();
+        let d = dialog;
+        new_btn.on_click(move |_| {
+            let entry = TextEntryDialog::builder(&d, "Category name:", "New Category").build();
+            if entry.show_modal() != 5100 {
+                return;
+            }
+            let name = entry.get_value().unwrap_or_default();
+            let name = name.trim().to_string();
+            if name.is_empty() {
+                return;
+            }
+            if let Ok(db) = Db::open(&crate::db_path()) {
+                let _ = db.add_category(&name);
+            }
+            let mut ids_mut = ids.borrow_mut();
+            if !ids_mut.contains(&name) {
+                ids_mut.push(name.clone());
+            }
+            let pos = ids_mut.iter().position(|id| id == &name).unwrap_or(0);
+            drop(ids_mut);
+            reload();
+            list.set_selection(pos as u32, true);
+            list.set_focus();
+        });
+    }
+    dialog.set_sizer(sizer, true);
+    dialog.set_size(Size::new(480, 420));
+    let result = if dialog.show_modal() == 5100 {
+        list.get_selection()
+            .and_then(|sel| ids.borrow().get(sel as usize).cloned())
+    } else {
+        None
+    };
+    dialog.destroy();
+    result
+}
+
+/// YouTube Account dialog (Python's YouTubeAccountDialog,
+/// gui/dialogs.py:9050; Audit 11 A11-01): read-only status,
+/// Sign In..., Open Sign-in Page, Copy Code, Sign Out, the
+/// auto-update check box (youtube_account_auto_add, saved on
+/// toggle), the account category with Change Category...,
+/// Update Account Now and Close. Sign-in runs the device-code
+/// flow on a worker; only the dialog's timer touches widgets.
 pub fn show_youtube_signin(frame: &impl WxWidget, config_path: &Path) {
     let cfg = Config::load(config_path).unwrap_or_default();
     let client_id = {
@@ -3934,107 +4248,359 @@ pub fn show_youtube_signin(frame: &impl WxWidget, config_path: &Path) {
         }
     };
     let secret = cfg.get_str("youtube_account_client_secret", "").to_string();
-    let dialog = Dialog::builder(frame, "Connect YouTube Account").build();
+    let dialog = Dialog::builder(frame, "YouTube Account").build();
     dialog.set_escape_id(5101);
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
-    let status = StaticText::builder(&dialog)
-        .with_label(&t("Contacting Google..."))
+    let status = TextCtrl::builder(&dialog)
+        .with_style(TextCtrlStyle::ReadOnly | TextCtrlStyle::MultiLine)
         .build();
-    sizer.add(&status, 0, SizerFlag::All, 8);
-    let code_label = StaticText::builder(&dialog).with_label("").build();
-    sizer.add(&code_label, 0, SizerFlag::All, 8);
-    let close_btn = Button::builder(&dialog).with_label(&t("Cancel")).build();
-    sizer.add(&close_btn, 0, SizerFlag::All, 4);
-    let (tx, rx) = std::sync::mpsc::channel::<Result<String, String>>();
-    let rx = Rc::new(rx);
+    crate::msaa_names::set_name(&status, &t("YouTube account status"));
+    sizer.add(&status, 0, SizerFlag::Expand | SizerFlag::All, 8);
+
+    let btn_row = BoxSizer::builder(Orientation::Horizontal).build();
+    let sign_in_btn = Button::builder(&dialog)
+        .with_label(&t("Sign In..."))
+        .build();
+    btn_row.add(&sign_in_btn, 0, SizerFlag::All, 4);
+    let open_page_btn = Button::builder(&dialog)
+        .with_label(&t("Open Sign-in Page"))
+        .build();
+    btn_row.add(&open_page_btn, 0, SizerFlag::All, 4);
+    let copy_code_btn = Button::builder(&dialog).with_label(&t("Copy Code")).build();
+    btn_row.add(&copy_code_btn, 0, SizerFlag::All, 4);
+    let sign_out_btn = Button::builder(&dialog).with_label(&t("Sign Out")).build();
+    btn_row.add(&sign_out_btn, 0, SizerFlag::All, 4);
+    sizer.add_sizer(&btn_row, 0, SizerFlag::All, 2);
+
+    let auto_add_chk = CheckBox::builder(&dialog)
+        .with_label(&t(
+            "Update subscriptions and recommendations automatically (every 15 minutes)",
+        ))
+        .build();
+    auto_add_chk.set_value(cfg.get_bool("youtube_account_auto_add", true));
+    sizer.add(&auto_add_chk, 0, SizerFlag::All, 8);
+
+    let cat_row = BoxSizer::builder(Orientation::Horizontal).build();
+    let cat_label = StaticText::builder(&dialog)
+        .with_label(&t("YouTube account category:"))
+        .build();
+    cat_row.add(&cat_label, 0, SizerFlag::All, 4);
+    let category_ctrl = TextCtrl::builder(&dialog)
+        .with_style(TextCtrlStyle::ReadOnly)
+        .build();
+    crate::msaa_names::set_name(&category_ctrl, &t("YouTube account category"));
+    cat_row.add(&category_ctrl, 1, SizerFlag::Expand | SizerFlag::All, 4);
+    let change_cat_btn = Button::builder(&dialog)
+        .with_label(&t("Change Category..."))
+        .build();
+    cat_row.add(&change_cat_btn, 0, SizerFlag::All, 4);
+    sizer.add_sizer(&cat_row, 0, SizerFlag::Expand | SizerFlag::All, 2);
+
+    let bottom_row = BoxSizer::builder(Orientation::Horizontal).build();
+    let sync_btn = Button::builder(&dialog)
+        .with_label(&t("Update Account Now"))
+        .build();
+    bottom_row.add(&sync_btn, 0, SizerFlag::All, 4);
+    let close_btn = Button::builder(&dialog).with_label(&t("Close")).build();
+    bottom_row.add(&close_btn, 0, SizerFlag::All, 4);
+    sizer.add_sizer(&bottom_row, 0, SizerFlag::All, 2);
+
+    // Dialog state (UI thread only): the pending device code,
+    // its verification URL, the chosen category, and the
+    // sign-in generation (closing or signing out invalidates
+    // an in-flight poll, Python's _sign_in_token).
+    struct YtState {
+        user_code: String,
+        verification_url: String,
+        category: String,
+    }
+    let state: Rc<RefCell<YtState>> = Rc::new(RefCell::new(YtState {
+        user_code: String::new(),
+        verification_url: "https://www.google.com/device".to_string(),
+        category: {
+            let c = cfg.get_str("youtube_account_category", "YouTube");
+            if c.is_empty() {
+                "YouTube".to_string()
+            } else {
+                c.to_string()
+            }
+        },
+    }));
+    let generation = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    category_ctrl.set_value(&state.borrow().category);
+
+    let save_options: Rc<dyn Fn()> = {
+        let state = state.clone();
+        let path = config_path.to_path_buf();
+        Rc::new(move || {
+            let mut cfg = Config::load(&path).unwrap_or_default();
+            cfg.set_path("youtube_account_auto_add", json!(auto_add_chk.get_value()));
+            let category = state.borrow().category.clone();
+            cfg.set_path(
+                "youtube_account_category",
+                json!(if category.is_empty() {
+                    "YouTube".to_string()
+                } else {
+                    category
+                }),
+            );
+            let _ = cfg.save(&path);
+        })
+    };
+    // Python's _refresh_state: the status text (a given
+    // message, else the signed-in default) plus which
+    // buttons are live. Open/Copy only exist while a code
+    // is waiting.
+    let refresh_state: Rc<dyn Fn(Option<String>)> = {
+        let state = state.clone();
+        let path = config_path.to_path_buf();
+        Rc::new(move |message: Option<String>| {
+            let signed_in = !Config::load(&path)
+                .unwrap_or_default()
+                .get_str("youtube_account_refresh_token", "")
+                .is_empty();
+            let waiting = !state.borrow().user_code.is_empty();
+            status.set_value(&message.unwrap_or_else(|| {
+                if signed_in {
+                    t("Signed in to YouTube.")
+                } else {
+                    t("Not signed in. Choose Sign In to connect your YouTube account.")
+                }
+            }));
+            sign_in_btn.enable(!signed_in && !waiting);
+            open_page_btn.show(waiting);
+            copy_code_btn.show(waiting);
+            sign_out_btn.enable(signed_in);
+            sync_btn.enable(signed_in);
+        })
+    };
+    refresh_state(None);
     {
+        let save_options = save_options.clone();
+        auto_add_chk.on_toggled(move |_| save_options());
+    }
+
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let rx = Rc::new(rx);
+
+    // Update Account Now (Python's _on_sync): save options,
+    // disable the button, run the sync on a worker, and let
+    // the timer report through _refresh_state.
+    let run_sync: Rc<dyn Fn()> = {
+        let save_options = save_options.clone();
+        let path = config_path.to_path_buf();
         let tx = tx.clone();
-        std::thread::spawn(move || {
-            let signin = match blindrss_core::youtube_account::start_sign_in(&client_id) {
-                Ok(s) => s,
-                Err(e) => {
-                    let _ = tx.send(Err(e));
-                    return;
-                }
-            };
-            // Instructions travel through the channel; only
-            // the dialog's timer (UI thread) touches widgets.
-            let _ = tx.send(Ok(format!(
-                "PROGRESS:{}:{}",
-                signin.user_code, signin.verification_url
-            )));
-            let deadline = std::time::Instant::now()
-                + std::time::Duration::from_secs(signin.expires_in.max(60));
-            loop {
-                if std::time::Instant::now() >= deadline {
-                    let _ = tx.send(Err("sign-in code expired".to_string()));
-                    return;
-                }
-                std::thread::sleep(std::time::Duration::from_secs(signin.interval.max(2)));
-                match blindrss_core::youtube_account::poll_sign_in(
-                    &client_id,
-                    &secret,
-                    &signin.device_code,
-                ) {
-                    Ok(Some(token)) => {
-                        let _ = tx.send(Ok(format!("TOKEN:{token}")));
-                        return;
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        let _ = tx.send(Err(e));
-                        return;
-                    }
-                }
+        Rc::new(move || {
+            save_options();
+            sync_btn.enable(false);
+            status.set_value(&t(
+                "Updating your YouTube subscriptions and recommendations...",
+            ));
+            let tx = tx.clone();
+            let path = path.clone();
+            std::thread::spawn(move || {
+                let msg = match youtube_account_sync(&path) {
+                    Ok(m) => format!("SYNC:{m}"),
+                    Err(e) => format!("SYNCERR:{e}"),
+                };
+                let _ = tx.send(msg);
+            });
+        })
+    };
+    {
+        let run_sync = run_sync.clone();
+        sync_btn.on_click(move |_| run_sync());
+    }
+    {
+        let state = state.clone();
+        open_page_btn.on_click(move |_| {
+            let url = state.borrow().verification_url.clone();
+            crate::open_in_browser(&url);
+        });
+    }
+    {
+        let state = state.clone();
+        copy_code_btn.on_click(move |_| {
+            let code = state.borrow().user_code.clone();
+            if !code.is_empty() {
+                let _ = Clipboard::get().set_text(&code);
             }
         });
     }
-    let done: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
+    {
+        let state = state.clone();
+        let generation = generation.clone();
+        let refresh_state = refresh_state.clone();
+        let path = config_path.to_path_buf();
+        sign_out_btn.on_click(move |_| {
+            generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            state.borrow_mut().user_code.clear();
+            let mut cfg = Config::load(&path).unwrap_or_default();
+            cfg.set_path("youtube_account_refresh_token", json!(""));
+            let _ = cfg.save(&path);
+            refresh_state(Some(t("Signed out. Feeds already added stay in BlindRSS.")));
+        });
+    }
+    {
+        let state = state.clone();
+        let save_options = save_options.clone();
+        let d = dialog;
+        change_cat_btn.on_click(move |_| {
+            let current = state.borrow().category.clone();
+            if let Some(picked) = pick_youtube_category(&d, &current) {
+                state.borrow_mut().category = picked.clone();
+                category_ctrl.set_value(&picked);
+                save_options();
+            }
+        });
+    }
+    {
+        let generation = generation.clone();
+        let state = state.clone();
+        let tx = tx.clone();
+        sign_in_btn.on_click(move |_| {
+            let gen_id = generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            state.borrow_mut().user_code.clear();
+            sign_in_btn.enable(false);
+            status.set_value(&t("Getting a sign-in code..."));
+            let tx = tx.clone();
+            let client_id = client_id.clone();
+            let secret = secret.clone();
+            let generation = generation.clone();
+            std::thread::spawn(move || {
+                let alive = || generation.load(std::sync::atomic::Ordering::SeqCst) == gen_id;
+                let signin = match blindrss_core::youtube_account::start_sign_in(&client_id) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        if alive() {
+                            let _ = tx.send(format!("ERR:{e}"));
+                        }
+                        return;
+                    }
+                };
+                if !alive() {
+                    return;
+                }
+                let _ = tx.send(format!(
+                    "PROGRESS:{}:{}",
+                    signin.user_code, signin.verification_url
+                ));
+                let deadline = std::time::Instant::now()
+                    + std::time::Duration::from_secs(signin.expires_in.max(60));
+                loop {
+                    if !alive() {
+                        return;
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        let _ = tx.send("ERR:The sign-in code expired.".to_string());
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(signin.interval.max(2)));
+                    if !alive() {
+                        return;
+                    }
+                    match blindrss_core::youtube_account::poll_sign_in(
+                        &client_id,
+                        &secret,
+                        &signin.device_code,
+                    ) {
+                        Ok(Some(token)) => {
+                            let _ = tx.send(format!("TOKEN:{token}"));
+                            return;
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            let _ = tx.send(format!("ERR:{e}"));
+                            return;
+                        }
+                    }
+                }
+            });
+        });
+    }
+
     let timer = Box::leak(Box::new(Timer::new(&dialog)));
     {
         let rx = rx.clone();
-        let status3 = status;
-        let code_label3 = code_label;
-        let done = done.clone();
-        let d = dialog;
+        let state = state.clone();
+        let refresh_state = refresh_state.clone();
+        let save_options = save_options.clone();
+        let run_sync = run_sync.clone();
         let path = config_path.to_path_buf();
+        let d = dialog;
         timer.on_tick(move |_| {
-            while let Ok(result) = rx.try_recv() {
-                match result {
-                    Ok(msg) if msg.starts_with("PROGRESS:") => {
-                        let rest = msg.trim_start_matches("PROGRESS:");
-                        let (code, url) = rest
-                            .split_once(':')
-                            .map(|(c, u)| (c.to_string(), u.to_string()))
-                            .unwrap_or_default();
-                        status3.set_label("Open the verification page and enter the code:");
-                        code_label3.set_label(&format!("Code: {code}\n{url}"));
-                        crate::open_in_browser(&url);
+            while let Ok(msg) = rx.try_recv() {
+                if let Some(rest) = msg.strip_prefix("PROGRESS:") {
+                    let (code, url) = rest
+                        .split_once(':')
+                        .map(|(c, u)| (c.to_string(), u.to_string()))
+                        .unwrap_or_default();
+                    {
+                        let mut st = state.borrow_mut();
+                        st.user_code = code.clone();
+                        if !url.is_empty() {
+                            st.verification_url = url.clone();
+                        }
                     }
-                    Ok(msg) if msg.starts_with("TOKEN:") => {
-                        let token = msg.trim_start_matches("TOKEN:").to_string();
-                        let mut cfg = Config::load(&path).unwrap_or_default();
-                        cfg.set_path("youtube_account_refresh_token", serde_json::json!(token));
-                        let _ = cfg.save(&path);
-                        status3.set_label("YouTube account connected.");
-                        *done.borrow_mut() = true;
-                        d.end_modal(5100);
+                    refresh_state(Some(
+                        t("Go to {url} in your browser, sign in to YouTube if asked, and enter this code: {code}\nWaiting for you to approve...")
+                            .replace("{url}", &url)
+                            .replace("{code}", &code),
+                    ));
+                    status.set_focus();
+                } else if let Some(token) = msg.strip_prefix("TOKEN:") {
+                    let mut cfg = Config::load(&path).unwrap_or_default();
+                    cfg.set_path(
+                        "youtube_account_refresh_token",
+                        json!(token.to_string()),
+                    );
+                    let _ = cfg.save(&path);
+                    state.borrow_mut().user_code.clear();
+                    // Python asks where the subscriptions go
+                    // before adding any of them.
+                    let current = state.borrow().category.clone();
+                    match pick_youtube_category(&d, &current) {
+                        Some(picked) => {
+                            state.borrow_mut().category = picked.clone();
+                            category_ctrl.set_value(&picked);
+                            save_options();
+                            run_sync();
+                        }
+                        None => {
+                            save_options();
+                            refresh_state(Some(t(
+                                "Signed in to YouTube. Choose Change Category, then Update Account Now.",
+                            )));
+                        }
                     }
-                    Ok(_) => {}
-                    Err(e) => {
-                        status3.set_label(&format!("Sign-in failed: {e}"));
-                        *done.borrow_mut() = true;
-                        d.end_modal(5101);
-                    }
+                    status.set_focus();
+                } else if let Some(m) = msg.strip_prefix("SYNC:") {
+                    refresh_state(Some(m.to_string()));
+                } else if let Some(e) = msg.strip_prefix("SYNCERR:") {
+                    refresh_state(Some(format!(
+                        "{} {e}",
+                        t("Could not update YouTube account:")
+                    )));
+                } else if let Some(e) = msg.strip_prefix("ERR:") {
+                    state.borrow_mut().user_code.clear();
+                    refresh_state(Some(format!("{} {e}", t("Sign-in failed:"))));
                 }
             }
         });
     }
     timer.start(200, false);
-    let d = dialog;
-    close_btn.on_click(move |_| d.end_modal(5101));
+    {
+        let generation = generation.clone();
+        let save_options = save_options.clone();
+        let d = dialog;
+        close_btn.on_click(move |_| {
+            generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            save_options();
+            d.end_modal(5101);
+        });
+    }
     dialog.set_sizer(sizer, true);
-    dialog.set_size(Size::new(520, 260));
+    dialog.set_size(Size::new(560, 420));
     dialog.show_modal();
     timer.stop();
     dialog.destroy();

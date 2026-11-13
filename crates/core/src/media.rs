@@ -133,12 +133,20 @@ pub fn youtube_article_info(url: &str) -> Result<serde_json::Value, String> {
 /// phases. The cookie file comes from the app's environment
 /// (BLINDRSS_YTDLP_COOKIES, set at startup from config).
 pub fn stream_url(url: &str) -> Result<String, String> {
+    stream_url_with_config(url, &crate::config::Config::default())
+}
+
+/// `stream_url` honouring the caller's config: the yt-dlp CLI
+/// timeout derives from `playback_resolve_timeout_s`
+/// (Audit 11 A11-11; Python gui/player.py derives it the same
+/// way for `_extract_ytdlp_info_via_cli`).
+pub fn stream_url_with_config(url: &str, cfg: &crate::config::Config) -> Result<String, String> {
     let exe = find_ytdlp().ok_or("yt-dlp not found (install it or set BLINDRSS_YTDLP)")?;
     let cookie_file = std::env::var("BLINDRSS_YTDLP_COOKIES")
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
-    stream_url_with(&exe, url, cookie_file.as_deref())
+    stream_url_with_timeout(&exe, url, cookie_file.as_deref(), ytdlp_cli_timeout(cfg))
 }
 
 /// `stream_url` against an explicit executable and cookie file
@@ -147,6 +155,16 @@ pub fn stream_url_with(
     exe: &std::path::Path,
     url: &str,
     cookie_file: Option<&str>,
+) -> Result<String, String> {
+    stream_url_with_timeout(exe, url, cookie_file, std::time::Duration::from_secs(30))
+}
+
+/// `stream_url_with` with an explicit per-attempt timeout.
+pub fn stream_url_with_timeout(
+    exe: &std::path::Path,
+    url: &str,
+    cookie_file: Option<&str>,
+    timeout: std::time::Duration,
 ) -> Result<String, String> {
     use crate::ytdlp_recovery::{AttemptOutcome, CookieAttempt};
     crate::ytdlp_recovery::run_recovery(url, cookie_file, |phase, attempt| {
@@ -187,7 +205,7 @@ pub fn stream_url_with(
         }
         args.push(phase.target_url.clone());
         let arg_refs: Vec<&str> = args.iter().map(|a| a.as_str()).collect();
-        match crate::dependency::run_tool(exe, &arg_refs, std::time::Duration::from_secs(30)) {
+        match crate::dependency::run_tool(exe, &arg_refs, timeout) {
             Ok(run) if run.success => {
                 match run.stdout.lines().map(|s| s.trim()).find(|s| !s.is_empty()) {
                     Some(u) => AttemptOutcome::Success(u.to_string()),
@@ -627,6 +645,96 @@ pub fn local_media_url(path: &std::path::Path) -> Result<String, String> {
 }
 
 /// Prefer completed downloads, including files indexed by the Python app.
+/// Python's `playback_resolve_timeout_s` config value
+/// (Audit 11 A11-11): the redirect-resolve timeout in
+/// gui/player.py, default 4.0 s; an unparseable or non-positive
+/// value falls back to the default the way Python's
+/// `float(... or 4.0)` + except path does.
+pub fn playback_resolve_timeout_s(cfg: &crate::config::Config) -> f64 {
+    let raw = cfg.raw().get("playback_resolve_timeout_s");
+    let value = match raw {
+        Some(serde_json::Value::Number(n)) => n.as_f64(),
+        Some(serde_json::Value::String(s)) => s.trim().parse::<f64>().ok(),
+        _ => None,
+    };
+    match value {
+        Some(v) if v > 0.0 => v,
+        _ => 4.0,
+    }
+}
+
+/// The yt-dlp CLI timeout Python derives from
+/// `playback_resolve_timeout_s` (gui/player.py): 8x, clamped
+/// to 10–120 s.
+pub fn ytdlp_cli_timeout(cfg: &crate::config::Config) -> std::time::Duration {
+    let secs = (playback_resolve_timeout_s(cfg) * 8.0).clamp(10.0, 120.0);
+    std::time::Duration::from_secs(secs as u64)
+}
+
+/// Python `utils.resolve_final_url`: resolve tracking /
+/// redirect URLs to the final URL with a GET that follows
+/// redirects and reads nothing; any failure returns the
+/// original URL unchanged.
+pub fn resolve_final_url(url: &str, max_redirects: i64, timeout_s: f64) -> String {
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        return url.to_string();
+    }
+    let max_redirects = if max_redirects > 0 { max_redirects } else { 30 };
+    let config = ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_secs_f64(timeout_s.max(0.1))))
+        .user_agent(crate::http::user_agent())
+        .max_redirects(max_redirects.min(u32::MAX as i64) as u32)
+        .http_status_as_error(false)
+        .build();
+    let agent = ureq::Agent::new_with_config(config);
+    match agent.get(url).call() {
+        Ok(resp) => {
+            use ureq::ResponseExt as _;
+            let final_url = resp.get_uri().to_string();
+            if final_url.is_empty() {
+                url.to_string()
+            } else {
+                final_url
+            }
+        }
+        Err(_) => url.to_string(),
+    }
+}
+
+/// The Rokfin public-playback fallback (Audit 11 A11-10;
+/// Python gui/player.py after yt-dlp fails): Some(result)
+/// when the URL is a Rokfin one the probe can settle —
+/// the public HLS stream, or the specific error Python
+/// raises for auth_required / invalid_playback_id /
+/// no_content_url — and None when the chain should
+/// continue as if Rokfin were not involved.
+fn rokfin_playback_fallback(url: &str) -> Option<Result<ResolvedMedia, String>> {
+    if crate::discovery::rokfin_public_id_from_url(url).is_empty() {
+        return None;
+    }
+    let probe = crate::discovery::probe_rokfin_public_playback(url, 12);
+    if probe.ok && !probe.media_url.is_empty() {
+        return Some(Ok(ResolvedMedia {
+            url: probe.media_url,
+            media_type: None,
+            detected: false,
+            via_ytdlp: false,
+        }));
+    }
+    match probe.reason.as_str() {
+        "auth_required" => Some(Err(
+            "Rokfin playback requires a Rokfin login/cookies for this post".to_string(),
+        )),
+        "invalid_playback_id" => Some(Err(
+            "Rokfin playback is broken on the source site (invalid playback ID)".to_string(),
+        )),
+        "no_content_url" => Some(Err(
+            "Rokfin did not provide a playable stream URL for this post".to_string(),
+        )),
+        _ => None,
+    }
+}
+
 pub fn resolve_article_for_play(
     cfg: &crate::config::Config,
     article: &crate::Article,
@@ -640,7 +748,8 @@ pub fn resolve_article_for_play(
             via_ytdlp: false,
         });
     }
-    resolve_for_play(
+    resolve_for_play_with_config(
+        cfg,
         article.media_url.as_deref(),
         article.media_type.as_deref(),
         &article.url,
@@ -651,6 +760,25 @@ pub fn resolve_article_for_play(
 /// The full play-resolution chain, in Python's order. Runs on a
 /// worker thread: it may fetch the article page and run yt-dlp.
 pub fn resolve_for_play(
+    media_url: Option<&str>,
+    media_type: Option<&str>,
+    page_url: &str,
+    stored_html: Option<&str>,
+) -> Result<ResolvedMedia, String> {
+    resolve_for_play_with_config(
+        &crate::config::Config::default(),
+        media_url,
+        media_type,
+        page_url,
+        stored_html,
+    )
+}
+
+/// `resolve_for_play` with the caller's config (Audit 11
+/// A11-11: `playback_resolve_timeout_s` governs both the
+/// redirect resolve below and the yt-dlp CLI timeout).
+pub fn resolve_for_play_with_config(
+    cfg: &crate::config::Config,
     media_url: Option<&str>,
     media_type: Option<&str>,
     page_url: &str,
@@ -670,15 +798,38 @@ pub fn resolve_for_play(
     if let Some(m) = media_url.filter(|u| !u.is_empty())
         && is_playable_media(m, media_type)
     {
+        // Python's direct branch resolves redirects before
+        // load when `_should_resolve_direct_media_url` says
+        // so, bounded by playback_resolve_timeout_s and
+        // http_max_redirects (A11-11).
+        let url = if should_resolve_direct_media_url(m, media_type.unwrap_or("")) {
+            resolve_final_url(
+                m,
+                cfg.get_i64("http_max_redirects", 30),
+                playback_resolve_timeout_s(cfg),
+            )
+        } else {
+            m.to_string()
+        };
         return Ok(ResolvedMedia {
-            url: m.to_string(),
+            url,
             media_type: media_type.map(|s| s.to_string()),
             detected: false,
             via_ytdlp: false,
         });
     }
     if !page_url.is_empty() && is_ytdlp_supported(page_url) {
-        let stream = stream_url(page_url)?;
+        let stream = match stream_url_with_config(page_url, cfg) {
+            Ok(stream) => stream,
+            Err(e) => {
+                // After yt-dlp fails, Python probes Rokfin's
+                // public playback before giving up (A11-10).
+                if let Some(result) = rokfin_playback_fallback(page_url) {
+                    return result;
+                }
+                return Err(e);
+            }
+        };
         return Ok(ResolvedMedia {
             url: stream,
             media_type: None,
@@ -709,13 +860,18 @@ pub fn resolve_for_play(
         }
         // Last resort, mirroring Python's player: let yt-dlp's
         // generic extractor try the page before giving up.
-        if let Ok(stream) = stream_url(page_url) {
+        if let Ok(stream) = stream_url_with_config(page_url, cfg) {
             return Ok(ResolvedMedia {
                 url: stream,
                 media_type: None,
                 detected: true,
                 via_ytdlp: true,
             });
+        }
+        // yt-dlp failed: the Rokfin public probe gets its
+        // chance before the chain gives up (A11-10).
+        if let Some(result) = rokfin_playback_fallback(page_url) {
+            return result;
         }
         return Err("No playable media found for this article".to_string());
     }
@@ -792,6 +948,45 @@ mod tests {
     // live here covered the removed pure `resolve_ytdlp` helper.
     // Precedence is now `dependency::find_tool`'s and is covered
     // in crates/core/tests/dependency_parity.rs (Audit 8 Task 23).
+
+    #[test]
+    fn playback_timeouts_follow_the_config_value() {
+        // Audit 11 A11-11 (Python gui/player.py): the
+        // redirect-resolve timeout comes from
+        // playback_resolve_timeout_s (default 4.0); the yt-dlp
+        // CLI timeout is 8x clamped to 10-120 s.
+        let mut cfg = crate::config::Config::default();
+        assert_eq!(playback_resolve_timeout_s(&cfg), 4.0);
+        assert_eq!(ytdlp_cli_timeout(&cfg), std::time::Duration::from_secs(32));
+        cfg.set_path("playback_resolve_timeout_s", serde_json::json!(2.0));
+        assert_eq!(playback_resolve_timeout_s(&cfg), 2.0);
+        assert_eq!(ytdlp_cli_timeout(&cfg), std::time::Duration::from_secs(16));
+        // A string value parses the way Python's float() does.
+        cfg.set_path("playback_resolve_timeout_s", serde_json::json!("1"));
+        assert_eq!(playback_resolve_timeout_s(&cfg), 1.0);
+        // 8x of 1 s clamps up to the 10 s floor.
+        assert_eq!(ytdlp_cli_timeout(&cfg), std::time::Duration::from_secs(10));
+        // A huge value clamps to the 120 s ceiling.
+        cfg.set_path("playback_resolve_timeout_s", serde_json::json!(60.0));
+        assert_eq!(ytdlp_cli_timeout(&cfg), std::time::Duration::from_secs(120));
+        // Non-positive / unparseable fall back to the default.
+        cfg.set_path("playback_resolve_timeout_s", serde_json::json!(0));
+        assert_eq!(playback_resolve_timeout_s(&cfg), 4.0);
+        cfg.set_path("playback_resolve_timeout_s", serde_json::json!("soon"));
+        assert_eq!(playback_resolve_timeout_s(&cfg), 4.0);
+    }
+
+    #[test]
+    fn resolve_final_url_passes_non_http_through() {
+        // Python utils.resolve_final_url: only http(s) URLs
+        // are resolved; anything else returns unchanged
+        // without touching the network.
+        assert_eq!(
+            resolve_final_url("file:///tmp/ep.mp3", 30, 4.0),
+            "file:///tmp/ep.mp3"
+        );
+        assert_eq!(resolve_final_url("", 30, 4.0), "");
+    }
 
     #[test]
     fn detect_media_ytdlp_ext_types_match_python() {

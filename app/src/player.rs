@@ -610,6 +610,16 @@ fn resume_verifier(target_ms: i64, stream: &str) -> SeekVerifier {
 /// stream seek-supported, and starts the seek guard on the
 /// target actually requested (the backend's computed target,
 /// not the raw delta).
+/// Speak Python's seek-limit announcement when a relative
+/// seek cannot move (player.py:6100; Audit 11 A11-07):
+/// "Beginning of track" / "End of track".
+fn announce_seek_limit(media: &MediaBackend, delta_ms: i64) {
+    if let Some(limit) = blindrss_core::playback::seek_limit(media.tell(), media.length(), delta_ms)
+    {
+        crate::announce("general", limit.announcement());
+    }
+}
+
 fn begin_user_seek(state: &mut PlayerState, target_ms: i64) {
     state.stopped_needs_resume = false;
     state.seeked = true;
@@ -1919,7 +1929,9 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
         Rc::new(move || {
             let cfg =
                 blindrss_core::config::Config::load(&crate::config_path()).unwrap_or_default();
-            let target = m.seek(-cfg.get_i64("seek_back_ms", 10_000), SeekMode::FromCurrent);
+            let delta = -cfg.get_i64("seek_back_ms", 10_000);
+            announce_seek_limit(&m, delta);
+            let target = m.seek(delta, SeekMode::FromCurrent);
             begin_user_seek(&mut st.borrow_mut(), target);
             arm_seek_summary(&st);
         })
@@ -1931,7 +1943,9 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
             let cfg =
                 blindrss_core::config::Config::load(&crate::config_path()).unwrap_or_default();
             let back = cfg.get_i64("seek_back_ms", 10_000);
-            let target = m.seek(cfg.get_i64("seek_forward_ms", back), SeekMode::FromCurrent);
+            let delta = cfg.get_i64("seek_forward_ms", back);
+            announce_seek_limit(&m, delta);
+            let target = m.seek(delta, SeekMode::FromCurrent);
             begin_user_seek(&mut st.borrow_mut(), target);
             arm_seek_summary(&st);
         })
@@ -2357,11 +2371,13 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
                     code,
                 ) {
                     Some("seek_back") => {
+                        announce_seek_limit(&m, -seek_back_ms);
                         let target = m.seek(-seek_back_ms, SeekMode::FromCurrent);
                         begin_user_seek(&mut st_k.borrow_mut(), target);
                         true
                     }
                     Some("seek_forward") => {
+                        announce_seek_limit(&m, seek_fwd_ms);
                         let target = m.seek(seek_fwd_ms, SeekMode::FromCurrent);
                         begin_user_seek(&mut st_k.borrow_mut(), target);
                         true
@@ -2412,8 +2428,9 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
                 314 if !on_slider && !on_list => {
                     let cfg = blindrss_core::config::Config::load(&crate::config_path())
                         .unwrap_or_default();
-                    let target =
-                        m.seek(-cfg.get_i64("seek_back_ms", 10_000), SeekMode::FromCurrent);
+                    let delta = -cfg.get_i64("seek_back_ms", 10_000);
+                    announce_seek_limit(&m, delta);
+                    let target = m.seek(delta, SeekMode::FromCurrent);
                     begin_user_seek(&mut st_k.borrow_mut(), target);
                     arm_seek_summary(&st_k);
                     ev.skip(false);
@@ -2422,8 +2439,9 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
                     let cfg = blindrss_core::config::Config::load(&crate::config_path())
                         .unwrap_or_default();
                     let back = cfg.get_i64("seek_back_ms", 10_000);
-                    let target =
-                        m.seek(cfg.get_i64("seek_forward_ms", back), SeekMode::FromCurrent);
+                    let delta = cfg.get_i64("seek_forward_ms", back);
+                    announce_seek_limit(&m, delta);
+                    let target = m.seek(delta, SeekMode::FromCurrent);
                     begin_user_seek(&mut st_k.borrow_mut(), target);
                     arm_seek_summary(&st_k);
                     ev.skip(false);

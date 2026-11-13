@@ -710,6 +710,49 @@ pub fn live_status_text(snapshot: &PlaybackSnapshot) -> String {
 /// seek presses settles (`_compose_time_info`): elapsed,
 /// remaining and total, or elapsed only for a live stream /
 /// unknown length.
+/// Which end of the track a relative seek is stuck at
+/// (Audit 11 A11-07; Python gui/player.py
+/// `_announce_seek_limit`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeekLimit {
+    Beginning,
+    End,
+}
+
+impl SeekLimit {
+    /// The words Python speaks for this limit.
+    pub fn announcement(self) -> &'static str {
+        match self {
+            SeekLimit::Beginning => "Beginning of track",
+            SeekLimit::End => "End of track",
+        }
+    }
+}
+
+/// Whether a relative seek of `delta_ms` from `position_ms`
+/// in a track of `duration_ms` cannot move, and at which end
+/// (Python's seek_relative_ms refusal): a forward seek is
+/// refused once the position reaches the last second (the
+/// upper bound is duration - 1000, or duration - 1 for very
+/// short tracks); a backward seek is refused at position 0.
+/// An unknown duration refuses only the backward-at-0 case.
+pub fn seek_limit(position_ms: i64, duration_ms: i64, delta_ms: i64) -> Option<SeekLimit> {
+    if delta_ms < 0 && position_ms <= 0 {
+        return Some(SeekLimit::Beginning);
+    }
+    if delta_ms > 0 && duration_ms > 0 {
+        let upper = if duration_ms > 1000 {
+            duration_ms - 1000
+        } else {
+            (duration_ms - 1).max(0)
+        };
+        if position_ms >= upper {
+            return Some(SeekLimit::End);
+        }
+    }
+    None
+}
+
 pub fn seek_summary(position_ms: i64, duration_ms: i64) -> String {
     let elapsed = format_time_ms(position_ms);
     if duration_ms <= 0 {
@@ -730,6 +773,31 @@ mod tests {
             duration_ms: Some(600_000),
             ..PlaybackState::default()
         }
+    }
+
+    #[test]
+    fn seek_limit_announces_both_ends() {
+        // Audit 11 A11-07 (Python's _announce_seek_limit).
+        assert_eq!(seek_limit(0, 600_000, -10_000), Some(SeekLimit::Beginning));
+        assert_eq!(
+            seek_limit(0, 600_000, -10_000).unwrap().announcement(),
+            "Beginning of track"
+        );
+        assert_eq!(seek_limit(599_500, 600_000, 10_000), Some(SeekLimit::End));
+        assert_eq!(
+            seek_limit(599_500, 600_000, 10_000).unwrap().announcement(),
+            "End of track"
+        );
+        // Mid-track seeks move: no announcement.
+        assert_eq!(seek_limit(300_000, 600_000, -10_000), None);
+        assert_eq!(seek_limit(300_000, 600_000, 10_000), None);
+        // Unknown duration: only the beginning refuses.
+        assert_eq!(seek_limit(0, 0, -10_000), Some(SeekLimit::Beginning));
+        assert_eq!(seek_limit(5_000, 0, 10_000), None);
+        // Very short track: the last millisecond counts as the end.
+        assert_eq!(seek_limit(500, 500, 10_000), Some(SeekLimit::End));
+        // A zero delta is not a seek at all.
+        assert_eq!(seek_limit(0, 600_000, 0), None);
     }
 
     #[test]

@@ -6,6 +6,8 @@
 //! (Google Groups, Groups.io filtered, Discourse forums) need
 //! provider-side enumeration and are tracked in docs/PARITY.md.
 
+use serde_json::Value;
+
 /// Split a URL into (scheme, host, path, query) without a URL crate.
 /// Sufficient for the validated shapes handled here.
 fn split_url(url: &str) -> Option<(String, String, String, String)> {
@@ -816,6 +818,466 @@ fn is_youtube_host(host: &str) -> bool {
     host_matches(host, "youtube.com") || host_matches(host, "youtu.be")
 }
 
+/// Python `_clean_page_title`: collapse whitespace and drop
+/// the known useless titles.
+pub fn clean_page_title(title: &str) -> String {
+    let t = title.split_whitespace().collect::<Vec<_>>().join(" ");
+    let low = t.to_lowercase();
+    if t.is_empty()
+        || ["error", "not found", "403 forbidden", "404 not found"].contains(&low.as_str())
+        || low == "rokfin | the best way to monetize your content"
+    {
+        return String::new();
+    }
+    t
+}
+
+/// Python `_ROKFIN_PUBLIC_API_BASE`.
+const ROKFIN_PUBLIC_API_BASE: &str = "https://prod-api-v2.production.rokfin.com/api/v2/public";
+
+/// Python `_rokfin_public_id_from_url`: the public-API path
+/// id ("post/56518", "stream/18601", "stack/1176") for a
+/// Rokfin post/stream/stack URL, "" for anything else.
+pub fn rokfin_public_id_from_url(url: &str) -> String {
+    let Ok(parsed) = url::Url::parse(url.trim()) else {
+        return String::new();
+    };
+    let host = parsed.host_str().unwrap_or("").to_lowercase();
+    if !host_matches(&host, "rokfin.com") {
+        return String::new();
+    }
+    let parts: Vec<&str> = parsed
+        .path()
+        .split('/')
+        .map(|p| p.trim())
+        .filter(|p| !p.is_empty())
+        .collect();
+    if parts.len() < 2 {
+        return String::new();
+    }
+    let kind = parts[0].to_lowercase();
+    if !["post", "stream", "stack"].contains(&kind.as_str())
+        || !parts[1].chars().all(|c| c.is_ascii_digit())
+        || parts[1].is_empty()
+    {
+        return String::new();
+    }
+    format!("{kind}/{}", parts[1])
+}
+
+/// One JSON GET with a finite timeout; None on any failure or
+/// a non-200 status (Python's safe_requests_get call sites all
+/// fail closed to an empty result).
+fn get_json_timeout(url: &str, timeout_s: u64, headers: &[(&str, &str)]) -> Option<Value> {
+    let config = ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_secs(timeout_s.max(1))))
+        .user_agent(crate::http::user_agent())
+        .http_status_as_error(false)
+        .build();
+    let agent = ureq::Agent::new_with_config(config);
+    let mut req = agent.get(url);
+    for (k, v) in headers {
+        req = req.header(*k, *v);
+    }
+    let mut resp = req.call().ok()?;
+    if resp.status().as_u16() != 200 {
+        return None;
+    }
+    let bytes = resp
+        .body_mut()
+        .with_config()
+        .limit(4 * 1024 * 1024)
+        .read_to_vec()
+        .ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Python `_youtube_oembed_title`: the fast YouTube title
+/// lookup for direct video URLs.
+fn youtube_oembed_title(url: &str, timeout_s: u64) -> String {
+    let Ok(parsed) = url::Url::parse(url.trim()) else {
+        return String::new();
+    };
+    let host = parsed.host_str().unwrap_or("").to_lowercase();
+    if host.is_empty() || !is_youtube_host(&host) {
+        return String::new();
+    }
+    let timeout_s = timeout_s.clamp(2, 15);
+    let mut oembed =
+        url::Url::parse("https://www.youtube.com/oembed").expect("static oembed URL parses");
+    oembed
+        .query_pairs_mut()
+        .append_pair("url", url.trim())
+        .append_pair("format", "json");
+    let Some(data) = get_json_timeout(oembed.as_str(), timeout_s, &[]) else {
+        return String::new();
+    };
+    clean_page_title(data.get("title").and_then(|v| v.as_str()).unwrap_or(""))
+}
+
+/// What Python's `_rokfin_public_api_enrichment` returns.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RokfinEnrichment {
+    pub title: String,
+    pub source_subscribe_url: String,
+}
+
+/// Python `_rokfin_public_api_enrichment`: best-effort
+/// metadata from the Rokfin public API for post/stream/stack
+/// URLs (a /post/<id> record may actually live under
+/// /stream/<id>, so that fallback is tried too).
+pub fn rokfin_public_api_enrichment(url: &str, timeout_s: u64) -> RokfinEnrichment {
+    let mut out = RokfinEnrichment::default();
+    let rk_id = rokfin_public_id_from_url(url);
+    if rk_id.is_empty() {
+        return out;
+    }
+    let timeout_s = timeout_s.clamp(4, 30);
+    let (kind, _, num) = match rk_id.split_once('/') {
+        Some((k, n)) => (k.to_string(), (), n.to_string()),
+        None => return out,
+    };
+    let mut data = get_json_timeout(&format!("{ROKFIN_PUBLIC_API_BASE}/{rk_id}"), timeout_s, &[]);
+    if data.is_none() && kind == "post" {
+        data = get_json_timeout(
+            &format!("{ROKFIN_PUBLIC_API_BASE}/stream/{num}"),
+            timeout_s,
+            &[],
+        );
+    }
+    let Some(data) = data.filter(|d| d.is_object()) else {
+        return out;
+    };
+    let str_at = |v: &Value| v.as_str().unwrap_or("").trim().to_string();
+    let mut title = clean_page_title(&str_at(data.get("title").unwrap_or(&Value::Null)));
+    if title.is_empty() {
+        title = clean_page_title(&str_at(data.get("name").unwrap_or(&Value::Null)));
+    }
+    if title.is_empty() {
+        title = clean_page_title(&str_at(data.get("text").unwrap_or(&Value::Null)));
+    }
+    if title.is_empty() {
+        title = clean_page_title(
+            data.get("content")
+                .and_then(|c| c.get("contentTitle"))
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+        );
+    }
+    if title.is_empty() && kind == "stack" {
+        let items = data.get("content").and_then(|v| v.as_array());
+        match items {
+            Some(items) if !items.is_empty() => {
+                let first = &items[0];
+                let mut ft =
+                    clean_page_title(first.get("text").and_then(|v| v.as_str()).unwrap_or(""));
+                if ft.is_empty() {
+                    ft = clean_page_title(
+                        first
+                            .get("content")
+                            .and_then(|c| c.get("contentTitle"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(""),
+                    );
+                }
+                title = if ft.is_empty() {
+                    format!("Rokfin stack {num} ({} items)", items.len())
+                } else {
+                    ft
+                };
+            }
+            _ => title = format!("Rokfin stack {num}"),
+        }
+    }
+    out.title = title;
+    let username_of = |v: Option<&Value>| -> String {
+        let Some(v) = v else { return String::new() };
+        ["createdBy", "creator"]
+            .iter()
+            .filter_map(|k| v.get(k))
+            .filter_map(|u| u.get("username"))
+            .filter_map(|u| u.as_str())
+            .map(|s| s.trim().to_string())
+            .find(|s| !s.is_empty())
+            .unwrap_or_default()
+    };
+    let mut username = username_of(Some(&data));
+    if username.is_empty()
+        && kind == "stack"
+        && let Some(first) = data
+            .get("content")
+            .and_then(|v| v.as_array())
+            .and_then(|a| a.first())
+    {
+        username = username_of(Some(first));
+    }
+    if !username.is_empty() {
+        out.source_subscribe_url = format!("https://rokfin.com/{username}");
+    }
+    out
+}
+
+/// Python `resolve_quick_url_title`: a fast title lookup for
+/// common URL-only rows — YouTube oEmbed first, then the
+/// Rokfin public API. "" when neither knows the URL.
+pub fn resolve_quick_url_title(url: &str, timeout_s: u64) -> String {
+    let t = youtube_oembed_title(url, timeout_s);
+    if !t.is_empty() {
+        return t;
+    }
+    let rk_timeout = timeout_s.clamp(3, 8);
+    rokfin_public_api_enrichment(url, rk_timeout).title
+}
+
+/// Python `_resolve_quick_url_title_cached`: the same lookup
+/// behind a process-wide cache (Python's lru_cache, 4096).
+pub fn resolve_quick_url_title_cached(url: &str) -> String {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    static CACHE: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
+    let key = url.trim().to_string();
+    {
+        let guard = CACHE.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(map) = guard.as_ref()
+            && let Some(hit) = map.get(&key)
+        {
+            return hit.clone();
+        }
+    }
+    let title = resolve_quick_url_title(&key, 4).trim().to_string();
+    let mut guard = CACHE.lock().unwrap_or_else(|p| p.into_inner());
+    let map = guard.get_or_insert_with(HashMap::new);
+    if map.len() >= 4096 {
+        map.clear();
+    }
+    map.insert(key, title.clone());
+    title
+}
+
+/// Python `supports_quick_url_title`: true when
+/// `resolve_quick_url_title` has a cheap HTTP fast path for
+/// the URL (YouTube or Rokfin hosts only).
+pub fn supports_quick_url_title(url: &str) -> bool {
+    let raw = url.trim();
+    if raw.is_empty() {
+        return false;
+    }
+    let Ok(parsed) = url::Url::parse(raw) else {
+        return false;
+    };
+    let host = parsed.host_str().unwrap_or("").to_lowercase();
+    if host.is_empty() {
+        return false;
+    }
+    let host = host.strip_prefix("www.").unwrap_or(&host);
+    is_youtube_host(host) || host_matches(host, "rokfin.com")
+}
+
+/// Python `_rokfin_hls_url_from_public_metadata`: the
+/// playable HLS URL from Rokfin post/stream public metadata —
+/// the content URL, or the stream.v.rokfin playlist derived
+/// from the storyboard timeline URL.
+pub fn rokfin_hls_url_from_public_metadata(data: &Value) -> String {
+    let content = data.get("content").filter(|c| c.is_object());
+    let content_url = content
+        .and_then(|c| c.get("contentUrl"))
+        .and_then(|v| v.as_str())
+        .or_else(|| data.get("url").and_then(|v| v.as_str()))
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if !content_url.is_empty() && !content_url.eq_ignore_ascii_case("fake.m3u8") {
+        return content_url;
+    }
+    let timeline_url = content
+        .and_then(|c| c.get("timelineUrl"))
+        .and_then(|v| v.as_str())
+        .or_else(|| data.get("timelineUrl").and_then(|v| v.as_str()))
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if !timeline_url.is_empty()
+        && let Ok(parsed) = url::Url::parse(&timeline_url)
+    {
+        let parts: Vec<&str> = parsed.path().split('/').filter(|p| !p.is_empty()).collect();
+        if parts.len() == 2 && parts[1].eq_ignore_ascii_case("storyboard.vtt") {
+            return format!("https://stream.v.rokfin.com/{}.m3u8", parts[0]);
+        }
+    }
+    String::new()
+}
+
+/// The outcome of Python's `probe_rokfin_public_playback`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RokfinPlayback {
+    pub ok: bool,
+    pub media_url: String,
+    pub title: String,
+    pub source_subscribe_url: String,
+    pub http_headers: Vec<(String, String)>,
+    /// "auth_required" | "invalid_playback_id" |
+    /// "no_content_url" | "not_rokfin" | ... (Python's
+    /// reason strings).
+    pub reason: String,
+    pub detail: String,
+}
+
+/// Python `_rokfin_public_content_access_state`: the
+/// anonymous access state for one Rokfin content id.
+fn rokfin_public_content_access_state(
+    content_id: &str,
+    timeout_s: u64,
+) -> (Option<bool>, Option<bool>) {
+    let Ok(cid) = content_id.trim().parse::<i64>() else {
+        return (None, None);
+    };
+    let Some(data) = get_json_timeout(
+        &format!("{ROKFIN_PUBLIC_API_BASE}/content/{cid}"),
+        timeout_s,
+        &[],
+    ) else {
+        return (None, None);
+    };
+    let is_authorized = data.get("is_authorized").and_then(|v| v.as_bool());
+    let has_content = Some(data.get("content").is_some_and(|c| c.is_object()));
+    (is_authorized, has_content)
+}
+
+/// Python `probe_rokfin_public_playback`: the best-effort
+/// Rokfin playback probe used after yt-dlp failures. Plays
+/// public Rokfin HLS or reports why not (auth_required and
+/// friends). Blocking network work — call off the UI thread.
+pub fn probe_rokfin_public_playback(url: &str, timeout_s: u64) -> RokfinPlayback {
+    let mut out = RokfinPlayback::default();
+    let rk_id = rokfin_public_id_from_url(url);
+    if rk_id.is_empty() {
+        out.reason = "not_rokfin".to_string();
+        return out;
+    }
+    let timeout_s = timeout_s.clamp(4, 30);
+    let Some(data) = get_json_timeout(&format!("{ROKFIN_PUBLIC_API_BASE}/{rk_id}"), timeout_s, &[])
+    else {
+        out.reason = "metadata_error".to_string();
+        out.detail = "Rokfin public metadata could not be fetched".to_string();
+        return out;
+    };
+    if !data.is_object() {
+        out.reason = "metadata_parse_error".to_string();
+        out.detail = "Rokfin public metadata was not a JSON object".to_string();
+        return out;
+    }
+    out.title = clean_page_title(data.get("title").and_then(|v| v.as_str()).unwrap_or(""));
+    if out.title.is_empty() {
+        out.title = clean_page_title(
+            data.get("content")
+                .and_then(|c| c.get("contentTitle"))
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+        );
+    }
+    let username = ["createdBy", "creator"]
+        .iter()
+        .filter_map(|k| data.get(k))
+        .filter_map(|u| u.get("username"))
+        .filter_map(|u| u.as_str())
+        .map(|s| s.trim().to_string())
+        .find(|s| !s.is_empty())
+        .unwrap_or_default();
+    if !username.is_empty() {
+        out.source_subscribe_url = format!("https://rokfin.com/{username}");
+    }
+    let content_id = data
+        .get("content")
+        .and_then(|c| c.get("contentId"))
+        .or_else(|| data.get("contentId"))
+        .map(|v| match v {
+            Value::Number(n) => n.to_string(),
+            Value::String(s) => s.trim().to_string(),
+            _ => String::new(),
+        })
+        .unwrap_or_default();
+    if !content_id.is_empty() {
+        let (is_authorized, has_content) =
+            rokfin_public_content_access_state(&content_id, timeout_s.min(15));
+        if is_authorized == Some(false) && has_content == Some(false) {
+            out.reason = "auth_required".to_string();
+            out.detail =
+                "Rokfin reports anonymous playback is not authorized for this content".to_string();
+            return out;
+        }
+    }
+    let media_url = rokfin_hls_url_from_public_metadata(&data);
+    if media_url.is_empty() {
+        out.reason = "no_content_url".to_string();
+        out.detail = "Rokfin public metadata did not include a playable stream URL".to_string();
+        return out;
+    }
+    // Probe the stream itself the way Python does: a ranged
+    // GET that must answer 200/206 with HLS-looking content.
+    let probe_headers: Vec<(String, String)> = vec![
+        ("Referer".to_string(), "https://rokfin.com/".to_string()),
+        ("Origin".to_string(), "https://rokfin.com".to_string()),
+        ("Accept".to_string(), "*/*".to_string()),
+    ];
+    let config = ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_secs(timeout_s.clamp(1, 15))))
+        .user_agent(crate::http::user_agent())
+        .http_status_as_error(false)
+        .build();
+    let agent = ureq::Agent::new_with_config(config);
+    let mut req = agent.get(&media_url).header("Range", "bytes=0-1024");
+    for (k, v) in &probe_headers {
+        req = req.header(k.as_str(), v.as_str());
+    }
+    match req.call() {
+        Ok(mut resp) => {
+            use ureq::ResponseExt as _;
+            let status = resp.status().as_u16();
+            let effective = resp.get_uri().to_string();
+            let content_type = resp
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_lowercase();
+            let body = resp
+                .body_mut()
+                .with_config()
+                .limit(512)
+                .read_to_vec()
+                .unwrap_or_default();
+            let body_prefix = String::from_utf8_lossy(&body).to_lowercase();
+            let looks_hls = content_type.contains("mpegurl")
+                || body_prefix.trim_start().starts_with("#extm3u")
+                || effective.to_lowercase().ends_with(".m3u8");
+            if [200, 206].contains(&status) && looks_hls {
+                out.ok = true;
+                out.media_url = effective;
+                out.http_headers = probe_headers;
+                return out;
+            }
+            if [401, 403].contains(&status) {
+                out.reason = "auth_required".to_string();
+                out.detail = format!("Rokfin stream returned HTTP {status}");
+                return out;
+            }
+            if status == 404 && body_prefix.contains("invalid playback id") {
+                out.reason = "invalid_playback_id".to_string();
+                out.detail = "Rokfin returned an invalid playback ID for this post".to_string();
+                return out;
+            }
+            out.reason = "stream_http_error".to_string();
+            out.detail = format!("Rokfin stream probe returned HTTP {status}");
+            out
+        }
+        Err(e) => {
+            out.reason = "stream_probe_error".to_string();
+            out.detail = e.to_string();
+            out
+        }
+    }
+}
+
 /// Python `_looks_like_feed_url`: feed-shaped path or a
 /// feed-selecting query parameter.
 pub fn looks_like_feed_url(url: &str) -> bool {
@@ -1480,4 +1942,82 @@ pub fn detect_page_feeds(url: &str) -> Result<Vec<DetectedFeed>, PageFetchError>
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn audit11_clean_page_title_drops_useless_titles() {
+        assert_eq!(clean_page_title("  A  Real\n Title "), "A Real Title");
+        assert_eq!(clean_page_title("Error"), "");
+        assert_eq!(clean_page_title("404 Not Found"), "");
+        assert_eq!(
+            clean_page_title("Rokfin | The best way to monetize your content"),
+            ""
+        );
+        assert_eq!(clean_page_title("   "), "");
+    }
+
+    #[test]
+    fn audit11_rokfin_public_id_from_url() {
+        assert_eq!(
+            rokfin_public_id_from_url("https://rokfin.com/post/56518"),
+            "post/56518"
+        );
+        assert_eq!(
+            rokfin_public_id_from_url("https://www.rokfin.com/stream/18601?x=1"),
+            "stream/18601"
+        );
+        assert_eq!(
+            rokfin_public_id_from_url("https://rokfin.com/stack/1176"),
+            "stack/1176"
+        );
+        assert_eq!(rokfin_public_id_from_url("https://rokfin.com/post/abc"), "");
+        assert_eq!(rokfin_public_id_from_url("https://rokfin.com/about"), "");
+        assert_eq!(
+            rokfin_public_id_from_url("https://example.com/post/56518"),
+            ""
+        );
+        assert_eq!(rokfin_public_id_from_url("not a url"), "");
+    }
+
+    #[test]
+    fn audit11_supports_quick_url_title_hosts() {
+        assert!(supports_quick_url_title(
+            "https://www.youtube.com/watch?v=abc"
+        ));
+        assert!(supports_quick_url_title("https://youtu.be/abc"));
+        assert!(supports_quick_url_title("https://rokfin.com/post/56518"));
+        assert!(!supports_quick_url_title("https://vimeo.com/123"));
+        assert!(!supports_quick_url_title(""));
+        assert!(!supports_quick_url_title("not a url"));
+    }
+
+    #[test]
+    fn audit11_rokfin_hls_url_from_public_metadata() {
+        // A real content URL wins.
+        let data = json!({"content": {"contentUrl": "https://cdn.example.com/x.m3u8"}});
+        assert_eq!(
+            rokfin_hls_url_from_public_metadata(&data),
+            "https://cdn.example.com/x.m3u8"
+        );
+        // fake.m3u8 falls through to the storyboard-derived
+        // stream.v.rokfin playlist.
+        let data = json!({"content": {
+            "contentUrl": "fake.m3u8",
+            "timelineUrl": "https://v.rokfin.com/18601/storyboard.vtt"
+        }});
+        assert_eq!(
+            rokfin_hls_url_from_public_metadata(&data),
+            "https://stream.v.rokfin.com/18601.m3u8"
+        );
+        // Nothing usable: empty.
+        let data = json!({"content": {"contentUrl": "fake.m3u8"}});
+        assert_eq!(rokfin_hls_url_from_public_metadata(&data), "");
+        let data = json!({});
+        assert_eq!(rokfin_hls_url_from_public_metadata(&data), "");
+    }
 }

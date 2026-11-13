@@ -6,6 +6,19 @@ as `0.1.2-0.1.3`. Each release's section below is its Forgejo release note,
 taken from this file by the release workflow. The in-app updater shows the
 same text.
 
+## 0.1.101
+
+- The YouTube Account dialog (Tools menu) is now the full account manager: sign out, copy or open the sign-in code while one is waiting, choose the category your subscriptions go into, toggle automatic updates, and update the account right away — not just sign in.
+- Settings path fields (download folder, playback cache, cookies file, backup folder, and the FFmpeg, FFprobe and yt-dlp paths) now have Browse buttons, and the media tools page shows the detected path for each tool.
+- The YouTube settings page can import cookies from your browser with a guided flow: install the export extension, export your cookies, and BlindRSS finds the export in your Downloads.
+- Video Search has a Filter Results choice that narrows the results to one site without searching again, and results that only had a web address for a title now pick up their real title in the background.
+- Rokfin links that yt-dlp cannot play now try Rokfin's public stream directly, and tell you when a post needs a Rokfin login.
+- The player now says "Beginning of track" or "End of track" when a seek cannot move any further.
+- The notifications feed picker now works the way it reads: checked feeds send notifications, with Check All and Uncheck All buttons.
+- The About dialog has buttons for the author's GitHub, the repository, and the changelog.
+- The article right-click menu now says Add to Favorites or Remove from Favorites, matching what will actually happen.
+- Playback now honours the playback_resolve_timeout_s setting for redirect lookups and yt-dlp timeouts.
+
 ## 0.1.100
 
 - The Rich Full-Text View no longer shows video cards with "Watch on YouTube" links, "Related Roundup" footer lines, "[Read: ...]" and "[Watch: ...]" recommendation cards, newsletter promos, or Axios photo captions mid-article. Videos now show as a single playable embed.

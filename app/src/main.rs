@@ -10645,7 +10645,16 @@ fn main() {
                 menu.append_submenu(sub.build(), "Chapter Links", "");
             }
             if article.is_some() {
-                menu.append(M_FAVORITE, "Toggle &Favorite", "", ItemKind::Normal);
+                // Python names the item by the article's
+                // current state (mainframe.py:5792; Audit 11
+                // A11-12): "Add to Favorites" / "Remove from
+                // Favorites", never "Toggle Favorite".
+                let fav_label = if article.as_ref().is_some_and(|a| a.is_favorite) {
+                    "Remove from &Favorites"
+                } else {
+                    "Add to &Favorites"
+                };
+                menu.append(M_FAVORITE, fav_label, "", ItemKind::Normal);
                 if has_history {
                     menu.append(M_HISTORY, "View &History...", "", ItemKind::Normal);
                 }
@@ -14146,6 +14155,106 @@ mod ui_parity_tests {
         assert!(
             help.contains("pub fn show_changelog"),
             "the changelog viewer is missing"
+        );
+    }
+
+    #[test]
+    fn audit11_youtube_account_dialog_is_the_full_dialog() {
+        // A11-01: Python's YouTubeAccountDialog — status,
+        // Sign In / Open Sign-in Page / Copy Code / Sign Out,
+        // the auto-update check box saved on toggle, the
+        // category with Change Category..., Update Account
+        // Now, Close. Guards against shrinking back to the
+        // sign-in-only dialog.
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let dialogs = std::fs::read_to_string(src_dir.join("dialogs.rs")).unwrap();
+        for needle in [
+            "\"YouTube Account\"",
+            "YouTube account status",
+            "Sign In...",
+            "Open Sign-in Page",
+            "Copy Code",
+            "Sign Out",
+            "Update subscriptions and recommendations automatically (every 15 minutes)",
+            "youtube_account_auto_add",
+            "YouTube account category:",
+            "Change Category...",
+            "Update Account Now",
+            "Signed out. Feeds already added stay in BlindRSS.",
+            "fn youtube_account_sync",
+            "fn pick_youtube_category",
+        ] {
+            assert!(dialogs.contains(needle), "dialogs.rs missing {needle}");
+        }
+    }
+
+    #[test]
+    fn audit11_settings_browse_buttons_detected_labels_and_cookies_import() {
+        // A11-02/03/04: Browse buttons with accessible names
+        // on the settings path fields, the "Detected ..."
+        // readouts filled off the UI thread, and the YouTube
+        // page's guided cookies import.
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let settings = std::fs::read_to_string(src_dir.join("settings.rs")).unwrap();
+        for needle in [
+            "fn add_field_browse",
+            "Browse for download folder",
+            "Browse for playback cache folder",
+            "Browse for cookies file",
+            "Browse for automatic backup folder",
+            "&tools_group, \"FFmpeg\"",
+            "&tools_group, \"FFprobe\"",
+            "&tools_group, \"yt-dlp\"",
+            "fn add_detected_label",
+            "Import from browser...",
+            "fn show_import_cookies_from_browser",
+            "Get cookies.txt LOCALLY",
+            "Find my export",
+        ] {
+            assert!(settings.contains(needle), "settings.rs missing {needle}");
+        }
+    }
+
+    #[test]
+    fn audit11_search_filter_about_exclude_and_seek_limit_wiring() {
+        // A11-05/06/08/09 in dialogs.rs, A11-07 in player.rs,
+        // A11-12 in main.rs.
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let dialogs = std::fs::read_to_string(src_dir.join("dialogs.rs")).unwrap();
+        for needle in [
+            "Filter Results:",
+            "Filter results by site",
+            "resolve_quick_url_title_cached",
+            "supports_quick_url_title",
+            "Follow me on GitHub (@serrebidev)",
+            "Visit Repository",
+            "View Changelog",
+            "Feeds are checked by default.",
+            "Check All",
+            "Uncheck All",
+            "No feeds available.",
+        ] {
+            assert!(dialogs.contains(needle), "dialogs.rs missing {needle}");
+        }
+        let player = std::fs::read_to_string(src_dir.join("player.rs")).unwrap();
+        assert!(
+            player.contains("fn announce_seek_limit"),
+            "player.rs missing the seek-limit announcer"
+        );
+        assert!(
+            player.matches("announce_seek_limit(&m,").count() >= 4,
+            "seek-limit announcement is not wired at the seek sites"
+        );
+        let main = std::fs::read_to_string(src_dir.join("main.rs")).unwrap();
+        let impl_src = main.split("mod ui_parity_tests").next().unwrap();
+        assert!(impl_src.contains("Add to &Favorites"), "Add label missing");
+        assert!(
+            impl_src.contains("Remove from &Favorites"),
+            "Remove label missing"
+        );
+        assert!(
+            !impl_src.contains("Toggle &Favorite"),
+            "the state-blind Toggle label is back"
         );
     }
 }
