@@ -56,12 +56,24 @@ mod imp {
 
     static OLD_PROC: AtomicUsize = AtomicUsize::new(0);
     static LAST_FOCUS: AtomicUsize = AtomicUsize::new(0);
+    // Frame hwnd awaiting the deferred re-assertion of LAST_FOCUS.
+    // wx can settle its default activation focus after this
+    // subclass returns (async activation queues), clobbering the
+    // immediate restore; the app drain re-asserts once, after
+    // activation has settled.
+    static PENDING_FRAME: AtomicUsize = AtomicUsize::new(0);
     static SENDER: OnceLock<Mutex<Option<std::sync::mpsc::Sender<crate::RefreshMsg>>>> =
         OnceLock::new();
     static APPLIED: Mutex<Option<(u32, u32)>> = Mutex::new(None);
 
-    fn keyboard_activation(wparam: usize) -> bool {
-        wparam & 0xffff == 1 && (wparam >> 16) & 0xffff == 0
+    // WA_ACTIVE (low word 1) is "activated by anything other than a
+    // mouse click" -- keyboard (Alt+Tab), programmatic raise. The
+    // high word carries minimized state, not input source, so it
+    // must not gate this: a window restored from minimized arrives
+    // with the high word set and still needs its focus back. The
+    // restore guard checks IsIconic itself.
+    fn active_not_mouse(wparam: usize) -> bool {
+        wparam & 0xffff == 1
     }
 
     fn remember_focus(hwnd: isize) {
@@ -111,13 +123,14 @@ mod imp {
         lparam: isize,
     ) -> isize {
         // Save the exact native descendant before wx deactivation can lose it.
-        // Restore only keyboard activation; mouse clicks choose their own target.
+        // Restore only non-mouse activation; mouse clicks choose their own target.
         if (msg == WM_ACTIVATE && wparam & 0xffff == 0)
             || (msg == WM_SYSCOMMAND && wparam & 0xfff0 == SC_MINIMIZE)
         {
             remember_focus(hwnd);
         }
-        let restore_to = if msg == WM_ACTIVATE && keyboard_activation(wparam) {
+        let restore_to = if msg == WM_ACTIVATE && active_not_mouse(wparam) {
+            PENDING_FRAME.store(hwnd as usize, Ordering::SeqCst);
             LAST_FOCUS.load(Ordering::SeqCst) as isize
         } else {
             0
@@ -220,6 +233,21 @@ mod imp {
         Err(ApplyError::Taken)
     }
 
+    /// Deferred half of the activation restore (see PENDING_FRAME):
+    /// the app drain calls this within one tick of a keyboard-
+    /// activation. Returns true when a frame was awaiting the
+    /// re-assertion. The restore's own guards (foreground,
+    /// visible, enabled, not minimized) keep this from stealing
+    /// focus after a fast Alt+Tab away or a mouse click.
+    pub fn consume_activation_restore() -> bool {
+        let frame = PENDING_FRAME.swap(0, Ordering::SeqCst) as isize;
+        if frame == 0 {
+            return false;
+        }
+        restore_activation_focus(frame, LAST_FOCUS.load(Ordering::SeqCst) as isize);
+        true
+    }
+
     pub fn foreground_is(hwnd: isize) -> bool {
         user32::<GetForegroundWindowFn>("GetForegroundWindow")
             .map(|f| unsafe { f() } == hwnd)
@@ -236,20 +264,26 @@ mod imp {
 
     #[cfg(test)]
     mod tests {
-        use super::keyboard_activation;
+        use super::active_not_mouse;
 
         #[test]
         fn activation_preserves_mouse_targets_and_skips_minimized_windows() {
-            assert!(keyboard_activation(1));
-            for message in [0, 2, 1 | (1 << 16), 2 | (1 << 16), 0xffff] {
-                assert!(!keyboard_activation(message));
+            // WA_ACTIVE (1) regardless of the minimized-state high
+            // word restores; WA_CLICKACTIVE (2) and WA_INACTIVE (0)
+            // never poke focus.
+            assert!(active_not_mouse(1));
+            assert!(active_not_mouse(1 | (1 << 16)));
+            for message in [0, 2, 2 | (1 << 16), 0xffff & !(1 | (1 << 16))] {
+                assert!(!active_not_mouse(message));
             }
         }
     }
 }
 
 #[cfg(target_os = "windows")]
-pub use imp::{ApplyError, apply, foreground_is, install, set_foreground};
+pub use imp::{
+    ApplyError, apply, consume_activation_restore, foreground_is, install, set_foreground,
+};
 
 #[cfg(not(target_os = "windows"))]
 #[allow(dead_code)]
@@ -266,6 +300,12 @@ pub fn install(_hwnd: isize, _tx: std::sync::mpsc::Sender<crate::RefreshMsg>) {}
 #[allow(dead_code)]
 pub fn apply(_hwnd: isize, _accel: &str) -> Result<Option<(u32, u32)>, ApplyError> {
     Ok(None)
+}
+
+#[cfg(not(target_os = "windows"))]
+#[allow(dead_code)]
+pub fn consume_activation_restore() -> bool {
+    false
 }
 
 #[cfg(not(target_os = "windows"))]

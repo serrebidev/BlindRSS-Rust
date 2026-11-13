@@ -10986,6 +10986,13 @@ fn main() {
         let tx_tick = tx.clone();
         let auto_ft_tick = act_fulltext.clone();
         timer.on_tick(move |_| {
+            // Deferred half of the Alt+Tab focus restore (see
+            // hotkey.rs PENDING_FRAME): wx can settle its default
+            // tree focus after the subclass's immediate restore,
+            // so re-assert the remembered descendant once the
+            // activation has settled. A no-op without a pending
+            // activation or when the window is not foreground.
+            let _ = hotkey::consume_activation_restore();
             if frame_tick.is_shown() && frame_tick.is_iconized() {
                 let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
                 if cfg.get_bool("minimize_to_tray", true) {
@@ -13487,6 +13494,19 @@ mod ui_parity_tests {
                     3 => {
                         if !list.has_focus() {
                             failures.borrow_mut().push("list fell back to All Articles");
+                        }
+                        // A late wx default-focus clobber is repaired
+                        // by the deferred half of the restore.
+                        tree.set_focus();
+                        if !hotkey::consume_activation_restore() {
+                            failures
+                                .borrow_mut()
+                                .push("deferred restore had nothing pending");
+                        }
+                        if !list.has_focus() {
+                            failures
+                                .borrow_mut()
+                                .push("deferred restore missed the list");
                         }
                         reader.set_focus();
                         reader.set_selection(6, 15);

@@ -8702,3 +8702,16 @@ resume-backoff config key remains for compatibility. Regression coverage:
 skip_policy_* tests pin the end-of-range target and
 skip_lands_at_padded_end_not_beyond_speech_onset pins a real episode
 range.
+
+## ALT+Tab focus follow-up (2026-11-12)
+
+The activation restore only ran inside the WM_ACTIVATE handler. Windows
+activation is asynchronous across queues, so wx could settle its default
+tree focus after the restore and the first fix appeared intermittent.
+The subclass now also records the frame as pending restore, and the
+150 ms drain re-asserts the remembered descendant once activation has
+settled, under the same foreground/visible/enabled/not-iconic guards.
+The WA_ACTIVE test no longer treats the minimized-state high word as an
+input source; restoring from minimized works again. The native ignored
+test now injects a late tree-focus clobber and proves the deferred half
+repairs it.

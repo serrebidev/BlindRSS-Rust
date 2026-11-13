@@ -6,6 +6,10 @@ as `0.1.2-0.1.3`. Each release's section below is its Forgejo release note,
 taken from this file by the release workflow. The in-app updater shows the
 same text.
 
+## 0.1.97
+
+- Alt+Tab now keeps your place again. The last fix only restored focus at the moment Windows switched windows back, and wx could reset it to the All Articles tree right after. Focus is now also restored again a moment later, once the switch has settled.
+
 ## 0.1.96
 
 - Skip Silence no longer clips the first words after a pause. Skips now land exactly where the silence ends instead of several hundred milliseconds into the next word.
