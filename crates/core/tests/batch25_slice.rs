@@ -362,6 +362,28 @@ fn sky_akamai_wall_is_gate_not_article() {
 }
 
 #[test]
+fn techcrunch_footer_boilerplate_removed() {
+    let text = "Muse can now place calls to U.S. businesses.\nWhen you purchase through links in our articles, we may earn a small commission. This doesn't affect our editorial independence.\nSarah has worked as a reporter for TechCrunch since August 2011. She joined the company after having previously spent over three years at ReadWriteWeb.\nYou can contact or verify outreach from Sarah by emailing [email protected] or via encrypted message at sarahperez.01 on Signal.\nView Bio\n2027\n**San Francisco**\n**Get an Early Peek at the Next TechCrunch Disrupt**\n## Most Popular";
+    let cleaned = pp(
+        text,
+        "https://techcrunch.com/2026/11/12/muse-can-now-place-calls-to-u-s-businesses-if-you-pay/",
+    );
+    assert_eq!(cleaned, "Muse can now place calls to U.S. businesses.");
+    assert!(!cleaned.contains("purchase through links"));
+    assert!(!cleaned.contains("has worked as a reporter"));
+    assert!(!cleaned.contains("contact or verify outreach"));
+    assert!(!cleaned.contains("View Bio"));
+    assert!(!cleaned.contains("Most Popular"));
+    // A legitimate mention elsewhere keeps its body.
+    let other = "Sarah spoke about the launch at the conference.\nSecond real paragraph.";
+    assert_eq!(
+        pp(other, "https://techcrunch.com/2026/11/12/story/"),
+        "Sarah spoke about the launch at the conference.\n\nSecond real paragraph."
+    );
+    assert_eq!(pp(other, "https://example.com/story"), other);
+}
+
+#[test]
 fn recirculation_label_lines_dropped() {
     let text = "Real paragraph one.\nYou May Also Like\nReal paragraph two.";
     assert_eq!(

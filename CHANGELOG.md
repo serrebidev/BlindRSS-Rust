@@ -6,6 +6,10 @@ as `0.1.2-0.1.3`. Each release's section below is its Forgejo release note,
 taken from this file by the release workflow. The in-app updater shows the
 same text.
 
+## 0.1.99
+
+- TechCrunch articles no longer end with the affiliate disclosure ("When you purchase through links ...") and the trailing author bio with its "View Bio" line in full text.
+
 ## 0.1.98
 
 - Atlantic articles no longer show the in-article recommendation cards such as "[Read: Is Marco Rubio the happiest Cabinet member?]" in full text.

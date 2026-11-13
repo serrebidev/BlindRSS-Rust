@@ -1175,6 +1175,60 @@ pub fn strip_proxy_trailing_boilerplate(text: &str) -> String {
     text.to_string()
 }
 
+static TECHCRUNCH_AFFILIATE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)When you purchase through links in our articles, we may earn a small commission\.\s*This doesn.t affect our editorial independence\.?").unwrap()
+});
+static TECHCRUNCH_CONTACT_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)You can contact or verify outreach from").unwrap());
+static TECHCRUNCH_BIO_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)has (?:worked|been)(?: as [a-z ]+)? (?:at|with|for) TechCrunch|has worked as a reporter for TechCrunch|joined TechCrunch").unwrap()
+});
+
+/// TechCrunch (footer observed on
+/// techcrunch.com/2026/11/12/muse-can-now-place-calls...): the
+/// affiliate disclosure ("When you purchase through links ...")
+/// plus the author bio ("<Name> has worked as a reporter for
+/// TechCrunch since ...", "You can contact or verify outreach
+/// from ... on Signal.", "View Bio") lands at the bottom of
+/// full text. Drop the disclosure paragraph wherever it appears
+/// and cut everything from the author bio start to the end, so
+/// the events / "Most Popular" rail that trails the bio goes
+/// with it. The cut is anchored on the contact sentence, which
+/// normal prose never contains, so an article that merely
+/// mentions a journalist keeps its body.
+pub fn strip_techcrunch_boilerplate(text: &str) -> String {
+    let t = TECHCRUNCH_AFFILIATE_RE.replace_all(text, "").to_string();
+    let paras = split_paragraphs(&t);
+    if paras.is_empty() {
+        return String::new();
+    }
+    let mut cut: Option<usize> = None;
+    for (i, p) in paras.iter().enumerate() {
+        if TECHCRUNCH_CONTACT_RE.is_match(p) {
+            cut = Some(i);
+            if i >= 1 && TECHCRUNCH_BIO_RE.is_match(&paras[i - 1]) {
+                cut = Some(i - 1);
+            }
+            break;
+        }
+    }
+    if cut.is_none() {
+        for (i, p) in paras.iter().enumerate() {
+            if TECHCRUNCH_BIO_RE.is_match(p) && p.chars().count() <= 800 {
+                cut = Some(i);
+                break;
+            }
+        }
+    }
+    let end = cut.unwrap_or(paras.len());
+    let kept: Vec<String> = paras[..end]
+        .iter()
+        .filter(|p| !p.trim().eq_ignore_ascii_case("View Bio"))
+        .cloned()
+        .collect();
+    kept.join("\n\n").trim().to_string()
+}
+
 static LINK_LIST_SENTENCE_END_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"[.!?…](\s|$)").unwrap());
 /// Python `_LINK_LIST_MAX_LINE_LEN`.
@@ -1257,6 +1311,8 @@ pub fn postprocess_extracted_text(text: &str, url: &str, published: &str) -> Str
         strip_windowslatest_boilerplate(&t)
     } else if host_matches(url, "wired.com") {
         strip_wired_boilerplate(&t)
+    } else if host_matches(url, "techcrunch.com") {
+        strip_techcrunch_boilerplate(&t)
     } else if host_matches(url, "theatlantic.com") {
         strip_atlantic_boilerplate(&t)
     } else if host_matches(url, "news.sky.com") {
