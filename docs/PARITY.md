@@ -8715,3 +8715,123 @@ The WA_ACTIVE test no longer treats the minimized-state high word as an
 input source; restoring from minimized works again. The native ignored
 test now injects a late tree-focus clobber and proves the deferred half
 repairs it.
+
+## Audit 11 — Python v2.6.1 comparison (2026-11-13, Brandon's order)
+
+Baselines: Python `c196113` (v2.6.1) at `C:/Users/admin/git/BlindRSS`;
+Rust `17a82df` (v0.1.99). Method: Python's 16 commits since the Audit 8
+baseline (`2a7eeb3`) read one by one; mechanical sweeps of every
+`core/config.py` default key, every `core/shortcuts.py` command id,
+every translatable label in `gui/dialogs.py`, `gui/mainframe.py`,
+`gui/player.py` and the tree/list/content context menus, every Python
+dialog class, and the discovery source list, each checked against
+`app/src` and `crates/core/src`; then each hit was read in both trees.
+Labels that differ only in wording, the removed Accessible Browser
+(`view.accessible_browser`, Batch 40) and the Deleted dialog (recorded
+deviation for Python's Deleted view) are not findings.
+
+Clean sweeps: every config key except `playback_resolve_timeout_s`
+(A11-11) is read by Rust (`translation_<provider>_*` keys through the
+format! paths in `translate.rs`; `max_cached_views` and
+`auto_download_*` are recorded non-gaps); all 69 live shortcut command
+ids are registered and dispatched; every discovery source in Python's
+Add Feed list is present.
+
+Python changes since Audit 8:
+- v2.6.1 #58 (timed-out yt-dlp runs leave 30 MB `%TEMP%\_MEI*`
+  folders) and v2.5.9 #150: ALREADY PORTED — `dependency.rs`
+  `end_tool_tree` / `end_onefile_tree` (Python `_end_onefile_tree`).
+  The reconciliation note above calling #150 "NOT APPLICABLE" is
+  superseded: the folders belong to the yt-dlp.exe PyInstaller
+  bootloader, which Rust launches too, and the port is in place.
+- v2.6.0 Forgejo updater: already Rust's design (ship-shape, Forgejo).
+- v2.5.9 #148, #151: ported (see the v2.5.8 -> v2.5.9 note above).
+- `portable.spec` VLC-plugin fix, release/CI commits: packaging only,
+  not applicable.
+
+Open findings (to port, in this order):
+
+- **A11-01 — P2: YouTube Account dialog is sign-in only.** Python
+  `gui/dialogs.py:9050` `YouTubeAccountDialog`: read-only status text
+  ("YouTube account status"), Sign In..., Open Sign-in Page, Copy Code,
+  Sign Out (`_on_sign_out` :9229 clears `youtube_account_refresh_token`,
+  says "Signed out. Feeds already added stay in BlindRSS."), the
+  "Update subscriptions and recommendations automatically (every 15
+  minutes)" check box (`youtube_account_auto_add`, saved on toggle),
+  the account category field plus Change Category..., Update Account
+  Now (`_on_sync`), Close. Rust `app/src/dialogs.rs:3926`
+  `show_youtube_signin` only runs the device-code flow with a Cancel
+  button: no sign-out, no copy/open, no category or auto-update
+  control, no manual sync. Port the full dialog; Tools > YouTube
+  Account opens it.
+- **A11-02 — P2: Settings path fields have no Browse buttons.** Python
+  gives Browse... (folder or file dialog) to Download Path
+  (`dialogs.py:1306`), the YouTube playback cache folder (:1579), the
+  yt-dlp cookies file (:1530, hint "Path to a cookies.txt file"), the
+  automatic backup folder (:1826) and each media tool path
+  (FFmpeg/FFprobe/yt-dlp, :3207, accessible name "{tool} executable
+  path override"). Rust `app/src/settings.rs` builds them with plain
+  `add_field` (tool paths :1252, download path :1279). Add Browse
+  buttons with MSAA names ("Browse for download folder", ...), as
+  `add_sound_row` already does for sounds.
+- **A11-03 — P2: Media tools show no detected path.** Python
+  `dialogs.py:3212` adds a "Detected {tool}: checking…" label under each
+  tool path and fills it from `_detect_media_tools_async` on a worker
+  (resolved path, or not found). Rust has no readout. Fill it from
+  `dependency::find_tool` on a worker; never on the UI thread.
+- **A11-04 — P2: YouTube page lacks "Import from browser...".**
+  Python `dialogs.py:1533` / `_on_import_cookies_from_browser` :2846:
+  guided cookies.txt export (steps text, "Open extension page" for
+  Get cookies.txt LOCALLY, "Find my export" scans Downloads for the
+  newest export, "Choose file..." fallback), then imports it and sets
+  `ytdlp_cookies_file`. Rust Settings has only the path field; Tools >
+  Import Site Cookies is a different flow. Port the button and flow.
+- **A11-05 — P2: Global search has no Filter Results choice.** Python
+  `dialogs.py:6631` `YtdlpGlobalSearchDialog`: "Filter Results:"
+  choice (accessible name "Filter results by site") between Search
+  Sites and Sort by, narrowing the shown rows to one site without a new
+  search. Rust `app/src/dialogs.rs:1813` has Search Sites and Sort by
+  only. Port it; keep control order Search Sites, Filter Results,
+  Sort by.
+- **A11-06 — P3: About dialog buttons.** Python `dialogs.py:8184`:
+  Follow me on GitHub (@serrebidev), Visit Repository, View Changelog,
+  Close. Rust `app/src/dialogs.rs:1194` shows text lines and OK only.
+  Add the three buttons (View Changelog reuses `show_changelog`; the
+  repository button opens the Forgejo repo, the code's source of
+  truth).
+- **A11-07 — P3: Seek at the track edge is silent.** Python
+  `player.py:6858` `_announce_seek_limit` speaks "Beginning of track"
+  / "End of track" (interrupt) when a seek cannot move. Rust
+  `player.rs` says nothing. Announce through `crate::announce`.
+- **A11-08 — P3: Exclude-from-notifications dialog semantics.** Python
+  `dialogs.py:617`: list named "Feeds (checked feeds send
+  notifications)" — checked = notify — plus Check All / Uncheck All,
+  a selection status line and "No feeds available." when empty. Rust
+  `dialogs.rs:3874` inverts it ("Checked feeds will not send
+  notifications") and has no bulk buttons. Match Python; the stored
+  `windows_notifications_excluded_feeds` list stays the same shape.
+- **A11-09 — P3: Search results keep placeholder titles.** Python
+  `core/discovery.py:1639-1723` `resolve_quick_url_title` /
+  `supports_quick_url_title` (YouTube oEmbed, HTML `<title>`, cached,
+  pooled) upgrades URL-only result titles
+  (`dialogs.py:6975`, :7748, :7767). Rust `videosearch.rs:814` leaves
+  the placeholder. Port as a background enrichment pass with finite
+  timeouts.
+- **A11-10 — P3: Rokfin playback fallback.** Python
+  `discovery.py:1400` `probe_rokfin_public_playback`, called by
+  `player.py:4141` after yt-dlp fails, plays public Rokfin HLS or
+  reports auth_required. Rust has Rokfin search only
+  (`videosearch.rs`). Port the probe into the player's fallback chain.
+- **A11-11 — P3: `playback_resolve_timeout_s` ignored.** Python
+  `player.py:4258` resolves redirects before load with this timeout
+  (default 4.0) and derives the yt-dlp CLI timeout from it (8x,
+  clamped 10–120 s, :3922). Rust never reads the key. Honour it at
+  both sites.
+- **A11-12 — P3: Favorite menu label.** Python `mainframe.py:5792`
+  shows "Add to Favorites" or "Remove from Favorites" by the row's
+  state; Rust `main.rs:10559` shows "Toggle Favorite". Use the
+  state-aware label (screen readers announce the action that will
+  happen).
+
+Each finding gets a regression test (source-scan for UI wiring, unit
+tests for core helpers) and a resolution paragraph here when it lands.
