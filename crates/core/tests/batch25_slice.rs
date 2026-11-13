@@ -321,6 +321,47 @@ fn sky_related_sections_removed() {
 }
 
 #[test]
+fn atlantic_read_cards_removed() {
+    let text = "Opening paragraph of the story.\n[Read: Is Marco Rubio the happiest Cabinet member?]\nMiddle paragraph of the story.\n[Read: How to fix the mess of college sports]\nClosing paragraph of the story.";
+    let cleaned = pp(
+        text,
+        "https://www.theatlantic.com/culture/2026/11/marco-rubio-flights-football/689424/",
+    );
+    assert_eq!(
+        cleaned,
+        "Opening paragraph of the story.\n\nMiddle paragraph of the story.\n\nClosing paragraph of the story."
+    );
+    assert!(!cleaned.contains("[Read:"));
+    assert!(!cleaned.contains("Marco Rubio the happiest"));
+    assert!(!cleaned.contains("college sports"));
+    let other = "Body.\n[Read: A related headline]";
+    assert_eq!(pp(other, "https://example.com/story"), other);
+}
+
+#[test]
+fn sky_akamai_wall_is_gate_not_article() {
+    let html = "<html><body><p>Powered and protected by Akamai</p><p>Privacy</p></body></html>";
+    match extract_article(
+        html,
+        "https://news.sky.com/story/four-shot-in-washington-dc-13611509",
+        None,
+    ) {
+        ExtractOutcome::Gate { .. } => {}
+        other => panic!("expected Gate, got {other:?}"),
+    }
+    let cleaned = pp(
+        "Powered and protected by Akamai\nPrivacy",
+        "https://news.sky.com/story/x",
+    );
+    assert_eq!(cleaned, "");
+    let with_body = "Four people were shot in Washington DC.\nPowered and protected by Akamai";
+    assert_eq!(
+        pp(with_body, "https://news.sky.com/story/x"),
+        "Four people were shot in Washington DC."
+    );
+}
+
+#[test]
 fn recirculation_label_lines_dropped() {
     let text = "Real paragraph one.\nYou May Also Like\nReal paragraph two.";
     assert_eq!(

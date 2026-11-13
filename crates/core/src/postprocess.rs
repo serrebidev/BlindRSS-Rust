@@ -1028,6 +1028,23 @@ static SKY_RELATED_SECTION_RE: LazyLock<Regex> = LazyLock::new(|| {
 
 /// Python `_strip_sky_related_sections`.
 pub fn strip_sky_related_sections(text: &str) -> String {
+    // Akamai bot wall: Sky serves "Powered and protected by
+    // Akamai ..." as the whole extracted body when it 403s a
+    // plain client. The gate markers now reject it before
+    // extraction, but cut it here too so a thin win never
+    // surfaces it as article text.
+    static AKAMAI_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?i)Powered and protected by Akamai").unwrap());
+    let owned;
+    let text = if let Some(m) = AKAMAI_RE.find(text) {
+        owned = text[..m.start()].trim_end().to_string();
+        owned.as_str()
+    } else {
+        text
+    };
+    if text.is_empty() {
+        return String::new();
+    }
     let Some(m) = SKY_RELATED_SECTION_RE.find(text) else {
         return text.to_string();
     };
@@ -1036,6 +1053,33 @@ pub fn strip_sky_related_sections(text: &str) -> String {
         text.to_string()
     } else {
         cleaned
+    }
+}
+
+static ATLANTIC_READ_LINK_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\[(?:Read|Watch|Listen|See):[^\]]*\]\s*").unwrap());
+static ATLANTIC_READ_LINE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)^\s*\[(?:Read|Watch|Listen|See):.*\]\s*$").unwrap());
+
+/// The Atlantic prints in-article recommendation cards as
+/// "[Read: <headline>]" — the extraction engines keep them as
+/// their own paragraphs mid-article. They are navigation
+/// furniture, not prose: drop the whole line when it is only
+/// that card, and remove the inline bracket segment when the
+/// card is glued onto a real paragraph.
+pub fn strip_atlantic_boilerplate(text: &str) -> String {
+    let paras = split_paragraphs(text);
+    let kept: Vec<String> = paras
+        .into_iter()
+        .filter(|p| !ATLANTIC_READ_LINE_RE.is_match(p))
+        .map(|p| ATLANTIC_READ_LINK_RE.replace_all(&p, "").trim().to_string())
+        .filter(|p| !p.is_empty())
+        .collect();
+    let out = kept.join("\n\n").trim().to_string();
+    if out.is_empty() {
+        text.to_string()
+    } else {
+        out
     }
 }
 
@@ -1213,6 +1257,8 @@ pub fn postprocess_extracted_text(text: &str, url: &str, published: &str) -> Str
         strip_windowslatest_boilerplate(&t)
     } else if host_matches(url, "wired.com") {
         strip_wired_boilerplate(&t)
+    } else if host_matches(url, "theatlantic.com") {
+        strip_atlantic_boilerplate(&t)
     } else if host_matches(url, "news.sky.com") {
         strip_sky_related_sections(&t)
     } else if netloc.ends_with(".ning.com") || netloc == "ning.com" {

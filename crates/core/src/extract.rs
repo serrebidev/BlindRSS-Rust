@@ -86,6 +86,8 @@ const GATE_MARKERS: &[&str] = &[
     "please enable js and disable any ad blocker",
     "valid tollbit token",
     "tollbit.dev",
+    "powered and protected by akamai",
+    "powered and protected by",
 ];
 
 /// Paywall call-to-action phrases (Python `_PAYWALL_CTA_RE`, flattened

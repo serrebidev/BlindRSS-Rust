@@ -6,6 +6,11 @@ as `0.1.2-0.1.3`. Each release's section below is its Forgejo release note,
 taken from this file by the release workflow. The in-app updater shows the
 same text.
 
+## 0.1.98
+
+- Atlantic articles no longer show the in-article recommendation cards such as "[Read: Is Marco Rubio the happiest Cabinet member?]" in full text.
+- Sky News articles no longer show only "Powered and protected by Akamai". The Akamai bot wall is now recognised as a block page, so the normal fallback chain fetches the story text instead of displaying the block notice.
+
 ## 0.1.97
 
 - Alt+Tab now keeps your place again. The last fix only restored focus at the moment Windows switched windows back, and wx could reset it to the All Articles tree right after. Focus is now also restored again a moment later, once the switch has settled.
