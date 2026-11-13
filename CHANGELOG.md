@@ -6,6 +6,11 @@ as `0.1.2-0.1.3`. Each release's section below is its Forgejo release note,
 taken from this file by the release workflow. The in-app updater shows the
 same text.
 
+## 0.1.100
+
+- The Rich Full-Text View no longer shows video cards with "Watch on YouTube" links, "Related Roundup" footer lines, "[Read: ...]" and "[Watch: ...]" recommendation cards, newsletter promos, or Axios photo captions mid-article. Videos now show as a single playable embed.
+- The Rich Full-Text View no longer traps keyboard focus: Shift+Tab at the top returns to the article list, Shift+F6 to the feed tree, F6 or Escape to the article list, and Ctrl+Shift+H switches back to plain text.
+
 ## 0.1.99
 
 - TechCrunch articles no longer end with the affiliate disclosure ("When you purchase through links ...") and the trailing author bio with its "View Bio" line in full text.

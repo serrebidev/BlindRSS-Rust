@@ -33,7 +33,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use wxdragon::event::webview_events::WebViewEvents;
 use wxdragon::event::window_events::WindowEvents;
 use wxdragon::prelude::*;
-use wxdragon::widgets::webview::{WebView, WebViewBackend};
+use wxdragon::widgets::webview::{WebView, WebViewBackend, WebViewUserScriptInjectionTime};
 
 fn home_dir() -> PathBuf {
     std::env::var("HOME")
@@ -1493,8 +1493,68 @@ pub(crate) fn rich_document(fragment: &str) -> String {
         "<!DOCTYPE html><html><head><meta charset=\"utf-8\">\
          <style>body {{ font-family: sans-serif; line-height: 1.5; margin: 1em; }} \
          img, iframe, video {{ max-width: 100%; }}</style></head>\
-         <body>{fragment}</body></html>"
+         <body><div id=\"content\" tabindex=\"-1\">{fragment}</div></body></html>"
     )
+}
+
+/// In-page key bridge for the rich reader (port of Python's
+/// `_RICH_VIEW_KEYS_JS`, mainframe.py): WebView2 swallows ALT /
+/// F6 / Shift+Tab before wx sees them, so document-level listeners
+/// catch them and post to the script-message handler, handled in
+/// the frame's `on_script_message_received` below.
+/// - Escape / F6 -> focus the article list
+/// - Shift+F6 -> focus the category tree
+/// - Shift+Tab at the top of the article -> focus the article list
+/// - Ctrl+Shift+H -> toggle the rich view
+/// - bare ALT / F10 -> open the native menu bar
+const RICH_VIEW_KEYS_JS: &str = r"
+(function(){
+  if(window.__blindrssKeys) return;
+  window.__blindrssKeys = true;
+  function content(){ return document.getElementById('content'); }
+  function post(t){ try{ if(window.blindrssKeyBridge && window.blindrssKeyBridge.postMessage){ window.blindrssKeyBridge.postMessage(t); } }catch(e){} }
+  var altAlone = false;
+  window.addEventListener('keyup', function(e){
+    if(e.key==='Alt'){ if(altAlone){ e.stopPropagation(); e.preventDefault(); post('__menu'); } altAlone=false; }
+  }, true);
+  window.addEventListener('keydown', function(e){
+    if(e.key==='Alt' && !e.ctrlKey && !e.shiftKey && !e.metaKey){ altAlone=true; return; }
+    altAlone = false;
+    if(e.key==='F10' && !e.ctrlKey && !e.altKey && !e.shiftKey && !e.metaKey){ e.stopPropagation(); e.preventDefault(); post('__menu'); return; }
+    if(e.key==='F6' && e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey){ e.stopPropagation(); e.preventDefault(); post('__focus_tree'); return; }
+    if(e.key==='F6' && !e.ctrlKey && !e.altKey && !e.shiftKey && !e.metaKey){ e.stopPropagation(); e.preventDefault(); post('__focus_list'); return; }
+    if((e.key==='H'||e.key==='h'||e.code==='KeyH') && (e.ctrlKey||e.metaKey) && !(e.ctrlKey&&e.metaKey) && e.shiftKey && !e.altKey){ e.stopPropagation(); e.preventDefault(); post('__toggle_rich'); return; }
+    if(e.key==='Escape' && !e.ctrlKey && !e.altKey && !e.shiftKey && !e.metaKey){ e.stopPropagation(); e.preventDefault(); post('__focus_list'); return; }
+    if(e.key==='Tab' && e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey){
+      var c = content(); var a = document.activeElement;
+      if(!c || a===c || a===document.body || a===null || !c.contains(a)){
+        e.stopPropagation(); e.preventDefault(); post('__focus_list');
+      }
+    }
+  }, true);
+})();
+";
+
+/// Open the native menu bar from the focused WebView (ALT / F10,
+/// Python `_open_menu_bar_from_rich_view`): posts WM_SYSCOMMAND /
+/// SC_KEYMENU to the frame, entering the native menu-bar keyboard
+/// loop. No-op off Windows (other WebView backends route ALT natively).
+#[cfg(target_os = "windows")]
+fn open_menu_bar_from_rich_view(frame: &Frame) {
+    unsafe extern "system" {
+        fn PostMessageW(h: isize, m: u32, w: usize, l: isize) -> i32;
+    }
+    let hwnd = frame.get_handle() as isize;
+    if hwnd != 0 {
+        unsafe {
+            PostMessageW(hwnd, 0x0112, 0xF100, 0);
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn open_menu_bar_from_rich_view(frame: &Frame) {
+    frame.set_focus();
 }
 
 /// Python rich_view_links.external_url: a plain HTTP(S) URL safe to
@@ -4642,6 +4702,35 @@ fn main() {
         let rich_loading = std::rc::Rc::new(std::cell::Cell::new(false));
         if let Some(wv) = rich_view.as_ref() {
             wv.show(false);
+            // Key bridge (Python _RICH_VIEW_KEYS_JS): without it the
+            // WebView traps keyboard focus — every article link is a
+            // tab stop and WebView2 swallows Shift+Tab / F6 / ALT.
+            wv.add_script_message_handler("blindrssKeyBridge");
+            wv.add_user_script(
+                RICH_VIEW_KEYS_JS,
+                WebViewUserScriptInjectionTime::AtDocumentStart,
+            );
+            let frame_keys = frame;
+            let tree_keys = tree;
+            let list_keys = list;
+            wv.on_script_message_received(move |data| {
+                let Some(msg) = data.get_string() else { return };
+                match msg.as_str() {
+                    "__focus_list" => {
+                        list_keys.set_focus();
+                    }
+                    "__focus_tree" => {
+                        tree_keys.set_focus();
+                    }
+                    "__toggle_rich" => {
+                        frame_keys.process_menu_command(M_RICH_VIEW);
+                    }
+                    "__menu" => {
+                        open_menu_bar_from_rich_view(&frame_keys);
+                    }
+                    _ => {}
+                }
+            });
             let loading = rich_loading.clone();
             wv.on_loaded(move |_| loading.set(false));
             let frame_nav = frame;

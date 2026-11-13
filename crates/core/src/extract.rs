@@ -455,6 +455,7 @@ fn json_ld_text(html: &str) -> String {
             let t = crate::postprocess::strip_embedded_script_code(
                 &crate::postprocess::normalize_whitespace(&c),
             );
+            let t = strip_photo_caption_paragraphs(&t);
             if !t.is_empty() {
                 cleaned.push(t);
             }
@@ -500,6 +501,28 @@ fn register_text(html: &str) -> String {
     best_text
 }
 
+/// Photo-credit caption paragraphs inside JSON/structured text:
+/// Axios's `articleBody` and `bodyHtml` carry figure captions as
+/// whole paragraphs ("Scene. Photo: Name/Agency"). They are
+/// furniture, not prose — the DOM `drop_figcaptions` never sees
+/// them because they arrive as text, not nodes. A short paragraph
+/// ending with such a credit is dropped whole.
+pub(crate) fn strip_photo_caption_paragraphs(text: &str) -> String {
+    static CREDIT_RE: OnceLock<Regex> = OnceLock::new();
+    let credit = CREDIT_RE
+        .get_or_init(|| Regex::new(r"(?i)Photo:\s*[^/\n]{1,60}/[A-Za-z0-9'’.\-]+\.?\s*$").unwrap());
+    crate::postprocess::normalize_whitespace(
+        &crate::postprocess::split_paragraphs(text)
+            .into_iter()
+            .filter(|p| {
+                let n = p.trim().chars().count();
+                !((20..=400).contains(&n) && credit.is_match(p.trim()))
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+    )
+}
+
 /// Axios dedicated extractor (Python `_extract_axios_text`): the story
 /// body from the __NEXT_DATA__ JSON blob, >= 200 chars.
 fn axios_text(html: &str) -> String {
@@ -530,6 +553,7 @@ fn axios_text(html: &str) -> String {
             .filter(|t| !t.is_empty())
             .collect::<Vec<_>>()
             .join("\n\n");
+        let text = strip_photo_caption_paragraphs(&text);
         if text.chars().count() >= 200 {
             return text;
         }
@@ -1818,6 +1842,10 @@ fn html_to_text_raw(html: &str, keep_alt: bool) -> String {
                 "script" => skipping = Some("</script"),
                 "style" => skipping = Some("</style"),
                 "svg" => skipping = Some("</svg"),
+                // Figure captions are furniture, not prose (see
+                // drop_figcaptions): the feed-display path never saw
+                // the raw-page strip, so skip the subtree here too.
+                "figcaption" => skipping = Some("</figcaption"),
                 "img" if keep_alt => {
                     let tag_full = &html[i..=i + end];
                     let alt = attr_value(tag_full, "alt")
@@ -1828,8 +1856,8 @@ fn html_to_text_raw(html: &str, keep_alt: bool) -> String {
                 }
                 "br" | "hr" => out.push('\n'),
                 "p" | "div" | "section" | "article" | "header" | "footer" | "main" | "aside"
-                | "nav" | "blockquote" | "pre" | "table" | "tr" | "ul" | "ol" | "figure"
-                | "figcaption" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
+                | "nav" | "blockquote" | "pre" | "table" | "tr" | "ul" | "ol" | "figure" | "h1"
+                | "h2" | "h3" | "h4" | "h5" | "h6" => {
                     out.push_str("\n\n");
                 }
                 "li" => out.push('\n'),

@@ -8835,3 +8835,53 @@ Open findings (to port, in this order):
 
 Each finding gets a regression test (source-scan for UI wiring, unit
 tests for core helpers) and a resolution paragraph here when it lands.
+
+## Rich reader junk + focus trap (2026-11-13, Brandon's report)
+
+Three reported defects, all reproduced against the live pages before
+fixing (MacRumors `iphone-duo-fold-testing`, The Atlantic
+`joe-biden-memoir-trump`, Axios `logan-circle-shooting-dc-barricade`).
+
+- **MacRumors "Watch on YouTube" cards and footer lines (live-derived,
+  ranked #1).** The WordPress `yt-facade` watch card (thumbnail,
+  channel link, title link, "Watch on YouTube") and the `linkback`
+  footer divs ("Related Roundup / Forum", "Buyer's Guide") sit inside
+  `.js-content`; `publisher_body_fragment` copies them verbatim and
+  rebuilt fragments are exempt from the trafilatura prune, so nothing
+  dropped them. The plain engines already excluded them. Fix: the
+  cleaner now rewrites `yt-facade` divs into `iframe` embeds (the
+  existing URL normalization then maps them to YouTube watch pages,
+  per the issue-102 contract) and drops `linkback` elements.
+- **Atlantic `[Read:]` / `[Watch:]` junk and newsletter promo
+  (ranked #2).** `strip_atlantic_boilerplate` removed the cards from
+  plain text only; the Rich cleaner kept them, standalone or glued
+  inline, plus The Atlantic's "featured in the One Story newsletter"
+  masthead. Fix: the cleaner now drops standalone `[Read|Watch|
+  Listen|See: ...]` blocks and strips glued segments, and drops the
+  newsletter and Axios "preferred source" promo blocks the text
+  path strips.
+- **Axios photo captions mid-article (ranked #3).** `drop_figcaptions`
+  strips DOM captions pre-engine, but Axios carries them as JSON
+  text (`__NEXT_DATA__` `bodyHtml`, JSON-LD `articleBody`), so the
+  "Scene. Photo: Name/Agency" paragraphs leaked into the text, and
+  the Rich images' `alt` repeated the credit inline. Fix: short
+  paragraphs ending with a `Photo: Name/Agency` credit are dropped
+  from those text sources, `html_to_text` skips `<figcaption>`
+  subtrees (the feed-display path never saw the raw-page strip),
+  and the cleaner scrubs credit suffixes off `alt` text.
+- **Focus trap (ranked root cause of the keyboard complaint).** Rust
+  had no equivalent of Python's `_RICH_VIEW_KEYS_JS` bridge, so
+  every surviving link was a tab stop with no escape. Ported: a
+  script-message handler plus a document-start user script —
+  Shift+Tab at the top returns focus to the article list,
+  Shift+F6 to the tree, F6/Escape to the list, Ctrl+Shift+H toggles
+  the view, and ALT/F10 posts `WM_SYSCOMMAND`/`SC_KEYMENU` to the
+  frame. The reader document now wraps its fragment in
+  `<div id="content" tabindex="-1">` so the "at the top" check
+  works. Live key behaviour still needs a manual NVDA pass (Stage
+  0/6 acceptance); the wiring is compile-verified only.
+
+Tests: `crates/core/tests/rich_junk_parity.rs` (MacRumors facade +
+linkback -> iframe + no junk anchors; Atlantic standalone and glued
+cards plus newsletter promo; Axios `__NEXT_DATA__` captions; Axios
+rich promo). Full workspace suite green; clippy zero.

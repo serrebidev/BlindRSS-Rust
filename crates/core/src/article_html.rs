@@ -753,6 +753,209 @@ fn convert_social_embeds(html: &str, base_url: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// In-article recommendation cards and facade widgets (Owner's Rich View
+// report, 2026-11-13): publisher bodies embed click-furniture inline —
+// YouTube watch cards (MacRumors `yt-facade`: thumbnail, channel link,
+// title link, "Watch on YouTube") and `[Read: ...]` / `[Watch: ...]`
+// recommendation cards whose plain-text twin `strip_atlantic_boilerplate`
+// already removes — each with a pile of tab stops for keyboard users.
+// ---------------------------------------------------------------------------
+
+static READ_CARD_STANDALONE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)^\s*\[(?:Read|Watch|Listen|See):[\s\S]*\]\s*$").unwrap());
+static READ_CARD_SEGMENT_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\s*\[(?:Read|Watch|Listen|See):[\s\S]*?\]\s*").unwrap());
+static YT_FACADE_ID_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)youtube\.com/watch\?v=([A-Za-z0-9_-]{6,})").unwrap());
+static YT_THUMB_ID_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)/(?:vi|shorts)/([A-Za-z0-9_-]{6,})").unwrap());
+
+fn yt_facade_id(open: &str, inner: &str) -> Option<String> {
+    let id = attr_value(open, "data-yt-id").unwrap_or_default();
+    let id = id.trim().to_string();
+    if !id.is_empty() {
+        return Some(id);
+    }
+    if let Some(caps) = YT_FACADE_ID_RE.captures(inner) {
+        return Some(caps.get(1).unwrap().as_str().to_string());
+    }
+    YT_THUMB_ID_RE
+        .captures(inner)
+        .map(|caps| caps.get(1).unwrap().as_str().to_string())
+}
+
+/// Rewrite YouTube watch-card widgets into plain iframe embeds, so the
+/// card's links and thumbnails do not survive as reading junk.
+fn convert_yt_facades(html: &str) -> String {
+    let elems = all_elements(html);
+    let mut edits: Vec<(usize, usize, String)> = Vec::new();
+    for e in &elems {
+        if e.name != "div" && e.name != "section" && e.name != "figure" {
+            continue;
+        }
+        let open = e.open(html);
+        if !has_class(open, "yt-facade") && attr_value(open, "data-yt-id").is_none() {
+            continue;
+        }
+        let Some(id) = yt_facade_id(open, e.inner(html)) else {
+            continue;
+        };
+        let replacement = format!(
+            "<iframe src=\"https://www.youtube.com/embed/{}\" title=\"YouTube video\" allowfullscreen=\"true\"></iframe>",
+            esc_attr(&id)
+        );
+        edits.push((e.start, e.end, replacement));
+    }
+    apply_edits(html, edits)
+}
+
+/// Drop standalone `[Read|Watch|Listen|See: ...]` cards and strip the
+/// same bracket segments when glued onto real prose.
+fn strip_recommendation_cards(html: &str) -> String {
+    let elems = all_elements(html);
+    let mut edits: Vec<(usize, usize, String)> = Vec::new();
+    for e in &elems {
+        if !matches!(
+            e.name.as_str(),
+            "p" | "div" | "span" | "section" | "aside" | "small" | "li" | "a"
+        ) {
+            continue;
+        }
+        let inner = e.inner(html);
+        if has_media(inner) || has_content_image(inner) {
+            continue;
+        }
+        let text = leaf_text(inner);
+        let trimmed = text.trim();
+        if trimmed.is_empty() || char_len(trimmed) > 400 {
+            continue;
+        }
+        if READ_CARD_STANDALONE_RE.is_match(trimmed) {
+            edits.push((e.start, e.end, String::new()));
+        } else if READ_CARD_SEGMENT_RE.is_match(trimmed) {
+            let cleaned = READ_CARD_SEGMENT_RE.replace_all(inner, "").to_string();
+            if !leaf_text(&cleaned).trim().is_empty() {
+                edits.push((e.inner_start, e.inner_end, cleaned));
+            }
+        }
+    }
+    apply_edits(html, edits)
+}
+
+/// Stock promo blocks the text path strips but the HTML cleaner kept:
+/// the Atlantic's newsletter masthead and Axios's preferred-source
+/// promo (which the feed splits across two paragraphs).
+static NEWSLETTER_PROMO_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)(featured in the .{0,80} newsletter|sign up for it here)").unwrap()
+});
+static AXIOS_PROMO_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)(add\s+axios\s+as\s+(?:a|your|our)?\s*preferred\s+source|see more of our stories on google)",
+    )
+    .unwrap()
+});
+
+static PHOTO_CREDIT_ALT_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"(?i)(?:[\s\.\"”’]|^)Photo:\s*[^"]{1,60}$"#).unwrap());
+
+/// Scrub " Photo: Name/Agency" credits off image `alt` text: the
+/// caption survives as a description, the credit does not announce
+/// inline mid-article.
+fn scrub_photo_credit_alts(html: &str) -> String {
+    let toks = tag_tokens(html);
+    let mut edits: Vec<(usize, usize, String)> = Vec::new();
+    for tok in &toks {
+        if tok.close || tok.name != "img" {
+            continue;
+        }
+        let open = &html[tok.start..tok.end];
+        let Some(alt) = attr_value(open, "alt") else {
+            continue;
+        };
+        if char_len(&alt) >= 500 {
+            continue;
+        }
+        let Some(m) = PHOTO_CREDIT_ALT_RE.find(&alt) else {
+            continue;
+        };
+        let cleaned = alt[..m.start()].trim_end().to_string();
+        // Rebuild the tag without its `alt` attribute, then set the
+        // scrubbed value: the tag scanner gives exact attr spans, so
+        // this never touches a `>` or quote inside another value.
+        let attrs = open_attrs(open);
+        let mut new_open = String::from("<img");
+        for (k, v) in attrs {
+            if k.eq_ignore_ascii_case("alt") {
+                new_open.push_str(&format!(" {}=\"{}\"", k, esc_attr(&cleaned)));
+            } else {
+                new_open.push_str(&format!(" {}=\"{}\"", k, esc_attr(&v)));
+            }
+        }
+        new_open.push('>');
+        edits.push((tok.start, tok.end, new_open));
+    }
+    apply_edits(html, edits)
+}
+
+/// Parse an open tag's attributes as (name, value) pairs.
+fn open_attrs(open: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let body = open.trim_start_matches('<').trim_end_matches('>');
+    let body = body.trim_end_matches('/');
+    let bytes = body.as_bytes();
+    let mut i = 0usize;
+    // Skip the tag name.
+    while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    while i < bytes.len() {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        let name_start = i;
+        while i < bytes.len() && !bytes[i].is_ascii_whitespace() && bytes[i] != b'=' {
+            i += 1;
+        }
+        let name = body[name_start..i].to_string();
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let mut value = String::new();
+        if i < bytes.len() && bytes[i] == b'=' {
+            i += 1;
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            if i < bytes.len() && (bytes[i] == b'"' || bytes[i] == b'\'') {
+                let q = bytes[i];
+                i += 1;
+                let v_start = i;
+                while i < bytes.len() && bytes[i] != q {
+                    i += 1;
+                }
+                value = body[v_start..i].to_string();
+                if i < bytes.len() {
+                    i += 1;
+                }
+            } else {
+                let v_start = i;
+                while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+                    i += 1;
+                }
+                value = body[v_start..i].to_string();
+            }
+        }
+        if !name.is_empty() {
+            out.push((name, value));
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Body reconstructions (Python _publisher_body_reconstruct /
 // _socast_reconstruct): layouts with no single node holding the
 // whole body are rebuilt before the generic pick.
@@ -1038,8 +1241,13 @@ pub fn clean_article_html(html: &str, url: &str, use_traf_prune: bool) -> String
     let mut frag = rebuilt.unwrap_or_else(|| pick_main_fragment(html));
 
     // Social embeds first, so the passes below keep the resulting
-    // iframe/anchor nodes.
+    // iframe/anchor nodes. YouTube watch cards and [Read:/Watch:]
+    // cards go next, for the same reason (Owner's Rich View report,
+    // 2026-11-13).
     frag = convert_social_embeds(&frag, url);
+    frag = convert_yt_facades(&frag);
+    frag = strip_recommendation_cards(&frag);
+    frag = scrub_photo_credit_alts(&frag);
 
     // Category/tag links (WordPress rel="tag"/"category tag").
     frag = remove_elements(&frag, &|name, open| {
@@ -1058,6 +1266,11 @@ pub fn clean_article_html(html: &str, url: &str, use_traf_prune: bool) -> String
     frag = drop_elements(&frag, &|open, inner, e| {
         if !ALLOWED_TAGS.contains(&e.name.as_str()) && !DROP_TAGS.contains(&e.name.as_str()) {
             return false;
+        }
+        if has_class(open, "linkback") && !has_media(inner) {
+            // MacRumors' footer card lines ("Related Roundup / Forum",
+            // "Buyer's Guide") live inside the body container.
+            return true;
         }
         let ident = format!(
             "{} {}",
@@ -1093,6 +1306,8 @@ pub fn clean_article_html(html: &str, url: &str, use_traf_prune: bool) -> String
             return false;
         }
         BOILERPLATE_TEXT_RE.is_match(&txt)
+            || NEWSLETTER_PROMO_RE.is_match(&txt)
+            || AXIOS_PROMO_RE.is_match(&txt)
             || (char_len(&txt) <= 70 && WIDGET_HEADER_RE.is_match(&txt))
     });
 
