@@ -6,6 +6,10 @@ as `0.1.2-0.1.3`. Each release's section below is its Forgejo release note,
 taken from this file by the release workflow. The in-app updater shows the
 same text.
 
+## 0.1.96
+
+- Skip Silence no longer clips the first words after a pause. Skips now land exactly where the silence ends instead of several hundred milliseconds into the next word.
+
 ## 0.1.95
 
 - Switching back to BlindRSS with Alt+Tab now restores the control you were using when Windows activation falls back to the feed tree. Article-list focus, article-text selection, and other native controls are preserved. Clicking a different control still follows the mouse.

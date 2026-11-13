@@ -8689,3 +8689,16 @@ intermittent trigger. It is ignored in normal offline suites because it opens
 windows; run `cargo test -p blindrss native_activation_preserves_focused_descendant
 -- --ignored --test-threads=1`. The normal suite covers keyboard versus mouse and
 minimized activation flags. Real NVDA acceptance remains the owner's gate.
+
+## Skip Silence landing fix (2026-11-12)
+
+Owner-directed divergence from Python's skip target. Python seeked to
+silence end + resume_backoff, but the published ranges already expand the
+end by the padding, so landings sat ~420 ms into speech and clipped soft
+dialogue onsets (audited on AANNews1046). The Rust policy now lands at the
+padded range end itself; the last-target loop guard and the position floor
+already prevent re-skips, so the extra backoff was redundant. The
+resume-backoff config key remains for compatibility. Regression coverage:
+skip_policy_* tests pin the end-of-range target and
+skip_lands_at_padded_end_not_beyond_speech_onset pins a real episode
+range.

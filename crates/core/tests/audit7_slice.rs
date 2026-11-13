@@ -606,7 +606,7 @@ fn skip_policy_guards_block_the_skip() {
     assert_eq!(p.evaluate(&ranges, 10_500, t0, &ctx), None);
     // Seekable unknown (None) does not block (Python proceeds).
     let mut p = SilenceSkipPolicy::new();
-    assert_eq!(p.evaluate(&ranges, 10_500, t0, &skip_ctx()), Some(20_360));
+    assert_eq!(p.evaluate(&ranges, 10_500, t0, &skip_ctx()), Some(20_000));
     // Resume restore pending.
     let mut p = SilenceSkipPolicy::new();
     let mut ctx = skip_ctx();
@@ -624,11 +624,11 @@ fn skip_policy_hit_arithmetic_matches_python() {
     let ranges = vec![(10_000, 20_000)];
     let t0 = Instant::now();
     // Containment is start-100 <= pos <= end-100; the target
-    // is end + resume_backoff.
+    // is the range end itself (the padded end at publish time).
     let mut p = SilenceSkipPolicy::new();
-    assert_eq!(p.evaluate(&ranges, 9_900, t0, &skip_ctx()), Some(20_360));
+    assert_eq!(p.evaluate(&ranges, 9_900, t0, &skip_ctx()), Some(20_000));
     let mut p = SilenceSkipPolicy::new();
-    assert_eq!(p.evaluate(&ranges, 19_900, t0, &skip_ctx()), Some(20_360));
+    assert_eq!(p.evaluate(&ranges, 19_900, t0, &skip_ctx()), Some(20_000));
     let mut p = SilenceSkipPolicy::new();
     assert_eq!(p.evaluate(&ranges, 19_901, t0, &skip_ctx()), None);
     let mut p = SilenceSkipPolicy::new();
@@ -645,7 +645,7 @@ fn skip_policy_cooldown_and_user_seek_pause() {
     let ranges = vec![(10_000, 20_000), (30_000, 40_000)];
     let t0 = Instant::now();
     let mut p = SilenceSkipPolicy::new();
-    assert_eq!(p.evaluate(&ranges, 10_500, t0, &skip_ctx()), Some(20_360));
+    assert_eq!(p.evaluate(&ranges, 10_500, t0, &skip_ctx()), Some(20_000));
     // Local cooldown is 2.5 s: a second range 1 s later waits.
     assert_eq!(
         p.evaluate(
@@ -663,7 +663,7 @@ fn skip_policy_cooldown_and_user_seek_pause() {
             t0 + Duration::from_millis(2600),
             &skip_ctx()
         ),
-        Some(40_360)
+        Some(40_000)
     );
     // A user seek pauses skipping for 1.2 s (local).
     let mut p = SilenceSkipPolicy::new();
@@ -684,7 +684,7 @@ fn skip_policy_cooldown_and_user_seek_pause() {
             t0 + Duration::from_millis(1300),
             &skip_ctx()
         ),
-        Some(20_360)
+        Some(20_000)
     );
     // Remote pause is 2.5 s and remote cooldown is 5 s.
     let mut p = SilenceSkipPolicy::new();
@@ -697,7 +697,7 @@ fn skip_policy_cooldown_and_user_seek_pause() {
     );
     assert_eq!(
         p.evaluate(&ranges, 10_500, t0 + Duration::from_millis(2600), &ctx),
-        Some(20_360)
+        Some(20_000)
     );
     assert_eq!(
         p.evaluate(&ranges, 30_500, t0 + Duration::from_millis(7000), &ctx),
@@ -705,7 +705,7 @@ fn skip_policy_cooldown_and_user_seek_pause() {
     );
     assert_eq!(
         p.evaluate(&ranges, 30_500, t0 + Duration::from_millis(7700), &ctx),
-        Some(40_360)
+        Some(40_000)
     );
 }
 
@@ -731,14 +731,14 @@ fn skip_policy_floor_and_loop_guard() {
     assert_eq!(
         p.evaluate(&[(10_000, 10_600)], 10_500, t0, &skip_ctx()),
         None,
-        "target 10960 < floor 11000 must be refused"
+        "target 10600 < floor 11000 must be refused"
     );
     // Loop guard: after skipping to a target, landing back in
     // the same range does not re-seek to (nearly) the same
     // target once the cooldown has passed.
     let ranges = vec![(10_000, 20_000)];
     let mut p = SilenceSkipPolicy::new();
-    assert_eq!(p.evaluate(&ranges, 10_500, t0, &skip_ctx()), Some(20_360));
+    assert_eq!(p.evaluate(&ranges, 10_500, t0, &skip_ctx()), Some(20_000));
     assert_eq!(
         p.evaluate(
             &ranges,
@@ -751,7 +751,7 @@ fn skip_policy_floor_and_loop_guard() {
     // Retrigger cleanup: passing the last range's end by more
     // than retrigger + 300 ms retires the last-index memory.
     let mut p = SilenceSkipPolicy::new();
-    assert_eq!(p.evaluate(&ranges, 10_500, t0, &skip_ctx()), Some(20_360));
+    assert_eq!(p.evaluate(&ranges, 10_500, t0, &skip_ctx()), Some(20_000));
     assert_eq!(p.last_idx(), Some(0));
     assert_eq!(
         p.evaluate(
@@ -770,7 +770,7 @@ fn skip_policy_verify_reseeks_once_then_settles() {
     let ranges = vec![(10_000, 20_000)];
     let t0 = Instant::now();
     let mut p = SilenceSkipPolicy::new();
-    assert_eq!(p.evaluate(&ranges, 10_500, t0, &skip_ctx()), Some(20_360));
+    assert_eq!(p.evaluate(&ranges, 10_500, t0, &skip_ctx()), Some(20_000));
     // Too early for the verify re-seek (min wait 0.35 s local).
     assert_eq!(
         p.verify_tick(15_000, t0 + Duration::from_millis(200), false),
@@ -779,7 +779,7 @@ fn skip_policy_verify_reseeks_once_then_settles() {
     // Still short of the target past the wait: re-seek once.
     assert_eq!(
         p.verify_tick(15_000, t0 + Duration::from_millis(400), false),
-        Some(20_360)
+        Some(20_000)
     );
     // Already attempted: no second re-seek.
     assert_eq!(
@@ -788,7 +788,7 @@ fn skip_policy_verify_reseeks_once_then_settles() {
     );
     // Landing within the local threshold (700 ms) settles it.
     let mut p = SilenceSkipPolicy::new();
-    assert_eq!(p.evaluate(&ranges, 10_500, t0, &skip_ctx()), Some(20_360));
+    assert_eq!(p.evaluate(&ranges, 10_500, t0, &skip_ctx()), Some(20_000));
     assert_eq!(
         p.verify_tick(19_700, t0 + Duration::from_millis(400), false),
         None
@@ -796,7 +796,7 @@ fn skip_policy_verify_reseeks_once_then_settles() {
     assert!(!p.verify_active());
     // The window (3 s local) expiring also settles it.
     let mut p = SilenceSkipPolicy::new();
-    assert_eq!(p.evaluate(&ranges, 10_500, t0, &skip_ctx()), Some(20_360));
+    assert_eq!(p.evaluate(&ranges, 10_500, t0, &skip_ctx()), Some(20_000));
     assert_eq!(
         p.verify_tick(15_000, t0 + Duration::from_millis(3100), false),
         None
@@ -805,9 +805,27 @@ fn skip_policy_verify_reseeks_once_then_settles() {
     // A user seek cancels verification outright (Python
     // _note_user_seek clears the verify state).
     let mut p = SilenceSkipPolicy::new();
-    assert_eq!(p.evaluate(&ranges, 10_500, t0, &skip_ctx()), Some(20_360));
+    assert_eq!(p.evaluate(&ranges, 10_500, t0, &skip_ctx()), Some(20_000));
     p.note_user_seek(t0 + Duration::from_millis(300), false);
     assert!(!p.verify_active());
+}
+
+#[test]
+fn skip_lands_at_padded_end_not_beyond_speech_onset() {
+    // Regression: AANNews1046-style dialogue pauses. The skip
+    // target is the padded end (raw end + pad), never raw end +
+    // pad + backoff, so the first words after the pause survive.
+    use blindrss_core::silence::pad_and_merge_ms;
+    let raw = vec![(191_250, 192_450)];
+    let padded = pad_and_merge_ms(raw, 60, 200);
+    assert_eq!(padded, vec![(191_190, 192_510)]);
+    let t0 = Instant::now();
+    let mut p = SilenceSkipPolicy::new();
+    let mut ctx = skip_ctx();
+    ctx.is_remote = true;
+    let target = p.evaluate(&padded, 191_500, t0, &ctx);
+    // 60 ms past the raw silence end, not 420 ms into speech.
+    assert_eq!(target, Some(192_510));
 }
 
 // ---------------------------------------------------------------------

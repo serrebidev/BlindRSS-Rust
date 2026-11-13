@@ -884,10 +884,12 @@ pub struct SkipContext {
     /// is a main-window surface there).
     pub casting: bool,
     /// The current media is remote (http, non-loopback):
-    /// selects the conservative cooldowns/windows and caps
-    /// the resume backoff at 1000 ms.
+    /// selects the conservative cooldowns/windows.
     pub is_remote: bool,
-    /// `silence_skip_resume_backoff_ms`.
+    /// `silence_skip_resume_backoff_ms`. Retained for config
+    /// compatibility; the landing is the padded range end
+    /// itself, so this no longer shifts the target (see
+    /// `evaluate`).
     pub resume_backoff_ms: i64,
     /// `silence_skip_retrigger_backoff_ms`.
     pub retrigger_backoff_ms: i64,
@@ -1068,10 +1070,14 @@ impl SilenceSkipPolicy {
         {
             return None;
         }
-        let mut resume_backoff = ctx.resume_backoff_ms.max(0);
-        if ctx.is_remote && resume_backoff > 1000 {
-            resume_backoff = 1000;
-        }
+        // Landing is the PADDED range end itself. Python seeked
+        // to end + resume_backoff, but padding already expands
+        // the end by pad_ms, so the extra backoff landed parents
+        // 400+ ms into speech and crapped the first words of
+        // nearly every skip on dialogue with soft onsets. The
+        // last-target loop guard and the floor already stop
+        // re-skips; landing at the padded end is the stop point
+        // that keeps speech intact.
         let retrigger = ctx.retrigger_backoff_ms;
         let current_target = self.active_target;
         for (idx, &(start, end)) in ranges.iter().enumerate() {
@@ -1080,7 +1086,7 @@ impl SilenceSkipPolicy {
                 break;
             }
             if start - 100 <= pos_ms && pos_ms <= end - 100 {
-                let target_ms = end + resume_backoff;
+                let target_ms = end;
                 if target_ms < self.floor_ms {
                     return None;
                 }
