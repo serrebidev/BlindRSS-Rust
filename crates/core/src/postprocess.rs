@@ -756,6 +756,26 @@ pub fn strip_macrumors_boilerplate(text: &str) -> String {
 /// article trails the WordPress syndication line "The post
 /// ... appeared first on Windows Latest". Cut it (and
 /// anything after it) wherever it appears.
+/// The same footer cut for display of a stored feed body: the
+/// "The post ... appeared first on ..." line and everything after it
+/// go, the layout above stays as the reader built it.
+pub fn strip_windowslatest_footer_keep_layout(text: &str) -> String {
+    let mut offset = 0usize;
+    for line in text.split_inclusive('\n') {
+        let t = line.trim_start();
+        if t.starts_with("The post ") && t.contains("appeared first on") {
+            let kept = text[..offset].trim_end();
+            return if kept.is_empty() {
+                text.to_string()
+            } else {
+                kept.to_string()
+            };
+        }
+        offset += line.len();
+    }
+    text.to_string()
+}
+
 pub fn strip_windowslatest_boilerplate(text: &str) -> String {
     let paras = split_paragraphs(text);
     if paras.is_empty() {

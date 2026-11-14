@@ -6,6 +6,11 @@ as `0.1.2-0.1.3`. Each release's section below is its Forgejo release note,
 taken from this file by the release workflow. The in-app updater shows the
 same text.
 
+## 0.1.106
+
+- Windows Latest: image galleries no longer leave their title and slide counter ("Windows 11 running on iPhone Duo", "1 of 3") in the middle of articles, in the text view or the Rich View. Section headings stay.
+- The Rich View no longer stops on empty image links, and Windows Latest articles no longer end with the "The post ... appeared first on Windows Latest" line in either view.
+
 ## 0.1.105
 
 - Escape now closes every dialog: Feeds with Errors, About, Find a Podcast or RSS Feed, Podcast Archive, Video Search, Filter Rules, Import Site Cookies, YouTube Account, Keyboard Shortcuts, Add BlindRSS Shortcuts, Configure Persistent Search, Open Article and the rest. Escape does what the dialog's Close or Cancel button does.

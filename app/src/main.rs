@@ -1167,6 +1167,10 @@ fn local_utc_offset_secs() -> i64 {
 pub(crate) fn hosted_body_for_display(feed_id: &str, article_url: &str, body_text: &str) -> String {
     if blindrss_core::postprocess::host_matches(article_url, "theatlantic.com") {
         blindrss_core::postprocess::strip_atlantic_cards_keep_layout(body_text)
+    } else if blindrss_core::postprocess::host_matches(article_url, "windowslatest.com") {
+        // Feed bodies end "The post ... appeared first on Windows
+        // Latest" (Brandon's report, 2026-11-13).
+        blindrss_core::postprocess::strip_windowslatest_footer_keep_layout(body_text)
     } else if feed_id.starts_with("miniflux:") && article_url.contains("macrumors.com") {
         blindrss_core::postprocess::strip_macrumors_boilerplate(body_text)
     } else {

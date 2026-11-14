@@ -809,6 +809,55 @@ fn convert_yt_facades(html: &str) -> String {
     apply_edits(html, edits)
 }
 
+/// Links with nothing to read: no text, no image, no media — e.g.
+/// Windows Latest's featured-image wrapper left as
+/// `<a href="...jpg"></a>` once its image is gone (Brandon's report,
+/// 2026-11-13). A screen reader still stops on each one. Anchors
+/// carrying an id/name stay: they are in-page jump targets.
+fn drop_empty_links(html: &str) -> String {
+    let elems = all_elements(html);
+    let mut edits: Vec<(usize, usize, String)> = Vec::new();
+    for e in &elems {
+        if e.name != "a" {
+            continue;
+        }
+        let open = e.open(html);
+        if attr_value(open, "href").is_none()
+            || attr_value(open, "id").is_some()
+            || attr_value(open, "name").is_some()
+        {
+            continue;
+        }
+        let inner = e.inner(html);
+        if leaf_text(inner).trim().is_empty()
+            && !has_media(inner)
+            && !has_any_tag(inner, &["img", "picture", "svg"])
+        {
+            edits.push((e.start, e.end, String::new()));
+        }
+    }
+    apply_edits(html, edits)
+}
+
+/// WordPress feeds end each body with "The post <title> appeared
+/// first on <site>"; the text path's site strip already cuts it, the
+/// Rich View kept it as a last paragraph of links.
+fn drop_wordpress_feed_footer(html: &str) -> String {
+    let elems = all_elements(html);
+    let mut edits: Vec<(usize, usize, String)> = Vec::new();
+    for e in &elems {
+        if e.name != "p" {
+            continue;
+        }
+        let text = leaf_text(e.inner(html));
+        let text = text.trim();
+        if text.starts_with("The post ") && text.contains(" appeared first on ") {
+            edits.push((e.start, e.end, String::new()));
+        }
+    }
+    apply_edits(html, edits)
+}
+
 /// A block whose only text outside its links is the card's brackets:
 /// `[<a>Ian Bogost: Airport chaos began…</a>]` (an author label, not
 /// `Read:`) and the split `[<a>Read: </a>]<a>Headline</a>` shape. The
@@ -1266,6 +1315,10 @@ pub fn clean_article_html(html: &str, url: &str, use_traf_prune: bool) -> String
     frag = convert_yt_facades(&frag);
     frag = strip_recommendation_cards(&frag);
     frag = scrub_photo_credit_alts(&frag);
+    frag = crate::extract::strip_slider_chrome(&frag);
+    if crate::postprocess::host_matches(url, "windowslatest.com") {
+        frag = drop_wordpress_feed_footer(&frag);
+    }
 
     // Category/tag links (WordPress rel="tag"/"category tag").
     frag = remove_elements(&frag, &|name, open| {
@@ -1435,6 +1488,10 @@ pub fn clean_article_html(html: &str, url: &str, use_traf_prune: bool) -> String
     body = BR_RUN_RE.replace_all(&body, "<br>").to_string();
     body = BR_AFTER_OPEN_RE.replace_all(&body, "$1").to_string();
     body = BR_BEFORE_CLOSE_RE.replace_all(&body, "$1").to_string();
+
+    // After sanitize: it drops images it cannot keep, which can
+    // leave their wrapper link empty.
+    body = drop_empty_links(&body);
 
     // Drop empty media-less containers left behind by chrome removal.
     for _ in 0..4 {

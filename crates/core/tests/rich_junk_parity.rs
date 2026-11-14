@@ -146,3 +146,51 @@ fn atlantic_author_and_split_link_cards_stripped_from_rich() {
         "editor's note (no link) lost: {out}"
     );
 }
+
+/// Windows Latest feed body around its TagDiv gallery (trimmed from
+/// the 2026-11-14 iPhone Duo story's feed item).
+const WL_GALLERY: &str = r#"<h2>How Google used Gemini to run Windows 11 on an iPhone Duo, and why it&#8217;s a big deal</h2>
+<style type="text/css">#tdi_1 .td-doubleSlider-2 .td-item1 { background: url(https://www.windowslatest.com/a-80x60.jpg) 0 0 no-repeat; }</style>
+<div id="tdi_1" class="td-gallery td-slide-on-2-columns"><div class="post_td_gallery"><div class="td-gallery-slide-top"><div class="td-gallery-title">Windows 11 running on iPhone Duo</div><div class="td-gallery-controls-wrapper"><div class="td-gallery-slide-count"><span class="td-gallery-slide-item-focus">1</span> of 3</div><div class="td-gallery-slide-prev-next-but"><i class = "td-icon-left doubleSliderPrevButton"></i><i class = "td-icon-right doubleSliderNextButton"></i></div></div></div>
+<div class = "td-doubleSlider-1 "><div class = "td-slider"><div class = "td-slide-item td-item1"><figure class="td-slide-galery-figure td-slide-popup-gallery"><a class="slide-gallery-image-link" href="https://www.windowslatest.com/a.jpg" title="Windows 11 desktop on iPhone Duo"><img src="https://www.windowslatest.com/a-560x420.jpg" alt="Windows 11 desktop on iPhone Duo"></a></figure></div></div></div>
+<div class = "td-doubleSlider-2"><div class = "td-slider"><div class = "td-button td-item1"><div class = "td-border"></div></div></div></div></div></div>
+<p>It&#8217;s not the first time we&#8217;ve seen Windows 11 running on an iPhone, but this project is particularly interesting because Reshi used Gemini to help build it.</p>"#;
+
+#[test]
+fn windowslatest_gallery_chrome_and_footer_stripped() {
+    // Brandon's report, 2026-11-13: Windows Latest bodies read
+    // "Windows 11 running on iPhone Duo / 1 of 3" mid-article in
+    // both views; the Rich View also kept the empty featured-image
+    // link and the "The post ... appeared first on" footer.
+    let url =
+        "https://www.windowslatest.com/2026/11/14/windows-11-can-run-on-apples-foldable-iphone/";
+    let feed = format!(
+        r#"<div><a href="https://www.windowslatest.com/featured.jpg"></a></div><p>{BODY_PARA}</p>{WL_GALLERY}<p>{BODY_PARA}</p><p>The post <a href="{url}">Windows 11 can run on Apple's foldable iPhone</a> appeared first on <a href="https://www.windowslatest.com">Windows Latest</a></p>"#
+    );
+    let text = blindrss_core::extract::html_to_text_opts(&feed, false);
+    assert!(
+        text.contains("why it’s a big deal"),
+        "section heading lost: {text}"
+    );
+    assert!(!text.contains("1 of 3"), "slide counter survived: {text}");
+    assert!(
+        !text.contains("running on iPhone Duo\n"),
+        "gallery title survived: {text}"
+    );
+    let rich = clean_article_html(&feed, url, false);
+    assert!(rich.contains(BODY_PARA), "body prose lost: {rich}");
+    assert!(rich.contains("big deal"), "section heading lost: {rich}");
+    assert!(!rich.contains("of 3"), "slide counter survived: {rich}");
+    assert!(
+        !rich.contains("td-gallery-title") && !rich.contains(">Windows 11 running on iPhone Duo<"),
+        "gallery title survived: {rich}"
+    );
+    assert!(
+        !rich.contains("featured.jpg\"></a>"),
+        "empty image link survived: {rich}"
+    );
+    assert!(
+        !rich.contains("appeared first on"),
+        "feed footer survived: {rich}"
+    );
+}

@@ -1051,3 +1051,17 @@ fn atlantic_author_and_split_cards_removed_from_text() {
         "Item one\nItem two\nItem three"
     );
 }
+
+#[test]
+fn windowslatest_feed_footer_cut_keeps_layout() {
+    use blindrss_core::postprocess::strip_windowslatest_footer_keep_layout;
+    let body = "Para one.\n\nItem a\nItem b\n\nThe post Title appeared first on Windows Latest";
+    assert_eq!(
+        strip_windowslatest_footer_keep_layout(body),
+        "Para one.\n\nItem a\nItem b"
+    );
+    assert_eq!(
+        strip_windowslatest_footer_keep_layout("No footer."),
+        "No footer."
+    );
+}

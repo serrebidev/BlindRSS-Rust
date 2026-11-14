@@ -9039,3 +9039,21 @@ Resolutions (v0.1.101, 2026-11-13):
   text view shows feed bodies without the extraction postprocess,
   so `hosted_body_for_display` now strips Atlantic cards for every
   provider, keeping the body's line layout.
+
+## Windows Latest gallery chrome (2026-11-13, Brandon's report, v0.1.106)
+
+Windows Latest (WordPress "Newspaper"/TagDiv theme) ships its
+`td-gallery` slider verbatim in feed bodies: a title bar, a "1 of 3"
+counter, arrow icons and an empty thumbnail strip. Page extraction
+already dropped it; the feed-body text and Rich views did not.
+Reproduced against the live feed item and page
+(`windows-11-can-run-on-apples-foldable-iphone...`). Fix:
+`extract::strip_slider_chrome` removes `td-gallery-slide-top` and
+`td-doubleSlider-2` in `html_to_text_with_structure` (every
+HTML-to-text path) and in the Rich cleaner; the slides keep their
+images. The Rich cleaner also drops empty links (no text, no image or
+media, no id/name; run after sanitize, which can empty a featured-image
+wrapper) and, on windowslatest.com, the "The post ... appeared first
+on" footer, which the feed-body text view now cuts too
+(`strip_windowslatest_footer_keep_layout`). The h2 above the gallery
+is the article's own section heading and stays.

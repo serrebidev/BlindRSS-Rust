@@ -1788,7 +1788,24 @@ pub fn html_to_text_with_structure(
     keep_alt: bool,
     options: StructureOptions,
 ) -> String {
-    html_to_text_raw(&linearize_structure_html(html, options), keep_alt)
+    let html = strip_slider_chrome(html);
+    html_to_text_raw(&linearize_structure_html(&html, options), keep_alt)
+}
+
+/// TagDiv (WordPress "Newspaper" theme) gallery sliders ship in feed
+/// bodies verbatim: a title bar ("Windows 11 running on iPhone Duo"),
+/// a "1 of 3" counter, arrow icons and an empty thumbnail strip, read
+/// mid-article in both views (Brandon's report, 2026-11-13, Windows
+/// Latest). Drop that chrome; the slides themselves (images with alt
+/// text) stay.
+pub(crate) fn strip_slider_chrome(html: &str) -> String {
+    if !html.contains("td-gallery") && !html.contains("td-doubleSlider") {
+        return html.to_string();
+    }
+    remove_elements(html, &|_, open| {
+        has_class(open, "td-gallery-slide-top") || has_class(open, "td-doubleSlider-2")
+    })
+    .0
 }
 
 pub fn html_to_text(html: &str) -> String {
