@@ -489,7 +489,7 @@ fn inoreader_listener_connect(
     open_url(&url);
     // Drain on a dialog timer like the other async flows.
     let dialog2 = Dialog::builder(frame, "Inoreader Sign-in").build();
-    dialog2.set_escape_id(5101);
+    crate::dialogs::escape_closes(&dialog2);
     let sizer2 = BoxSizer::builder(Orientation::Vertical).build();
     let label = StaticText::builder(&dialog2)
         .with_label(&t("Waiting for the browser sign-in to complete..."))
@@ -571,7 +571,7 @@ fn inoreader_listener_connect(
 fn show_import_cookies_from_browser(parent: &Dialog, cookies_field: TextCtrl) {
     use blindrss_core::cookies_import;
     let dialog = Dialog::builder(parent, "Import cookies from browser").build();
-    dialog.set_escape_id(5101);
+    crate::dialogs::escape_closes(&dialog);
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let steps = StaticText::builder(&dialog)
         .with_label(&t(
@@ -594,7 +594,10 @@ fn show_import_cookies_from_browser(parent: &Dialog, cookies_field: TextCtrl) {
         .with_label(&t("Choose file..."))
         .build();
     row.add(&choose_btn, 0, SizerFlag::All, 4);
-    let close_btn = Button::builder(&dialog).with_label(&t("Close")).build();
+    let close_btn = Button::builder(&dialog)
+        .with_id(ID_CANCEL)
+        .with_label(&t("Close"))
+        .build();
     row.add(&close_btn, 0, SizerFlag::All, 4);
     sizer.add_sizer(&row, 0, SizerFlag::All, 2);
 
@@ -686,7 +689,7 @@ fn show_import_cookies_from_browser(parent: &Dialog, cookies_field: TextCtrl) {
 pub fn show_settings(frame: &Frame, config_path: &Path) -> Option<&'static str> {
     let cfg = Config::load(config_path).unwrap_or_default();
     let dialog = Dialog::builder(frame, "BlindRSS Settings").build();
-    dialog.set_escape_id(5101);
+    crate::dialogs::escape_closes(&dialog);
     // The Save button below carries the standard OK id
     // (5100), so the dialog's affirmative id names it
     // explicitly. Python's SettingsDialog builds its buttons

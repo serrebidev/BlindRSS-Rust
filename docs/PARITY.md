@@ -9000,3 +9000,42 @@ Resolutions (v0.1.101, 2026-11-13):
   Favorites" when it is not a favorite, "Remove from
   Favorites" when it is. The command id and handler are
   unchanged.
+
+## Dialog Escape, local times, silent tree commands, Atlantic author cards (2026-11-13, Brandon's reports, v0.1.105)
+
+- **Escape dead in nearly every dialog.** Every custom dialog called
+  `set_escape_id(5101)`, but wx maps Escape (and the title-bar close)
+  to the escape id only by clicking a *button* carrying that id, and
+  every Close/Cancel button had an auto id — so Escape clicked
+  nothing. Reproduced live: About, Open Article (focus in the text
+  field), Add BlindRSS Shortcuts, Configure Persistent Search, Find
+  Feeds and Keyboard Shortcuts. Fix: Close/Cancel buttons are built
+  `.with_id(ID_CANCEL)`, so Escape runs the button's own handler
+  (Podcast Archive's wait-for-idle, YouTube Account's save), and
+  `dialogs::escape_closes` replaces the bare `set_escape_id`: it sets
+  the id and, for a dialog with no cancel-id button, ends the modal
+  as cancel. Verified live on the debug build for the six dialogs
+  above. Source scans guard both halves.
+- **Feed-error times in GMT.** `fmt_ts` printed UTC; Python formats
+  with `time.localtime`. It now applies `local_utc_offset_secs()`
+  (Feed Errors, Article History, Import Site Cookies).
+- **Silent tree commands.** Remove Feed, Edit Feed, Refresh Feed,
+  Feed Properties, Podcast Archive, Notifications/Image settings for
+  this feed, Reset Title, and the category commands (Remove
+  Category, Delete Category and Feeds, ...) only wrote "Select a ...
+  first" to the status bar, which a screen reader never reads.
+  Python's handlers are silent too; the owner asked for a notice.
+  They now show a message box via a one-shot timer (safe while a
+  State borrow is held). The feed-only commands also stop acting on
+  `cat:`/`smart:` tree ids.
+- **Atlantic `[Author: headline]` cards.** The Atlantic also prints
+  recommendation cards with an author label ("[Ian Bogost: Airport
+  chaos began long before the ground stop]") and a split
+  "[Read: ]<a>headline</a>" shape (both seen in stored Atlantic feed
+  bodies; the live page is bot-walled to plain clients). The Rich
+  cleaner now drops any block whose only text outside its links is
+  the brackets; the text path drops author-label card lines (label
+  of at most four words, editorial notes kept) and split cards. The
+  text view shows feed bodies without the extraction postprocess,
+  so `hosted_body_for_display` now strips Atlantic cards for every
+  provider, keeping the body's line layout.

@@ -1061,17 +1061,68 @@ static ATLANTIC_READ_LINK_RE: LazyLock<Regex> =
 static ATLANTIC_READ_LINE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)^\s*\[(?:Read|Watch|Listen|See):.*\]\s*$").unwrap());
 
+/// The split card: "[Read: ]" with the headline link after the
+/// bracket ("[Read: ]Visit this website while you still can").
+static ATLANTIC_SPLIT_CARD_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)^\s*\[(?:Read|Watch|Listen|See):\s*\]\s*[^\[\]\n]{1,200}$").unwrap()
+});
+/// The author card: "[Ian Bogost: Airport chaos began long before
+/// the ground stop]" (Brandon's report, 2026-11-13). The label is
+/// a short name; editorial notes ("[Editor's note: ...]") are not
+/// cards and stay.
+static ATLANTIC_AUTHOR_CARD_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s*\[([^\[\]:\n]{2,40}):\s*[^\[\]\n]{3,200}\]\s*$").unwrap());
+static ATLANTIC_NOTE_LABEL_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(?:note|update[sd]?|correction|clarification|editor)").unwrap()
+});
+
+fn is_atlantic_card_line(p: &str) -> bool {
+    if ATLANTIC_READ_LINE_RE.is_match(p) || ATLANTIC_SPLIT_CARD_RE.is_match(p) {
+        return true;
+    }
+    ATLANTIC_AUTHOR_CARD_RE.captures(p).is_some_and(|c| {
+        let label = c.get(1).unwrap().as_str().trim();
+        label.split_whitespace().count() <= 4
+            && label.chars().next().is_some_and(|ch| ch.is_uppercase())
+            && !ATLANTIC_NOTE_LABEL_RE.is_match(label)
+    })
+}
+
 /// The Atlantic prints in-article recommendation cards as
-/// "[Read: <headline>]" — the extraction engines keep them as
-/// their own paragraphs mid-article. They are navigation
-/// furniture, not prose: drop the whole line when it is only
-/// that card, and remove the inline bracket segment when the
-/// card is glued onto a real paragraph.
+/// "[Read: <headline>]" or "[<Author>: <headline>]" — the
+/// extraction engines keep them as their own paragraphs
+/// mid-article. They are navigation furniture, not prose: drop
+/// the whole line when it is only that card, and remove the
+/// inline "[Read: ...]" segment when the card is glued onto a
+/// real paragraph.
+/// The same card strip for display of a stored feed body: only
+/// card lines and inline "[Read: ...]" segments go; every other
+/// line and the blank-line layout stay as the reader built them.
+pub fn strip_atlantic_cards_keep_layout(text: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    for line in text.split('\n') {
+        if is_atlantic_card_line(line) {
+            continue;
+        }
+        let cleaned = ATLANTIC_READ_LINK_RE.replace_all(line, "");
+        let blank = cleaned.trim().is_empty();
+        if blank && out.last().is_some_and(|l| l.trim().is_empty()) {
+            continue; // the dropped card's blank line
+        }
+        out.push(if blank && !line.trim().is_empty() {
+            String::new()
+        } else {
+            cleaned.trim_end().to_string()
+        });
+    }
+    out.join("\n").trim().to_string()
+}
+
 pub fn strip_atlantic_boilerplate(text: &str) -> String {
     let paras = split_paragraphs(text);
     let kept: Vec<String> = paras
         .into_iter()
-        .filter(|p| !ATLANTIC_READ_LINE_RE.is_match(p))
+        .filter(|p| !is_atlantic_card_line(p))
         .map(|p| ATLANTIC_READ_LINK_RE.replace_all(&p, "").trim().to_string())
         .filter(|p| !p.is_empty())
         .collect();

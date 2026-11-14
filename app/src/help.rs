@@ -103,7 +103,7 @@ pub fn show_help_topic(frame: &Frame, locale: &str, topic_id: Option<&str>) {
     };
 
     let dialog = Dialog::builder(frame, "BlindRSS Help").build();
-    dialog.set_escape_id(5101);
+    crate::dialogs::escape_closes(&dialog);
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     if doc.is_fallback() {
         let notice = StaticText::builder(&dialog)
@@ -152,7 +152,10 @@ pub fn show_help_topic(frame: &Frame, locale: &str, topic_id: Option<&str>) {
     row.add(&list, 1, SizerFlag::Expand | SizerFlag::All, 4);
     row.add(&reader, 2, SizerFlag::Expand | SizerFlag::All, 4);
     sizer.add_sizer(&row, 1, SizerFlag::Expand | SizerFlag::All, 2);
-    let close_btn = Button::builder(&dialog).with_label(&t("Close")).build();
+    let close_btn = Button::builder(&dialog)
+        .with_id(ID_CANCEL)
+        .with_label(&t("Close"))
+        .build();
     sizer.add(&close_btn, 0, SizerFlag::All, 4);
     dialog.set_sizer(sizer, true);
     dialog.set_size(Size::new(760, 520));

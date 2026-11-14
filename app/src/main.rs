@@ -1158,8 +1158,16 @@ fn local_utc_offset_secs() -> i64 {
 /// Local publisher bodies are untouched, and only MacRumors
 /// is gated: other hosts stay raw until a report evidences
 /// their server chrome.
+///
+/// The Atlantic's own feed bodies (any provider, local too)
+/// carry its "[Read: ...]" / "[Author: headline]" cards
+/// mid-text; the text view showed them raw because a feed
+/// body never reaches the extraction postprocess (Brandon's
+/// report, 2026-11-13).
 pub(crate) fn hosted_body_for_display(feed_id: &str, article_url: &str, body_text: &str) -> String {
-    if feed_id.starts_with("miniflux:") && article_url.contains("macrumors.com") {
+    if blindrss_core::postprocess::host_matches(article_url, "theatlantic.com") {
+        blindrss_core::postprocess::strip_atlantic_cards_keep_layout(body_text)
+    } else if feed_id.starts_with("miniflux:") && article_url.contains("macrumors.com") {
         blindrss_core::postprocess::strip_macrumors_boilerplate(body_text)
     } else {
         body_text.to_string()
@@ -2719,13 +2727,59 @@ fn article_copy_url(article: &Article) -> &str {
     }
 }
 
-/// Format a unix timestamp as "YYYY-MM-DD HH:MM" UTC (civil-date
-/// conversion, no date crate needed at this precision).
+/// Format a unix timestamp as "YYYY-MM-DD HH:MM" in the
+/// computer's local time, as Python's `time.localtime` does.
+/// It was UTC until v0.1.105: a feed error at 07:30 local
+/// (UTC+3:30) read "04:00" (Brandon's report, 2026-11-13).
 fn fmt_ts(ts: Option<f64>) -> String {
+    fmt_ts_at(ts, local_utc_offset_secs())
+}
+
+/// A tree command run without the item it needs (Remove Feed
+/// with no feed focused, Remove Category with no category)
+/// says so in a message box (Brandon's reports, 2026-11-13:
+/// these did nothing audible; the status bar alone is silent
+/// for a screen reader). The box opens from a one-shot timer,
+/// after the menu handler returns, so callers may still hold a
+/// State borrow (a modal pumps the drain timer, which borrows
+/// State mutably).
+fn tell_user(frame: &Frame, msg: &str) {
+    frame.set_status_text(msg, 0);
+    let frame = *frame;
+    let msg = msg.to_string();
+    // ponytail: one leaked Timer per notice; these fire only on
+    // a user mistake, so the leak stays a few bytes per session.
+    let timer = Box::leak(Box::new(Timer::new(&frame)));
+    timer.on_tick(move |_| {
+        MessageDialog::builder(&frame, &msg, "BlindRSS")
+            .with_style(MessageDialogStyle::OK | MessageDialogStyle::IconInformation)
+            .build()
+            .show_modal();
+    });
+    timer.start(1, true);
+}
+
+fn tell_no_feed_selected(frame: &Frame) {
+    tell_user(
+        frame,
+        &t("No feed is selected. Select a feed in the tree first."),
+    );
+}
+
+fn tell_no_category_selected(frame: &Frame) {
+    tell_user(
+        frame,
+        &t("No category is selected. Select a category in the tree first."),
+    );
+}
+
+/// fmt_ts with an explicit UTC offset (testable; civil-date
+/// conversion, no date crate needed at this precision).
+fn fmt_ts_at(ts: Option<f64>, offset_secs: i64) -> String {
     let Some(ts) = ts.filter(|t| *t > 0.0) else {
         return "never".to_string();
     };
-    let secs = ts as i64;
+    let secs = ts as i64 + offset_secs;
     let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
     let (h, m) = (rem / 3600, (rem % 3600) / 60);
     // Howard Hinnant's civil-from-days algorithm.
@@ -5659,7 +5713,7 @@ fn main() {
                     found
                 };
                 let Some(feed) = feed else {
-                    frame_rf.set_status_text("Select a feed in the tree first", 0);
+                    tell_no_feed_selected(&frame_rf);
                     return;
                 };
                 frame_rf.set_status_text(&format!("Refreshing feed: {}...", feed.title), 0);
@@ -5958,7 +6012,7 @@ fn main() {
                 return;
             }
             let dlg = Dialog::builder(&frame_deleted, "Deleted Articles").build();
-            dlg.set_escape_id(5101);
+            crate::dialogs::escape_closes(&dlg);
             dlg.set_size(Size::new(820, 480));
             let search_label = StaticText::builder(&dlg).with_label("Search:").build();
             let search_box = TextCtrl::builder(&dlg).build();
@@ -5972,7 +6026,10 @@ fn main() {
             let purge_btn = Button::builder(&dlg)
                 .with_label("Delete Permanently...")
                 .build();
-            let close_btn = Button::builder(&dlg).with_label("Close").build();
+            let close_btn = Button::builder(&dlg)
+                .with_id(ID_CANCEL)
+                .with_label("Close")
+                .build();
             let ds = BoxSizer::builder(Orientation::Vertical).build();
             let srow = BoxSizer::builder(Orientation::Horizontal).build();
             srow.add(&search_label, 0, SizerFlag::All, 4);
@@ -6696,7 +6753,7 @@ fn main() {
                 )
             };
             let Some(feed) = feed else {
-                frame_ef.set_status_text("Select a feed in the tree first", 0);
+                tell_no_feed_selected(&frame_ef);
                 return;
             };
             if !db_ok {
@@ -6784,7 +6841,7 @@ fn main() {
                 (selected_category(&st), st.db.is_some())
             };
             let Some(category) = category else {
-                frame_ec.set_status_text("Select a category in the tree first", 0);
+                tell_no_category_selected(&frame_ec);
                 return;
             };
             if is_protected_uncategorized(Some(&category)) {
@@ -6873,7 +6930,7 @@ fn main() {
                 )
             };
             let Some(feed) = feed else {
-                frame_sc.set_status_text("Select a feed in the tree first", 0);
+                tell_no_feed_selected(&frame_sc);
                 return;
             };
             if !db_ok {
@@ -7232,7 +7289,7 @@ fn main() {
                     .and_then(|id| st.feeds.iter().find(|f| &f.id == id).cloned())
             };
             let Some(feed) = feed else {
-                frame_fp.set_status_text("Select a feed in the tree first", 0);
+                tell_no_feed_selected(&frame_fp);
                 return;
             };
             // `feed` is the pre-dialog snapshot (title/url/
@@ -8017,7 +8074,7 @@ fn main() {
                     .and_then(|id| st.feeds.iter().find(|f| &f.id == id).cloned())
             };
             let Some(feed) = feed else {
-                frame_ar.set_status_text("Select a feed in the tree first", 0);
+                tell_no_feed_selected(&frame_ar);
                 return;
             };
             frame_ar.set_status_text("Rescanning archive...", 0);
@@ -8524,13 +8581,17 @@ fn main() {
         let act_remove: Rc<dyn Fn()> = Rc::new(move || {
             let feed = {
                 let st = state_rm.borrow();
-                let Some(id) = st.selected_feed.clone() else {
-                    frame_rm.set_status_text("Select a feed in the tree first", 0);
-                    return;
-                };
-                st.feeds.iter().find(|f| f.id == id).cloned()
+                st.selected_feed
+                    .as_ref()
+                    .and_then(|id| st.feeds.iter().find(|f| &f.id == id).cloned())
             };
-            let Some(feed) = feed else { return };
+            // A category, a smart folder or nothing focused: say
+            // so instead of doing nothing (the borrow above is
+            // released; the message box pumps the drain timer).
+            let Some(feed) = feed else {
+                tell_no_feed_selected(&frame_rm);
+                return;
+            };
             let dlg = MessageDialog::builder(
                 &frame_rm,
                 &format!("Remove {} and its stored articles?", feed.title),
@@ -8776,7 +8837,7 @@ fn main() {
                         return;
                     }
                     let Some(path) = selected_category(&st) else {
-                        frame_rc.set_status_text("Select a category in the tree first", 0);
+                        tell_no_category_selected(&frame_rc);
                         return;
                     };
                     let feeds = feeds_in_category(&st.feeds, &path);
@@ -8854,11 +8915,11 @@ fn main() {
             let tx_dc = tx.clone();
             Rc::new(move || {
                 let Some(path) = selected_category(&state_dc.borrow()) else {
-                    frame_dc.set_status_text("Select a category in the tree first", 0);
+                    tell_no_category_selected(&frame_dc);
                     return;
                 };
                 if is_protected_uncategorized(Some(&path)) {
-                    frame_dc.set_status_text("The Uncategorized folder cannot be removed.", 0);
+                    tell_user(&frame_dc, &t("The Uncategorized folder cannot be removed."));
                     return;
                 }
                 let dlg = MessageDialog::builder(
@@ -8945,8 +9006,16 @@ fn main() {
             let state_nt = state.clone();
             let frame_nt = frame;
             Rc::new(move || {
-                let Some(feed_id) = state_nt.borrow().selected_feed.clone() else {
-                    frame_nt.set_status_text("Select a feed in the tree first", 0);
+                // Only a real feed: selected_feed also holds
+                // `cat:`/`smart:` tree ids.
+                let selected = {
+                    let st = state_nt.borrow();
+                    st.selected_feed
+                        .clone()
+                        .filter(|id| st.feeds.iter().any(|f| &f.id == id))
+                };
+                let Some(feed_id) = selected else {
+                    tell_no_feed_selected(&frame_nt);
                     return;
                 };
                 let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
@@ -8974,7 +9043,10 @@ fn main() {
             Rc::new(move || {
                 let (feed_id, done) = {
                     let st = state_ia.borrow();
-                    let feed_id = st.selected_feed.clone();
+                    let feed_id = st
+                        .selected_feed
+                        .clone()
+                        .filter(|id| st.feeds.iter().any(|f| &f.id == id));
                     let done = match (&feed_id, &st.db) {
                         (Some(id), Some(db)) => db.set_feed_show_images(id, mode).is_ok(),
                         _ => false,
@@ -8982,7 +9054,7 @@ fn main() {
                     (feed_id, done)
                 };
                 if feed_id.is_none() {
-                    frame_ia.set_status_text("Select a feed in the tree first", 0);
+                    tell_no_feed_selected(&frame_ia);
                 } else if done {
                     frame_ia.set_status_text(
                         match mode {
@@ -9028,11 +9100,11 @@ fn main() {
             let tx_df = tx.clone();
             Rc::new(move || {
                 let Some(path) = selected_category(&state_df.borrow()) else {
-                    frame_df.set_status_text("Select a category in the tree first", 0);
+                    tell_no_category_selected(&frame_df);
                     return;
                 };
                 if is_protected_uncategorized(Some(&path)) {
-                    frame_df.set_status_text("The Uncategorized folder cannot be removed.", 0);
+                    tell_user(&frame_df, &t("The Uncategorized folder cannot be removed."));
                     return;
                 }
                 let (feeds, subcats) = {
@@ -9260,7 +9332,7 @@ fn main() {
             let tx_ih = tx.clone();
             Rc::new(move || {
                 let Some(path) = selected_category(&state_ih.borrow()) else {
-                    frame_ih.set_status_text("Select a category in the tree first", 0);
+                    tell_no_category_selected(&frame_ih);
                     return;
                 };
                 let dlg = FileDialog::builder(&frame_ih)
@@ -9293,7 +9365,7 @@ fn main() {
                 let work = {
                     let st = state_ec.borrow();
                     let Some(path) = selected_category(&st) else {
-                        frame_ec.set_status_text("Select a category in the tree first", 0);
+                        tell_no_category_selected(&frame_ec);
                         return;
                     };
                     (feeds_in_category(&st.feeds, &path), path)
@@ -9842,7 +9914,7 @@ fn main() {
                         .and_then(|id| st.feeds.iter().find(|f| &f.id == id).cloned())
                 };
                 let Some(feed) = feed else {
-                    frame_rt.set_status_text("Select a feed in the tree first", 0);
+                    tell_no_feed_selected(&frame_rt);
                     return;
                 };
                 match blindrss_core::feeds::fetch_and_parse(&feed.url) {
@@ -12614,11 +12686,18 @@ mod ui_parity_tests {
             let text = std::fs::read_to_string(&path).unwrap();
             let lines: Vec<&str> = text.lines().collect();
             for (i, line) in lines.iter().enumerate() {
-                if line.contains("= Dialog::builder") {
+                if line.contains("= Dialog::builder") && !line.contains("line.contains(") {
                     checked += 1;
                     let window: String = lines[i..(i + 6).min(lines.len())].join("\n");
+                    // escape_closes, not a bare set_escape_id: the
+                    // id alone needs a button with that id, and no
+                    // button had one (Brandon, 2026-11-13). Only
+                    // the key-capture dialog keeps the bare id; it
+                    // handles Escape itself.
                     assert!(
-                        window.contains("set_escape_id(5101)"),
+                        window.contains("escape_closes(&")
+                            || (window.contains("Press Shortcut")
+                                && window.contains("set_escape_id(5101)")),
                         "{}:{}: custom dialog without an escape id: {}",
                         path.display(),
                         i + 1,
@@ -12628,6 +12707,79 @@ mod ui_parity_tests {
             }
         }
         assert!(checked >= 30, "scan found only {checked} dialogs");
+    }
+
+    #[test]
+    fn close_and_cancel_buttons_carry_the_cancel_id() {
+        // Brandon, 2026-11-13: Escape did nothing in Feed
+        // Errors, About, Podcast Archive, Video Search and the
+        // rest. wx maps Escape to the escape id by clicking a
+        // button with that id; the Close/Cancel buttons had
+        // auto ids, so Escape clicked nothing. Every button
+        // labelled Close or Cancel must be built with
+        // ID_CANCEL (or 5101).
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut checked = 0;
+        for entry in std::fs::read_dir(&src_dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            let lines: Vec<&str> = text.lines().collect();
+            for (i, line) in lines.iter().enumerate() {
+                let l = line.trim();
+                let labelled = ["\"Close\")", "\"Cancel\")"].iter().any(|lab| {
+                    [
+                        format!("with_label({lab}"),
+                        format!("with_label(&t({lab}"),
+                        format!("mk({lab}"),
+                        format!("mk(&t({lab}"),
+                    ]
+                    .iter()
+                    .any(|pat| l.contains(pat.as_str()))
+                });
+                if !labelled {
+                    continue;
+                }
+                checked += 1;
+                let window: String = lines[i.saturating_sub(3)..=i].join("\n");
+                assert!(
+                    window.contains("with_id(ID_CANCEL)") || window.contains("with_id(5101)"),
+                    "{}:{}: Close/Cancel button without the cancel id: {l}",
+                    path.display(),
+                    i + 1
+                );
+            }
+        }
+        assert!(
+            checked >= 18,
+            "scan found only {checked} Close/Cancel buttons"
+        );
+    }
+
+    #[test]
+    fn timestamps_format_in_local_time() {
+        // Brandon, 2026-11-13: a feed error at 07:30 local
+        // (UTC+3:30) read "04:00"; fmt_ts printed UTC.
+        let ts = 1_794_628_800.0; // 2026-11-14 04:00 UTC
+        assert_eq!(super::fmt_ts_at(Some(ts), 0), "2026-11-14 04:00");
+        assert_eq!(super::fmt_ts_at(Some(ts), 12_600), "2026-11-14 07:30");
+        assert_eq!(super::fmt_ts_at(Some(ts), -7 * 3600), "2026-11-13 21:00");
+        assert_eq!(super::fmt_ts_at(None, 12_600), "never");
+    }
+
+    #[test]
+    fn tree_commands_without_a_target_say_so() {
+        // Brandon, 2026-11-13: Remove Feed / Remove Category
+        // with nothing suitable focused did nothing audible.
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let main = std::fs::read_to_string(src_dir.join("main.rs")).unwrap();
+        let impl_src = main.split("mod ui_parity_tests").next().unwrap();
+        assert!(!impl_src.contains("set_status_text(\"Select a feed in the tree first\""));
+        assert!(!impl_src.contains("set_status_text(\"Select a category in the tree first\""));
+        assert!(impl_src.matches("tell_no_feed_selected(&").count() >= 9);
+        assert!(impl_src.matches("tell_no_category_selected(&").count() >= 6);
     }
 
     #[test]

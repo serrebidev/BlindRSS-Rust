@@ -251,7 +251,10 @@ fn choice_row(
 fn ok_cancel(dialog: &Dialog, sizer: &BoxSizer) {
     let row = BoxSizer::builder(Orientation::Horizontal).build();
     let ok_btn = Button::builder(dialog).with_label(&t("OK")).build();
-    let cancel_btn = Button::builder(dialog).with_label(&t("Cancel")).build();
+    let cancel_btn = Button::builder(dialog)
+        .with_id(ID_CANCEL)
+        .with_label(&t("Cancel"))
+        .build();
     row.add(&ok_btn, 0, SizerFlag::All, 4);
     row.add(&cancel_btn, 0, SizerFlag::All, 4);
     sizer.add_sizer(&row, 0, SizerFlag::All, 2);
@@ -270,7 +273,7 @@ pub fn edit_smart_folder(
     rule0: &Value,
 ) -> Option<(String, Value)> {
     let dialog = Dialog::builder(frame, title).build();
-    dialog.set_escape_id(5101);
+    crate::dialogs::escape_closes(&dialog);
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let name_ctrl = name_row(&dialog, &sizer, "Folder name:", name0);
     let block = CondBlock::build(&dialog, &sizer, rule0);
@@ -323,7 +326,7 @@ pub fn edit_filter_rule(
         ),
     };
     let dialog = Dialog::builder(frame, "Filter Rule").build();
-    dialog.set_escape_id(5101);
+    crate::dialogs::escape_closes(&dialog);
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let name_ctrl = name_row(&dialog, &sizer, "Rule name:", &name0);
     let block = CondBlock::build(&dialog, &sizer, &rule0);
@@ -418,6 +421,30 @@ fn dialog_topic(kind: &str) -> &'static str {
 /// Guide, or F1 while F1 itself is unbound (the platform help
 /// key). When the user has given F1 to another command, the
 /// press is left alone — no help intercept.
+/// Escape closes the dialog (Brandon's reports, 2026-11-13:
+/// Escape did nothing in Feed Errors, About, Find a Podcast,
+/// Podcast Archive, Video Search, Filter Rules, Keyboard
+/// Shortcuts and more). Every dialog mapped Escape to id 5101
+/// (wxID_CANCEL), but wx acts on that only by clicking a
+/// BUTTON with that id, and no button had it. Close/Cancel
+/// buttons are now built `.with_id(ID_CANCEL)`, so Escape and
+/// the title-bar close run that button's own handler (Podcast
+/// Archive's wait-for-idle, YouTube Account's save). A dialog
+/// with no such button ends the modal as cancel instead — the
+/// same code the title-bar close returns.
+pub fn escape_closes(dialog: &Dialog) {
+    dialog.set_escape_id(ID_CANCEL);
+    let d = *dialog;
+    dialog.bind_internal(EventType::CHAR_HOOK, move |ev| {
+        if ev.get_key_code().unwrap_or(0) == 27 && d.find_window_by_id(ID_CANCEL).is_none() {
+            d.end_modal(ID_CANCEL);
+            ev.skip(false);
+        } else {
+            ev.skip(true);
+        }
+    });
+}
+
 pub fn bind_f1(frame: &Frame, dialog: &Dialog, kind: &'static str) {
     bind_f1_impl(frame, dialog, kind, None);
 }
@@ -480,7 +507,7 @@ fn bind_f1_impl(
 
 pub fn show_filter_rules(frame: &Frame, db: &Db) {
     let dialog = Dialog::builder(frame, "Filter Rules").build();
-    dialog.set_escape_id(5101);
+    crate::dialogs::escape_closes(&dialog);
     bind_f1(frame, &dialog, "FilterRulesDialog");
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let list = ListCtrl::builder(&dialog)
@@ -505,7 +532,11 @@ pub fn show_filter_rules(frame: &Frame, db: &Db) {
     let up_btn = mk("Move Up");
     let down_btn = mk("Move Down");
     let apply_btn = mk("Apply to Existing Articles");
-    let close_btn = mk("Close");
+    let close_btn = Button::builder(&dialog)
+        .with_id(ID_CANCEL)
+        .with_label("Close")
+        .build();
+    row.add(&close_btn, 0, SizerFlag::All, 4);
     sizer.add_sizer(&row, 0, SizerFlag::Expand | SizerFlag::All, 2);
 
     // The dialog outlives the Db borrow problem by re-opening
@@ -674,7 +705,7 @@ pub fn show_category_picker(
     prompt: &str,
 ) -> Option<String> {
     let dialog = Dialog::builder(frame, title).build();
-    dialog.set_escape_id(5101);
+    crate::dialogs::escape_closes(&dialog);
     bind_f1(frame, &dialog, "ChooseCategoryDialog");
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let label = StaticText::builder(&dialog).with_label(prompt).build();
@@ -795,7 +826,7 @@ fn category_leaf_parent(path: &str) -> (String, Option<String>) {
 /// moves the whole subtree, which covers both edits).
 pub fn show_category_properties(frame: &Frame, db: &Db, category_path: &str) -> Option<String> {
     let dialog = Dialog::builder(frame, "Category Properties").build();
-    dialog.set_escape_id(5101);
+    crate::dialogs::escape_closes(&dialog);
     bind_f1(frame, &dialog, "CategoryPropertiesDialog");
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let (leaf, current_parent) = category_leaf_parent(category_path);
@@ -851,7 +882,7 @@ pub fn show_feed_properties(frame: &Frame, db: &Db, feed: &blindrss_core::Feed) 
     use blindrss_core::feed_settings as fs;
     let settings0 = db.feed_settings(&feed.id).unwrap_or(Value::Null);
     let dialog = Dialog::builder(frame, "Feed Properties").build();
-    dialog.set_escape_id(5101);
+    crate::dialogs::escape_closes(&dialog);
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     // Python's dialog is a notebook: General + List Headers.
     // The existing General controls keep their order; the
@@ -1061,7 +1092,10 @@ pub fn show_feed_properties(frame: &Frame, db: &Db, feed: &blindrss_core::Feed) 
     // saved (Python refuses the dialog with its codec error).
     let btn_row = BoxSizer::builder(Orientation::Horizontal).build();
     let ok_btn = Button::builder(&dialog).with_label(&t("OK")).build();
-    let cancel_btn = Button::builder(&dialog).with_label(&t("Cancel")).build();
+    let cancel_btn = Button::builder(&dialog)
+        .with_id(ID_CANCEL)
+        .with_label(&t("Cancel"))
+        .build();
     btn_row.add(&ok_btn, 0, SizerFlag::All, 4);
     btn_row.add(&cancel_btn, 0, SizerFlag::All, 4);
     sizer.add_sizer(&btn_row, 0, SizerFlag::All, 2);
@@ -1198,7 +1232,7 @@ pub fn show_feed_properties(frame: &Frame, db: &Db, feed: &blindrss_core::Feed) 
 /// Help menu's changelog viewer.
 pub fn show_about(frame: &Frame) {
     let dialog = Dialog::builder(frame, "About BlindRSS").build();
-    dialog.set_escape_id(5101);
+    crate::dialogs::escape_closes(&dialog);
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let lines = [
         format!("BlindRSS {}", env!("CARGO_PKG_VERSION")),
@@ -1234,7 +1268,10 @@ pub fn show_about(frame: &Frame) {
             crate::help::show_changelog(&frame_cl);
         });
     }
-    let close_btn = Button::builder(&dialog).with_label(&t("Close")).build();
+    let close_btn = Button::builder(&dialog)
+        .with_id(ID_CANCEL)
+        .with_label(&t("Close"))
+        .build();
     sizer.add(&close_btn, 0, SizerFlag::All, 4);
     let d = dialog;
     close_btn.on_click(move |_| d.end_modal(5101));
@@ -1290,7 +1327,7 @@ pub fn show_open_article_dialog(
     rich_default: bool,
 ) -> Option<(String, bool)> {
     let dialog = Dialog::builder(frame, "Open Article").build();
-    dialog.set_escape_id(5101);
+    crate::dialogs::escape_closes(&dialog);
     bind_f1(frame, &dialog, "OpenArticleDialog");
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let intro = StaticText::builder(&dialog)
@@ -1347,7 +1384,7 @@ pub fn show_article_history(frame: &Frame, db: &Db, article: &blindrss_core::Art
     }
     let total = versions.len();
     let dialog = Dialog::builder(frame, "Article History").build();
-    dialog.set_escape_id(5101);
+    crate::dialogs::escape_closes(&dialog);
     bind_f1(frame, &dialog, "ArticleHistoryDialog");
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let heading = StaticText::builder(&dialog)
@@ -1377,7 +1414,10 @@ pub fn show_article_history(frame: &Frame, db: &Db, article: &blindrss_core::Art
     keep_text_place(&text);
     row.add(&text, 2, SizerFlag::Expand | SizerFlag::All, 4);
     sizer.add_sizer(&row, 1, SizerFlag::Expand | SizerFlag::All, 2);
-    let close_btn = Button::builder(&dialog).with_label(&t("Close")).build();
+    let close_btn = Button::builder(&dialog)
+        .with_id(ID_CANCEL)
+        .with_label(&t("Close"))
+        .build();
     sizer.add(&close_btn, 0, SizerFlag::All, 4);
     let versions = Rc::new(versions);
     let show_version: Rc<dyn Fn(usize)> = {
@@ -1607,13 +1647,16 @@ pub fn show_article_columns(frame: &Frame, config_path: &Path) {
     use blindrss_core::article_columns::{layout_from_config, layout_to_json};
     let cfg = Config::load(config_path).unwrap_or_default();
     let dialog = Dialog::builder(frame, "Article Columns").build();
-    dialog.set_escape_id(5101);
+    crate::dialogs::escape_closes(&dialog);
     bind_f1(frame, &dialog, "list-headers");
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let editor = ColumnEditor::build(&dialog, &sizer, layout_from_config(&cfg), true);
     let row = BoxSizer::builder(Orientation::Horizontal).build();
     let ok_btn = Button::builder(&dialog).with_label(&t("OK")).build();
-    let cancel_btn = Button::builder(&dialog).with_label(&t("Cancel")).build();
+    let cancel_btn = Button::builder(&dialog)
+        .with_id(ID_CANCEL)
+        .with_label(&t("Cancel"))
+        .build();
     row.add(&ok_btn, 0, SizerFlag::All, 4);
     row.add(&cancel_btn, 0, SizerFlag::All, 4);
     sizer.add_sizer(&row, 0, SizerFlag::All, 2);
@@ -1656,7 +1699,7 @@ pub fn show_add_feed(
     initial_url: &str,
 ) -> Option<(String, String)> {
     let dialog = Dialog::builder(frame, "Add Feed").build();
-    dialog.set_escape_id(5101);
+    crate::dialogs::escape_closes(&dialog);
     bind_f1(frame, &dialog, "AddFeedDialog");
     // Escape must close the dialog from every control
     // (Brandon's report, 2026-11-13): with focus in the URL
@@ -1796,7 +1839,7 @@ pub fn show_detected_feed_choice(
     feeds: &[blindrss_core::discovery::DetectedFeed],
 ) -> Option<String> {
     let dialog = Dialog::builder(frame, "Detected Feeds").build();
-    dialog.set_escape_id(5101);
+    crate::dialogs::escape_closes(&dialog);
     bind_f1(frame, &dialog, "DetectFeedsDialog");
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let label = StaticText::builder(&dialog)
@@ -1851,7 +1894,7 @@ pub fn show_video_search(
     let cfg = Config::load(config_path).unwrap_or_default();
     let sites = searchable_sites(cfg.get_bool("enable_adult_search", false));
     let dialog = Dialog::builder(frame, "Video Search").build();
-    dialog.set_escape_id(5101);
+    crate::dialogs::escape_closes(&dialog);
     bind_f1(frame, &dialog, "YtdlpGlobalSearchDialog");
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let query_ctrl = name_row(&dialog, &sizer, "Search:", "");
@@ -1918,7 +1961,11 @@ pub fn show_video_search(
     let play_btn = mk("Play");
     let sub_btn = mk("Subscribe");
     let copy_btn = mk("Copy URL");
-    let close_btn = mk("Close");
+    let close_btn = Button::builder(&dialog)
+        .with_id(ID_CANCEL)
+        .with_label("Close")
+        .build();
+    row.add(&close_btn, 0, SizerFlag::All, 4);
     // Python's Subscribe (native) / Subscribe (source)
     // actions (Audit 8 F05), appended after the existing
     // buttons so no existing control moves.
@@ -2237,7 +2284,7 @@ pub fn show_persistent_searches(frame: &Frame, config_path: &Path) -> Option<Str
         .unwrap_or_default();
     let searches = Rc::new(RefCell::new(normalize_saved_searches(&stored)));
     let dialog = Dialog::builder(frame, "Configure Persistent Search").build();
-    dialog.set_escape_id(5101);
+    crate::dialogs::escape_closes(&dialog);
     bind_f1(frame, &dialog, "PersistentSearchDialog");
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let list_label = StaticText::builder(&dialog)
@@ -2268,7 +2315,11 @@ pub fn show_persistent_searches(frame: &Frame, config_path: &Path) -> Option<Str
     let add_btn = mk(&t("Add..."));
     let remove_btn = mk(&t("Remove"));
     let ok_btn = mk(&t("OK"));
-    let cancel_btn = mk(&t("Cancel"));
+    let cancel_btn = Button::builder(&dialog)
+        .with_id(ID_CANCEL)
+        .with_label(&t("Cancel"))
+        .build();
+    row.add(&cancel_btn, 0, SizerFlag::All, 4);
     sizer.add_sizer(&row, 0, SizerFlag::Expand | SizerFlag::All, 2);
 
     let chosen: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
@@ -2431,7 +2482,7 @@ pub(crate) fn feed_error_detail(e: &blindrss_core::db::FeedError) -> String {
 pub fn show_feed_errors(frame: &Frame) -> bool {
     let changed = Rc::new(RefCell::new(false));
     let dialog = Dialog::builder(frame, "Feeds with Errors").build();
-    dialog.set_escape_id(5101);
+    crate::dialogs::escape_closes(&dialog);
     bind_f1(frame, &dialog, "FeedErrorsDialog");
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let heading = StaticText::builder(&dialog).with_label("").build();
@@ -2468,7 +2519,10 @@ pub fn show_feed_errors(frame: &Frame) -> bool {
     let remove_btn = Button::builder(&dialog)
         .with_label(&t("Remove Feed"))
         .build();
-    let close_btn = Button::builder(&dialog).with_label(&t("Close")).build();
+    let close_btn = Button::builder(&dialog)
+        .with_id(ID_CANCEL)
+        .with_label(&t("Close"))
+        .build();
     for b in [&refresh_btn, &copy_btn, &props_btn, &remove_btn, &close_btn] {
         btn_row.add(b, 0, SizerFlag::All, 4);
     }
@@ -2735,7 +2789,7 @@ pub fn show_podcast_archive(
     }
 
     let dialog = Dialog::builder(frame, "Podcast Archive").build();
-    dialog.set_escape_id(5101);
+    crate::dialogs::escape_closes(&dialog);
     bind_f1(frame, &dialog, "PodcastArchiveDialog");
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let feed_row = BoxSizer::builder(Orientation::Horizontal).build();
@@ -2787,7 +2841,11 @@ pub fn show_podcast_archive(
     let dl_selected_btn = mk(&t("Download selected"));
     let dl_all_btn = mk(&t("Download all"));
     let cancel_btn = mk(&t("Cancel downloads"));
-    let close_btn = mk(&t("Close"));
+    let close_btn = Button::builder(&dialog)
+        .with_id(ID_CANCEL)
+        .with_label(&t("Close"))
+        .build();
+    btn_row.add(&close_btn, 0, SizerFlag::All, 4);
     sizer.add_sizer(&btn_row, 0, SizerFlag::Expand | SizerFlag::All, 2);
 
     let all_articles: Rc<RefCell<Vec<blindrss_core::Article>>> = Rc::new(RefCell::new(Vec::new()));
@@ -3562,7 +3620,7 @@ pub fn show_queue(
 ) -> Option<usize> {
     let entries = Rc::new(RefCell::new(load_queue(config_path)));
     let dialog = Dialog::builder(frame, "Play Queue").build();
-    dialog.set_escape_id(5101);
+    crate::dialogs::escape_closes(&dialog);
     bind_f1(frame, &dialog, "play-queue");
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let list = ListBox::builder(&dialog).build();
@@ -3612,7 +3670,11 @@ pub fn show_queue(
     let down_btn = mk("Move Down");
     let remove_btn = mk("Remove");
     let clear_btn = mk("Clear All");
-    let close_btn = mk("Close");
+    let close_btn = Button::builder(&dialog)
+        .with_id(ID_CANCEL)
+        .with_label("Close")
+        .build();
+    row.add(&close_btn, 0, SizerFlag::All, 4);
     sizer.add_sizer(&row, 0, SizerFlag::Expand | SizerFlag::All, 2);
 
     let path = config_path.to_path_buf();
@@ -3733,7 +3795,7 @@ pub fn select_takeout_sources(
         CheckboxState, TreeListCtrl, TreeListCtrlStyle, TreeListItem,
     };
     let dialog = Dialog::builder(frame, "Import YouTube Takeout").build();
-    dialog.set_escape_id(5101);
+    crate::dialogs::escape_closes(&dialog);
     bind_f1(frame, &dialog, "TakeoutImportSelectionDialog");
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let label = StaticText::builder(&dialog)
@@ -3799,7 +3861,7 @@ pub fn choose_takeout_category(frame: &Frame, categories: &[String]) -> Option<S
         }
     }
     let dialog = Dialog::builder(frame, "Import YouTube Takeout").build();
-    dialog.set_escape_id(5101);
+    crate::dialogs::escape_closes(&dialog);
     bind_f1(frame, &dialog, "TakeoutCategoryDialog");
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let label = StaticText::builder(&dialog)
@@ -3835,7 +3897,7 @@ pub fn choose_takeout_category(frame: &Frame, categories: &[String]) -> Option<S
 /// and subscribes the chosen one.
 pub fn show_feed_search(frame: &Frame) -> Option<String> {
     let dialog = Dialog::builder(frame, "Find Feeds").build();
-    dialog.set_escape_id(5101);
+    crate::dialogs::escape_closes(&dialog);
     bind_f1(frame, &dialog, "FeedSearchDialog");
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let url_ctrl = name_row(&dialog, &sizer, "Search terms or site/feed URL:", "");
@@ -3869,7 +3931,11 @@ pub fn show_feed_search(frame: &Frame) -> Option<String> {
     };
     let search_btn = mk("Search");
     let sub_btn = mk("Subscribe");
-    let close_btn = mk("Close");
+    let close_btn = Button::builder(&dialog)
+        .with_id(ID_CANCEL)
+        .with_label("Close")
+        .build();
+    row.add(&close_btn, 0, SizerFlag::All, 4);
     sizer.add_sizer(&row, 0, SizerFlag::Expand | SizerFlag::All, 2);
 
     let candidates: Rc<RefCell<Vec<blindrss_core::feedsearch::FeedResult>>> =
@@ -4010,7 +4076,7 @@ pub fn show_exclude_feeds(frame: &impl WxWidget, config_path: &Path) {
         })
         .unwrap_or_default();
     let dialog = Dialog::builder(frame, "Exclude Feeds from Notifications").build();
-    dialog.set_escape_id(5101);
+    crate::dialogs::escape_closes(&dialog);
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let label = StaticText::builder(&dialog)
         .with_label(&t(
@@ -4165,7 +4231,7 @@ fn youtube_account_sync(config_path: &Path) -> Result<String, String> {
 /// id, None when cancelled.
 fn pick_youtube_category(parent: &Dialog, current: &str) -> Option<String> {
     let dialog = Dialog::builder(parent, "Choose Category").build();
-    dialog.set_escape_id(5101);
+    crate::dialogs::escape_closes(&dialog);
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let label = StaticText::builder(&dialog)
         .with_label(&t("Category for your YouTube subscriptions:"))
@@ -4267,7 +4333,7 @@ pub fn show_youtube_signin(frame: &impl WxWidget, config_path: &Path) {
     };
     let secret = cfg.get_str("youtube_account_client_secret", "").to_string();
     let dialog = Dialog::builder(frame, "YouTube Account").build();
-    dialog.set_escape_id(5101);
+    crate::dialogs::escape_closes(&dialog);
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let status = TextCtrl::builder(&dialog)
         .with_style(TextCtrlStyle::ReadOnly | TextCtrlStyle::MultiLine)
@@ -4319,7 +4385,10 @@ pub fn show_youtube_signin(frame: &impl WxWidget, config_path: &Path) {
         .with_label(&t("Update Account Now"))
         .build();
     bottom_row.add(&sync_btn, 0, SizerFlag::All, 4);
-    let close_btn = Button::builder(&dialog).with_label(&t("Close")).build();
+    let close_btn = Button::builder(&dialog)
+        .with_id(ID_CANCEL)
+        .with_label(&t("Close"))
+        .build();
     bottom_row.add(&close_btn, 0, SizerFlag::All, 4);
     sizer.add_sizer(&bottom_row, 0, SizerFlag::All, 2);
 
@@ -4631,7 +4700,7 @@ pub fn show_cast_picker(
     devices: &[blindrss_core::cast::CastDevice],
 ) -> Option<blindrss_core::cast::CastDevice> {
     let dialog = Dialog::builder(frame, "Cast to Device").build();
-    dialog.set_escape_id(5101);
+    crate::dialogs::escape_closes(&dialog);
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let list = ListBox::builder(&dialog).build();
     for d in devices {
@@ -4669,7 +4738,7 @@ pub fn show_cast_picker(
 pub fn show_import_cookies(frame: &Frame, config_path: &Path) {
     use blindrss_core::chromium;
     let dialog = Dialog::builder(frame, "Import Site Cookies").build();
-    dialog.set_escape_id(5101);
+    crate::dialogs::escape_closes(&dialog);
     bind_f1(frame, &dialog, "site-cookies");
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let label = StaticText::builder(&dialog)
@@ -4699,7 +4768,10 @@ pub fn show_import_cookies(frame: &Frame, config_path: &Path) {
     let row = BoxSizer::builder(Orientation::Horizontal).build();
     let import_btn = Button::builder(&dialog).with_label(&t("Import")).build();
     row.add(&import_btn, 0, SizerFlag::All, 4);
-    let close_btn = Button::builder(&dialog).with_label(&t("Close")).build();
+    let close_btn = Button::builder(&dialog)
+        .with_id(ID_CANCEL)
+        .with_label(&t("Close"))
+        .build();
     row.add(&close_btn, 0, SizerFlag::All, 4);
     sizer.add_sizer(&row, 0, SizerFlag::All, 2);
     // Python's dialog also carries an exported-file import and
@@ -5008,7 +5080,7 @@ fn pick_firefox_profile(
     profiles: &[blindrss_core::firefox::FirefoxProfile],
 ) -> Option<usize> {
     let dialog = Dialog::builder(frame, "Import from Firefox").build();
-    dialog.set_escape_id(5101);
+    crate::dialogs::escape_closes(&dialog);
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let label = StaticText::builder(&dialog)
         .with_label(&t("Choose the Firefox profile to import from:"))
@@ -5046,7 +5118,7 @@ pub fn show_equalizer(frame: &Frame, config_path: &Path) {
         cfg.raw().get("equalizer_user_presets"),
     )));
     let dialog = Dialog::builder(frame, "Equalizer").build();
-    dialog.set_escape_id(5101);
+    crate::dialogs::escape_closes(&dialog);
     bind_f1(frame, &dialog, "EqualizerDialog");
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let enabled_cb = CheckBox::builder(&dialog)
@@ -5221,7 +5293,10 @@ pub fn show_equalizer(frame: &Frame, config_path: &Path) {
 
     let btn_row = BoxSizer::builder(Orientation::Horizontal).build();
     let ok_btn = Button::builder(&dialog).with_label(&t("OK")).build();
-    let cancel_btn = Button::builder(&dialog).with_label(&t("Cancel")).build();
+    let cancel_btn = Button::builder(&dialog)
+        .with_id(ID_CANCEL)
+        .with_label(&t("Cancel"))
+        .build();
     btn_row.add(&ok_btn, 0, SizerFlag::All, 4);
     btn_row.add(&cancel_btn, 0, SizerFlag::All, 4);
     sizer.add_sizer(&btn_row, 0, SizerFlag::All, 2);
@@ -5296,7 +5371,7 @@ pub fn show_equalizer(frame: &Frame, config_path: &Path) {
 pub fn show_add_shortcuts(frame: &Frame) {
     use blindrss_core::windows_shortcuts::{self, ShortcutSelection};
     let dialog = Dialog::builder(frame, &t("Add BlindRSS Shortcuts")).build();
-    dialog.set_escape_id(5101);
+    crate::dialogs::escape_closes(&dialog);
     bind_f1(frame, &dialog, "AddShortcutsDialog");
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let intro = StaticText::builder(&dialog)

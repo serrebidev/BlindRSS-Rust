@@ -1,8 +1,9 @@
 [package]
 name = "blindrss"
-version = "0.1.104"
+version = "0.1.105"
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 
 # patois: this package's strings (and any translatable
 # library's) are collected into po/blindrss.pot and the

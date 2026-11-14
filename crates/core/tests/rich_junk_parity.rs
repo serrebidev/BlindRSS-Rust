@@ -117,3 +117,32 @@ fn axios_preferred_source_promo_dropped_from_rich() {
         "promo tail survived: {out}"
     );
 }
+
+#[test]
+fn atlantic_author_and_split_link_cards_stripped_from_rich() {
+    // Brandon's report, 2026-11-13: Atlantic bodies print
+    // "[Ian Bogost: Airport chaos began long before the ground
+    // stop]" mid-article, and in the Rich View each was a link.
+    // Shapes from stored Atlantic feed bodies: an author-label
+    // card, a Read card, and the split "[Read: ]Headline" card.
+    let html = format!(
+        r#"<html><body><article><p>{BODY_PARA}</p><p><i>[<a href="https://www.theatlantic.com/ideas/2026/11/airport-chaos/689400/">Ian Bogost: Airport chaos began long before the ground stop</a>]</i></p><p>{BODY_PARA}</p><p><i>[<a href="https://www.theatlantic.com/technology/2026/10/ai-agent-chaos-e-commerce/689010/">Read: </a>]</i><a href="https://www.theatlantic.com/technology/2026/10/ai-agent-chaos-e-commerce/689010/">Imagine every AI agent on Earth buying the same cheap paper towels</a></p><p>{BODY_PARA} See <a href="https://example.com/x">[the report]</a>: it matters.</p><p>[Editor's note: This article was updated.]</p></article></body></html>"#
+    );
+    let url = "https://www.theatlantic.com/ideas/2026/11/flights-grounded-why/689446/";
+    let out = clean_article_html(&html, url, false);
+    assert!(out.contains(BODY_PARA), "body prose lost: {out}");
+    assert!(!out.contains("Ian Bogost"), "author card survived: {out}");
+    assert!(
+        !out.contains("paper towels"),
+        "split card headline survived: {out}"
+    );
+    assert!(!out.contains("Read: "), "split card label survived: {out}");
+    assert!(
+        out.contains("it matters"),
+        "prose with a bracketed link lost: {out}"
+    );
+    assert!(
+        out.contains("Editor"),
+        "editor's note (no link) lost: {out}"
+    );
+}

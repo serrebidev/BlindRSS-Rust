@@ -89,7 +89,10 @@ fn capture_shortcut(parent: &Dialog, command_label: &str) -> Option<String> {
     let btn_row = BoxSizer::builder(Orientation::Horizontal).build();
     let ok_btn = Button::builder(&dialog).with_label("OK").build();
     ok_btn.enable(false);
-    let cancel_btn = Button::builder(&dialog).with_label("Cancel").build();
+    let cancel_btn = Button::builder(&dialog)
+        .with_id(ID_CANCEL)
+        .with_label("Cancel")
+        .build();
     btn_row.add(&ok_btn, 0, SizerFlag::All, 4);
     btn_row.add(&cancel_btn, 0, SizerFlag::All, 4);
     sizer.add_sizer(&btn_row, 0, SizerFlag::All, 2);
@@ -145,7 +148,7 @@ pub fn show_shortcuts(frame: &Frame, config_path: &Path) {
     let rows: Rc<Vec<Row>> = Rc::new(rows());
 
     let dialog = Dialog::builder(frame, "Keyboard Shortcuts").build();
-    dialog.set_escape_id(5101);
+    crate::dialogs::escape_closes(&dialog);
     crate::dialogs::bind_f1(frame, &dialog, "KeyboardShortcutsDialog");
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     let info = StaticText::builder(&dialog)
@@ -183,7 +186,10 @@ pub fn show_shortcuts(frame: &Frame, config_path: &Path) {
     let reset_btn = Button::builder(&dialog)
         .with_label("Reset All to &Defaults")
         .build();
-    let close_btn = Button::builder(&dialog).with_label("Close").build();
+    let close_btn = Button::builder(&dialog)
+        .with_id(ID_CANCEL)
+        .with_label("Close")
+        .build();
     btn_row.add(&change_btn, 0, SizerFlag::All, 4);
     btn_row.add(&remove_btn, 0, SizerFlag::All, 4);
     btn_row.add(&reset_btn, 0, SizerFlag::All, 4);

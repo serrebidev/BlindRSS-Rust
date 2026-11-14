@@ -1027,3 +1027,27 @@ fn category_tree_collection_and_delete() {
     assert!(!db.delete_category_tree("News").unwrap());
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn atlantic_author_and_split_cards_removed_from_text() {
+    // Brandon's report, 2026-11-13: "[Ian Bogost: Airport chaos
+    // began long before the ground stop]" mid-article.
+    use blindrss_core::postprocess::strip_atlantic_cards_keep_layout;
+    let url = "https://www.theatlantic.com/ideas/2026/11/flights-grounded-why/689446/";
+    let text = "Opening paragraph.\n\n[Ian Bogost: Airport chaos began long before the ground stop]\n\nMiddle paragraph.\n\n[Read: ]Imagine every AI agent on Earth buying the same cheap paper towels\n\n[Editor's note: This story was updated.]\n\nClosing paragraph.";
+    for cleaned in [pp(text, url), strip_atlantic_cards_keep_layout(text)] {
+        assert!(!cleaned.contains("Ian Bogost"), "{cleaned}");
+        assert!(!cleaned.contains("paper towels"), "{cleaned}");
+        assert!(cleaned.contains("Editor's note"), "{cleaned}");
+        assert!(cleaned.contains("Middle paragraph."), "{cleaned}");
+    }
+    assert_eq!(
+        strip_atlantic_cards_keep_layout(text),
+        "Opening paragraph.\n\nMiddle paragraph.\n\n[Editor's note: This story was updated.]\n\nClosing paragraph."
+    );
+    // Single-newline lines keep their layout.
+    assert_eq!(
+        strip_atlantic_cards_keep_layout("Item one\nItem two\n[Read: A card]\nItem three"),
+        "Item one\nItem two\nItem three"
+    );
+}

@@ -809,6 +809,24 @@ fn convert_yt_facades(html: &str) -> String {
     apply_edits(html, edits)
 }
 
+/// A block whose only text outside its links is the card's brackets:
+/// `[<a>Ian Bogost: Airport chaos began…</a>]` (an author label, not
+/// `Read:`) and the split `[<a>Read: </a>]<a>Headline</a>` shape. The
+/// Atlantic prints both mid-article (Brandon's report, 2026-11-13);
+/// in the Rich View each was a link in the middle of the text.
+fn is_link_only_bracket_card(inner: &str, trimmed: &str) -> bool {
+    if !trimmed.starts_with('[') || !trimmed.contains(']') || !trimmed.contains(':') {
+        return false;
+    }
+    if !has_any_tag(inner, &["a"]) {
+        return false;
+    }
+    let (outside, _) = crate::extract::remove_elements(inner, &|name, _| name == "a");
+    leaf_text(&outside)
+        .chars()
+        .all(|c| c.is_whitespace() || c == '[' || c == ']')
+}
+
 /// Drop standalone `[Read|Watch|Listen|See: ...]` cards and strip the
 /// same bracket segments when glued onto real prose.
 fn strip_recommendation_cards(html: &str) -> String {
@@ -830,7 +848,7 @@ fn strip_recommendation_cards(html: &str) -> String {
         if trimmed.is_empty() || char_len(trimmed) > 400 {
             continue;
         }
-        if READ_CARD_STANDALONE_RE.is_match(trimmed) {
+        if READ_CARD_STANDALONE_RE.is_match(trimmed) || is_link_only_bracket_card(inner, trimmed) {
             edits.push((e.start, e.end, String::new()));
         } else if READ_CARD_SEGMENT_RE.is_match(trimmed) {
             let cleaned = READ_CARD_SEGMENT_RE.replace_all(inner, "").to_string();

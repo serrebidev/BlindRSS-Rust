@@ -3,6 +3,7 @@ name = "blindrss-core"
 version = "0.1.34"
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [dependencies]
 rusqlite = { version = "0.40", features = ["bundled"] }
@@ -23,7 +24,6 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 base64 = "0.22"
 aes = "0.8"
 cbc = { version = "0.1", features = ["block-padding", "alloc"] }
-pbkdf2 = "0.12"
 sha1 = "0.10"
 ring = "0.17"
 alac-encoder = "0.3"
@@ -37,6 +37,11 @@ webrtc-vad = "0.4"
 wreq = "0.16.1"
 wreq-util = "0.2"
 tokio = { version = "1", features = ["rt", "net", "time"] }
+
+# Chromium cookie key derivation runs only on macOS/Linux
+# (Windows uses DPAPI / app-bound keys).
+[target.'cfg(not(windows))'.dependencies]
+pbkdf2 = "0.12"
 
 [dev-dependencies]
 rusqlite = { version = "0.40", features = ["bundled"] }
