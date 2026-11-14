@@ -6,6 +6,10 @@ as `0.1.2-0.1.3`. Each release's section below is its Forgejo release note,
 taken from this file by the release workflow. The in-app updater shows the
 same text.
 
+## 0.1.107
+
+- Player seek options: fixed Back 60 seconds / Forward 60 seconds buttons plus a Jump to Time dialog (hours:minutes:seconds, minutes:seconds or seconds), alongside the user-configurable seek step in Settings.
+
 ## 0.1.106
 
 - Windows Latest: image galleries no longer leave their title and slide counter ("Windows 11 running on iPhone Duo", "1 of 3") in the middle of articles, in the text view or the Rich View. Section headings stay.

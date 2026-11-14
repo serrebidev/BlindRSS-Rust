@@ -134,6 +134,31 @@ fn arm_seek_summary(state: &Rc<RefCell<PlayerState>>) {
         Some(std::time::Instant::now() + std::time::Duration::from_millis(400));
 }
 
+/// Parse a "jump to time" entry into milliseconds: plain seconds
+/// ("90"), mm:ss ("1:23") or h:mm:ss ("1:23:45"). None on invalid input.
+fn parse_jump_to_ms(text: &str) -> Option<i64> {
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let parts: Vec<&str> = text.split(':').collect();
+    if parts.len() > 3 {
+        return None;
+    }
+    let mut total: i64 = 0;
+    for part in parts {
+        let v: i64 = part.trim().parse().ok()?;
+        if v < 0 {
+            return None;
+        }
+        total = total * 60 + v;
+    }
+    Some(total * 1000)
+}
+
+/// The fixed large seek step in milliseconds (60 seconds).
+const SEEK_BIG_MS: i64 = 60_000;
+
 /// The volume step for one button press, read from the config
 /// at use time (percent → fraction, clamped like Python's).
 fn volume_step() -> f64 {
@@ -1603,6 +1628,16 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
     let fwd_btn = Button::builder(&frame)
         .with_label(&format!("Forward {}s", seek_fwd_ms / 1000))
         .build();
+    // Fixed 60-second steps alongside the user-configured step.
+    let back60_btn = Button::builder(&frame)
+        .with_label(&t("Back 60 seconds"))
+        .build();
+    let fwd60_btn = Button::builder(&frame)
+        .with_label(&t("Forward 60 seconds"))
+        .build();
+    let jump_btn = Button::builder(&frame)
+        .with_label(&t("Jump to Time"))
+        .build();
     let vdown_btn = Button::builder(&frame)
         .with_label(&t("Volume Down"))
         .build();
@@ -1691,6 +1726,9 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
         &fwd_btn,
         &format!("{} {}s", t("Fast Forward"), seek_fwd_ms / 1000),
     );
+    crate::msaa_names::set_name(&back60_btn, &t("Back 60 seconds"));
+    crate::msaa_names::set_name(&fwd60_btn, &t("Forward 60 seconds"));
+    crate::msaa_names::set_name(&jump_btn, &t("Jump to Time"));
     let seek_caption = StaticText::builder(&frame).with_label(&t("Seek")).build();
     let chapters_caption = StaticText::builder(&frame)
         .with_label(&t("Chapters"))
@@ -1703,6 +1741,9 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
     row.add(&stop_btn, 0, SizerFlag::All, 4);
     row.add(&back_btn, 0, SizerFlag::All, 4);
     row.add(&fwd_btn, 0, SizerFlag::All, 4);
+    row.add(&back60_btn, 0, SizerFlag::All, 4);
+    row.add(&fwd60_btn, 0, SizerFlag::All, 4);
+    row.add(&jump_btn, 0, SizerFlag::All, 4);
     row.add(&vdown_btn, 0, SizerFlag::All, 4);
     row.add(&vup_btn, 0, SizerFlag::All, 4);
     let row2 = BoxSizer::builder(Orientation::Horizontal).build();
@@ -1950,6 +1991,29 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
             arm_seek_summary(&st);
         })
     };
+    // Fixed 60-second steps (independent of the configured step).
+    let back60: Rc<dyn Fn()> = {
+        let m = media;
+        let st = state.clone();
+        Rc::new(move || {
+            let delta = -SEEK_BIG_MS;
+            announce_seek_limit(&m, delta);
+            let target = m.seek(delta, SeekMode::FromCurrent);
+            begin_user_seek(&mut st.borrow_mut(), target);
+            arm_seek_summary(&st);
+        })
+    };
+    let fwd60: Rc<dyn Fn()> = {
+        let m = media;
+        let st = state.clone();
+        Rc::new(move || {
+            let delta = SEEK_BIG_MS;
+            announce_seek_limit(&m, delta);
+            let target = m.seek(delta, SeekMode::FromCurrent);
+            begin_user_seek(&mut st.borrow_mut(), target);
+            arm_seek_summary(&st);
+        })
+    };
     let volume_down: Rc<dyn Fn()> = {
         let m = media;
         Rc::new(move || {
@@ -1978,6 +2042,47 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
     back_btn.on_click(move |_| rw());
     let fw = forward.clone();
     fwd_btn.on_click(move |_| fw());
+    let b60 = back60.clone();
+    back60_btn.on_click(move |_| b60());
+    let f60 = fwd60.clone();
+    fwd60_btn.on_click(move |_| f60());
+    // Jump to time: ask for h:mm:ss, mm:ss or seconds, then seek.
+    {
+        let m = media;
+        let st = state.clone();
+        let frame_jump = frame;
+        jump_btn.on_click(move |_| {
+            let dlg = TextEntryDialog::builder(
+                &frame_jump,
+                &t("Enter time as hours:minutes:seconds, minutes:seconds or seconds:"),
+                &t("Jump to Time"),
+            )
+            .build();
+            if dlg.show_modal() != 5100 {
+                return;
+            }
+            let text = dlg.get_value().unwrap_or_default();
+            match parse_jump_to_ms(&text) {
+                Some(target_ms) => {
+                    let len = m.length();
+                    let target = if len > 0 {
+                        target_ms.min(len)
+                    } else {
+                        target_ms
+                    };
+                    m.seek(target, SeekMode::FromStart);
+                    begin_user_seek(&mut st.borrow_mut(), target);
+                    m.play();
+                    arm_seek_summary(&st);
+                }
+                None => {
+                    frame_jump
+                        .set_status_text(&t("Invalid time. Use e.g. 1:23:45, 1:23 or 90."), 0);
+                    crate::announce("general", &t("Invalid time. Use e.g. 1:23:45, 1:23 or 90."));
+                }
+            }
+        });
+    }
     let vd = volume_down.clone();
     vdown_btn.on_click(move |_| vd());
     let vu = volume_up.clone();
@@ -3217,6 +3322,26 @@ mod tests {
         // Nor is the very start of a long episode.
         assert!(!reached_end(0, 600_000, 60_000));
         assert!(!reached_end(0, 0, 60_000));
+    }
+
+    #[test]
+    fn jump_to_time_parses_all_forms() {
+        assert_eq!(parse_jump_to_ms("90"), Some(90_000));
+        assert_eq!(parse_jump_to_ms(" 90 "), Some(90_000));
+        assert_eq!(parse_jump_to_ms("1:23"), Some(83_000));
+        assert_eq!(parse_jump_to_ms("1:23:45"), Some(5_025_000));
+        assert_eq!(parse_jump_to_ms("0"), Some(0));
+        assert_eq!(parse_jump_to_ms("0:00:00"), Some(0));
+    }
+
+    #[test]
+    fn jump_to_time_rejects_garbage() {
+        assert_eq!(parse_jump_to_ms(""), None);
+        assert_eq!(parse_jump_to_ms("   "), None);
+        assert_eq!(parse_jump_to_ms("abc"), None);
+        assert_eq!(parse_jump_to_ms("1:2:3:4"), None);
+        assert_eq!(parse_jump_to_ms("-5"), None);
+        assert_eq!(parse_jump_to_ms("1::2"), None);
     }
 
     #[test]
