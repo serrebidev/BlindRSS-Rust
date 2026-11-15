@@ -6,6 +6,12 @@ as `0.1.2-0.1.3`. Each release's section below is its Forgejo release note,
 taken from this file by the release workflow. The in-app updater shows the
 same text.
 
+## 0.1.112
+
+- HTML view no longer traps the keyboard. In the main window, Shift+Tab from the first link on the page now goes back to the article list, and Tab from the last link moves on to the feed tree, instead of dropping focus somewhere silent where even F6 stopped working. F6, Shift+F6 and Escape also work if focus ever lands on the HTML view's frame.
+- The article window's HTML view now takes keyboard focus when the page appears. Before, focus stayed on the hidden text box, so NVDA kept reading "Loading article..." even though the page had loaded. In that window, Escape closes it, Ctrl+Shift+H switches views, and Shift+Tab, F6 or Tab past the last link return to the "Show in HTML view" switch.
+- Switching between the text and HTML views (Ctrl+Shift+H) moves focus with the reading pane instead of leaving it on the hidden one.
+
 ## 0.1.111
 
 - The system tray icon's text now shows how many unread articles and unread podcasts you have, right next to the BlindRSS name — and goes back to the plain name when there are none. There is also a new "Announce Unread Articles and Podcasts" command (default Ctrl+Shift+B, changeable in Tools > Keyboard Shortcuts, and in the Help menu) that speaks the counts whenever you want them.

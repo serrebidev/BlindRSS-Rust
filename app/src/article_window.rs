@@ -185,6 +185,28 @@ fn open_impl(
     if let Some(view) = web {
         layout.add(&view, 1, SizerFlag::Expand | SizerFlag::All, 4);
         view.show(false);
+        // The main window's key bridge (Brandon's report,
+        // 2026-11-15): WebView2 swallows Escape / F6 / Shift+Tab,
+        // so without it a rich article window could not be
+        // closed or left from the keyboard at all. Leaving the
+        // page lands on the HTML view switch, Escape closes.
+        view.add_script_message_handler("blindrssKeyBridge");
+        view.add_user_script(
+            crate::RICH_VIEW_KEYS_JS,
+            wxdragon::widgets::webview::WebViewUserScriptInjectionTime::AtDocumentStart,
+        );
+        view.on_script_message_received(move |data| match data.get_string().as_deref() {
+            Some("__escape") => {
+                frame.close(false);
+            }
+            Some("__toggle_rich") => {
+                frame.process_menu_command(4005);
+            }
+            Some("__focus_list" | "__focus_tree" | "__tab_out") => {
+                rich.set_focus();
+            }
+            _ => {}
+        });
         let flag = loading.clone();
         view.on_loaded(move |_| flag.set(false));
         let flag = loading.clone();
@@ -285,6 +307,9 @@ fn open_impl(
                     view.show(false);
                 }
                 frame.layout();
+                if !rich.has_focus() {
+                    reader.set_focus();
+                }
             }
             if !reload {
                 if !want_rich {
@@ -297,6 +322,11 @@ fn open_impl(
                         reader.show(false);
                         view.show(true);
                         frame.layout();
+                        // Focus follows the visible reader: the hidden
+                        // plain box kept NVDA on "Loading article...".
+                        if !rich.has_focus() {
+                            view.set_focus();
+                        }
                     }
                     return;
                 }
@@ -441,6 +471,11 @@ fn open_impl(
                         reader.show(false);
                         view.show(true);
                         frame.layout();
+                        // Focus follows the visible reader: the hidden
+                        // plain box kept NVDA on "Loading article...".
+                        if !rich.has_focus() {
+                            view.set_focus();
+                        }
                     }
                     frame.set_status_text("HTML article loaded", 0);
                 }
@@ -479,6 +514,11 @@ fn open_impl(
                             reader.show(false);
                             view.show(true);
                             frame.layout();
+                            // Focus follows the visible reader: the hidden
+                            // plain box kept NVDA on "Loading article...".
+                            if !rich.has_focus() {
+                                view.set_focus();
+                            }
                         }
                         frame.set_status_text("This page could not be read.", 0);
                     } else if start_load {

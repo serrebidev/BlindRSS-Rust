@@ -1544,20 +1544,36 @@ pub(crate) fn rich_document(fragment: &str) -> String {
 /// F6 / Shift+Tab before wx sees them, so document-level listeners
 /// catch them and post to the script-message handler, handled in
 /// the frame's `on_script_message_received` below.
-/// - Escape / F6 -> focus the article list
+/// - Escape -> `__escape` (main window: the article list; the
+///   article window closes)
+/// - F6 -> focus the article list
 /// - Shift+F6 -> focus the category tree
-/// - Shift+Tab at the top of the article -> focus the article list
+/// - Shift+Tab at the top of the article (on the body or the
+///   FIRST tab stop) -> focus the article list
+/// - Tab on the LAST tab stop (or with none) -> `__tab_out`
 /// - Ctrl+Shift+H -> toggle the rich view
+///
+/// The tab-stop edges are owned here because WebView2's own
+/// tab-out (MoveFocusRequested) is unhandled by wx: Shift+Tab off
+/// the first link (where Tab from the list lands) moved focus out
+/// of the page into nowhere, and F6 / Escape went dead with it
+/// (Brandon's report, 2026-11-15).
 /// - bare ALT / F10 -> swallowed, nothing happens (Brandon's
 ///   report, 2026-11-13): opening the native menu bar while the
 ///   WebView owns focus leaves NVDA silent until the menu is
 ///   closed, so the stranded user never reaches the menus anyway —
 ///   they get there through Escape / F6 back to the list.
-const RICH_VIEW_KEYS_JS: &str = r"
+pub(crate) const RICH_VIEW_KEYS_JS: &str = r#"
 (function(){
   if(window.__blindrssKeys) return;
   window.__blindrssKeys = true;
   function content(){ return document.getElementById('content'); }
+  var STOPS = 'a[href],area[href],button,input:not([type=hidden]),select,textarea,iframe,summary,audio[controls],video[controls],[contenteditable=""],[contenteditable="true"],[tabindex]';
+  function stops(){
+    return Array.prototype.filter.call(document.querySelectorAll(STOPS), function(el){
+      return el.tabIndex >= 0 && !el.disabled && el.getClientRects().length > 0;
+    });
+  }
   function post(t){ try{ if(window.blindrssKeyBridge && window.blindrssKeyBridge.postMessage){ window.blindrssKeyBridge.postMessage(t); } }catch(e){} }
   var altAlone = false;
   window.addEventListener('keyup', function(e){
@@ -1570,16 +1586,20 @@ const RICH_VIEW_KEYS_JS: &str = r"
     if(e.key==='F6' && e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey){ e.stopPropagation(); e.preventDefault(); post('__focus_tree'); return; }
     if(e.key==='F6' && !e.ctrlKey && !e.altKey && !e.shiftKey && !e.metaKey){ e.stopPropagation(); e.preventDefault(); post('__focus_list'); return; }
     if((e.key==='H'||e.key==='h'||e.code==='KeyH') && (e.ctrlKey||e.metaKey) && !(e.ctrlKey&&e.metaKey) && e.shiftKey && !e.altKey){ e.stopPropagation(); e.preventDefault(); post('__toggle_rich'); return; }
-    if(e.key==='Escape' && !e.ctrlKey && !e.altKey && !e.shiftKey && !e.metaKey){ e.stopPropagation(); e.preventDefault(); post('__focus_list'); return; }
-    if(e.key==='Tab' && e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey){
-      var c = content(); var a = document.activeElement;
-      if(!c || a===c || a===document.body || a===null || !c.contains(a)){
-        e.stopPropagation(); e.preventDefault(); post('__focus_list');
+    if(e.key==='Escape' && !e.ctrlKey && !e.altKey && !e.shiftKey && !e.metaKey){ e.stopPropagation(); e.preventDefault(); post('__escape'); return; }
+    if(e.key==='Tab' && !e.ctrlKey && !e.altKey && !e.metaKey){
+      var c = content(); var a = document.activeElement; var s = stops();
+      if(e.shiftKey){
+        if(!c || a===c || a===document.body || a===null || !c.contains(a) || a===s[0]){
+          e.stopPropagation(); e.preventDefault(); post('__focus_list');
+        }
+      } else if(s.length===0 || a===s[s.length-1]){
+        e.stopPropagation(); e.preventDefault(); post('__tab_out');
       }
     }
   }, true);
 })();
-";
+"#;
 
 /// Python rich_view_links.external_url: a plain HTTP(S) URL safe to
 /// hand to the OS (host present, no credentials, no whitespace,
@@ -4798,10 +4818,12 @@ fn main() {
             wv.on_script_message_received(move |data| {
                 let Some(msg) = data.get_string() else { return };
                 match msg.as_str() {
-                    "__focus_list" => {
+                    "__focus_list" | "__escape" => {
                         list_keys.set_focus();
                     }
-                    "__focus_tree" => {
+                    // Tab past the last link wraps to the first
+                    // pane, as wx's own traversal would.
+                    "__focus_tree" | "__tab_out" => {
                         tree_keys.set_focus();
                     }
                     "__toggle_rich" => {
@@ -9286,9 +9308,21 @@ fn main() {
                     frame.set_status_text(&format!("Could not save reader mode: {e}"), 0);
                     return;
                 }
+                // Focus follows the reading pane across the swap:
+                // hiding the focused pane left NVDA on an
+                // invisible control (Brandon's report, 2026-11-15).
+                let reader_had_focus = reader.has_focus();
+                let pane_had_focus =
+                    !show && !list.has_focus() && !tree.has_focus() && !search_box.has_focus();
                 reader.show(!show);
+                if pane_had_focus {
+                    reader.set_focus();
+                }
                 if let Some(view) = rich_view.as_ref() {
                     view.show(show);
+                    if show && reader_had_focus {
+                        view.set_focus();
+                    }
                     if show
                         && let Some(article) = state
                             .borrow()
@@ -10965,6 +10999,30 @@ fn main() {
                     tree.set_focus();
                     ev.skip(false);
                     return;
+                }
+                // Rich view host fallback: when focus sits on the
+                // WebView's own wx window rather than inside the
+                // page, the in-page key bridge never sees F6 /
+                // Escape, so the pane exits are owned here too.
+                if f1_rich.is_some_and(|h| {
+                    ev.get_event_object()
+                        .is_some_and(|w| w.get_handle() as usize == h)
+                }) && !(mods.ctrl || mods.alt || mods.cmd)
+                {
+                    let target = match (code, mods.shift) {
+                        (345, true) => Some(false), // Shift+F6: tree
+                        (345, false) | (27, false) => Some(true),
+                        _ => None,
+                    };
+                    if let Some(to_list) = target {
+                        if to_list {
+                            list.set_focus();
+                        } else {
+                            tree.set_focus();
+                        }
+                        ev.skip(false);
+                        return;
+                    }
                 }
                 let accel = blindrss_core::shortcuts::event_accel(code, mods, true);
                 // Context help for the control that has focus
@@ -14472,6 +14530,41 @@ mod ui_parity_tests {
         assert!(
             win.contains("Loading this article took too long"),
             "no timeout outcome"
+        );
+    }
+
+    #[test]
+    fn rich_view_focus_can_always_leave_the_page() {
+        // Brandon's report, 2026-11-15: in the rich view
+        // Shift+Tab and F6 could not reach the list or tree,
+        // and the rich article window sat on "Loading
+        // article...". The bridge owns both tab-stop edges, the
+        // frame owns F6 / Escape on the WebView host, the
+        // article window carries the bridge, and focus follows
+        // the visible reader instead of a hidden one.
+        let js = RICH_VIEW_KEYS_JS;
+        assert!(
+            js.contains("a===s[0]"),
+            "Shift+Tab off the first link escapes the page"
+        );
+        assert!(
+            js.contains("post('__tab_out')"),
+            "Tab off the last link escapes the page"
+        );
+        assert!(js.contains("post('__escape')"), "Escape is not bridged");
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let main = std::fs::read_to_string(src_dir.join("main.rs")).unwrap();
+        let impl_src = main.split("#[cfg(test)]").next().unwrap();
+        assert!(impl_src.contains("\"__focus_tree\" | \"__tab_out\""));
+        assert!(impl_src.contains("Rich view host fallback"));
+        assert!(impl_src.contains("if show && reader_had_focus"));
+        let win = std::fs::read_to_string(src_dir.join("article_window.rs")).unwrap();
+        assert!(win.contains("add_script_message_handler(\"blindrssKeyBridge\")"));
+        assert!(win.contains("crate::RICH_VIEW_KEYS_JS"));
+        assert!(win.contains("Some(\"__escape\")"));
+        assert!(
+            win.matches("view.set_focus()").count() >= 3,
+            "a shown rich reader must take focus from the hidden plain one"
         );
     }
 
