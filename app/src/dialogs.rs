@@ -2148,7 +2148,7 @@ pub fn show_video_search(
             if sel >= 0
                 && let Some(r) = results.borrow().get(sel as usize)
             {
-                let _ = Clipboard::get().set_text(&r.url);
+                let _ = crate::copy_to_clipboard(&r.url);
                 status.set_label("URL copied");
             }
         });
@@ -2607,7 +2607,7 @@ pub fn show_feed_errors(frame: &Frame) -> bool {
         });
     }
     copy_btn.on_click(move |_| {
-        let _ = Clipboard::get().set_text(&detail.get_value());
+        let _ = crate::copy_to_clipboard(&detail.get_value());
     });
     // Retry: a real single-feed refresh on a worker, using the
     // main refresh path's knobs (global delete behavior,
@@ -4518,7 +4518,7 @@ pub fn show_youtube_signin(frame: &impl WxWidget, config_path: &Path) {
         copy_code_btn.on_click(move |_| {
             let code = state.borrow().user_code.clone();
             if !code.is_empty() {
-                let _ = Clipboard::get().set_text(&code);
+                let _ = crate::copy_to_clipboard(&code);
             }
         });
     }

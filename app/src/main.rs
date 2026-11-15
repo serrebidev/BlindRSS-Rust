@@ -1455,6 +1455,25 @@ fn announce(event: &str, message: &str) {
     let _ = blindrss_core::announce::Announcements::from_config(&cfg).announce(event, message);
 }
 
+/// Copy text to the clipboard so it SURVIVES the app
+/// closing (Brandon's report, 2026-11-15): wxdragon's bare
+/// set_text leaves the data owned by this process, and
+/// Windows drops it when the process exits — a copied feed
+/// URL was gone by the time he went to paste it. The
+/// BlindRadio pattern: open, set, FLUSH (hands the data to
+/// the system for good), close. Every copy site goes
+/// through here.
+pub(crate) fn copy_to_clipboard(text: &str) -> bool {
+    let clipboard = Clipboard::get();
+    if !clipboard.open() {
+        return false;
+    }
+    let set = clipboard.set_text(text);
+    clipboard.flush();
+    clipboard.close();
+    set
+}
+
 pub(crate) fn open_in_browser(url: &str) {
     #[cfg(target_os = "windows")]
     let _ = std::process::Command::new("rundll32")
@@ -8756,7 +8775,7 @@ fn main() {
                 if text.is_empty() {
                     frame.set_status_text("No selected article content to copy", 0);
                 } else {
-                    let ok = Clipboard::get().set_text(&text);
+                    let ok = copy_to_clipboard(&text);
                     frame.set_status_text(if ok { "Copied" } else { "Copy failed" }, 0);
                 }
             })
@@ -8801,7 +8820,7 @@ fn main() {
                 frame_cf.set_status_text("No feed selected", 0);
                 return;
             };
-            let ok = Clipboard::get().set_text(&feed.url);
+            let ok = copy_to_clipboard(&feed.url);
             frame_cf.set_status_text(if ok { "Feed URL copied" } else { "Copy failed" }, 0);
         });
 
@@ -9891,7 +9910,7 @@ fn main() {
                 };
                 match first_image_url(article.content.as_deref()) {
                     Some(url) => {
-                        let ok = Clipboard::get().set_text(&url);
+                        let ok = copy_to_clipboard(&url);
                         frame_ci.set_status_text(
                             if ok {
                                 "Image link copied"
@@ -14345,6 +14364,57 @@ mod ui_parity_tests {
         assert!(
             !help.contains("render_changelog_text"),
             "the in-app changelog viewer is back"
+        );
+    }
+
+    #[test]
+    fn clipboard_copies_flush_so_they_survive_exit() {
+        // Brandon's report, 2026-11-15: copy a feed URL,
+        // close BlindRSS, and the clipboard is empty — the
+        // copy was owned by the process and died with it.
+        // Every programmatic copy goes through
+        // copy_to_clipboard, which flushes (the BlindRadio
+        // pattern); no bare set_text may remain.
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        for name in ["main.rs", "dialogs.rs", "article_window.rs", "player.rs"] {
+            let src = std::fs::read_to_string(src_dir.join(name)).unwrap();
+            let impl_src = src.split("#[cfg(test)]").next().unwrap();
+            assert!(
+                !impl_src.contains("Clipboard::get().set_text"),
+                "{name} writes the clipboard without flushing"
+            );
+        }
+        let main = std::fs::read_to_string(src_dir.join("main.rs")).unwrap();
+        let start = main.find("pub(crate) fn copy_to_clipboard").unwrap();
+        let helper = &main[start..start + 700];
+        assert!(
+            helper.contains("clipboard.flush()"),
+            "the copy helper does not flush"
+        );
+        assert!(
+            helper.contains("clipboard.open()"),
+            "the copy helper does not open"
+        );
+    }
+
+    #[test]
+    fn article_window_loads_always_resolve() {
+        // Brandon's report, 2026-11-15: ticking HTML view
+        // left the article window on "Loading article..."
+        // forever. The worker now answers even on a panic
+        // (catch_unwind), and the window's timer enforces a
+        // deadline that resolves the window with the
+        // failure presentation.
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let win = std::fs::read_to_string(src_dir.join("article_window.rs")).unwrap();
+        assert!(
+            win.contains("catch_unwind"),
+            "the load worker can still die silently"
+        );
+        assert!(win.contains("LOAD_DEADLINE"), "no load deadline");
+        assert!(
+            win.contains("Loading this article took too long"),
+            "no timeout outcome"
         );
     }
 

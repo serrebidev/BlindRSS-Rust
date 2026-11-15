@@ -39,6 +39,16 @@ pub fn open_url(url: &str, rich: bool) {
     );
 }
 
+/// How long the article window waits for a load before it
+/// resolves with the failure presentation instead of
+/// sitting on "Loading article..." forever (Brandon's
+/// report, 2026-11-15; enforced in open_impl's timer).
+const LOAD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// A finished load: (page title, reader text or rich HTML)
+/// on success, a readable reason on failure.
+type LoadResult = Result<(String, String), String>;
+
 /// Python `core/open_article.py` `_reason_from`: one
 /// readable line out of a failure, whitespace-collapsed and
 /// capped.
@@ -245,6 +255,9 @@ fn open_impl(
     // happens to hold while richer content is on screen.
     let current_text = Rc::new(RefCell::new(body.to_string()));
     let generation = Rc::new(Cell::new(0_u64));
+    // The in-flight load (token, rich?, start time); the
+    // timer enforces LOAD_DEADLINE against it.
+    let pending: Rc<RefCell<Option<(u64, bool, std::time::Instant)>>> = Rc::new(RefCell::new(None));
     let (tx, rx) = std::sync::mpsc::channel::<(u64, bool, Result<(String, String), String>)>();
     let load: Rc<dyn Fn(bool)> = {
         let url = url.clone();
@@ -260,6 +273,7 @@ fn open_impl(
         let cached = cached.clone();
         let generation = generation.clone();
         let loading = loading.clone();
+        let pending = pending.clone();
         Rc::new(move |reload| {
             let want_rich = rich.is_checked() && web.is_some();
             if let Some(bar) = frame.get_menu_bar() {
@@ -294,58 +308,68 @@ fn open_impl(
             }
             generation.set(generation.get() + 1);
             let token = generation.get();
+            *pending.borrow_mut() = Some((token, want_rich, std::time::Instant::now()));
             frame.set_status_text("Loading article...", 0);
             let tx = tx.clone();
             let url = url.clone();
             let title = title.clone();
             let fallback = fallback.clone();
             std::thread::spawn(move || {
-                let jar = blindrss_core::cookies::load_jar_beside(&crate::config_path());
-                let header = blindrss_core::cookies::cookie_header_for(&jar, &url);
-                let result = if want_rich {
-                    blindrss_core::article_html::render_rich_article(
-                        &url,
-                        &fallback,
-                        &title,
-                        "",
-                        "",
-                        &header,
-                        "",
-                        "",
-                        &crate::ui_language(),
-                    )
-                    .map(|html| (String::new(), html))
-                    .ok_or_else(|| "Could not load HTML; switch to the text reader.".into())
-                } else {
-                    match blindrss_core::extract::fetch_full_text(
-                        &url,
-                        &header,
-                        Some(&fallback),
-                        "",
-                    )
-                    .0
-                    {
-                        // The extracted title rides along so
-                        // the caption follows the page, and
-                        // URL windows translate the plain
-                        // result (Python's ArticleWindow
-                        // translate callback, Audit 8 G13).
-                        blindrss_core::ExtractOutcome::Article {
-                            title: page_title,
-                            text,
-                            ..
-                        } => {
-                            let text = if translate_plain {
-                                crate::auto_translate_text(text)
-                            } else {
-                                text
-                            };
-                            Ok((page_title, text))
+                // catch_unwind: a panic anywhere in the
+                // fetch/render cascade must still answer the
+                // window — an unanswered load used to leave
+                // it on "Loading article..." forever.
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let jar = blindrss_core::cookies::load_jar_beside(&crate::config_path());
+                    let header = blindrss_core::cookies::cookie_header_for(&jar, &url);
+                    if want_rich {
+                        blindrss_core::article_html::render_rich_article(
+                            &url,
+                            &fallback,
+                            &title,
+                            "",
+                            "",
+                            &header,
+                            "",
+                            "",
+                            &crate::ui_language(),
+                        )
+                        .map(|html| (String::new(), html))
+                        .ok_or_else(|| "Could not load HTML; switch to the text reader.".into())
+                    } else {
+                        match blindrss_core::extract::fetch_full_text(
+                            &url,
+                            &header,
+                            Some(&fallback),
+                            "",
+                        )
+                        .0
+                        {
+                            // The extracted title rides along so
+                            // the caption follows the page, and
+                            // URL windows translate the plain
+                            // result (Python's ArticleWindow
+                            // translate callback, Audit 8 G13).
+                            blindrss_core::ExtractOutcome::Article {
+                                title: page_title,
+                                text,
+                                ..
+                            } => {
+                                let text = if translate_plain {
+                                    crate::auto_translate_text(text)
+                                } else {
+                                    text
+                                };
+                                Ok((page_title, text))
+                            }
+                            blindrss_core::ExtractOutcome::Gate { reason } => Err(reason),
+                            blindrss_core::ExtractOutcome::Empty => {
+                                Err("No article text found".into())
+                            }
                         }
-                        blindrss_core::ExtractOutcome::Gate { reason } => Err(reason),
-                        blindrss_core::ExtractOutcome::Empty => Err("No article text found".into()),
                     }
-                };
+                }))
+                .unwrap_or_else(|_| Err("The article loader stopped unexpectedly.".to_string()));
                 let _ = tx.send((token, want_rich, result));
             });
         })
@@ -364,7 +388,7 @@ fn open_impl(
             }
         }
         4003 => {
-            Clipboard::get().set_text(&source);
+            crate::copy_to_clipboard(&source);
         }
         4004 => {
             // Copy Text copies the WHOLE current result in
@@ -382,7 +406,7 @@ fn open_impl(
                 current_text_menu.borrow().clone()
             };
             if !text.trim().is_empty() {
-                Clipboard::get().set_text(&text);
+                crate::copy_to_clipboard(&text);
             }
         }
         4005 => {
@@ -394,26 +418,26 @@ fn open_impl(
         }
         _ => event.skip(true),
     });
-    let timer = Box::leak(Box::new(Timer::new(&frame)));
-    let source = url;
-    let current_text_tick = current_text.clone();
-    let title_tick = title.to_string();
-    let author_tick = author.to_string();
-    timer.on_tick(move |_| {
-        while let Ok((token, html, result)) = rx.try_recv() {
-            if token != generation.get() || html != rich.is_checked() {
-                continue;
-            }
+    // One result handler for worker answers AND the load
+    // deadline below: both end in the same success/failure
+    // presentation, so the window always resolves.
+    let handle: Rc<dyn Fn(bool, LoadResult)> = {
+        let cached_h = cached.clone();
+        let current_text_h = current_text.clone();
+        let title_h = title.to_string();
+        let author_h = author.to_string();
+        let source_h = url.clone();
+        Rc::new(move |html, result| {
             match result {
                 Ok((_title, text)) if html => {
-                    *cached.borrow_mut() = Some(text.clone());
+                    *cached_h.borrow_mut() = Some(text.clone());
                     let page_title = title_from_rich_html(&text);
                     if !page_title.is_empty() {
                         frame.set_title(&format!("BlindRSS - {page_title}"));
                     }
                     if let Some(view) = web {
                         loading.set(true);
-                        view.set_page(&crate::rich_document(&text), &source);
+                        view.set_page(&crate::rich_document(&text), &source_h);
                         reader.show(false);
                         view.show(true);
                         frame.layout();
@@ -421,18 +445,18 @@ fn open_impl(
                     frame.set_status_text("HTML article loaded", 0);
                 }
                 Ok((page_title, text)) => {
-                    *current_text_tick.borrow_mut() = text.clone();
+                    *current_text_h.borrow_mut() = text.clone();
                     // The plain result is a full-text render:
                     // it carries Python's Title:/Author: header
                     // (render_full_article), not the bare body.
                     let display_title = if page_title.is_empty() {
-                        title_tick.as_str()
+                        title_h.as_str()
                     } else {
                         page_title.as_str()
                     };
                     reader.set_value(&crate::fulltext_reader_text(
                         display_title,
-                        &author_tick,
+                        &author_h,
                         &text,
                     ));
                     if !page_title.is_empty() {
@@ -449,8 +473,8 @@ fn open_impl(
                         if let Some(view) = web {
                             loading.set(true);
                             view.set_page(
-                                &crate::rich_document(&failure_html(&source, &error)),
-                                &source,
+                                &crate::rich_document(&failure_html(&source_h, &error)),
+                                &source_h,
                             );
                             reader.show(false);
                             view.show(true);
@@ -458,8 +482,8 @@ fn open_impl(
                         }
                         frame.set_status_text("This page could not be read.", 0);
                     } else if start_load {
-                        let text = failure_text(&source, &error);
-                        *current_text_tick.borrow_mut() = text.clone();
+                        let text = failure_text(&source_h, &error);
+                        *current_text_h.borrow_mut() = text.clone();
                         reader.set_value(&text);
                         frame.set_status_text("This page could not be read.", 0);
                     } else {
@@ -467,6 +491,45 @@ fn open_impl(
                     }
                 }
             }
+        })
+    };
+    let timer = Box::leak(Box::new(Timer::new(&frame)));
+    let pending_tick = pending.clone();
+    timer.on_tick(move |_| {
+        while let Ok((token, html, result)) = rx.try_recv() {
+            if let Some((pt, _, _)) = *pending_tick.borrow()
+                && pt == token
+            {
+                *pending_tick.borrow_mut() = None;
+            }
+            if token != generation.get() || html != rich.is_checked() {
+                continue;
+            }
+            handle(html, result);
+        }
+        // The load deadline (Brandon's report, 2026-11-15):
+        // the pipeline's own worst case is far longer than
+        // anyone will wait — a yt-dlp comment run alone may
+        // take 900 s — and a stuck or slow worker used to
+        // leave this window on "Loading article..." for
+        // good. Past the deadline the window resolves with
+        // the failure presentation; the late answer is
+        // generation-stale by then and drops.
+        let overdue = match &*pending_tick.borrow() {
+            Some((token, html, since)) => {
+                *token == generation.get()
+                    && *html == rich.is_checked()
+                    && since.elapsed() >= LOAD_DEADLINE
+            }
+            None => false,
+        };
+        if overdue {
+            let (_, html, _) = pending_tick.borrow_mut().take().unwrap();
+            generation.set(generation.get() + 1);
+            handle(
+                html,
+                Err("Loading this article took too long, so it was stopped.".to_string()),
+            );
         }
     });
     timer.start(150, false);
