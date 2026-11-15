@@ -20,6 +20,7 @@ mod keys;
 mod media_backend;
 mod msaa_names;
 mod player;
+mod rich_view;
 mod settings;
 mod startup;
 mod update;
@@ -1683,9 +1684,12 @@ fn spawn_chapter_fetch(tx: &Sender<RefreshMsg>, generation: u64, article: &Artic
     });
 }
 
-fn spawn_rich_fetch(tx: &Sender<RefreshMsg>, article: &blindrss_core::db::Article) {
+fn spawn_rich_fetch(
+    tx: &Sender<RefreshMsg>,
+    request: blindrss_core::reader_cache::ReaderRequest,
+    article: &blindrss_core::db::Article,
+) {
     let tx = tx.clone();
-    let id = article.id.clone();
     let url = article.url.clone();
     let fallback = article
         .content
@@ -1695,6 +1699,7 @@ fn spawn_rich_fetch(tx: &Sender<RefreshMsg>, article: &blindrss_core::db::Articl
         .unwrap_or_default();
     let title = article.title.clone();
     let author = article.author.clone().unwrap_or_default();
+    let language = ui_language();
     let date = article
         .date
         .clone()
@@ -1704,21 +1709,60 @@ fn spawn_rich_fetch(tx: &Sender<RefreshMsg>, article: &blindrss_core::db::Articl
         .unwrap_or("")
         .to_string();
     std::thread::spawn(move || {
-        let jar = blindrss_core::cookies::load_jar_beside(&config_path());
-        let header = blindrss_core::cookies::cookie_header_for(&jar, &url);
-        let frag = blindrss_core::article_html::render_rich_article(
-            &url,
-            &fallback,
-            &title,
-            &author,
-            &date,
-            &header,
-            "",
-            "",
-            &ui_language(),
-        );
-        let _ = tx.send(RefreshMsg::RichHtml(id, frag));
+        // Always settle the request: a failed worker must not leave its cache
+        // key permanently in flight and suppress every later retry.
+        let frag = std::panic::catch_unwind(|| {
+            let jar = blindrss_core::cookies::load_jar_beside(&config_path());
+            let header = blindrss_core::cookies::cookie_header_for(&jar, &url);
+            blindrss_core::article_html::render_rich_article(
+                &url, &fallback, &title, &author, &date, &header, "", "", &language,
+            )
+        })
+        .ok()
+        .flatten();
+        let _ = tx.send(RefreshMsg::RichHtml(request, frag));
     });
+}
+
+fn rich_cache_key(article: &Article) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    (&article.title, &article.author, &article.date).hash(&mut hash);
+    format!(
+        "{}:{:016x}",
+        reader_cache_key(article, false, "::rich"),
+        hash.finish()
+    )
+}
+
+/// Revisited articles render immediately; selection changes share one debounced request.
+fn request_rich_article(
+    state: &mut State,
+    frame: &Frame,
+    view: &rich_view::RichView,
+    article: &Article,
+) -> bool {
+    if let Some(row) = state
+        .selected_article
+        .and_then(|i| state.articles.get_mut(i))
+        && row.id == article.id
+        && row.url == article.url
+    {
+        row.content = article.content.clone();
+    }
+    let request = blindrss_core::reader_cache::ReaderRequest {
+        key: rich_cache_key(article),
+        article_id: article.id.clone(),
+        url: article.url.clone(),
+        generation: state.reader_generation,
+    };
+    if let Some(html) = state.rich_reader.select(request, std::time::Instant::now()) {
+        view.render(&html, &article.url);
+        frame.set_status_text("Rich HTML retrieved from cache", 0);
+        true
+    } else {
+        false
+    }
 }
 
 fn open_article_link(frame: &Frame, url: &str) {
@@ -1786,9 +1830,7 @@ fn rerender_current_article(
     state: &Rc<RefCell<State>>,
     frame: &Frame,
     reader: &TextCtrl,
-    rich_view: &Rc<Option<WebView>>,
-    rich_loading: &Rc<std::cell::Cell<bool>>,
-    tx: &Sender<RefreshMsg>,
+    rich_view: &Rc<Option<rich_view::RichView>>,
 ) {
     let mut st = state.borrow_mut();
     let Some(idx) = st.selected_article else {
@@ -1805,6 +1847,7 @@ fn rerender_current_article(
     st.pending_fulltext = None;
     st.auto_load = None;
     st.reader_cache.remove_prefix(&format!("{}:", a.id));
+    st.rich_reader.remove_prefix(&format!("{}:", a.id));
     let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
     let keep_alt = show_image_alt_for(&cfg, st.db.as_ref(), &a.feed_id);
     let raw_body = a
@@ -1841,12 +1884,11 @@ fn rerender_current_article(
             );
             match frag {
                 Some(frag) => {
-                    rich_loading.set(true);
-                    wv.set_page(&rich_document(&frag), &a.url);
+                    wv.render(&frag, &a.url);
                     wv.show(true);
                     reader.show(false);
                     frame.layout();
-                    spawn_rich_fetch(tx, &a);
+                    request_rich_article(&mut st, frame, wv, &a);
                 }
                 None => {
                     wv.show(false);
@@ -2273,6 +2315,7 @@ struct State {
     /// Zero is never a live generation.
     pending_play_gen: u64,
     reader_cache: blindrss_core::reader_cache::ReaderCache,
+    rich_reader: blindrss_core::reader_cache::RichReaderCache,
     reader_generation: u64,
     pending_fulltext: Option<(u64, String)>,
     /// A scheduled automatic full-text load (Audit 8 G02):
@@ -2348,8 +2391,8 @@ enum RefreshMsg {
         blindrss_core::extract::ExtractOutcome,
         Option<String>,
     ),
-    /// Rich (WebView) full article: (article id, fragment if any).
-    RichHtml(String, Option<String>),
+    /// Rich (WebView) full article: stamped request and fragment if any.
+    RichHtml(blindrss_core::reader_cache::ReaderRequest, Option<String>),
     /// yt-dlp resolution for playback: (player generation,
     /// article id, stream + headers). Deliveries stamped with
     /// a generation that is no longer current are dropped.
@@ -4793,15 +4836,14 @@ fn main() {
         // gui/rich_view_links.py (issue #102): main-frame link clicks
         // go to the system browser; embeds load in view. wxDragon
         // exposes neither IsTargetMainFrame nor the navigation
-        // action, so the load window (set_page -> Loaded), named
+        // action, so document startup and pending DOM swaps, named
         // sub-frames, and embed-shaped URLs are the discriminators.
-        let rich_view: std::rc::Rc<Option<WebView>> =
+        let rich_view: std::rc::Rc<Option<rich_view::RichView>> =
             std::rc::Rc::new(if WebView::is_backend_available(WebViewBackend::Default) {
-                Some(WebView::builder(&right).build())
+                Some(rich_view::RichView::new(WebView::builder(&right).build()))
             } else {
                 None
             });
-        let rich_loading = std::rc::Rc::new(std::cell::Cell::new(false));
         if let Some(wv) = rich_view.as_ref() {
             wv.show(false);
             // Key bridge (Python _RICH_VIEW_KEYS_JS): without it the
@@ -4829,15 +4871,13 @@ fn main() {
                     "__toggle_rich" => {
                         frame_keys.process_menu_command(M_RICH_VIEW);
                     }
-                    _ => {}
+                    _ => data.event.event.skip(true),
                 }
             });
-            let loading = rich_loading.clone();
-            wv.on_loaded(move |_| loading.set(false));
             let frame_nav = frame;
-            let loading_nav = rich_loading.clone();
+            let view_nav = wv.clone();
             wv.on_navigating(move |data| {
-                if loading_nav.get() {
+                if view_nav.is_loading() {
                     return;
                 }
                 let Some(url) = data.get_url() else { return };
@@ -4866,7 +4906,7 @@ fn main() {
         right_sizer.add(&list, 1, SizerFlag::Expand | SizerFlag::All, 2);
         right_sizer.add(&reader, 2, SizerFlag::Expand | SizerFlag::All, 2);
         if let Some(wv) = rich_view.as_ref() {
-            right_sizer.add(wv, 2, SizerFlag::Expand | SizerFlag::All, 2);
+            right_sizer.add(&wv.view(), 2, SizerFlag::Expand | SizerFlag::All, 2);
         }
         right.set_sizer(right_sizer, true);
         splitter.split_vertically(&tree, &right, 280);
@@ -4930,6 +4970,7 @@ fn main() {
             view_places: std::collections::HashMap::new(),
             menu_label_bases: std::collections::HashMap::new(),
             reader_cache: blindrss_core::reader_cache::ReaderCache::default(),
+            rich_reader: blindrss_core::reader_cache::RichReaderCache::default(),
             reader_generation: 0,
             pending_fulltext: None,
             auto_load: None,
@@ -5106,8 +5147,6 @@ fn main() {
         let state_list = state.clone();
         let frame_list = frame;
         let rich_view_sel = rich_view.clone();
-        let rich_loading_sel = rich_loading.clone();
-        let tx_sel = tx.clone();
         list.on_item_selected(move |ev| {
             let idx = ev.get_item_index();
             if idx < 0 {
@@ -5173,29 +5212,37 @@ fn main() {
             let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
             if cfg.get_bool("full_text_rich_view", false) {
                 if let Some(wv) = rich_view_sel.as_ref() {
-                    let frag = blindrss_core::article_html::rich_article_from_feed(
-                        &a.url,
-                        &raw_body,
-                        &a.title,
-                        a.author.as_deref().unwrap_or(""),
-                        a.date
-                            .as_deref()
-                            .unwrap_or("")
-                            .split('T')
-                            .next()
-                            .unwrap_or(""),
-                        "",
-                        "",
-                        &ui_language(),
-                    );
+                    let cached = request_rich_article(&mut st, &frame_list, wv, &a);
+                    let frag = (!cached)
+                        .then(|| {
+                            blindrss_core::article_html::rich_article_from_feed(
+                                &a.url,
+                                &raw_body,
+                                &a.title,
+                                a.author.as_deref().unwrap_or(""),
+                                a.date
+                                    .as_deref()
+                                    .unwrap_or("")
+                                    .split('T')
+                                    .next()
+                                    .unwrap_or(""),
+                                "",
+                                "",
+                                &ui_language(),
+                            )
+                        })
+                        .flatten();
                     match frag {
                         Some(frag) => {
-                            rich_loading_sel.set(true);
-                            wv.set_page(&rich_document(&frag), &a.url);
+                            wv.render(&frag, &a.url);
                             wv.show(true);
                             reader.show(false);
                             frame_list.layout();
-                            spawn_rich_fetch(&tx_sel, &a);
+                        }
+                        None if cached => {
+                            wv.show(true);
+                            reader.show(false);
+                            frame_list.layout();
                         }
                         None => {
                             wv.show(false);
@@ -5204,6 +5251,7 @@ fn main() {
                     }
                 }
             } else {
+                st.rich_reader.cancel_selection();
                 if let Some(wv) = rich_view_sel.as_ref() {
                     wv.show(false);
                 }
@@ -6563,6 +6611,14 @@ fn main() {
             // are light) before either is computed.
             ensure_content(st.db.as_ref(), &mut article);
             let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
+            // Rich HTML has its own cache and request. Defer the hidden plain
+            // extraction until the user switches readers, as Python does.
+            if cfg.get_bool("full_text_rich_view", false)
+                && let Some(view) = rich_view_ft.as_ref()
+            {
+                request_rich_article(&mut st, &frame_ft, view, &article);
+                return;
+            }
             let keep_alt = show_image_alt_for(&cfg, st.db.as_ref(), &article.feed_id);
             let cache_key = reader_cache_key(&article, keep_alt, &translation_variant(&cfg));
             if let Some((text, source)) = st
@@ -6581,9 +6637,6 @@ fn main() {
                     ),
                 );
                 frame_ft.set_status_text(&format!("Full text ({source}, cached)"), 0);
-                if cfg.get_bool("full_text_rich_view", false) && rich_view_ft.as_ref().is_some() {
-                    spawn_rich_fetch(&tx_ft, &article);
-                }
                 return;
             }
             if st
@@ -6674,13 +6727,8 @@ fn main() {
                     let _ = tx.send(RefreshMsg::FullText(request, outcome, first_html));
                 }
             });
-            // Rich mode: the WebView gets its own full article. The
-            // text result above still lands in the hidden text
-            // reader, so toggling modes stays truthful.
-            let cfg = blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
-            if cfg.get_bool("full_text_rich_view", false) && rich_view_ft.as_ref().is_some() {
-                spawn_rich_fetch(&tx_ft, &article);
-            }
+            // Switching back to this reader starts or reuses this plain load;
+            // rich mode requests only its own full article above.
         });
 
         // Translate Article: send the reader's text (or the
@@ -8390,8 +8438,6 @@ fn main() {
             ("equalizer", act_equalizer.clone()),
         ];
         let rich_view_set = rich_view.clone();
-        let rich_loading_set = rich_loading.clone();
-        let tx_set = tx.clone();
         let act_settings: Rc<dyn Fn()> = Rc::new(move || {
             #[cfg(target_os = "windows")]
             let prior_accel = blindrss_core::config::Config::load(&config_path())
@@ -8418,14 +8464,7 @@ fn main() {
                 .map(|c| c.get_bool("show_image_alt", false))
                 .unwrap_or(false);
             if now_alt != prior_alt {
-                rerender_current_article(
-                    &state_set,
-                    &frame_set,
-                    &reader,
-                    &rich_view_set,
-                    &rich_loading_set,
-                    &tx_set,
-                );
+                rerender_current_article(&state_set, &frame_set, &reader, &rich_view_set);
             }
             // Audit 8 M21: a soundcard change reaches the live
             // player session immediately (Python's mainframe
@@ -8478,6 +8517,7 @@ fn main() {
                 st.auto_load = None;
                 st.reader_generation = st.reader_generation.wrapping_add(1);
                 st.reader_cache = blindrss_core::reader_cache::ReaderCache::default();
+                st.rich_reader.clear();
                 st.refresh_new.clear();
                 st.refresh_new_total = 0;
                 st.refresh_failed = false;
@@ -9101,8 +9141,6 @@ fn main() {
             let state_ia = state.clone();
             let frame_ia = frame;
             let rich_view_ia = rich_view.clone();
-            let rich_loading_ia = rich_loading.clone();
-            let tx_ia = tx.clone();
             Rc::new(move || {
                 let (feed_id, done) = {
                     let st = state_ia.borrow();
@@ -9138,14 +9176,7 @@ fn main() {
                             .map(|a| a.feed_id.clone())
                     };
                     if selected_feed.as_deref() == feed_id.as_deref() {
-                        rerender_current_article(
-                            &state_ia,
-                            &frame_ia,
-                            &reader,
-                            &rich_view_ia,
-                            &rich_loading_ia,
-                            &tx_ia,
-                        );
+                        rerender_current_article(&state_ia, &frame_ia, &reader, &rich_view_ia);
                     }
                 }
             })
@@ -9293,8 +9324,7 @@ fn main() {
         let act_rich_view: Rc<dyn Fn()> = {
             let state = state.clone();
             let rich_view = rich_view.clone();
-            let loading = rich_loading.clone();
-            let tx = tx.clone();
+            let fulltext = act_fulltext.clone();
             Rc::new(move || {
                 let mut cfg =
                     blindrss_core::config::Config::load(&config_path()).unwrap_or_default();
@@ -9323,36 +9353,43 @@ fn main() {
                     if show && reader_had_focus {
                         view.set_focus();
                     }
+                    let mut st = state.borrow_mut();
                     if show
-                        && let Some(article) = state
-                            .borrow()
+                        && let Some(mut article) = st
                             .selected_article
-                            .and_then(|i| state.borrow().articles.get(i).cloned())
+                            .and_then(|i| st.articles.get(i).cloned())
                     {
+                        ensure_content(st.db.as_ref(), &mut article);
+                        let cached = request_rich_article(&mut st, &frame, view, &article);
                         let body = article
                             .content
                             .as_deref()
                             .or(article.description.as_deref())
                             .unwrap_or("");
-                        if let Some(html) = blindrss_core::article_html::rich_article_from_feed(
-                            &article.url,
-                            body,
-                            &article.title,
-                            article.author.as_deref().unwrap_or(""),
-                            article.date.as_deref().unwrap_or(""),
-                            "",
-                            "",
-                            &ui_language(),
-                        ) {
-                            loading.set(true);
-                            view.set_page(&rich_document(&html), &article.url);
+                        if !cached
+                            && let Some(html) = blindrss_core::article_html::rich_article_from_feed(
+                                &article.url,
+                                body,
+                                &article.title,
+                                article.author.as_deref().unwrap_or(""),
+                                article.date.as_deref().unwrap_or(""),
+                                "",
+                                "",
+                                &ui_language(),
+                            )
+                        {
+                            view.render(&html, &article.url);
                         }
-                        spawn_rich_fetch(&tx, &article);
+                    } else if !show {
+                        st.rich_reader.cancel_selection();
                     }
                 }
                 right.layout();
                 if let Some(bar) = frame.get_menu_bar() {
                     bar.check_item(M_RICH_VIEW, show);
+                }
+                if !show {
+                    fulltext();
                 }
             })
         };
@@ -11265,7 +11302,6 @@ fn main() {
         let state_tick = state.clone();
         let frame_tick = frame;
         let rich_view_tick = rich_view.clone();
-        let rich_loading_tick = rich_loading.clone();
         let rx_tick = rx.clone();
         let tx_tick = tx.clone();
         let auto_ft_tick = act_fulltext.clone();
@@ -11373,6 +11409,38 @@ fn main() {
                         {
                             list.set_item_text_by_column(idx as i64, mcol as i32, &media);
                         }
+                    }
+                }
+            }
+            // Only the landed-on rich article starts a worker; cache hits need
+            // no network and obsolete results cannot replace this selection.
+            if let Some(view) = rich_view_tick.as_ref() {
+                let mut st = state_tick.borrow_mut();
+                let article = st.selected_article.and_then(|i| st.articles.get(i).cloned());
+                if !view.is_shown() || article.is_none() {
+                    st.rich_reader.cancel_selection();
+                } else if let Some(article) = article
+                    && let Some(work) = st.rich_reader.take_ready(std::time::Instant::now())
+                {
+                    let request = match &work {
+                        blindrss_core::reader_cache::RichLoad::Cached(request, _)
+                        | blindrss_core::reader_cache::RichLoad::Fetch(request) => request,
+                    };
+                    if request.is_current(st.reader_generation, &article.id, &article.url)
+                        && request.key == rich_cache_key(&article)
+                    {
+                        match work {
+                            blindrss_core::reader_cache::RichLoad::Cached(_, html) => {
+                                view.render(&html, &article.url);
+                                frame_tick.set_status_text("Rich HTML retrieved from cache", 0);
+                            }
+                            blindrss_core::reader_cache::RichLoad::Fetch(request) => {
+                                spawn_rich_fetch(&tx_tick, request, &article);
+                            }
+                        }
+                    } else {
+                        st.rich_reader.finish(request, None);
+                        st.rich_reader.cancel_selection();
                     }
                 }
             }
@@ -11689,9 +11757,9 @@ fn main() {
                                     // toggling modes stays
                                     // truthful.
                                     if cfg.get_bool("full_text_rich_view", false)
-                                        && rich_view_tick.as_ref().is_some()
+                                        && let Some(view) = rich_view_tick.as_ref()
                                     {
-                                        spawn_rich_fetch(&tx_tick, &article);
+                                        request_rich_article(&mut state_tick.borrow_mut(), &frame_tick, view, &article);
                                     }
                                 }
                                 Err(e) => {
@@ -12091,30 +12159,20 @@ fn main() {
                             _ => {}
                         }
                     }
-                    Ok(RefreshMsg::RichHtml(id, fragment)) => {
-                        let st = state_tick.borrow();
-                        let current = st
-                            .selected_article
-                            .and_then(|i| st.articles.get(i))
-                            .map(|a| a.id.clone());
-                        if current.as_deref() == Some(id.as_str())
-                            && let (Some(wv), Some(article)) = (
-                                rich_view_tick.as_ref(),
-                                st.articles.iter().find(|a| a.id == id),
-                            )
-                        {
-                            match fragment {
-                                Some(frag) => {
-                                    rich_loading_tick.set(true);
-                                    wv.set_page(&rich_document(&frag), &article.url);
-                                    frame_tick.set_status_text("Full text (rich view)", 0);
-                                }
-                                None => {
-                                    frame_tick.set_status_text(
-                                        "Rich full text unavailable; showing feed content",
-                                        0,
-                                    );
-                                }
+                    Ok(RefreshMsg::RichHtml(request, fragment)) => {
+                        let mut st = state_tick.borrow_mut();
+                        let failed = fragment.is_none();
+                        let html = st.rich_reader.finish(&request, fragment);
+                        let current = st.selected_article.and_then(|i| st.articles.get(i)).is_some_and(|a| {
+                            request.is_current(st.reader_generation, &a.id, &a.url)
+                                && request.key == rich_cache_key(a)
+                        });
+                        if current && let Some(view) = rich_view_tick.as_ref().clone().filter(|v| v.is_shown()) {
+                            if let Some(html) = html {
+                                view.render(&html, &request.url);
+                                frame_tick.set_status_text("Full text fetched (rich view)", 0);
+                            } else if failed {
+                                frame_tick.set_status_text("Rich full text unavailable; showing feed content", 0);
                             }
                         }
                     }
@@ -14044,6 +14102,29 @@ mod ui_parity_tests {
     }
 
     #[test]
+    fn rich_cache_keys_include_body_url_and_rendered_header() {
+        let original = article("https://example.com/post", None);
+        let key = rich_cache_key(&original);
+        assert!(key.starts_with("episode:"));
+        assert_ne!(key, reader_cache_key(&original, false, ""));
+        let mut changed = original.clone();
+        changed.content = Some("<p>Updated body</p>".into());
+        assert_ne!(key, rich_cache_key(&changed));
+        changed = original.clone();
+        changed.url = "https://example.com/other".into();
+        assert_ne!(key, rich_cache_key(&changed));
+        changed = original.clone();
+        changed.title.push_str(" updated");
+        assert_ne!(key, rich_cache_key(&changed));
+        changed = original.clone();
+        changed.author = Some("Updated author".into());
+        assert_ne!(key, rich_cache_key(&changed));
+        changed = original;
+        changed.date = Some("2026-11-15T12:00:00Z".into());
+        assert_ne!(key, rich_cache_key(&changed));
+    }
+
+    #[test]
     fn copy_episode_link_prefers_playable_enclosure_over_homepage() {
         let a = article(
             "https://example.com/?source=podcast",
@@ -14244,6 +14325,7 @@ mod ui_parity_tests {
                 pending_queue: None,
                 pending_play_gen: 0,
                 reader_cache: blindrss_core::reader_cache::ReaderCache::default(),
+                rich_reader: blindrss_core::reader_cache::RichReaderCache::default(),
                 reader_generation: 0,
                 auto_load: None,
                 pending_fulltext: None,
@@ -14563,7 +14645,7 @@ mod ui_parity_tests {
         assert!(win.contains("crate::RICH_VIEW_KEYS_JS"));
         assert!(win.contains("Some(\"__escape\")"));
         assert!(
-            win.matches("view.set_focus()").count() >= 3,
+            win.matches(".set_focus()").count() >= 3,
             "a shown rich reader must take focus from the hidden plain one"
         );
     }

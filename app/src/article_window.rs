@@ -8,6 +8,8 @@ use wxdragon::event::window_events::WindowEvents;
 use wxdragon::prelude::*;
 use wxdragon::widgets::webview::{WebView, WebViewBackend};
 
+use crate::rich_view::RichView;
+
 pub fn open(title: &str, body: &str, url: Option<&str>) {
     open_impl(title, body, url, None, false, false, "");
 }
@@ -195,10 +197,11 @@ fn open_impl(
     reader.set_value(body);
     layout.add(&reader, 1, SizerFlag::Expand | SizerFlag::All, 4);
     let web = WebView::is_backend_available(WebViewBackend::Default)
-        .then(|| WebView::builder(&frame).build());
-    let loading = Rc::new(Cell::new(false));
-    if let Some(view) = web {
-        layout.add(&view, 1, SizerFlag::Expand | SizerFlag::All, 4);
+        .then(|| RichView::new(WebView::builder(&frame).build()));
+    let rich_status = Rc::new(RefCell::new(String::new()));
+    let focus_after_render = Rc::new(Cell::new(false));
+    if let Some(view) = web.as_ref() {
+        layout.add(&view.view(), 1, SizerFlag::Expand | SizerFlag::All, 4);
         view.show(false);
         // The main window's key bridge (Brandon's report,
         // 2026-11-15): WebView2 swallows Escape / F6 / Shift+Tab,
@@ -210,23 +213,40 @@ fn open_impl(
             crate::RICH_VIEW_KEYS_JS,
             wxdragon::widgets::webview::WebViewUserScriptInjectionTime::AtDocumentStart,
         );
-        view.on_script_message_received(move |data| match data.get_string().as_deref() {
-            Some("__escape") => {
-                frame.close(false);
+        view.on_script_message_received(move |data| {
+            data.event.skip(true);
+            match data.get_string().as_deref() {
+                Some("__escape") => {
+                    frame.close(false);
+                }
+                Some("__toggle_rich") => {
+                    frame.process_menu_command(4005);
+                }
+                Some("__focus_list" | "__focus_tree" | "__tab_out") => {
+                    rich.set_focus();
+                }
+                _ => {}
             }
-            Some("__toggle_rich") => {
-                frame.process_menu_command(4005);
-            }
-            Some("__focus_list" | "__focus_tree" | "__tab_out") => {
-                rich.set_focus();
-            }
-            _ => {}
         });
-        let flag = loading.clone();
-        view.on_loaded(move |_| flag.set(false));
-        let flag = loading.clone();
+        let shown = view.view();
+        let status = rich_status.clone();
+        let focus = focus_after_render.clone();
+        view.on_rendered(move || {
+            if !rich.is_checked() {
+                focus.set(false);
+                return;
+            }
+            frame.set_status_text(&status.borrow(), 0);
+            if focus.replace(false)
+                && !rich.has_focus()
+                && (reader.has_focus() || shown.has_focus())
+            {
+                shown.set_focus();
+            }
+        });
+        let navigation = view.clone();
         view.on_navigating(move |event| {
-            if flag.get() || !event.get_target().unwrap_or_default().is_empty() {
+            if navigation.is_loading() || !event.get_target().unwrap_or_default().is_empty() {
                 return;
             }
             if let Some(url) = event.get_url()
@@ -309,7 +329,9 @@ fn open_impl(
         };
         let cached = cached.clone();
         let generation = generation.clone();
-        let loading = loading.clone();
+        let web = web.clone();
+        let rich_status = rich_status.clone();
+        let focus_after_render = focus_after_render.clone();
         let pending = pending.clone();
         Rc::new(move |reload| {
             let want_rich = rich.is_checked() && web.is_some();
@@ -317,8 +339,9 @@ fn open_impl(
                 bar.check_item(4005, want_rich);
             }
             if !want_rich {
+                focus_after_render.set(false);
                 reader.show(true);
-                if let Some(view) = web {
+                if let Some(view) = web.as_ref() {
                     view.show(false);
                 }
                 frame.layout();
@@ -331,17 +354,13 @@ fn open_impl(
                     return;
                 }
                 if let Some(html) = cached.borrow().as_ref() {
-                    if let Some(view) = web {
-                        loading.set(true);
-                        view.set_page(&crate::rich_document(html), &url);
+                    if let Some(view) = web.as_ref() {
+                        *rich_status.borrow_mut() = "HTML article loaded".into();
+                        focus_after_render.set(reader.has_focus() || view.has_focus());
                         reader.show(false);
                         view.show(true);
                         frame.layout();
-                        // Focus follows the visible reader: the hidden
-                        // plain box kept NVDA on "Loading article...".
-                        if !rich.has_focus() {
-                            view.set_focus();
-                        }
+                        view.render(html, &url);
                     }
                     return;
                 }
@@ -425,6 +444,7 @@ fn open_impl(
     let source = url.clone();
     let cached_menu = cached.clone();
     let current_text_menu = current_text.clone();
+    let web_menu = web.clone();
     frame.on_menu(move |event| match event.get_id() {
         4001 => action(true),
         4002 => {
@@ -442,7 +462,7 @@ fn open_impl(
             // loaded document — never the hidden plain
             // control's stale contents. Ctrl+C in the reader
             // keeps its selection semantics untouched.
-            let text = if rich.is_checked() && web.is_some() {
+            let text = if rich.is_checked() && web_menu.is_some() {
                 match cached_menu.borrow().as_ref() {
                     Some(html) => collapse_blank_lines(&blindrss_core::extract::html_to_text(html)),
                     None => current_text_menu.borrow().clone(),
@@ -455,7 +475,7 @@ fn open_impl(
             }
         }
         4005 => {
-            rich.set_value(!rich.is_checked() && web.is_some() && !source.is_empty());
+            rich.set_value(!rich.is_checked() && web_menu.is_some() && !source.is_empty());
             action(false);
         }
         4006 => {
@@ -472,6 +492,9 @@ fn open_impl(
         let title_h = title.to_string();
         let author_h = author.to_string();
         let source_h = url.clone();
+        let web = web.clone();
+        let rich_status = rich_status.clone();
+        let focus_after_render = focus_after_render.clone();
         Rc::new(move |html, result| {
             match result {
                 Ok((_title, text)) if html => {
@@ -480,19 +503,14 @@ fn open_impl(
                     if !page_title.is_empty() {
                         frame.set_title(&format!("BlindRSS - {page_title}"));
                     }
-                    if let Some(view) = web {
-                        loading.set(true);
-                        view.set_page(&crate::rich_document(&text), &source_h);
+                    if let Some(view) = web.as_ref() {
+                        *rich_status.borrow_mut() = "HTML article loaded".into();
+                        focus_after_render.set(reader.has_focus() || view.has_focus());
                         reader.show(false);
                         view.show(true);
                         frame.layout();
-                        // Focus follows the visible reader: the hidden
-                        // plain box kept NVDA on "Loading article...".
-                        if !rich.has_focus() {
-                            view.set_focus();
-                        }
+                        view.render(&text, &source_h);
                     }
-                    frame.set_status_text("HTML article loaded", 0);
                 }
                 Ok((page_title, text)) => {
                     *current_text_h.borrow_mut() = text.clone();
@@ -520,22 +538,14 @@ fn open_impl(
                     // (Audit 8 G13); article windows keep the
                     // status-only behaviour.
                     if start_load && html {
-                        if let Some(view) = web {
-                            loading.set(true);
-                            view.set_page(
-                                &crate::rich_document(&failure_html(&source_h, &error)),
-                                &source_h,
-                            );
+                        if let Some(view) = web.as_ref() {
+                            *rich_status.borrow_mut() = "This page could not be read.".into();
+                            focus_after_render.set(reader.has_focus() || view.has_focus());
                             reader.show(false);
                             view.show(true);
                             frame.layout();
-                            // Focus follows the visible reader: the hidden
-                            // plain box kept NVDA on "Loading article...".
-                            if !rich.has_focus() {
-                                view.set_focus();
-                            }
+                            view.render(&failure_html(&source_h, &error), &source_h);
                         }
-                        frame.set_status_text("This page could not be read.", 0);
                     } else if start_load {
                         let text = failure_text(&source_h, &error);
                         *current_text_h.borrow_mut() = text.clone();

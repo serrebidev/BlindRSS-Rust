@@ -1,8 +1,9 @@
 //! Bounded on-demand reader text cache; background prefetch is deliberately disabled.
 
 use std::collections::VecDeque;
+use std::time::{Duration, Instant};
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReaderRequest {
     pub key: String,
     pub article_id: String,
@@ -119,9 +120,240 @@ impl ReaderCache {
     }
 }
 
+pub enum RichLoad {
+    Cached(ReaderRequest, String),
+    Fetch(ReaderRequest),
+}
+
+/// On-demand HTML cache and debounced selection; workers never own UI state.
+#[derive(Default)]
+pub struct RichReaderCache {
+    cache: ReaderCache,
+    desired: Option<ReaderRequest>,
+    pending: Option<(ReaderRequest, Instant)>,
+    in_flight: Vec<ReaderRequest>,
+}
+
+impl RichReaderCache {
+    pub fn select(&mut self, request: ReaderRequest, now: Instant) -> Option<String> {
+        self.desired = Some(request.clone());
+        if let Some((html, _)) = self.cache.get(&request.key, false) {
+            self.pending = None;
+            return Some(html);
+        }
+        if !self
+            .pending
+            .as_ref()
+            .is_some_and(|(pending, _)| pending == &request)
+        {
+            self.pending = Some((request, now + Duration::from_millis(180)));
+        }
+        None
+    }
+
+    pub fn take_ready(&mut self, now: Instant) -> Option<RichLoad> {
+        let (request, ready_at) = self.pending.as_ref()?;
+        if now < *ready_at {
+            return None;
+        }
+        if let Some((html, _)) = self.cache.get(&request.key, false) {
+            let (request, _) = self.pending.take()?;
+            return Some(RichLoad::Cached(request, html));
+        }
+        if self
+            .in_flight
+            .iter()
+            .any(|active| active.key == request.key)
+        {
+            return None;
+        }
+        let (request, _) = self.pending.take()?;
+        self.in_flight.push(request.clone());
+        Some(RichLoad::Fetch(request))
+    }
+
+    pub fn finish(&mut self, request: &ReaderRequest, html: Option<String>) -> Option<String> {
+        let index = self.in_flight.iter().position(|active| active == request)?;
+        self.in_flight.remove(index);
+        let current = self.desired.as_ref() == Some(request);
+        if current {
+            self.pending = None;
+        }
+        let html = html.filter(|html| !html.trim().is_empty())?;
+        self.cache.insert(
+            request.key.clone(),
+            html.clone(),
+            "rich",
+            request.generation,
+        );
+        current.then_some(html)
+    }
+
+    pub fn cancel_selection(&mut self) {
+        self.desired = None;
+        self.pending = None;
+    }
+
+    pub fn clear(&mut self) {
+        self.cache = ReaderCache::default();
+        self.cancel_selection();
+        self.in_flight.clear();
+    }
+
+    pub fn remove_prefix(&mut self, prefix: &str) {
+        self.cache.remove_prefix(prefix);
+        self.in_flight
+            .retain(|request| !request.key.starts_with(prefix));
+        if self
+            .desired
+            .as_ref()
+            .is_some_and(|request| request.key.starts_with(prefix))
+        {
+            self.cancel_selection();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rich_request(id: &str, generation: u64) -> ReaderRequest {
+        ReaderRequest {
+            key: format!("{id}:body:settings"),
+            article_id: id.into(),
+            url: format!("https://example.com/{id}"),
+            generation,
+        }
+    }
+
+    fn fetch(cache: &mut RichReaderCache, now: std::time::Instant) -> ReaderRequest {
+        match cache.take_ready(now).expect("ready request") {
+            RichLoad::Fetch(request) => request,
+            RichLoad::Cached(..) => panic!("unexpected cached document"),
+        }
+    }
+
+    #[test]
+    fn rich_selection_debounces_to_latest_without_blocking_on_old_work() {
+        let now = std::time::Instant::now();
+        let later = now + std::time::Duration::from_millis(180);
+        let mut cache = RichReaderCache::default();
+        cache.select(rich_request("a", 1), now);
+        assert!(cache.take_ready(now).is_none());
+        cache.select(rich_request("b", 2), now);
+        assert_eq!(fetch(&mut cache, later).article_id, "b");
+        cache.select(rich_request("c", 3), later);
+        assert_eq!(fetch(&mut cache, later + (later - now)).article_id, "c");
+    }
+
+    #[test]
+    fn rich_duplicate_request_keeps_debounce_and_fetches_once() {
+        let now = std::time::Instant::now();
+        let mut cache = RichReaderCache::default();
+        cache.select(rich_request("a", 1), now);
+        cache.select(
+            rich_request("a", 1),
+            now + std::time::Duration::from_millis(100),
+        );
+        let request = fetch(&mut cache, now + std::time::Duration::from_millis(180));
+        cache.select(rich_request("a", 1), now);
+        assert!(
+            cache
+                .take_ready(now + std::time::Duration::from_secs(1))
+                .is_none()
+        );
+        assert_eq!(
+            cache.finish(&request, Some("html".into())),
+            Some("html".into())
+        );
+        assert_eq!(cache.select(rich_request("a", 2), now), Some("html".into()));
+    }
+
+    #[test]
+    fn rich_old_a_result_is_cached_but_applies_only_with_current_generation() {
+        let now = std::time::Instant::now();
+        let ready = now + std::time::Duration::from_secs(1);
+        let mut cache = RichReaderCache::default();
+        cache.select(rich_request("a", 1), now);
+        let old_a = fetch(&mut cache, ready);
+        cache.select(rich_request("b", 2), now);
+        cache.select(rich_request("a", 3), now);
+        assert!(cache.take_ready(ready).is_none());
+        assert!(cache.finish(&old_a, Some("html".into())).is_none());
+        match cache.take_ready(ready).expect("current cached request") {
+            RichLoad::Cached(request, html) => {
+                assert_eq!(request.generation, 3);
+                assert_eq!(html, "html");
+            }
+            RichLoad::Fetch(_) => panic!("duplicate fetch"),
+        }
+    }
+
+    #[test]
+    fn rich_failure_retries_on_next_request() {
+        let now = std::time::Instant::now();
+        let ready = now + std::time::Duration::from_secs(1);
+        let mut cache = RichReaderCache::default();
+        cache.select(rich_request("a", 1), now);
+        let request = fetch(&mut cache, ready);
+        assert!(cache.finish(&request, None).is_none());
+        assert!(cache.take_ready(ready).is_none());
+        assert!(cache.select(rich_request("a", 1), now).is_none());
+        assert_eq!(fetch(&mut cache, ready).article_id, "a");
+    }
+
+    #[test]
+    fn rich_invalidation_discards_stale_completion_without_consuming_new_request() {
+        let now = std::time::Instant::now();
+        let ready = now + std::time::Duration::from_secs(1);
+        let mut cache = RichReaderCache::default();
+        cache.select(rich_request("a", 1), now);
+        let old = fetch(&mut cache, ready);
+        cache.clear();
+        cache.select(rich_request("a", 2), now);
+        let new = fetch(&mut cache, ready);
+        assert!(cache.finish(&old, Some("old".into())).is_none());
+        assert_eq!(cache.finish(&new, Some("new".into())), Some("new".into()));
+        cache.remove_prefix("a:");
+        assert!(cache.select(rich_request("a", 3), now).is_none());
+        let request = fetch(&mut cache, ready);
+        cache.remove_prefix("a:");
+        assert!(cache.finish(&request, Some("stale".into())).is_none());
+        assert!(cache.select(rich_request("a", 4), now).is_none());
+    }
+
+    #[test]
+    fn rich_cancelled_selection_still_caches_completed_work() {
+        let now = Instant::now();
+        let ready = now + Duration::from_secs(1);
+        let mut cache = RichReaderCache::default();
+        cache.select(rich_request("a", 1), now);
+        let request = fetch(&mut cache, ready);
+        cache.select(rich_request("b", 2), now);
+        cache.cancel_selection();
+        assert!(cache.take_ready(ready).is_none());
+        assert!(cache.finish(&request, Some("html".into())).is_none());
+        assert_eq!(cache.select(rich_request("a", 3), now), Some("html".into()));
+    }
+
+    #[test]
+    fn rich_changed_body_does_not_accept_or_reuse_old_document() {
+        let now = Instant::now();
+        let ready = now + Duration::from_secs(1);
+        let mut cache = RichReaderCache::default();
+        cache.select(rich_request("a", 1), now);
+        let old = fetch(&mut cache, ready);
+        let mut changed = rich_request("a", 1);
+        changed.key.push_str(":changed-body");
+        cache.select(changed, now);
+        assert!(cache.finish(&old, Some("old body".into())).is_none());
+        let request = fetch(&mut cache, ready);
+        assert_eq!(
+            cache.finish(&request, Some("new body".into())),
+            Some("new body".into())
+        );
+    }
 
     #[test]
     fn successful_loads_are_lru_bounded_and_feed_fallbacks_retry() {

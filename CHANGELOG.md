@@ -6,6 +6,13 @@ as `0.1.2-0.1.3`. Each release's section below is its Forgejo release note,
 taken from this file by the release workflow. The in-app updater shows the
 same text.
 
+## 0.1.114
+
+- Rich View reuses its HTML document instead of reloading the browser for every article. Updates run after the UI event handler returns, preserving the keyboard bridge and keeping the interface responsive while HTML is replaced.
+- Returning to an article in the main reader reuses its cached rich HTML. Fast selection changes fetch only the article you settle on, duplicate requests share one fetch, and late answers cannot replace a newer selection.
+- Rich View no longer downloads and extracts a second, hidden plain-text copy of the same article. Switching to the text reader loads that version when needed.
+- The article window reports HTML completion after the browser has applied the article, and keeps keyboard focus on the visible reader.
+
 ## 0.1.113
 
 - Open Article works again. Since 0.1.110 the article window stayed on "Loading article..." forever, in both the text and HTML views, even though the page had already loaded: the window's timer crashed every time an answer came back. Pages now appear as soon as they load.

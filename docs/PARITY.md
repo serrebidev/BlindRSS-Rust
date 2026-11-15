@@ -9075,3 +9075,29 @@ client; sync now ports Python's list_subscriptions/parse_channels
 (the TV `FEchannels` browse page, channel tiles, first title
 wins, sorted by title, empty result is an error), sharing the
 browse helper with recommendations.
+
+## Rich View performance (2026-11-15, v0.1.114)
+
+The Netmeister `claude-delusion.html` report was investigated against Python's
+`core/article_html.py`, `gui/mainframe.py`, `gui/article_window.py`, and
+`gui/reader_performance.py`. With the same live page and Rust's locked
+dependencies, full rich extraction measured 0.604 seconds cold and 0.079
+seconds warm; Python measured 0.587 and 0.123 seconds. The reported multi-second
+stall was not reproduced by those extraction probes.
+
+The port nevertheless repeated work that Python avoids. Main-reader rich HTML
+now uses the existing bounded reader cache, debounces selection changes, shares
+matching in-flight requests, and checks generation, URL, and body/header identity
+before applying an answer. Stale successful answers may populate the cache but
+cannot replace the current article. Account and display invalidation discard
+old requests. The plain extractor waits until its reader is requested instead
+of running alongside every rich fetch.
+
+Both rich surfaces use a stable WebView document. A deferred, coalesced DOM swap
+preserves the keyboard bridge, updates the document base before inserting the
+complete sanitized fragment, retains the article's language, and marks the
+subtree busy during replacement. Browser acknowledgements distinguish document
+startup from applied article content. Standalone completion and focus follow
+that acknowledgement rather than the call that queued HTML. Recovery retains
+the full-page loading path. Native keyboard and NVDA acceptance remain manual;
+automated state and hidden-browser checks do not claim that acceptance.
