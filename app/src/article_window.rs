@@ -49,6 +49,21 @@ const LOAD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
 /// on success, a readable reason on failure.
 type LoadResult = Result<(String, String), String>;
 
+/// The in-flight load: (token, rich?, start time).
+type PendingLoad = RefCell<Option<(u64, bool, std::time::Instant)>>;
+
+/// Clear the pending load once its answer arrives. The shared
+/// borrow must end before the mutable one: holding it across
+/// an `if let` body panicked "RefCell already borrowed" on
+/// every answer, so the window never left "Loading article..."
+/// (v0.1.110 - v0.1.112).
+fn settle_pending(pending: &PendingLoad, token: u64) {
+    let answered = matches!(*pending.borrow(), Some((t, _, _)) if t == token);
+    if answered {
+        *pending.borrow_mut() = None;
+    }
+}
+
 /// Python `core/open_article.py` `_reason_from`: one
 /// readable line out of a failure, whitespace-collapsed and
 /// capped.
@@ -279,7 +294,7 @@ fn open_impl(
     let generation = Rc::new(Cell::new(0_u64));
     // The in-flight load (token, rich?, start time); the
     // timer enforces LOAD_DEADLINE against it.
-    let pending: Rc<RefCell<Option<(u64, bool, std::time::Instant)>>> = Rc::new(RefCell::new(None));
+    let pending: Rc<PendingLoad> = Rc::new(RefCell::new(None));
     let (tx, rx) = std::sync::mpsc::channel::<(u64, bool, Result<(String, String), String>)>();
     let load: Rc<dyn Fn(bool)> = {
         let url = url.clone();
@@ -537,11 +552,7 @@ fn open_impl(
     let pending_tick = pending.clone();
     timer.on_tick(move |_| {
         while let Ok((token, html, result)) = rx.try_recv() {
-            if let Some((pt, _, _)) = *pending_tick.borrow()
-                && pt == token
-            {
-                *pending_tick.borrow_mut() = None;
-            }
+            settle_pending(&pending_tick, token);
             if token != generation.get() || html != rich.is_checked() {
                 continue;
             }
@@ -615,6 +626,17 @@ fn open_impl(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn answered_load_settles_without_a_borrow_panic() {
+        // Open Article stuck on "Loading article..." (v0.1.112
+        // report): the tick panicked here on every answer.
+        let pending: PendingLoad = RefCell::new(Some((3, false, std::time::Instant::now())));
+        settle_pending(&pending, 2);
+        assert!(pending.borrow().is_some(), "a stale answer keeps the load");
+        settle_pending(&pending, 3);
+        assert!(pending.borrow().is_none(), "its own answer clears it");
+    }
 
     #[test]
     fn copy_text_source_is_the_whole_current_result() {

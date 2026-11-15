@@ -6,6 +6,13 @@ as `0.1.2-0.1.3`. Each release's section below is its Forgejo release note,
 taken from this file by the release workflow. The in-app updater shows the
 same text.
 
+## 0.1.113
+
+- Open Article works again. Since 0.1.110 the article window stayed on "Loading article..." forever, in both the text and HTML views, even though the page had already loaded: the window's timer crashed every time an answer came back. Pages now appear as soon as they load.
+- GSMArena's battery test page reads as a real table again: "Table with 370 rows", then one "Row N: Phone: ...; Active use score: ..." line per phone, instead of one enormous "Table data:" line. Very long tables are normally treated as page layout, but this one is known data, as in the Python app.
+- Android Authority full text no longer opens with photo credits such as "Kaitlyn Cimino / Android Authority" or the "Add Android Authority on Google:" promo. Credits under later photos, including brand-only ones like "Amazfit", are gone too.
+- Footnotes no longer end with a stray "↩" (the jump-back link), and an article no longer ends on a bare heading like "Links:" when the list under it was not part of the article.
+
 ## 0.1.112
 
 - HTML view no longer traps the keyboard. In the main window, Shift+Tab from the first link on the page now goes back to the article list, and Tab from the last link moves on to the feed tree, instead of dropping focus somewhere silent where even F6 stopped working. F6, Shift+F6 and Escape also work if focus ever lands on the HTML view's frame.

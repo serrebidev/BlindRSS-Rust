@@ -18,7 +18,7 @@
 
 use regex::Regex;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 const EMPTY_EXTRACTION_TTL: Duration = Duration::from_secs(15 * 60);
@@ -1106,8 +1106,26 @@ pub fn drop_pswp_captions(html: &str) -> String {
 /// and stays short is a credit line, not prose; drop the
 /// element. The raw-size gate keeps big containers (the
 /// article body itself) out of the text check entirely.
+///
+/// Android Authority (v0.1.112 report) prints bare credits
+/// ("Kaitlyn Cimino / Android Authority", or just "Amazfit")
+/// in hashed-class divs after each `<picture>`, and its page
+/// JSON lists every one as `"credits":[{"title":...}]`: an
+/// element whose whole text equals a listed credit goes too,
+/// as does the "Add Android Authority on Google:" promo.
 pub fn drop_image_credits(html: &str) -> String {
     const CANDIDATES: &[&str] = &["div", "p", "span", "em", "aside", "figure", "section", "td"];
+    static CREDITS_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#""credits"\s*:\s*\[\s*\{\s*"title"\s*:\s*("(?:[^"\\]|\\.)*")"#).unwrap()
+    });
+    static GOOGLE_PROMO_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?i)^add [^.]{1,60} on google:?$").unwrap());
+    let credits: Vec<String> = CREDITS_RE
+        .captures_iter(html)
+        .filter_map(|c| serde_json::from_str::<String>(&c[1]).ok())
+        .map(|t| t.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|t| !t.is_empty())
+        .collect();
     let toks = tag_tokens(html);
     let mut removals: Vec<(usize, usize)> = Vec::new();
     let mut cursor = 0usize;
@@ -1148,7 +1166,10 @@ pub fn drop_image_credits(html: &str) -> String {
             let text = leaf_text(&html[tok.end..inner_end]);
             let lower = text.to_lowercase();
             if text.len() <= 300
-                && (lower.starts_with("image credit:") || lower.starts_with("image credits:"))
+                && (lower.starts_with("image credit:")
+                    || lower.starts_with("image credits:")
+                    || GOOGLE_PROMO_RE.is_match(&text)
+                    || credits.contains(&text))
             {
                 removals.push((tok.start, end));
                 cursor = end;
@@ -1162,6 +1183,37 @@ pub fn drop_image_credits(html: &str) -> String {
         return html.to_string();
     }
     remove_spans(html, removals)
+}
+
+/// Drop footnote back-links: an in-page anchor whose whole text
+/// is a return arrow (netmeister.org's `&larrhk;`, the "↩" at each
+/// footnote's end, v0.1.112 report). In plain text it is a stray
+/// glyph with nowhere to go.
+pub fn drop_footnote_backrefs(html: &str) -> String {
+    static RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r#"(?is)<a\b[^>]*\bhref\s*=\s*["']#[^"']*["'][^>]*>\s*(?:&larrhk;|&hookleftarrow;|&#8617;|&#x0*21a9;|\x{21A9}|&uarr;|&#8593;|\x{2191}|\^)\s*(?:\x{FE0E}|\x{FE0F}|&#xfe0e;|&#65038;)?\s*</a>"#,
+        )
+        .unwrap()
+    });
+    RE.replace_all(html, "").into_owned()
+}
+
+/// Drop a closing label left with nothing under it ("Links:"
+/// once the extractor dropped the link list after it).
+fn drop_trailing_orphan_label(text: &str) -> String {
+    let trimmed = text.trim_end();
+    let (head, last) = trimmed.rsplit_once('\n').unwrap_or(("", trimmed));
+    let last = last.trim();
+    if !head.trim().is_empty()
+        && last.ends_with(':')
+        && last.chars().count() <= 40
+        && last.split_whitespace().count() <= 4
+    {
+        head.trim_end().to_string()
+    } else {
+        text.to_string()
+    }
 }
 
 /// Reuters dedicated extractor (Python `_extract_reuters_text`):
@@ -1602,7 +1654,12 @@ fn escape_structure_text(text: &str) -> String {
         .replace('>', "&gt;")
 }
 
-fn table_text(html: &str) -> String {
+/// Python `_TABLE_MAX_ROWS`: a bigger table is treated as layout.
+const TABLE_MAX_ROWS: usize = 100;
+
+/// `max_rows` is `None` only for a table positively identified as
+/// data (GSMArena's battery table, Python `max_rows=None`).
+fn table_text(html: &str, max_rows: Option<usize>) -> String {
     if tag_tokens(html).iter().any(|t| {
         !t.close
             && matches!(
@@ -1666,7 +1723,7 @@ fn table_text(html: &str) -> String {
             header = Some(texts);
         } else {
             grid.push(texts);
-            if grid.len() > 100 {
+            if max_rows.is_some_and(|max| grid.len() > max) {
                 return String::new();
             }
         }
@@ -1717,13 +1774,17 @@ fn table_text(html: &str) -> String {
     lines.join("\n")
 }
 
-fn linearize_structure_html(html: &str, options: StructureOptions) -> String {
+fn linearize_structure_html(
+    html: &str,
+    options: StructureOptions,
+    max_rows: Option<usize>,
+) -> String {
     let mut html = html.to_string();
     if options.tables {
         let mut tables = find_elements(&html, Some("table"), &|_| true);
         tables.reverse();
         for table in tables {
-            let text = table_text(&html[table.start..table.end]);
+            let text = table_text(&html[table.start..table.end], max_rows);
             if !text.is_empty() {
                 let paragraphs = text
                     .lines()
@@ -1824,7 +1885,10 @@ pub fn html_to_text_with_structure(
     options: StructureOptions,
 ) -> String {
     let html = strip_slider_chrome(html);
-    html_to_text_raw(&linearize_structure_html(&html, options), keep_alt)
+    html_to_text_raw(
+        &linearize_structure_html(&html, options, Some(TABLE_MAX_ROWS)),
+        keep_alt,
+    )
 }
 
 /// TagDiv (WordPress "Newspaper" theme) gallery sliders ship in feed
@@ -2636,7 +2700,9 @@ pub fn extract_article_opts(
     // hidden caption twins go with them, and standalone
     // "Image credit:" elements (MacRumors prints credits
     // outside any figcaption) go too.
-    let figcaption_stripped = drop_image_credits(&drop_pswp_captions(&drop_figcaptions(html_in)));
+    let figcaption_stripped = drop_footnote_backrefs(&drop_image_credits(&drop_pswp_captions(
+        &drop_figcaptions(html_in),
+    )));
     let html_in = &figcaption_stripped;
     // NPR's complete body may be only a summary; generic engines reject it
     // as navigation and then pick player chrome from the main-site fallback.
@@ -2697,7 +2763,10 @@ pub fn extract_article_opts(
             source: "bloomberg",
         };
     }
-    let structured = linearize_structure_html(html_in, structure_options());
+    // The battery table is ~300 rows of real data: Python lifts
+    // the row cap for it, or it fell back to one "Table data" line.
+    let max_rows = (!is_gsmarena_battery_test_url(url)).then_some(TABLE_MAX_ROWS);
+    let structured = linearize_structure_html(html_in, structure_options(), max_rows);
     match extract_article_impl(&structured, url, feed_text, keep_alt) {
         ExtractOutcome::Article {
             title,
@@ -2951,7 +3020,7 @@ fn extract_article_impl(
     }
     // Reuters-style zero-width injection is stripped for clean
     // word matching and screen-reader output.
-    text = strip_zero_width(&text);
+    text = drop_trailing_orphan_label(&strip_zero_width(&text));
     // Metered preview: say so instead of trailing off mid-story.
     if METERED_MARKERS.iter().any(|m| html_lower.contains(m)) {
         text.push_str("\n\n");
@@ -5488,5 +5557,29 @@ mod parity_recovery_tests {
         assert!(text.contains("substantial paragraph"), "{text}");
         assert!(!text.contains("cbeScriptObserver"), "JS leaked: {text}");
         assert!(!text.contains("querySelectorAll"), "JS leaked: {text}");
+    }
+
+    #[test]
+    fn footnote_backrefs_and_orphan_closing_label_are_dropped() {
+        // v0.1.112 report (netmeister.org): each footnote ended in
+        // "↩" and the article ended on a bare "Links:".
+        let html = "<p id=\"3\"><small>[3] We already know how. \
+                    <sup><a href=\"#b3\">&larrhk;</a></sup></small></p>\
+                    <p>Back <a href='#top'>\u{21A9}\u{FE0E}</a> and \
+                    <a href=\"https://example.com/\">a real link</a>.</p>";
+        let out = drop_footnote_backrefs(html);
+        assert!(
+            !out.contains("larrhk") && !out.contains('\u{21A9}'),
+            "{out}"
+        );
+        assert!(out.contains("[3] We already know how."));
+        assert!(out.contains(">a real link</a>"));
+        assert_eq!(
+            drop_trailing_orphan_label("Story text.\n\nFootnotes:\n[1] Note.\n\nLinks:\n"),
+            "Story text.\n\nFootnotes:\n[1] Note."
+        );
+        let kept = "Story text.\n\nThe last line is a full sentence: kept.";
+        assert_eq!(drop_trailing_orphan_label(kept), kept);
+        assert_eq!(drop_trailing_orphan_label("Links:"), "Links:");
     }
 }

@@ -182,3 +182,59 @@ fn collapse_source_whitespace_keeps_markup_and_verbatim_blocks() {
     );
     assert_eq!(c("x < y\n z"), "x < y z");
 }
+
+#[test]
+fn gsmarena_battery_table_reads_one_row_per_line() {
+    // v0.1.112 report: the 370-row battery table blew the 100-row
+    // layout cap and reached the reader as one "Table data: a | b"
+    // line. Python lifts the cap for this table (max_rows=None).
+    let rows: String = (1..=150)
+        .map(|i| format!("<tr><td>Phone {i}</td><td>{}:00h</td></tr>", 200 - i))
+        .collect();
+    let html = format!(
+        "<html><head><title>Battery life test results v2.0</title></head><body><article>\
+         <p>This page puts together the stats for all phones we have tested in our most recent \
+         Battery life test 2.0. Our former battery test is now discontinued, and the endurance \
+         ratings are archived here. Find all about our battery life testing procedure here.</p>\
+         <table id=\"battery-table\"><thead><tr><th>Phone</th><th>Your score</th></tr></thead>\
+         <tbody>{rows}</tbody></table></article></body></html>"
+    );
+    let url = "https://www.gsmarena.com/battery-test-v2.php3";
+    let blindrss_core::ExtractOutcome::Article { text, .. } =
+        blindrss_core::extract::extract_article(&html, url, None)
+    else {
+        panic!("battery page did not extract");
+    };
+    assert!(!text.contains("Table data:"), "{text}");
+    assert!(text.contains("Table with 150 rows and 2 columns."));
+    assert!(text.contains("Row 1: Phone: Phone 1; Your score: 199:00h."));
+    assert!(text.contains("Row 150: Phone: Phone 150; Your score: 50:00h."));
+}
+
+#[test]
+fn android_authority_credits_and_google_promo_are_dropped() {
+    // v0.1.112 report: full text opened with "Kaitlyn Cimino /
+    // Android Authority" and "Add Android Authority on Google:".
+    // Credits sit in hashed-class divs after each <picture>; the
+    // page JSON names every one.
+    let html = "<div class=\"e_a\"><picture><img alt=\"A watch\" src=\"a.jpg\"/></picture>\
+        <div class=\"e_TI e_8G\"><div class=\"e_HC\">Kaitlyn Cimino / Android Authority</div></div></div>\
+        <div class=\"e_mi\"><div class=\"e_hi\"><div class=\"e_li\">Add Android Authority on Google: </div>\
+        <div class=\"e_ii\"><a href=\"https://andauth.co/x\">Google</a></div></div></div>\
+        <p>Fitness trackers are having a moment.</p><h2>Amazfit Bip Max</h2>\
+        <div class=\"e_a\"><picture><img alt=\"Bip\" src=\"b.jpg\"/></picture>\
+        <div class=\"e_TI\"><div class=\"e_HC\">Amazfit</div></div></div>\
+        <p>Amazfit makes cheap watches.</p>\
+        <script>window.d={\"image\":{\"credits\":[{\"title\":\"Kaitlyn Cimino / Android Authority\",\"pLink\":null}]},\
+        \"b\":{\"credits\":[{\"title\":\"Amazfit\",\"pLink\":null}]}}</script>";
+    let out = blindrss_core::extract::drop_image_credits(html);
+    assert!(
+        !out.contains(">Kaitlyn Cimino / Android Authority<"),
+        "{out}"
+    );
+    assert!(!out.contains("Add Android Authority on Google"), "{out}");
+    assert!(!out.contains(">Amazfit<"), "{out}");
+    assert!(out.contains("<h2>Amazfit Bip Max</h2>"));
+    assert!(out.contains("<p>Fitness trackers are having a moment.</p>"));
+    assert!(out.contains("<p>Amazfit makes cheap watches.</p>"));
+}
