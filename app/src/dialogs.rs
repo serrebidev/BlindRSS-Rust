@@ -251,6 +251,8 @@ fn choice_row(
 fn ok_cancel(dialog: &Dialog, sizer: &BoxSizer) {
     let row = BoxSizer::builder(Orientation::Horizontal).build();
     let ok_btn = Button::builder(dialog).with_label(&t("OK")).build();
+    // Enter anywhere in the dialog presses OK (default button).
+    ok_btn.set_default();
     let cancel_btn = Button::builder(dialog)
         .with_id(ID_CANCEL)
         .with_label(&t("Cancel"))
@@ -1092,6 +1094,8 @@ pub fn show_feed_properties(frame: &Frame, db: &Db, feed: &blindrss_core::Feed) 
     // saved (Python refuses the dialog with its codec error).
     let btn_row = BoxSizer::builder(Orientation::Horizontal).build();
     let ok_btn = Button::builder(&dialog).with_label(&t("OK")).build();
+    // Enter anywhere in the dialog presses OK (default button).
+    ok_btn.set_default();
     let cancel_btn = Button::builder(&dialog)
         .with_id(ID_CANCEL)
         .with_label(&t("Cancel"))
@@ -1653,6 +1657,8 @@ pub fn show_article_columns(frame: &Frame, config_path: &Path) {
     let editor = ColumnEditor::build(&dialog, &sizer, layout_from_config(&cfg), true);
     let row = BoxSizer::builder(Orientation::Horizontal).build();
     let ok_btn = Button::builder(&dialog).with_label(&t("OK")).build();
+    // Enter anywhere in the dialog presses OK (default button).
+    ok_btn.set_default();
     let cancel_btn = Button::builder(&dialog)
         .with_id(ID_CANCEL)
         .with_label(&t("Cancel"))
@@ -2315,6 +2321,8 @@ pub fn show_persistent_searches(frame: &Frame, config_path: &Path) -> Option<Str
     let add_btn = mk(&t("Add..."));
     let remove_btn = mk(&t("Remove"));
     let ok_btn = mk(&t("OK"));
+    // Enter anywhere in the dialog presses OK (default button).
+    ok_btn.set_default();
     let cancel_btn = Button::builder(&dialog)
         .with_id(ID_CANCEL)
         .with_label(&t("Cancel"))
@@ -5293,6 +5301,8 @@ pub fn show_equalizer(frame: &Frame, config_path: &Path) {
 
     let btn_row = BoxSizer::builder(Orientation::Horizontal).build();
     let ok_btn = Button::builder(&dialog).with_label(&t("OK")).build();
+    // Enter anywhere in the dialog presses OK (default button).
+    ok_btn.set_default();
     let cancel_btn = Button::builder(&dialog)
         .with_id(ID_CANCEL)
         .with_label(&t("Cancel"))

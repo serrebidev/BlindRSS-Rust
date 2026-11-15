@@ -6,6 +6,12 @@ as `0.1.2-0.1.3`. Each release's section below is its Forgejo release note,
 taken from this file by the release workflow. The in-app updater shows the
 same text.
 
+## 0.1.109
+
+- Open Article: pressing Enter now opens the article, from the address field or after ticking "Open in HTML view". Before, Enter did nothing and the dialog stayed open. Enter also presses OK in Feed Properties, Article Columns, the Equalizer, Configure Persistent Search and the other OK/Cancel dialogs.
+- Articles whose web page wraps its paragraphs over several source lines (such as the netmeister.org blog) now show each paragraph on one line in the text view, so Ctrl+Up and Ctrl+Down move a whole paragraph at a time. Pages laid out inside a table no longer repeat the whole article at the end as "Table data".
+- Open Article in HTML view now heads the page with the article's own title instead of its web address.
+
 ## 0.1.108
 
 - Player announcements can now be turned off, like in BlindRadio. Settings, Notifications, Announcements has three new rows: Playback status (Playing, Paused, Loading media), Position after seeking (elapsed, remaining and total time, beginning or end of track) and Volume change. Each can be None, Only speech, Only Braille or Speech and Braille; all start on, as before. Load failures still speak under Other notifications.

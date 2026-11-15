@@ -192,7 +192,42 @@ fn table_lines(html: &str) -> Vec<String> {
         };
         let cell_html = &html[cell_start..cell_start + end];
         let text = strip_tags(cell_html).trim().to_string();
-        if text.chars().count() >= 2 {
+        // Python `format_table_text`: block content
+        // (`_TABLE_LAYOUT_TAGS`) or prose over
+        // `_TABLE_MAX_CELL_LEN` marks a layout cell holding the
+        // article itself, never missing table data — re-appending
+        // it repeated a whole table-laid-out page (netmeister.org).
+        let cell_lower = &lower[cell_start..cell_start + end];
+        let layout = text.chars().count() > 400
+            || [
+                "p",
+                "h1",
+                "h2",
+                "h3",
+                "h4",
+                "h5",
+                "h6",
+                "article",
+                "section",
+                "aside",
+                "nav",
+                "form",
+                "ul",
+                "ol",
+                "blockquote",
+                "figure",
+                "table",
+            ]
+            .iter()
+            .any(|tag| {
+                cell_lower.match_indices(&format!("<{tag}")).any(|(at, m)| {
+                    cell_lower[at + m.len()..]
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c == '>' || c == '/' || c.is_whitespace())
+                })
+            });
+        if !layout && text.chars().count() >= 2 {
             out.push(text);
         }
         idx = cell_start + end + 5;
@@ -2025,6 +2060,111 @@ pub fn keep_inline_gaps(html: &str) -> std::borrow::Cow<'_, str> {
     RE.replace_all(html, "${2}${1}<")
 }
 
+/// Collapse source-formatting whitespace in text nodes, as a
+/// browser renders it. rust-trafilatura 2.2.8 keeps the line
+/// breaks of hard-wrapped HTML (`<p>one\n two <a>x</a> three\n
+/// four</p>`) in paragraphs that contain inline elements, so each
+/// paragraph reached the reader as several lines and paragraph
+/// navigation (Ctrl+Up/Down) needed a press per source line
+/// (netmeister.org blog). Python's trafilatura collapses them.
+/// - Tags, comments, and `script`/`style`/`textarea` contents
+///   are copied unchanged; `<pre>` is verbatim (code).
+/// - Inside an element styled `white-space: pre*` (wrapped prose
+///   quotes on the same blog) a single line break is a wrap and
+///   becomes a space; a blank line is the author's paragraph
+///   break and stays one line break.
+pub fn collapse_source_whitespace(html: &str) -> String {
+    let lower = html.to_ascii_lowercase();
+    let bytes = html.as_bytes();
+    let mut out = String::with_capacity(html.len());
+    // The outermost whitespace-keeping element, how deep
+    // same-named elements nest inside it, and whether it is a
+    // verbatim `<pre>` (else a CSS pre-wrap element).
+    let mut keep: Option<(String, usize, bool)> = None;
+    let mut i = 0;
+    while i < html.len() {
+        if bytes[i] == b'<' {
+            let next = bytes.get(i + 1).copied().unwrap_or(b' ');
+            if lower[i..].starts_with("<!--") {
+                let end = lower[i..].find("-->").map_or(html.len(), |e| i + e + 3);
+                out.push_str(&html[i..end]);
+                i = end;
+                continue;
+            }
+            if next.is_ascii_alphabetic() || matches!(next, b'/' | b'!' | b'?') {
+                let end = html[i..].find('>').map_or(html.len(), |e| i + e + 1);
+                let closing = next == b'/';
+                let name: String = lower[i + 1 + usize::from(closing)..end]
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric())
+                    .collect();
+                let tag = &lower[i..end];
+                out.push_str(&html[i..end]);
+                i = end;
+                let void = tag.ends_with("/>")
+                    || matches!(
+                        name.as_str(),
+                        "area"
+                            | "base"
+                            | "br"
+                            | "col"
+                            | "embed"
+                            | "hr"
+                            | "img"
+                            | "input"
+                            | "link"
+                            | "meta"
+                            | "source"
+                            | "track"
+                            | "wbr"
+                    );
+                if let Some((kept, depth, _)) = keep.as_mut() {
+                    if *kept == name && !void {
+                        if !closing {
+                            *depth += 1;
+                        } else if *depth > 1 {
+                            *depth -= 1;
+                        } else {
+                            keep = None;
+                        }
+                    }
+                } else if !closing && matches!(name.as_str(), "script" | "style" | "textarea") {
+                    let close = format!("</{name}");
+                    let stop = lower[i..].find(&close).map_or(html.len(), |e| i + e);
+                    out.push_str(&html[i..stop]);
+                    i = stop;
+                } else if !closing && !void {
+                    let squashed: String = tag.chars().filter(|c| !c.is_whitespace()).collect();
+                    if name == "pre" {
+                        keep = Some((name, 1, true));
+                    } else if squashed.contains("white-space:pre") {
+                        keep = Some((name, 1, false));
+                    }
+                }
+                continue;
+            }
+        }
+        let ch = html[i..].chars().next().unwrap_or(' ');
+        let verbatim = matches!(keep, Some((_, _, true)));
+        if !verbatim && ch.is_ascii_whitespace() {
+            let run = html[i..]
+                .find(|c: char| !c.is_ascii_whitespace())
+                .unwrap_or(html.len() - i);
+            let blank_line = html[i..i + run].matches('\n').count() > 1;
+            out.push(if keep.is_some() && blank_line {
+                '\n'
+            } else {
+                ' '
+            });
+            i += run;
+        } else {
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    out
+}
+
 /// One rust-trafilatura pass with an explicit focus.
 pub(crate) fn extract_focus(
     html: &str,
@@ -2034,7 +2174,8 @@ pub(crate) fn extract_focus(
         focus,
         ..Default::default()
     };
-    let html = keep_inline_gaps(html);
+    let html = collapse_source_whitespace(html);
+    let html = keep_inline_gaps(&html);
     rust_trafilatura::extract(html.as_bytes(), &opts)
         .ok()
         .map(|r| (r.metadata.title.clone(), r.content_text.trim().to_string()))

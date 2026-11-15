@@ -92,3 +92,93 @@ fn reader_html_skips_unicode_script_without_panicking() {
         "Hello"
     );
 }
+
+/// Hard-wrapped HTML inside a table-based page layout (the
+/// netmeister.org blog shape): every paragraph must reach the
+/// plain reader as ONE line (Ctrl+Up/Down paragraph navigation),
+/// a pre-wrap quote's blank line stays a paragraph break, `<pre>`
+/// code keeps its lines, and the layout cell holding the article
+/// is never re-appended as "Table data".
+#[test]
+fn hard_wrapped_table_layout_page_reads_one_paragraph_per_line() {
+    let para = |n: usize| {
+        format!(
+            "<p>\n            Paragraph {n} starts here and keeps going\n            across several source lines with a <a\n            href=\"https://example.com/{n}\">link in it</a>\n            and then it continues for a while longer so the\n            extractor sees real prose and not a stub.\n          </p>\n\n"
+        )
+    };
+    let body: String = (1..=8).map(para).collect();
+    let page = format!(
+        "<!DOCTYPE html><html><head><title>Wrapped</title></head><body>\
+         <h1>Site name</h1><h2>Wrapped</h2>\
+         <table style=\"border-style:none; width:100%\"><tr><td>\n{body}\
+         <blockquote style=\"white-space: pre-wrap;\">Quoted first line goes\nonto a second line here.\n\nSecond quoted paragraph\nalso wraps.</blockquote>\n\
+         <pre>fn main() {{\n    run();\n}}</pre>\n\
+         {more}</td></tr></table></body></html>",
+        more = (9..=12).map(para).collect::<String>()
+    );
+    let text = match blindrss_core::extract::extract_article(
+        &page,
+        "https://example.com/blog/wrapped.html",
+        None,
+    ) {
+        blindrss_core::ExtractOutcome::Article { text, .. } => text,
+        other => panic!("expected an article, got {other:?}"),
+    };
+    for n in 1..=12 {
+        let line = text
+            .lines()
+            .find(|l| l.starts_with(&format!("Paragraph {n} ")))
+            .unwrap_or_else(|| panic!("paragraph {n} missing:\n{text}"));
+        assert!(
+            line.ends_with("not a stub."),
+            "paragraph {n} split across lines:\n{text}"
+        );
+        assert!(line.contains("with a link in it and then"), "{line}");
+    }
+    assert!(
+        text.lines()
+            .any(|l| l == "Quoted first line goes onto a second line here."),
+        "{text}"
+    );
+    assert!(
+        text.lines()
+            .any(|l| l == "Second quoted paragraph also wraps."),
+        "{text}"
+    );
+    assert!(
+        text.contains("fn main() {\nrun();\n}"),
+        "pre lost its lines:\n{text}"
+    );
+    assert!(
+        !text.contains("Table data"),
+        "layout cell re-appended:\n{text}"
+    );
+}
+
+#[test]
+fn collapse_source_whitespace_keeps_markup_and_verbatim_blocks() {
+    use blindrss_core::extract::collapse_source_whitespace as c;
+    assert_eq!(
+        c("<p>a\n  b <a\n href=\"x\">c</a>\n d</p>"),
+        "<p>a b <a\n href=\"x\">c</a> d</p>"
+    );
+    assert_eq!(c("<pre>a\n  b</pre> x\n y"), "<pre>a\n  b</pre> x y");
+    assert_eq!(
+        c("<pre>a<pre>b\n</pre>c\n</pre>d\n e"),
+        "<pre>a<pre>b\n</pre>c\n</pre>d e"
+    );
+    assert_eq!(
+        c("<script>var a=1; // x\nb()</script>"),
+        "<script>var a=1; // x\nb()</script>"
+    );
+    assert_eq!(c("<!-- a\n b -->x\n\ny"), "<!-- a\n b -->x y");
+    assert_eq!(
+        c("<div style=\"white-space:pre-wrap\">a\nb\n\nc<div>d</div>\ne</div>f\n\ng"),
+        "<div style=\"white-space:pre-wrap\">a b\nc<div>d</div> e</div>f g"
+    );
+    assert_eq!(
+        c("<img style=\"white-space:pre\">a\n b"),
+        "<img style=\"white-space:pre\">a b"
+    );
+    assert_eq!(c("x < y\n z"), "x < y z");
+}

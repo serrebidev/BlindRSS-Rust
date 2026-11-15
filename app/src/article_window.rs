@@ -248,8 +248,15 @@ fn open_impl(
     let (tx, rx) = std::sync::mpsc::channel::<(u64, bool, Result<(String, String), String>)>();
     let load: Rc<dyn Fn(bool)> = {
         let url = url.clone();
-        let title = title.to_string();
-        let fallback = body.to_string();
+        // URL windows have no feed title or body: their caption
+        // and "Loading article..." placeholder are not article
+        // data (Python `load_article` renders the URL alone), so
+        // the page's own title heads the rich view, not the URL.
+        let (title, fallback) = if start_load {
+            (String::new(), String::new())
+        } else {
+            (title.to_string(), body.to_string())
+        };
         let cached = cached.clone();
         let generation = generation.clone();
         let loading = loading.clone();
