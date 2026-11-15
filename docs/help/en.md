@@ -702,6 +702,9 @@ operable from the keyboard, and each announces its current value.
 - Ctrl+Left and Ctrl+Right rewind and fast-forward, and repeat while held. On
   macOS, Option+Left and Option+Right do the same, because Ctrl+Left and
   Ctrl+Right belong to Mission Control there.
+- Ctrl+Home goes back to the beginning of the current file or episode
+  (Option+Home on macOS). In the player window, Home alone does the same,
+  except on the position slider and the chapter list.
 - Ctrl+Up and Ctrl+Down change the volume.
 
 The seek and volume keys work from anywhere in BlindRSS while something is
@@ -715,6 +718,7 @@ window to pause.
 - Ctrl+S: stop.
 - Ctrl+Left and Ctrl+Right: rewind and fast-forward (Option+Left and
   Option+Right on macOS).
+- Ctrl+Home: back to the beginning (Home alone in the player window).
 - Ctrl+Up and Ctrl+Down: volume up and down.
 - Ctrl+Shift+U, Ctrl+Shift+D, Ctrl+Shift+N: faster, slower, back to normal
   speed.
@@ -916,8 +920,10 @@ Import OPML.
 - Test Notification sends one now.
 - Exclude Feeds chooses feeds that never notify.
 - Announcements: which events BlindRSS speaks directly to your screen reader,
-  per event, with a Test Announcement button that sends a test through both
-  speech and Braille.
+  per event. Playback status (Playing, Paused), Position after seeking
+  (elapsed, remaining and total time) and Volume change each have their own
+  row, so you can silence any of them. The Test Announcement button sends a
+  test through both speech and Braille.
 
 ## Settings: Translate {#settings-translate}
 
@@ -1075,7 +1081,8 @@ Articles and views:
 Player:
 
 - Ctrl+P: play or pause. Ctrl+S: stop. Ctrl+Shift+P: show or hide the player.
-- Ctrl+Left and Ctrl+Right: seek. Ctrl+Up and Ctrl+Down: volume.
+- Ctrl+Left and Ctrl+Right: seek. Ctrl+Home: back to the beginning. Ctrl+Up
+  and Ctrl+Down: volume.
 - Ctrl+Shift+U, Ctrl+Shift+D, Ctrl+Shift+N: speed up, down, normal.
 - Ctrl+Shift+E: equalizer.
 - Ctrl+Shift+C: play queue. Ctrl+Shift+T and Ctrl+Shift+V: next and previous.

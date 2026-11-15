@@ -113,7 +113,14 @@ fn identity_of(article: &Article) -> SessionIdentity {
 /// hiding the window never replays it.
 fn hidden_announce(state: &mut PlayerState, frame: &Frame, text: &str) {
     if state.hidden.should_speak(text, frame.is_shown()) {
-        crate::announce("general", text);
+        // Load failures stay on "general" so turning playback
+        // status off never hides trouble.
+        let event = if text.starts_with("Failed") {
+            "general"
+        } else {
+            "playback_state"
+        };
+        crate::announce(event, text);
     }
 }
 
@@ -641,7 +648,7 @@ fn resume_verifier(target_ms: i64, stream: &str) -> SeekVerifier {
 fn announce_seek_limit(media: &MediaBackend, delta_ms: i64) {
     if let Some(limit) = blindrss_core::playback::seek_limit(media.tell(), media.length(), delta_ms)
     {
-        crate::announce("general", limit.announcement());
+        crate::announce("seek_position", limit.announcement());
     }
 }
 
@@ -1541,7 +1548,7 @@ impl SessionControl {
                 // A deliberate pause cancels the autoplay
                 // watchdog — it must never fight the user.
                 s.autoplay_active = false;
-                crate::announce("general", "Paused");
+                crate::announce("playback_state", "Paused");
             }
             MediaState::Stopped => {
                 let (stream, headers) = {
@@ -1566,7 +1573,7 @@ impl SessionControl {
                     // position with the configured rewind
                     // (M08).
                     resume_after_stop(&self.state);
-                    crate::announce("general", "Playing");
+                    crate::announce("playback_state", "Playing");
                     let mut s = self.state.borrow_mut();
                     note_announced(&mut s, "Playing");
                 } else {
@@ -1578,7 +1585,7 @@ impl SessionControl {
             _ => {
                 resume_after_stop(&self.state);
                 self.media.play();
-                crate::announce("general", "Playing");
+                crate::announce("playback_state", "Playing");
                 let mut s = self.state.borrow_mut();
                 note_announced(&mut s, "Playing");
             }
@@ -1909,13 +1916,13 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
             // A deliberate pause/stop cancels the autoplay
             // watchdog — it must never fight the user.
             st_pp.borrow_mut().autoplay_active = false;
-            crate::announce("general", "Paused");
+            crate::announce("playback_state", "Paused");
         } else {
             // Play after Stop first re-runs the resume
             // restore against the saved row (M08).
             resume_after_stop(&st_pp);
             m.play();
-            crate::announce("general", "Playing");
+            crate::announce("playback_state", "Playing");
             // This press already said it: the tick's
             // hidden-window readiness announcement must not
             // repeat it when the state lands.
@@ -2014,6 +2021,18 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
             arm_seek_summary(&st);
         })
     };
+    // Back to the beginning of the current file (Ctrl+Home,
+    // Home in the player window, Player > Go to Beginning).
+    let seek_start: Rc<dyn Fn()> = {
+        let m = media;
+        let st = state.clone();
+        Rc::new(move || {
+            announce_seek_limit(&m, -1);
+            m.seek(0, SeekMode::FromStart);
+            begin_user_seek(&mut st.borrow_mut(), 0);
+            arm_seek_summary(&st);
+        })
+    };
     let volume_down: Rc<dyn Fn()> = {
         let m = media;
         Rc::new(move || {
@@ -2021,7 +2040,7 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
             m.set_volume(v);
             persist_volume(v);
             crate::announce(
-                "general",
+                "volume_change",
                 &format!("Volume {}%", (v * 100.0).round() as i64),
             );
         })
@@ -2033,7 +2052,7 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
             m.set_volume(v);
             persist_volume(v);
             crate::announce(
-                "general",
+                "volume_change",
                 &format!("Volume {}%", (v * 100.0).round() as i64),
             );
         })
@@ -2383,6 +2402,7 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
         let m = media;
         let st_k = state.clone();
         let pp_k = play_pause.clone();
+        let ss_k = seek_start.clone();
         let btn_handles: Vec<usize> = [
             play_btn,
             stop_btn,
@@ -2487,12 +2507,16 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
                         begin_user_seek(&mut st_k.borrow_mut(), target);
                         true
                     }
+                    Some("seek_start") => {
+                        ss_k();
+                        true
+                    }
                     Some("volume_up") => {
                         let v = (m.get_volume() + volume_step()).min(1.0);
                         m.set_volume(v);
                         persist_volume(v);
                         crate::announce(
-                            "general",
+                            "volume_change",
                             &format!("Volume {}%", (v * 100.0).round() as i64),
                         );
                         true
@@ -2502,7 +2526,7 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
                         m.set_volume(v);
                         persist_volume(v);
                         crate::announce(
-                            "general",
+                            "volume_change",
                             &format!("Volume {}%", (v * 100.0).round() as i64),
                         );
                         true
@@ -2526,6 +2550,12 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
                 // owns Space too (it opens the dropdown).
                 32 if !on_button && focused != speed_h => {
                     pp_k();
+                    ev.skip(false);
+                }
+                // Home goes back to the beginning, outside the
+                // controls where Home already moves (slider, list).
+                313 if !on_slider && !on_list => {
+                    ss_k();
                     ev.skip(false);
                 }
                 // Left/Right seek, Up/Down volume — outside the
@@ -2556,7 +2586,7 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
                     m.set_volume(v);
                     persist_volume(v);
                     crate::announce(
-                        "general",
+                        "volume_change",
                         &format!("Volume {}%", (v * 100.0).round() as i64),
                     );
                     ev.skip(false);
@@ -2566,7 +2596,7 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
                     m.set_volume(v);
                     persist_volume(v);
                     crate::announce(
-                        "general",
+                        "volume_change",
                         &format!("Volume {}%", (v * 100.0).round() as i64),
                     );
                     ev.skip(false);
@@ -2902,7 +2932,7 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
                 }
                 if step.announce_failure {
                     crate::announce(
-                        "general",
+                        "seek_position",
                         &format!(
                             "Could not seek there. Position {}",
                             blindrss_core::playback::format_time_ms(pos)
@@ -3135,7 +3165,7 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
             };
             if due {
                 crate::announce(
-                    "media_navigation",
+                    "seek_position",
                     &blindrss_core::playback::seek_summary(m.tell(), m.length()),
                 );
             }
@@ -3232,6 +3262,7 @@ fn create_session(article: &Article) -> Rc<SessionControl> {
             "player.stop" => stop(),
             "player.rewind" => rewind(),
             "player.forward" => forward(),
+            "player.seek_start" => seek_start(),
             "player.volume_up" => volume_up(),
             "player.volume_down" => volume_down(),
             "player.show_hide" => {

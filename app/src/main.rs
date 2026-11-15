@@ -2519,6 +2519,7 @@ const M_RESET_TITLE: i32 = 2243;
 const M_EDIT_CAT: i32 = 2244;
 const M_EQUALIZER: i32 = 2245;
 const M_MARKALL_CTX: i32 = 2247;
+const M_PLAYER_SEEK_START: i32 = 2248;
 /// Chapter Links submenu ids (Audit 8 G19): the article list
 /// context menu fills `chapter_link_urls` with the selected
 /// article's chapter links and gives item N the id BASE + N;
@@ -2526,7 +2527,7 @@ const M_MARKALL_CTX: i32 = 2247;
 /// so EVERY link is exposed — Python binds one item per link
 /// with no cap (the old 16-slot table silently dropped
 /// chapter 17+). The range sits above the fixed ids (which
-/// top out at 2247) and below the dialog range (5100+).
+/// top out at 2248) and below the dialog range (5100+).
 const M_CHAPTER_LINK_BASE: i32 = 2900;
 const M_CHAPTER_LINK_COUNT: i32 = 1000;
 
@@ -9696,6 +9697,7 @@ fn main() {
         let act_player_stop = player_cmd("player.stop", "Stop");
         let act_player_rewind = player_cmd("player.rewind", "Rewind");
         let act_player_ff = player_cmd("player.forward", "Fast Forward");
+        let act_player_seek_start = player_cmd("player.seek_start", "Go to Beginning");
         let act_player_vol_up = player_cmd("player.volume_up", "Volume Up");
         let act_player_vol_down = player_cmd("player.volume_down", "Volume Down");
         let act_speed_up = player_cmd("speed.up", "Increase Speed");
@@ -10167,6 +10169,12 @@ fn main() {
             "Fast forward",
             ItemKind::Normal,
         );
+        player_menu.append(
+            M_PLAYER_SEEK_START,
+            "Go to Beginning (Ctrl+Home)",
+            "Go back to the beginning of the current file",
+            ItemKind::Normal,
+        );
         player_menu.append_separator();
         player_menu.append(
             M_PLAYER_VOL_UP,
@@ -10400,6 +10408,7 @@ fn main() {
             (M_PLAYER_FF, act_player_ff.clone()),
             (M_PLAYER_VOL_UP, act_player_vol_up.clone()),
             (M_PLAYER_VOL_DOWN, act_player_vol_down.clone()),
+            (M_PLAYER_SEEK_START, act_player_seek_start.clone()),
             (M_SPEED_UP, act_speed_up.clone()),
             (M_SPEED_DOWN, act_speed_down.clone()),
             (M_SPEED_RESET, act_speed_reset.clone()),
@@ -11054,13 +11063,14 @@ fn main() {
                     let command = match action {
                         "seek_back" => "player.rewind",
                         "seek_forward" => "player.forward",
+                        "seek_start" => "player.seek_start",
                         "volume_up" => "player.volume_up",
                         _ => "player.volume_down",
                     };
                     // Seek needs media loaded (Python's
                     // has_media_loaded check); volume applies
                     // whenever a player session exists.
-                    if matches!(action, "seek_back" | "seek_forward")
+                    if matches!(action, "seek_back" | "seek_forward" | "seek_start")
                         && !player::progress_snapshot().has_media
                     {
                         ev.skip(true);

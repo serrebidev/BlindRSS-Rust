@@ -70,3 +70,19 @@ fn none_mode_and_empty_text_never_emit() {
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     assert!(!a.announce("start_update", "Refresh Feeds"));
 }
+
+#[test]
+fn player_announcements_have_their_own_events_defaulting_on() {
+    // Owner request 2026-11-14: playback status, seek position
+    // and volume announcements can be turned off one by one.
+    let a = Announcements::from_value(None);
+    for id in ["playback_state", "seek_position", "volume_change"] {
+        assert!(EVENTS.iter().any(|e| e.id == id), "{id}");
+        assert_eq!(a.mode(id), Mode::Both, "{id}");
+    }
+    let raw = json!({ "playback_state": "none", "seek_position": "none" });
+    let b = Announcements::from_value(Some(&raw));
+    assert!(!b.announce("playback_state", "Paused"));
+    assert!(!b.announce("seek_position", "Elapsed 0:00"));
+    assert_eq!(b.mode("volume_change"), Mode::Both);
+}

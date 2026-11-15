@@ -6,6 +6,11 @@ as `0.1.2-0.1.3`. Each release's section below is its Forgejo release note,
 taken from this file by the release workflow. The in-app updater shows the
 same text.
 
+## 0.1.108
+
+- Player announcements can now be turned off, like in BlindRadio. Settings, Notifications, Announcements has three new rows: Playback status (Playing, Paused, Loading media), Position after seeking (elapsed, remaining and total time, beginning or end of track) and Volume change. Each can be None, Only speech, Only Braille or Speech and Braille; all start on, as before. Load failures still speak under Other notifications.
+- Go to the beginning of the current file or podcast with Ctrl+Home (Option+Home on macOS), from the main window or the player, or with Home alone in the player window. Also in the Player menu as Go to Beginning.
+
 ## 0.1.107
 
 - Player seek options: fixed Back 60 seconds / Forward 60 seconds buttons plus a Jump to Time dialog (hours:minutes:seconds, minutes:seconds or seconds), alongside the user-configurable seek step in Settings.

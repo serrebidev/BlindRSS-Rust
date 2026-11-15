@@ -305,6 +305,12 @@ fn media_arrow_rules() {
         media_arrow_action(false, CTRL, KC_DOWN),
         Some("volume_down")
     );
+    // Ctrl+Home goes back to the beginning (2026-11-14 request);
+    // plain or Shift-extended Home stays navigation.
+    assert_eq!(media_arrow_action(false, CTRL, 313), Some("seek_start"));
+    assert_eq!(media_arrow_action(true, ALT, 313), Some("seek_start"));
+    assert_eq!(media_arrow_action(false, NONE, 313), None);
+    assert_eq!(media_arrow_action(false, CTRL_SHIFT, 313), None);
     // macOS Option+Arrow too; elsewhere Alt stays navigation.
     assert_eq!(media_arrow_action(true, ALT, KC_LEFT), Some("seek_back"));
     assert_eq!(media_arrow_action(false, ALT, KC_LEFT), None);

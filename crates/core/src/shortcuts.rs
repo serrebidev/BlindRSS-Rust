@@ -452,7 +452,7 @@ pub fn event_accel(code: i32, mods: KeyModifiers, require_modifier: bool) -> Opt
 // Media arrows (Python gui/hotkeys.py::resolve_media_action)
 // ---------------------------------------------------------------------------
 
-/// The media action for an arrow key, or None. Ctrl+Arrow maps
+/// The media action for an arrow key (or Home), or None. Ctrl+Arrow maps
 /// on every platform; on macOS Alt(Option)+Arrow maps too,
 /// because Ctrl+Left/Right are claimed by Mission Control.
 /// Ctrl+Alt mixed, Shift, or Cmd disqualify the chord
@@ -475,6 +475,8 @@ pub fn media_arrow_action(macos: bool, mods: KeyModifiers, code: i32) -> Option<
         316 => Some("seek_forward"),
         315 => Some("volume_up"),
         317 => Some("volume_down"),
+        // Ctrl+Home: back to the beginning of the current file.
+        313 => Some("seek_start"),
         _ => None,
     }
 }

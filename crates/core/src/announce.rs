@@ -67,7 +67,7 @@ pub struct Event {
 
 /// The event table, ids stable because they persist in config
 /// (Python core/announcements.py EVENTS, same order).
-pub const EVENTS: [Event; 10] = [
+pub const EVENTS: [Event; 13] = [
     Event {
         id: "filter_change",
         label: "Filter change",
@@ -121,6 +121,27 @@ pub const EVENTS: [Event; 10] = [
         id: "refresh_complete",
         label: "Refresh results",
         help: "Announce the result when a feed refresh finishes, including how many new articles arrived.",
+    },
+    // Appended 2026-11-14 (owner request, BlindRadio's
+    // announce-or-not model): the player's own confirmations
+    // used to ride the always-on "general" / "media_navigation"
+    // events. Each now has its own row, defaulting to both so
+    // nothing goes quiet until the user turns it off. Appended,
+    // never inserted: settings rows keep their order.
+    Event {
+        id: "playback_state",
+        label: "Playback status",
+        help: "Announce Playing and Paused, and that media is loading.",
+    },
+    Event {
+        id: "seek_position",
+        label: "Position after seeking",
+        help: "Announce elapsed, remaining and total time after a seek, and the beginning or end of the track.",
+    },
+    Event {
+        id: "volume_change",
+        label: "Volume change",
+        help: "Announce the new volume when it is changed.",
     },
 ];
 
