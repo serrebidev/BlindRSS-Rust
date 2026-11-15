@@ -46,6 +46,12 @@ same text.
 
 - In the Rich Full-Text View, pressing Alt (or F10) no longer opens the menu silently. It does nothing there now, so NVDA keeps speaking. Escape or F6 returns to the article list, where Alt works as usual.
 
+## 0.1.110
+
+- YouTube account sign-in works again. It failed with "Sign-in failed: request failed: http status: 403" before showing a code, because sign-in asked Google for a scope the YouTube TV client is not allowed to use. It now requests the same scopes as the Python app, and account sync reads your subscriptions from the TV client's channel page instead of the public YouTube Data API, which the TV client cannot use either.
+- Copied text now stays on the clipboard after BlindRSS closes. Before, copying a feed URL (or anything else) and then closing the app emptied the clipboard, so there was nothing left to paste.
+- The article window no longer sits on "Loading article..." forever. If a page takes too long to load, the window now says so and stops, with the usual advice on what to try, instead of waiting indefinitely.
+
 ## 0.1.101
 
 - The YouTube Account dialog (Tools menu) is now the full account manager: sign out, copy or open the sign-in code while one is waiting, choose the category your subscriptions go into, toggle automatic updates, and update the account right away — not just sign in.

@@ -242,6 +242,64 @@ fn cookies_import_downloads_merge() {
 }
 
 #[test]
+fn youtube_sign_in_scope_is_the_tv_client_scope() {
+    // Regression (Forgejo BlindRSS-Rust #1): the TV client is a
+    // restricted client — requesting youtube.readonly makes the
+    // device-code endpoint answer 403 restricted_client, so
+    // sign-in failed before a code was shown. Python's scope is
+    // the spec; reproduced live 2026-11-15 (readonly -> 403,
+    // Python scope -> 200 with a device code).
+    assert_eq!(
+        blindrss_core::youtube_account::SCOPE,
+        "http://gdata.youtube.com https://www.googleapis.com/auth/youtube-paid-content"
+    );
+}
+
+#[test]
+fn youtube_parse_channels_from_tv_browse() {
+    // Python's parse_channels over an FEchannels payload:
+    // channel tiles only, UC ids only, first title wins,
+    // sorted by title.
+    let payload = serde_json::json!({
+        "contents": {"shelves": [
+            {"tileRenderer": {
+                "contentType": "TILE_CONTENT_TYPE_CHANNEL",
+                "contentId": "UCzzzzzzzz",
+                "metadata": {"tileMetadataRenderer": {"title": {"simpleText": "Zeta Channel"}}}
+            }},
+            {"tileRenderer": {
+                "contentType": "TILE_CONTENT_TYPE_CHANNEL",
+                "contentId": "UCaaaaaaaa",
+                "metadata": {"tileMetadataRenderer": {"title": {"simpleText": "alpha channel"}}}
+            }},
+            {"tileRenderer": {
+                "contentType": "TILE_CONTENT_TYPE_CHANNEL",
+                "contentId": "UCaaaaaaaa",
+                "metadata": {"tileMetadataRenderer": {"title": {"simpleText": "Duplicate"}}}
+            }},
+            {"tileRenderer": {
+                "contentType": "TILE_CONTENT_TYPE_VIDEO",
+                "contentId": "dQw4w9WgXcQ",
+                "metadata": {"tileMetadataRenderer": {"title": {"simpleText": "Not a channel"}}}
+            }},
+            {"tileRenderer": {
+                "contentType": "TILE_CONTENT_TYPE_CHANNEL",
+                "contentId": "PLnotachannel",
+                "metadata": {"tileMetadataRenderer": {"title": {"simpleText": "Playlist id"}}}
+            }}
+        ]}
+    });
+    let channels = blindrss_core::youtube_account::parse_channels(&payload);
+    assert_eq!(
+        channels,
+        vec![
+            ("UCaaaaaaaa".to_string(), "alpha channel".to_string()),
+            ("UCzzzzzzzz".to_string(), "Zeta Channel".to_string()),
+        ]
+    );
+}
+
+#[test]
 fn youtube_secret_falls_back_to_tv_client() {
     // Python embeds the TV installed-app client secret; an empty
     // config value resolves to it, a set value wins. (The value

@@ -29,7 +29,14 @@ pub const CLIENT_SECRET: &str = "SboVhoG9s0rNafixCSGGKXAT";
 
 const DEVICE_CODE_URL: &str = "https://www.youtube.com/o/oauth2/device/code";
 const TOKEN_URL: &str = "https://www.youtube.com/o/oauth2/token";
-const SCOPE: &str = "https://www.googleapis.com/auth/youtube.readonly";
+/// The scopes the TV client requests (Python's SCOPE, verbatim).
+/// The TV client is a restricted client: asking it for
+/// `youtube.readonly` makes the device-code endpoint answer
+/// 403 `restricted_client`, so sign-in fails before a code is
+/// ever shown (Forgejo BlindRSS-Rust #1, reproduced live
+/// 2026-11-15: readonly scope -> 403, this scope -> 200).
+pub const SCOPE: &str =
+    "http://gdata.youtube.com https://www.googleapis.com/auth/youtube-paid-content";
 const GRANT_TYPE: &str = "http://oauth.net/grant_type/device/1.0";
 
 /// What starting a sign-in returns for the user to act on.
@@ -155,52 +162,99 @@ pub fn access_token(
         .ok_or_else(|| "no access_token in the token response".to_string())
 }
 
-/// The account's subscriptions: (channel id, channel title)
-/// via the YouTube Data API (paged).
-pub fn fetch_subscriptions(access: &str) -> Result<Vec<(String, String)>, String> {
-    let mut out = Vec::new();
-    let mut page_token = String::new();
-    loop {
-        let mut url = "https://www.googleapis.com/youtube/v3/subscriptions?part=snippet&mine=true&maxResults=50".to_string();
-        if !page_token.is_empty() {
-            url.push_str(&format!("&pageToken={page_token}"));
-        }
-        let mut resp = crate::http::agent()
-            .get(&url)
-            .header("Authorization", &format!("Bearer {access}"))
-            .call()
-            .map_err(|e| format!("subscriptions failed: {e}"))?;
-        let text = resp
-            .body_mut()
-            .read_to_string()
-            .map_err(|e| format!("read failed: {e}"))?;
-        let value: serde_json::Value =
-            serde_json::from_str(&text).map_err(|e| format!("bad response: {e}"))?;
-        if let Some(items) = value.get("items").and_then(|v| v.as_array()) {
-            for item in items {
-                let snippet = item.get("snippet").cloned().unwrap_or_default();
-                let channel_id = snippet
-                    .get("resourceId")
-                    .and_then(|r| r.get("channelId"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let title = snippet
-                    .get("title")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                if !channel_id.is_empty() {
-                    out.push((channel_id, title));
+/// One TV-client browse request (Python's BROWSE_URL posts).
+fn browse(access: &str, browse_id: &str) -> Result<serde_json::Value, String> {
+    let body = serde_json::json!({
+        "context": {"client": {
+            "clientName": "TVHTML5",
+            "clientVersion": "7.20250101.00.00",
+            "hl": "en",
+            "gl": "US",
+        }},
+        "browseId": browse_id,
+    });
+    let payload = serde_json::to_string(&body).map_err(|e| e.to_string())?;
+    let mut resp = crate::http::agent()
+        .post(BROWSE_URL)
+        .header("Authorization", &format!("Bearer {access}"))
+        .header("Content-Type", "application/json")
+        .send(payload.as_str())
+        .map_err(|e| format!("browse request failed: {e}"))?;
+    let text = resp
+        .body_mut()
+        .read_to_string()
+        .map_err(|e| format!("browse read failed: {e}"))?;
+    serde_json::from_str(&text).map_err(|e| format!("browse response was not JSON: {e}"))
+}
+
+/// (channel id, channel title) from a TV `FEchannels` browse
+/// response — port of Python's parse_channels: an iterative
+/// walk collecting channel tiles, first title wins, sorted by
+/// title. The public YouTube Data API is not enabled for the
+/// TV client, so subscriptions come from this page, never
+/// from googleapis.com/youtube/v3 (Python's docstring).
+pub fn parse_channels(data: &serde_json::Value) -> Vec<(String, String)> {
+    let mut found: Vec<(String, String)> = Vec::new();
+    let mut stack: Vec<&serde_json::Value> = vec![data];
+    while let Some(node) = stack.pop() {
+        match node {
+            serde_json::Value::Object(map) => {
+                if let Some(tile) = map.get("tileRenderer")
+                    && tile.get("contentType").and_then(|v| v.as_str())
+                        == Some("TILE_CONTENT_TYPE_CHANNEL")
+                {
+                    let channel_id = tile
+                        .get("contentId")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if channel_id.starts_with("UC")
+                        && !found.iter().any(|(id, _)| *id == channel_id)
+                    {
+                        let title = tile
+                            .get("metadata")
+                            .and_then(|m| m.get("tileMetadataRenderer"))
+                            .and_then(|m| m.get("title"))
+                            .map(text_runs)
+                            .unwrap_or_default()
+                            .trim()
+                            .to_string();
+                        let title = if title.is_empty() {
+                            channel_id.clone()
+                        } else {
+                            title
+                        };
+                        found.push((channel_id, title));
+                    }
+                }
+                let values: Vec<&serde_json::Value> = map.values().collect();
+                for value in values.into_iter().rev() {
+                    stack.push(value);
                 }
             }
-        }
-        match value.get("nextPageToken").and_then(|v| v.as_str()) {
-            Some(next) if !next.is_empty() => page_token = next.to_string(),
-            _ => break,
+            serde_json::Value::Array(items) => {
+                for value in items.iter().rev() {
+                    stack.push(value);
+                }
+            }
+            _ => {}
         }
     }
-    Ok(out)
+    found.sort_by_key(|a| a.1.to_lowercase());
+    found
+}
+
+/// The account's subscriptions: (channel id, channel title)
+/// via the TV client's `FEchannels` browse page (Python's
+/// list_subscriptions). An empty result is an error, not
+/// "unsubscribed from everything".
+pub fn fetch_subscriptions(access: &str) -> Result<Vec<(String, String)>, String> {
+    let value = browse(access, "FEchannels")?;
+    let channels = parse_channels(&value);
+    if channels.is_empty() {
+        return Err("YouTube returned no subscriptions".to_string());
+    }
+    Ok(channels)
 }
 
 pub const RECOMMENDATIONS_FEED_ID: &str = "youtube-account:recommendations";
@@ -353,29 +407,7 @@ pub fn list_recommendations(
     refresh_token: &str,
 ) -> Result<Vec<(String, String, String)>, String> {
     let access = access_token(client_id, client_secret, refresh_token)?;
-    let body = serde_json::json!({
-        "context": {"client": {
-            "clientName": "TVHTML5",
-            "clientVersion": "7.20250101.00.00",
-            "hl": "en",
-            "gl": "US",
-        }},
-        "browseId": "default",
-    });
-    let agent = crate::http::agent();
-    let payload = serde_json::to_string(&body).map_err(|e| e.to_string())?;
-    let mut resp = agent
-        .post(BROWSE_URL)
-        .header("Authorization", &format!("Bearer {access}"))
-        .header("Content-Type", "application/json")
-        .send(payload.as_str())
-        .map_err(|e| format!("recommendations request failed: {e}"))?;
-    let text = resp
-        .body_mut()
-        .read_to_string()
-        .map_err(|e| format!("recommendations read failed: {e}"))?;
-    let value: serde_json::Value = serde_json::from_str(&text)
-        .map_err(|e| format!("recommendations response was not JSON: {e}"))?;
+    let value = browse(&access, "default")?;
     let videos = parse_recommendations(&value);
     if videos.is_empty() {
         return Err("YouTube returned no recommendations".to_string());

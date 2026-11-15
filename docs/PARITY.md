@@ -9057,3 +9057,21 @@ wrapper) and, on windowslatest.com, the "The post ... appeared first
 on" footer, which the feed-body text view now cuts too
 (`strip_windowslatest_footer_keep_layout`). The h2 above the gallery
 is the article's own section heading and stays.
+
+## YouTube sign-in 403 (2026-11-15, Forgejo BlindRSS-Rust #1, Michal's report, v0.1.110)
+
+Sign-in failed with "request failed: http status: 403" before a
+code was shown. Root cause, reproduced live against
+youtube.com/o/oauth2/device/code: the Rust port requested scope
+`https://www.googleapis.com/auth/youtube.readonly`, which the
+YouTube TV client (a restricted client) may not request — the
+endpoint answers 403 `restricted_client`. Python's SCOPE
+(`http://gdata.youtube.com https://www.googleapis.com/auth/youtube-paid-content`)
+answers 200 with a device code. Fix: SCOPE now matches Python
+verbatim (regression test pins the string). Same audit found
+subscription sync used the public YouTube Data API, which
+Python's module docstring states is not enabled for the TV
+client; sync now ports Python's list_subscriptions/parse_channels
+(the TV `FEchannels` browse page, channel tiles, first title
+wins, sorted by title, empty result is an error), sharing the
+browse helper with recommendations.
