@@ -293,6 +293,49 @@ fn excluded_feed_ids(cfg: &Config) -> std::collections::HashSet<String> {
 /// `_queue_new_article_notifications_from_state` applied to
 /// each feed state in order, plus the refresh drivers'
 /// capped-summary tail). Pure: no I/O beyond reading `cfg`.
+fn unread_parts(unread_articles: i64, unread_podcasts: i64) -> Vec<String> {
+    let mut parts = Vec::new();
+    if unread_articles > 0 {
+        parts.push(format!(
+            "{unread_articles} unread article{}",
+            if unread_articles == 1 { "" } else { "s" }
+        ));
+    }
+    if unread_podcasts > 0 {
+        parts.push(format!(
+            "{unread_podcasts} unread podcast{}",
+            if unread_podcasts == 1 { "" } else { "s" }
+        ));
+    }
+    parts
+}
+
+/// The tray icon's text (Forgejo BlindRSS-Rust #2): the
+/// app name plus the unread split next to it when there
+/// is anything unread; the plain name when there is not,
+/// so nothing unread is displayed then.
+pub fn tray_tooltip(unread_articles: i64, unread_podcasts: i64) -> String {
+    let parts = unread_parts(unread_articles, unread_podcasts);
+    if parts.is_empty() {
+        "BlindRSS".to_string()
+    } else {
+        format!("BlindRSS - {}", parts.join(", "))
+    }
+}
+
+/// The spoken unread summary for the Announce Unread
+/// shortcut (Forgejo BlindRSS-Rust #2).
+pub fn unread_announcement(unread_articles: i64, unread_podcasts: i64) -> String {
+    let parts = unread_parts(unread_articles, unread_podcasts);
+    if parts.is_empty() {
+        "No unread articles or podcasts.".to_string()
+    } else if parts.len() == 2 {
+        format!("{} and {}.", parts[0], parts[1])
+    } else {
+        format!("{}.", parts[0])
+    }
+}
+
 pub fn plan_notifications(cfg: &Config, batches: &[FeedBatch]) -> NotifyPlan {
     let mut plan = NotifyPlan::default();
     if !cfg.get_bool("windows_notifications_enabled", false) {
@@ -502,6 +545,27 @@ pub fn resolve_payload_article(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unread_texts_match_issue_2() {
+        // Forgejo #2: nothing unread shows/says nothing
+        // extra; the split names articles and podcasts
+        // with correct plurals.
+        assert_eq!(tray_tooltip(0, 0), "BlindRSS");
+        assert_eq!(tray_tooltip(1, 0), "BlindRSS - 1 unread article");
+        assert_eq!(tray_tooltip(0, 2), "BlindRSS - 2 unread podcasts");
+        assert_eq!(
+            tray_tooltip(3, 1),
+            "BlindRSS - 3 unread articles, 1 unread podcast"
+        );
+        assert_eq!(unread_announcement(0, 0), "No unread articles or podcasts.");
+        assert_eq!(unread_announcement(1, 0), "1 unread article.");
+        assert_eq!(unread_announcement(0, 1), "1 unread podcast.");
+        assert_eq!(
+            unread_announcement(2, 3),
+            "2 unread articles and 3 unread podcasts."
+        );
+    }
 
     #[test]
     fn preview_strips_tags_and_collapses_whitespace() {

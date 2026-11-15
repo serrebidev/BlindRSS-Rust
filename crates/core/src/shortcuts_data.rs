@@ -201,6 +201,12 @@ pub const COMMANDS: &[(&str, &str, &str, &str)] = &[
         "Announce Version",
         "Ctrl+Shift+A",
     ),
+    (
+        "tools.announce_unread",
+        "Tools",
+        "Announce Unread Articles and Podcasts",
+        "Ctrl+Shift+B",
+    ),
     ("help.user_guide", "Help", "User Guide", "F1"),
     ("help.view_changelog", "Help", "View Changelog", ""),
 ];

@@ -149,6 +149,7 @@ pub const COMMAND_TOPIC_PAIRS: &[(&str, &str)] = &[
     ("speed.down", "playback-speed"),
     ("speed.reset", "playback-speed"),
     ("speed.up", "playback-speed"),
+    ("tools.announce_unread", "tray"),
     ("tools.announce_version", "version"),
     ("tools.backup_data", "export-opml"),
     ("tools.check_updates", "updates"),

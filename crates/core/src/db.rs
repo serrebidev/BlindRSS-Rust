@@ -1178,6 +1178,20 @@ impl Db {
         rows.collect()
     }
 
+    /// Unread counts split by kind (Forgejo BlindRSS-Rust
+    /// #2): (articles, podcasts). A podcast article is one
+    /// carrying a media URL — the same test the media
+    /// filters use.
+    pub fn unread_split(&self) -> rusqlite::Result<(i64, i64)> {
+        self.conn.query_row(
+            "SELECT COALESCE(SUM(CASE WHEN media_url IS NULL OR media_url = '' THEN 1 ELSE 0 END), 0), \
+             COALESCE(SUM(CASE WHEN media_url IS NOT NULL AND media_url <> '' THEN 1 ELSE 0 END), 0) \
+             FROM articles WHERE is_read = 0",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+    }
+
     pub fn article_by_id(&self, article_id: &str) -> rusqlite::Result<Option<Article>> {
         // Recommendation articles live in their own table, not
         // `articles` (Python's wrapper get_article_by_id routes

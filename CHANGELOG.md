@@ -6,6 +6,16 @@ as `0.1.2-0.1.3`. Each release's section below is its Forgejo release note,
 taken from this file by the release workflow. The in-app updater shows the
 same text.
 
+## 0.1.111
+
+- The system tray icon's text now shows how many unread articles and unread podcasts you have, right next to the BlindRSS name — and goes back to the plain name when there are none. There is also a new "Announce Unread Articles and Podcasts" command (default Ctrl+Shift+B, changeable in Tools > Keyboard Shortcuts, and in the Help menu) that speaks the counts whenever you want them.
+
+## 0.1.110
+
+- YouTube account sign-in works again. It failed with "Sign-in failed: request failed: http status: 403" before showing a code, because sign-in asked Google for a scope the YouTube TV client is not allowed to use. It now requests the same scopes as the Python app, and account sync reads your subscriptions from the TV client's channel page instead of the public YouTube Data API, which the TV client cannot use either.
+- Copied text now stays on the clipboard after BlindRSS closes. Before, copying a feed URL (or anything else) and then closing the app emptied the clipboard, so there was nothing left to paste.
+- The article window no longer sits on "Loading article..." forever. If a page takes too long to load, the window now says so and stops, with the usual advice on what to try, instead of waiting indefinitely.
+
 ## 0.1.109
 
 - Open Article: pressing Enter now opens the article, from the address field or after ticking "Open in HTML view". Before, Enter did nothing and the dialog stayed open. Enter also presses OK in Feed Properties, Article Columns, the Equalizer, Configure Persistent Search and the other OK/Cancel dialogs.
@@ -45,12 +55,6 @@ same text.
 ## 0.1.102
 
 - In the Rich Full-Text View, pressing Alt (or F10) no longer opens the menu silently. It does nothing there now, so NVDA keeps speaking. Escape or F6 returns to the article list, where Alt works as usual.
-
-## 0.1.110
-
-- YouTube account sign-in works again. It failed with "Sign-in failed: request failed: http status: 403" before showing a code, because sign-in asked Google for a scope the YouTube TV client is not allowed to use. It now requests the same scopes as the Python app, and account sync reads your subscriptions from the TV client's channel page instead of the public YouTube Data API, which the TV client cannot use either.
-- Copied text now stays on the clipboard after BlindRSS closes. Before, copying a feed URL (or anything else) and then closing the app emptied the clipboard, so there was nothing left to paste.
-- The article window no longer sits on "Loading article..." forever. If a page takes too long to load, the window now says so and stops, with the usual advice on what to try, instead of waiting indefinitely.
 
 ## 0.1.101
 

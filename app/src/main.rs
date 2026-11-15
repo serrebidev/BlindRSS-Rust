@@ -1391,6 +1391,17 @@ fn startup_maintenance() {
 /// payload in show order; the balloon surface displays one
 /// notification at a time (each show replaces the previous),
 /// so the payload a click can reach is the latest one stored.
+/// The tray icon bitmap (a plain orange square), rebuilt
+/// on demand so the drain tick can re-set the icon when
+/// only its tooltip text changes.
+fn tray_icon_bitmap() -> Option<Bitmap> {
+    let mut rgba = Vec::with_capacity(32 * 32 * 4);
+    for _ in 0..32 * 32 {
+        rgba.extend_from_slice(&[240, 130, 20, 255]);
+    }
+    Bitmap::from_rgba(&rgba, 32, 32)
+}
+
 fn refresh_side_effects(
     tray: &TaskBarIcon,
     batches: &[blindrss_core::notify::FeedBatch],
@@ -2539,6 +2550,7 @@ const M_EDIT_CAT: i32 = 2244;
 const M_EQUALIZER: i32 = 2245;
 const M_MARKALL_CTX: i32 = 2247;
 const M_PLAYER_SEEK_START: i32 = 2248;
+const M_ANNOUNCE_UNREAD: i32 = 2249;
 /// Chapter Links submenu ids (Audit 8 G19): the article list
 /// context menu fills `chapter_link_urls` with the selected
 /// article's chapter links and gives item N the id BASE + N;
@@ -2611,6 +2623,7 @@ fn shortcut_menu_id(command: &str) -> Option<i32> {
         "tools.check_updates" => M_UPDATE,
         "tools.import_site_cookies" => M_IMPORT_COOKIES,
         "tools.youtube_account" => M_YOUTUBE_ACCOUNT,
+        "tools.announce_unread" => M_ANNOUNCE_UNREAD,
         "player.equalizer" => M_EQUALIZER,
         "help.user_guide" => M_HELP,
         "help.view_changelog" => M_CHANGELOG,
@@ -4542,14 +4555,18 @@ fn main() {
         // hidden. The handle is shared with the refresh drain
         // for Windows balloon notifications.
         let tray = TaskBarIcon::builder().build();
-        {
-            let mut rgba = Vec::with_capacity(32 * 32 * 4);
-            for _ in 0..32 * 32 {
-                rgba.extend_from_slice(&[240, 130, 20, 255]);
-            }
-            if let Some(bmp) = Bitmap::from_rgba(&rgba, 32, 32) {
-                tray.set_icon(&bmp, "BlindRSS");
-            }
+        // The tray text carries the unread split next to
+        // the name (Forgejo #2); plain "BlindRSS" when
+        // nothing is unread. Refreshed by the drain tick.
+        let tray_split0 = Db::open(&db_path())
+            .ok()
+            .and_then(|db| db.unread_split().ok())
+            .unwrap_or((0, 0));
+        if let Some(bmp) = tray_icon_bitmap() {
+            tray.set_icon(
+                &bmp,
+                &blindrss_core::notify::tray_tooltip(tray_split0.0, tray_split0.1),
+            );
         }
         const TRAY_SHOW: i32 = 2301;
         const TRAY_REFRESH: i32 = 2302;
@@ -9737,6 +9754,21 @@ fn main() {
                 &format!("BlindRSS {}", env!("CARGO_PKG_VERSION")),
             );
         });
+        let act_announce_unread: Rc<dyn Fn()> = {
+            let state_au = state.clone();
+            let frame_au = frame;
+            Rc::new(move || {
+                let (articles, podcasts) = state_au
+                    .borrow()
+                    .db
+                    .as_ref()
+                    .and_then(|db| db.unread_split().ok())
+                    .unwrap_or((0, 0));
+                let text = blindrss_core::notify::unread_announcement(articles, podcasts);
+                frame_au.set_status_text(&text, 0);
+                announce("general", &text);
+            })
+        };
         let act_youtube_account: Rc<dyn Fn()> = {
             let state_ya = state.clone();
             let frame_ya = frame;
@@ -10275,6 +10307,11 @@ fn main() {
                 "Announce &Version",
                 "Announce the version",
             )
+            .append_item(
+                M_ANNOUNCE_UNREAD,
+                "Announce &Unread Count",
+                "Announce how many articles and podcasts are unread",
+            )
             .append_item(M_ABOUT, "&About", "About BlindRSS")
             .build();
         let menu_bar = MenuBar::builder()
@@ -10434,6 +10471,7 @@ fn main() {
             (M_PLAYER_CHAPTERS, act_player_chapters.clone()),
             (M_EQUALIZER, act_equalizer.clone()),
             (M_ANNOUNCE_VERSION, act_announce_version.clone()),
+            (M_ANNOUNCE_UNREAD, act_announce_unread.clone()),
             (M_YOUTUBE_ACCOUNT, act_youtube_account.clone()),
             (M_MARK_READ_SEL, act_mark_read_sel.clone()),
             (M_MARK_UNREAD_SEL, act_mark_unread_sel.clone()),
@@ -11163,6 +11201,7 @@ fn main() {
         let tray_menu_tick = tray_menu.clone();
         let notify_payload_tick = notify_payload.clone();
         let tray_unread_last = Rc::new(std::cell::Cell::new(tray_unread0));
+        let tray_split_last = Rc::new(std::cell::Cell::new(tray_split0));
         let tray_unread_ticks = std::cell::Cell::new(0u32);
         let search_tick = search_box;
         let state_tick = state.clone();
@@ -11325,6 +11364,24 @@ fn main() {
                     tray_unread_last.set(total);
                     if let Some(item) = tray_menu_tick.borrow().find_item(TRAY_UNREAD) {
                         item.set_label(&format!("Unread: {total}"));
+                    }
+                }
+                // Tray tooltip split (Forgejo #2): same ~2 s
+                // cadence; re-set the icon only when the
+                // split actually changed.
+                let split = state_tick
+                    .borrow()
+                    .db
+                    .as_ref()
+                    .and_then(|db| db.unread_split().ok())
+                    .unwrap_or((0, 0));
+                if tray_split_last.get() != split {
+                    tray_split_last.set(split);
+                    if let Some(bmp) = tray_icon_bitmap() {
+                        tray.set_icon(
+                            &bmp,
+                            &blindrss_core::notify::tray_tooltip(split.0, split.1),
+                        );
                     }
                 }
             }
@@ -14415,6 +14472,30 @@ mod ui_parity_tests {
         assert!(
             win.contains("Loading this article took too long"),
             "no timeout outcome"
+        );
+    }
+
+    #[test]
+    fn unread_split_reaches_tray_and_shortcut() {
+        // Forgejo #2: the tray text shows the unread split
+        // next to the name, and the remappable Announce
+        // Unread command reports it.
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let main = std::fs::read_to_string(src_dir.join("main.rs")).unwrap();
+        let impl_src = main.split("#[cfg(test)]").next().unwrap();
+        assert!(impl_src.contains("tray_tooltip"), "tray text never updated");
+        assert!(
+            impl_src.contains("\"tools.announce_unread\" => M_ANNOUNCE_UNREAD"),
+            "the Announce Unread command is not routed"
+        );
+        assert!(
+            impl_src.contains("unread_announcement"),
+            "the Announce Unread action never speaks"
+        );
+        let data = blindrss_core::shortcuts::commands();
+        assert!(
+            data.iter().any(|c| c.id == "tools.announce_unread"),
+            "the Announce Unread command is missing from the registry"
         );
     }
 

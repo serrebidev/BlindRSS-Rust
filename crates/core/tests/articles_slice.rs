@@ -91,3 +91,39 @@ fn mark_all_read_favorites_search() {
     assert!(db.search_articles("zzz-no-match", 10).unwrap().is_empty());
     std::fs::remove_file(&path).ok();
 }
+
+#[test]
+fn unread_split_counts_articles_and_podcasts() {
+    // Forgejo #2: the split behind the tray text and the
+    // Announce Unread shortcut. Podcasts carry a media URL.
+    let path = std::env::temp_dir().join(format!("blindrss_art_split_{}.db", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE feeds (id TEXT PRIMARY KEY, url TEXT, title TEXT, \
+         title_is_custom INTEGER DEFAULT 0, category TEXT, icon_url TEXT);
+         CREATE TABLE articles (id TEXT PRIMARY KEY, feed_id TEXT, title TEXT, \
+         url TEXT, content TEXT, description TEXT, date TEXT, author TEXT, \
+         is_read INTEGER DEFAULT 0, is_favorite INTEGER DEFAULT 0, \
+         media_url TEXT, media_type TEXT, chapter_url TEXT, opened_at REAL);
+         CREATE TABLE categories (id TEXT PRIMARY KEY, title TEXT UNIQUE);
+         CREATE TABLE deleted_articles (feed_id TEXT NOT NULL, \
+         article_id TEXT NOT NULL, url TEXT, deleted_at REAL NOT NULL, \
+         title TEXT, content TEXT, description TEXT, date TEXT, author TEXT, \
+         media_url TEXT, media_type TEXT, chapter_url TEXT);
+         INSERT INTO feeds VALUES ('f1','https://example.com/f','Feed',0,NULL,NULL);
+         INSERT INTO articles (id,feed_id,title,url,is_read,media_url) \
+         VALUES ('a1','f1','Plain','https://example.com/1',0,NULL);
+         INSERT INTO articles (id,feed_id,title,url,is_read,media_url) \
+         VALUES ('a2','f1','Episode','https://example.com/2',0,'https://example.com/ep.mp3');
+         INSERT INTO articles (id,feed_id,title,url,is_read,media_url) \
+         VALUES ('a3','f1','Heard','https://example.com/3',1,'https://example.com/old.mp3');",
+    )
+    .unwrap();
+    drop(conn);
+    let db = Db::open(&path).unwrap();
+    assert_eq!(db.unread_split().unwrap(), (1, 1));
+    assert_eq!(db.mark_all_read(None).unwrap(), 2);
+    assert_eq!(db.unread_split().unwrap(), (0, 0));
+    std::fs::remove_file(&path).ok();
+}
