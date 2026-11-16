@@ -4144,7 +4144,13 @@ preserved, snapshot duration wins when known) and rewrites
 the playing row's Media and title cells — except the focused
 row's title, which Python defers until the selection moves
 (NVDA would re-read the whole row); the deferred rewrite
-flushes in the selection handler. Queue dialog rows carry
+stays pending for the next poll, which applies it once the
+selection has settled (Python posts the flush with
+wx.CallAfter for the same reason: a column-0 write inside
+the selection handler changes the name of the row NVDA
+still has as its focus object, and NVDA re-reads the row
+being left — Home/End during playback announced the playing
+article again before the new row). Queue dialog rows carry
 the same shared time annotation, fed by one scan at open.
 
 G19 (>16 chapter links): the fixed 16-slot action table is

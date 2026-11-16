@@ -2191,6 +2191,19 @@ impl RowAnnotations {
     }
 }
 
+/// Whether a live title-cell rewrite of `row` must be deferred
+/// (Python `_update_article_chapter_indicator`): column 0 is
+/// the row's accessible name, and rewriting it on the selected
+/// row makes NVDA stop and read the whole row again. The poll
+/// keeps the write pending and applies it once the selection
+/// has moved off, on a later tick — never inside the selection
+/// handler, where NVDA still has the row being left as its
+/// focus object (Python posts the flush with wx.CallAfter,
+/// after the new row's focus event settles).
+fn title_write_deferred(selected: Option<usize>, row: usize) -> bool {
+    selected == Some(row)
+}
+
 struct State {
     db: Option<Db>,
     store_path: PathBuf,
@@ -2330,7 +2343,9 @@ struct State {
     /// to rewrite while it was the selected row: changing the
     /// focused row's name makes NVDA re-read the whole row, so
     /// Python defers it until the selection moves (its
-    /// `_flush_deferred_title_cells`).
+    /// `_flush_deferred_title_cells`, posted with wx.CallAfter).
+    /// The live poll applies it once the selection has moved
+    /// off the row — never in the selection handler.
     deferred_title_row: Option<usize>,
     /// The live playback status text currently shown in
     /// status field 2 (Audit 8 M15), so the poll writes only
@@ -5162,17 +5177,15 @@ fn main() {
             st.pending_fulltext = None;
             st.selected_article = Some(idx as usize);
             st.focus_list = true;
-            // Flush a deferred live title rewrite (Audit 8
-            // M15/G11): the row whose title a live annotation
-            // update held back while it was focused is safe to
-            // rewrite now that the selection has moved off it.
-            if let Some(deferred) = st.deferred_title_row.take()
-                && deferred != idx as usize
-                && let Some(a) = st.articles.get(deferred).cloned()
-            {
-                let title = st.row_annotations.title_for(&a);
-                list.set_item_text_by_column(deferred as i64, 0, &title);
-            }
+            // A deferred live title rewrite stays pending for
+            // the next poll (Audit 8 M15/G11): the list fires
+            // the new row's focus event only after this handler
+            // returns, so writing the row being left here would
+            // change the name of the row NVDA still has as its
+            // focus object, and NVDA would read the row being
+            // left again (Python's `_flush_deferred_title_cells`
+            // runs via wx.CallAfter for the same reason). The
+            // poll applies it once the selection has settled.
             let Some(mut a) = st.articles.get(idx as usize).cloned() else {
                 return;
             };
@@ -11403,13 +11416,16 @@ fn main() {
                             )
                         };
                         if list.get_item_text(idx as i64, 0) != title {
-                            if st.selected_article == Some(idx) {
+                            if title_write_deferred(st.selected_article, idx) {
                                 // Python defers rewriting the
-                                // focused row's title: NVDA
+                                // selected row's title: NVDA
                                 // would re-read the whole row.
                                 st.deferred_title_row = Some(idx);
                             } else {
                                 list.set_item_text_by_column(idx as i64, 0, &title);
+                                if st.deferred_title_row == Some(idx) {
+                                    st.deferred_title_row = None;
+                                }
                             }
                         }
                         if let Some(mcol) = st.media_column
@@ -12876,6 +12892,20 @@ mod ui_parity_tests {
         assert!(auto_fulltext_on_select(false, false, true, false));
         assert!(auto_fulltext_on_select(false, false, false, true));
         assert!(!auto_fulltext_on_select(false, false, false, false));
+    }
+
+    #[test]
+    fn live_title_rewrite_defers_while_row_selected() {
+        // The title cell is the row's accessible name: rewriting
+        // it while the row is selected makes NVDA re-read the
+        // whole row, so the live poll defers it. Once the
+        // selection has moved off (Home/End/arrows), the write
+        // applies on a later poll — never inside the selection
+        // handler — or NVDA re-reads the row being left.
+        assert!(title_write_deferred(Some(3), 3));
+        assert!(!title_write_deferred(Some(0), 3));
+        assert!(!title_write_deferred(Some(7), 3));
+        assert!(!title_write_deferred(None, 3));
     }
 
     #[test]

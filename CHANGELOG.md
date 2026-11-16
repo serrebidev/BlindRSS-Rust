@@ -6,6 +6,10 @@ as `0.1.2-0.1.3`. Each release's section below is its Forgejo release note,
 taken from this file by the release workflow. The in-app updater shows the
 same text.
 
+## 0.1.116
+
+- During audio playback, pressing Home or End no longer makes NVDA read the playing article again first. The row being left kept its playback-time title rewrite for the moment selection moved, which NVDA read as the row it still had focus on. The title now updates on the next poll, after focus has settled on the new row, so Home and End land directly on the new article.
+
 ## 0.1.115
 
 - The HTML view no longer traps the keyboard. Since 0.1.114, after Control+Shift+H, F6, Shift+F6, Escape, Tab and Shift+Tab did nothing, and only a restart got the feed tree and article list back. The keys work again, in the main window and in the article window.
