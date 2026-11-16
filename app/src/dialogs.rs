@@ -1243,6 +1243,7 @@ pub fn show_about(frame: &Frame) {
         "Copyright (c) 2024-2026 serrebidev and contributors".to_string(),
         "An accessible RSS reader for blind users.".to_string(),
         "https://git.serrebiradio.com/serrebi/BlindRSS-Rust".to_string(),
+        "Author: serrebidev. GitHub: https://github.com/serrebidev/BlindRSS-Rust. Projects: https://projects.serrebiradio.com. Telegram: https://t.me/SerrebiProjects. Full credits: CREDITS.md.".to_string(),
     ];
     for line in &lines {
         let t = StaticText::builder(&dialog).with_label(line).build();
