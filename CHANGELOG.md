@@ -6,6 +6,11 @@ as `0.1.2-0.1.3`. Each release's section below is its Forgejo release note,
 taken from this file by the release workflow. The in-app updater shows the
 same text.
 
+## 0.1.115
+
+- The HTML view no longer traps the keyboard. Since 0.1.114, after Control+Shift+H, F6, Shift+F6, Escape, Tab and Shift+Tab did nothing, and only a restart got the feed tree and article list back. The keys work again, in the main window and in the article window.
+- Control+F, F3 and Shift+F3 now act only in the article text. In the feed tree, the article list and the search box they no longer open Find or search the article.
+
 ## 0.1.114
 
 - Rich View reuses its HTML document instead of reloading the browser for every article. Updates run after the UI event handler returns, preserving the keyboard bridge and keeping the interface responsive while HTML is replaced.

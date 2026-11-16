@@ -30,7 +30,12 @@ impl RichView {
         // The native view owns these callbacks; destroying it also releases the timer.
         let tick = presenter.clone();
         presenter.timer.on_tick(move |_| tick.flush());
-        view.add_script_message_handler("blindrssRenderBridge");
+        // wx's Edge backend accepts ONE script message handler per view
+        // (a second AddScriptMessageHandler returns false), so render
+        // completions share the key bridge's channel. A second name left
+        // window.blindrssKeyBridge undefined in v0.1.114: F6 / Tab /
+        // Escape were swallowed and posted nowhere, trapping focus.
+        view.add_script_message_handler(BRIDGE);
         let loaded = presenter.clone();
         view.on_loaded(move |event| {
             event.event.skip(true);
@@ -193,13 +198,17 @@ fn document(fragment: &str, url: &str) -> String {
         )
 }
 
+/// The view's single script message handler, shared by the render
+/// runtime and `crate::RICH_VIEW_KEYS_JS`. Registered only here.
+pub(crate) const BRIDGE: &str = "blindrssKeyBridge";
+
 const RUNTIME_JS: &str = r#"
 (function(){
   var content=document.getElementById('content');
   var base=document.getElementById('blindrss-base');
   var latest=0, pending=null, timer=null;
   function post(kind,generation){
-    if(window.blindrssRenderBridge) window.blindrssRenderBridge.postMessage(kind+generation);
+    if(window.blindrssKeyBridge) window.blindrssKeyBridge.postMessage(kind+generation);
   }
   window.__blindrssRich={queue:function(update){
     if(update.generation<=latest) return true;
@@ -468,6 +477,19 @@ mod script_tests {
         assert!(script.contains(&serde_json::to_string(&update.html).unwrap()));
         assert!(script.contains("generation:7"));
         assert!(!script.contains("replaceChildren"));
+        assert!(RUNTIME_JS.contains(&format!("window.{BRIDGE}.postMessage")));
+        assert!(crate::RICH_VIEW_KEYS_JS.contains(&format!("window.{BRIDGE}.postMessage")));
+        // Edge allows one handler per view: nobody but RichView::new may
+        // register one, or the key bridge silently goes dead.
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        for file in ["main.rs", "article_window.rs"] {
+            let text = std::fs::read_to_string(src.join(file)).unwrap();
+            let code = text.split("#[cfg(test)]").next().unwrap();
+            assert!(
+                !code.contains("add_script_message_handler("),
+                "{file} registers a second script message handler"
+            );
+        }
         assert!(RUNTIME_JS.contains("setTimeout(function()"));
         assert!(RUNTIME_JS.contains("next.generation!==latest"));
         assert!(RUNTIME_JS.contains("content.replaceChildren(template.content)"));

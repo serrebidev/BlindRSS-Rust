@@ -9101,3 +9101,19 @@ startup from applied article content. Standalone completion and focus follow
 that acknowledgement rather than the call that queued HTML. Recovery retains
 the full-page loading path. Native keyboard and NVDA acceptance remain manual;
 automated state and hidden-browser checks do not claim that acceptance.
+
+## Rich View key bridge and reader-only Find (2026-11-15, v0.1.115)
+
+v0.1.114 registered a second script message handler (`blindrssRenderBridge`)
+before the key bridge. wx's Edge backend accepts only one handler per view
+(`wxWebViewEdge::AddScriptMessageHandler` returns false for any later name), so
+`window.blindrssKeyBridge` was never defined: the key script still swallowed
+F6, Shift+F6, Escape and the Tab edges but posted nowhere, and focus could not
+leave the HTML view without a restart. `rich_view::BRIDGE` is now the one
+handler, registered only in `RichView::new`, and both the render runtime and
+`RICH_VIEW_KEYS_JS` post through it. A test fails if any other file registers
+a handler.
+
+Python binds Find / Find Next / Find Previous to the content control. The Rust
+frame CHAR_HOOK ran them from any focus; it now passes Ctrl+F, F3, Ctrl+G and
+Shift+F3 to the focused control unless the article text has focus.

@@ -476,6 +476,11 @@ must stay compatible with):
 - The Rich View (wx WebView) is opt-in (`full_text_rich_view`, default
   off) and gated on the backend actually being available; navigation
   from it follows the Python link-diversion rules (issue #102).
+  wx's Edge backend allows ONE script message handler per WebView:
+  `rich_view::BRIDGE`, registered only in `RichView::new`, carries
+  both key-bridge and render messages. A second
+  `add_script_message_handler` silently fails and kills F6 / Tab /
+  Escape out of the page (the v0.1.114 focus trap).
 - The Accessible Browser front-end (Python `gui/accessibility.py`)
   landed in v0.1.38 and was REMOVED in v0.1.40 at the owner's
   direction: research found no separate macOS GUI is required

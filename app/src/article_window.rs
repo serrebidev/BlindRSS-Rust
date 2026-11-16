@@ -208,7 +208,6 @@ fn open_impl(
         // so without it a rich article window could not be
         // closed or left from the keyboard at all. Leaving the
         // page lands on the HTML view switch, Escape closes.
-        view.add_script_message_handler("blindrssKeyBridge");
         view.add_user_script(
             crate::RICH_VIEW_KEYS_JS,
             wxdragon::widgets::webview::WebViewUserScriptInjectionTime::AtDocumentStart,

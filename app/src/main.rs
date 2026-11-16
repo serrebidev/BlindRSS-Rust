@@ -4849,7 +4849,6 @@ fn main() {
             // Key bridge (Python _RICH_VIEW_KEYS_JS): without it the
             // WebView traps keyboard focus — every article link is a
             // tab stop and WebView2 swallows Shift+Tab / F6 / ALT.
-            wv.add_script_message_handler("blindrssKeyBridge");
             wv.add_user_script(
                 RICH_VIEW_KEYS_JS,
                 WebViewUserScriptInjectionTime::AtDocumentStart,
@@ -11244,6 +11243,15 @@ fn main() {
                     return;
                 };
                 // Find pair: reader-local, not registry commands.
+                // Only the article text owns them; elsewhere (tree,
+                // list, search box) they fall through untouched.
+                let on_reader = ev
+                    .get_event_object()
+                    .is_some_and(|w| w.get_handle() as usize == f1_reader);
+                if !on_reader && matches!(accel.as_str(), "Ctrl+F" | "F3" | "Ctrl+G" | "Shift+F3") {
+                    ev.skip(true);
+                    return;
+                }
                 if accel == "Ctrl+F" {
                     h_find();
                     ev.skip(false);
@@ -14616,6 +14624,23 @@ mod ui_parity_tests {
     }
 
     #[test]
+    fn find_keys_belong_to_the_article_text_only() {
+        // Brandon's report, 2026-11-15: Ctrl+F / F3 / Shift+F3 ran
+        // from the feed tree and article list (and found nothing
+        // there). The CHAR_HOOK must hand them back to the focused
+        // control unless the article text has focus.
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let main = std::fs::read_to_string(src_dir.join("main.rs")).unwrap();
+        let code = main.split("#[cfg(test)]").next().unwrap();
+        let guard = code
+            .find("w.get_handle() as usize == f1_reader")
+            .expect("Find pair is gated on the reader");
+        let gate = &code[guard..];
+        assert!(gate.contains("\"Ctrl+F\" | \"F3\" | \"Ctrl+G\" | \"Shift+F3\""));
+        assert!(gate.find("ev.skip(true)").unwrap() < gate.find("h_find();").unwrap());
+    }
+
+    #[test]
     fn rich_view_focus_can_always_leave_the_page() {
         // Brandon's report, 2026-11-15: in the rich view
         // Shift+Tab and F6 could not reach the list or tree,
@@ -14641,7 +14666,7 @@ mod ui_parity_tests {
         assert!(impl_src.contains("Rich view host fallback"));
         assert!(impl_src.contains("if show && reader_had_focus"));
         let win = std::fs::read_to_string(src_dir.join("article_window.rs")).unwrap();
-        assert!(win.contains("add_script_message_handler(\"blindrssKeyBridge\")"));
+        assert!(!win.contains("add_script_message_handler("));
         assert!(win.contains("crate::RICH_VIEW_KEYS_JS"));
         assert!(win.contains("Some(\"__escape\")"));
         assert!(
