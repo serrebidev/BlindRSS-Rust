@@ -6,7 +6,7 @@ as `0.1.2-0.1.3`. Each release's section below is its Forgejo release note,
 taken from this file by the release workflow. The in-app updater shows the
 same text.
 
-## 0.1.116
+## 0.1.117
 
 - During audio playback, pressing Home or End no longer makes NVDA read the playing article again first. The row being left kept its playback-time title rewrite for the moment selection moved, which NVDA read as the row it still had focus on. The title now updates on the next poll, after focus has settled on the new row, so Home and End land directly on the new article.
 
