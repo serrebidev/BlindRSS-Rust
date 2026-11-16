@@ -5,6 +5,12 @@ in parallel with the shipping Python application. The Python app remains
 the product until this port reaches feature parity under the migration
 programme's acceptance checklist.
 
+[![Join SerrebiProjects on Telegram](https://img.shields.io/badge/Telegram-SerrebiProjects-2CA5E0?style=for-the-badge&logo=telegram&logoColor=white)](https://t.me/SerrebiProjects)
+
+**Questions, bugs, or release news?** Join the [SerrebiProjects Telegram group](https://t.me/SerrebiProjects), the fastest place to get help.
+
+More serrebi projects: [projects.serrebiradio.com](https://projects.serrebiradio.com)
+
 Design records: audit, research, benchmarks, and the staged plan live in
 the migration workspace (`blindrss-rust-migration/reports/` on the
 maintainer's machine); the key decisions:
@@ -45,3 +51,7 @@ Linux VM: libclang, GTK 3, GStreamer, WebKitGTK dev packages).
 
 Set `BLINDRSS_DB` to point the app at a database; the dev default is
 the Python checkout's `rss.db`.
+
+## Credits
+
+See [CREDITS.md](CREDITS.md) for where the ideas behind this project came from, and the third-party projects it builds on.
