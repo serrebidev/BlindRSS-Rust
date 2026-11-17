@@ -1234,6 +1234,31 @@ pub fn show_feed_properties(frame: &Frame, db: &Db, feed: &blindrss_core::Feed) 
 /// The repository button opens the Forgejo repo — the
 /// code's source of truth — and View Changelog reuses the
 /// Help menu's changelog viewer.
+/// About's project links: Forgejo repository, GitHub repository,
+/// projects site, Telegram and the full credits.
+pub fn about_links() -> Vec<(String, &'static str)> {
+    const FORGEJO: &str = "https://git.serrebiradio.com/serrebi/BlindRSS-Rust";
+    vec![
+        (t("Visit Repository on Forgejo"), FORGEJO),
+        (
+            t("Visit Repository on GitHub"),
+            "https://github.com/serrebidev/BlindRSS-Rust",
+        ),
+        (
+            t("Projects: projects.serrebiradio.com"),
+            "https://projects.serrebiradio.com",
+        ),
+        (
+            t("Telegram: SerrebiProjects"),
+            "https://t.me/SerrebiProjects",
+        ),
+        (
+            t("Full Credits"),
+            "https://git.serrebiradio.com/serrebi/BlindRSS-Rust/src/branch/main/CREDITS.md",
+        ),
+    ]
+}
+
 pub fn show_about(frame: &Frame) {
     let dialog = Dialog::builder(frame, "About BlindRSS").build();
     crate::dialogs::escape_closes(&dialog);
@@ -1242,8 +1267,7 @@ pub fn show_about(frame: &Frame) {
         format!("BlindRSS {}", env!("CARGO_PKG_VERSION")),
         "Copyright (c) 2024-2026 serrebidev and contributors".to_string(),
         "An accessible RSS reader for blind users.".to_string(),
-        "https://git.serrebiradio.com/serrebi/BlindRSS-Rust".to_string(),
-        "Author: serrebidev. GitHub: https://github.com/serrebidev/BlindRSS-Rust. Projects: https://projects.serrebiradio.com. Telegram: https://t.me/SerrebiProjects. Full credits: CREDITS.md.".to_string(),
+        "Author: serrebidev.".to_string(),
     ];
     for line in &lines {
         let t = StaticText::builder(&dialog).with_label(line).build();
@@ -1256,13 +1280,15 @@ pub fn show_about(frame: &Frame) {
     github_btn.on_click(move |_| {
         crate::open_in_browser("https://github.com/serrebidev");
     });
-    let repo_btn = Button::builder(&dialog)
-        .with_label(&t("Visit Repository"))
-        .build();
-    sizer.add(&repo_btn, 0, SizerFlag::All, 4);
-    repo_btn.on_click(move |_| {
-        crate::open_in_browser("https://git.serrebiradio.com/serrebi/BlindRSS-Rust");
-    });
+    // Every project link is its own button, so Tab reaches it and Enter
+    // opens it; links written into the text lines were unreachable.
+    for (label, url) in about_links() {
+        let link_btn = Button::builder(&dialog).with_label(&label).build();
+        sizer.add(&link_btn, 0, SizerFlag::All, 4);
+        link_btn.on_click(move |_| {
+            crate::open_in_browser(url);
+        });
+    }
     let changelog_btn = Button::builder(&dialog)
         .with_label(&t("View Changelog"))
         .build();
@@ -1280,8 +1306,7 @@ pub fn show_about(frame: &Frame) {
     sizer.add(&close_btn, 0, SizerFlag::All, 4);
     let d = dialog;
     close_btn.on_click(move |_| d.end_modal(5101));
-    dialog.set_sizer(sizer, true);
-    dialog.set_size(Size::new(480, 340));
+    dialog.set_sizer_and_fit(sizer, true);
     dialog.show_modal();
     dialog.destroy();
 }
@@ -5520,6 +5545,27 @@ mod category_properties_tests {
         assert_eq!(
             feed_error_failures_line(3),
             "3 consecutive failed attempt(s) (likely a persistent problem)."
+        );
+    }
+}
+
+#[cfg(test)]
+mod about_tests {
+    #[test]
+    fn about_has_every_project_link() {
+        let urls: Vec<&str> = super::about_links()
+            .into_iter()
+            .map(|(_, url)| url)
+            .collect();
+        assert_eq!(
+            urls,
+            [
+                "https://git.serrebiradio.com/serrebi/BlindRSS-Rust",
+                "https://github.com/serrebidev/BlindRSS-Rust",
+                "https://projects.serrebiradio.com",
+                "https://t.me/SerrebiProjects",
+                "https://git.serrebiradio.com/serrebi/BlindRSS-Rust/src/branch/main/CREDITS.md",
+            ]
         );
     }
 }
