@@ -46,8 +46,7 @@ stated here and in `docs/PARITY.md`.
   `crates/core` for `x86_64-pc-windows-gnu` when `cfg(windows)` code was
   touched), `cargo test --workspace` fully green, `cargo build -p
   blindrss`.
-- Ship a release (Forgejo era, since v0.1.78 — GitHub is suspended;
-  Windows/Linux ship locally, and macOS uses the Forgejo Mac runner):
+- Ship a release (published on Forgejo, built on GitHub runners):
   1. Bump `version` in `app/Cargo.toml` to the next number above the
      latest PUBLISHED Forgejo release AND the latest tag. Never reuse or
      re-tag an older version, even one whose release failed.
@@ -59,9 +58,8 @@ stated here and in `docs/PARITY.md`.
      the user temp dir.
   3. Push to `main` on the `forgejo` remote, tag `vX.Y.Z` on the green
      commit, push the tag.
-  4. The tag push runs `release.yml` on Forgejo (since v0.1.84): Windows
-     on `desknasbox-windows-x64` (this PC, user `build`), Linux on the
-     server runner, macOS on `mac-mini-arm64`. Each leg gates, builds,
+  4. Start `release.yml` on GitHub runners: `gh workflow run release.yml
+     --repo serrebidev/BlindRSS-Rust -f release_tag=vX.Y.Z`. Each leg gates, builds,
      stages `dist/BlindRSS`, smoke-tests and signs with the
      MINISIGN_KEY/MINISIGN_PASSWORD repo secrets. The publish job checks
      all 7 assets, writes `SHA256SUMS`, fills the tag's draft (or creates

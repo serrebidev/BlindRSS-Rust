@@ -1,9 +1,8 @@
 name: Release
 
 on:
-  push:
-    tags: ["v*"]
-  # Rebuild an existing tag (all three legs) and publish it.
+  # Manual only: the Forgejo-to-GitHub sync disables GitHub workflows with
+  # automatic triggers. Build an existing tag (all three legs) and publish it.
   workflow_dispatch:
     inputs:
       release_tag:
