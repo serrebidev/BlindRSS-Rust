@@ -30,7 +30,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, wsl-linux, macos-latest]
+        os: [windows-latest, ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v5
         with:
@@ -76,66 +76,6 @@ jobs:
         if: runner.os == 'Windows'
         shell: bash
         run: echo "${RUNNER_TEMP}\\msys64\\usr\\bin" >> "$GITHUB_PATH"
-
-      # Host runners (macOS, Windows) start every job in a fresh,
-      # randomly named work folder, so rust-cache never matched
-      # there: its cache version hashes the absolute target path
-      # ("No cache found" on every v0.1.86 leg, full wxWidgets
-      # rebuilds). target/ points at a fixed per-repo folder on
-      # the runner instead and builds reuse the previous run
-      # directly. Two jobs on one folder take turns: cargo locks it. Owner-approved 2026-11-10.
-      # CARGO_TARGET_DIR is the folder's real path: CMake caches
-      # absolute paths, and the path through the link changes
-      # with every work folder ("CMakeCache.txt directory ... is
-      # different"). The link keeps target/... references working.
-      # ponytail: the folder only grows; delete it on the runner
-      # when disk gets tight (next build is cold once).
-      - name: Persistent target folder (Windows host runner)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $dir = 'C:/forgejo-runner/cargo-target/BlindRSS-Rust'
-          New-Item -ItemType Directory -Force $dir | Out-Null
-          if (Test-Path target) { cmd /c rmdir /s /q target }
-          New-Item -ItemType Junction -Path target -Target $dir | Out-Null
-          Add-Content -Path $env:GITHUB_ENV -Value "CARGO_TARGET_DIR=$dir"
-
-      - name: Persistent target folder (macOS host runner)
-        if: runner.os == 'macOS'
-        shell: bash
-        run: |
-          dir="$HOME/forgejo-runner/cargo-target/BlindRSS-Rust"
-          mkdir -p "$dir"
-          rm -rf target
-          ln -s "$dir" target
-          echo "CARGO_TARGET_DIR=$dir" >> "$GITHUB_ENV"
-
-      # Linux builds run on desknasbox's WSL (the wsl-linux-x64
-      # runner, a host runner inside the PC's WSL2 Ubuntu —
-      # owner's standing build routing). Like the other host
-      # runners it starts each job in a fresh work folder, so
-      # rust-cache never matched there either; same treatment
-      # (owner-approved 2026-11-10): target/ points at a fixed
-      # per-repo folder on the runner and builds reuse the
-      # previous run directly. CARGO_TARGET_DIR is the folder's
-      # real path: CMake caches absolute paths, and the path
-      # through the link changes with every work folder. The
-      # link keeps target/... references working. Builds still
-      # happen inside the release containers per the routing
-      # rules where a script provides them; this job's direct
-      # cargo steps run on the WSL host like the other host
-      # runners' jobs. ponytail: the folder only grows; delete
-      # it on the runner when disk gets tight (next build is
-      # cold once).
-      - name: Persistent target folder (Linux host runner)
-        if: runner.os == 'Linux'
-        shell: bash
-        run: |
-          dir="$HOME/forgejo-runner/cargo-target/BlindRSS-Rust"
-          mkdir -p "$dir"
-          rm -rf target
-          ln -s "$dir" target
-          echo "CARGO_TARGET_DIR=$dir" >> "$GITHUB_ENV"
 
       # Same guard as ci.yml: a restored cache can lack the
       # WebView2 SDK lib while wxdragon-sys looks fresh (LNK1104).
@@ -314,7 +254,7 @@ jobs:
           echo "$files" | xargs "$xtask" sign
 
       - name: Upload artifacts
-        uses: https://code.forgejo.org/forgejo/upload-artifact@v4
+        uses: actions/upload-artifact@v4
         with:
           name: BlindRSS-${{ env.TAG }}-${{ runner.os }}
           path: |
@@ -324,24 +264,6 @@ jobs:
             dist/BlindRSS.tar.gz.minisig
             dist/BlindRSS.dmg
             dist/BlindRSS.dmg.minisig
-
-      # Drop only the link, never the shared folder behind it,
-      # before the runner deletes the work folder.
-      - name: Unlink persistent target folder (Windows)
-        if: always() && runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          if (Test-Path target) { (Get-Item target).Delete() }
-
-      - name: Unlink persistent target folder (macOS)
-        if: always() && runner.os == 'macOS'
-        shell: bash
-        run: rm -f target
-
-      - name: Unlink persistent target folder (Linux)
-        if: always() && runner.os == 'Linux'
-        shell: bash
-        run: rm -f target
 
   publish:
     name: Publish release
@@ -353,7 +275,7 @@ jobs:
         with:
           ref: ${{ inputs.release_tag || github.ref }}
 
-      - uses: https://code.forgejo.org/forgejo/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           path: artifacts
           merge-multiple: true
@@ -406,7 +328,7 @@ jobs:
           FORGEJO_TOKEN: ${{ secrets.FORGEJO_TOKEN }}
         run: |
           set -euo pipefail
-          api="$GITHUB_SERVER_URL/api/v1/repos/$GITHUB_REPOSITORY"
+          api="https://git.serrebiradio.com/api/v1/repos/serrebi/BlindRSS-Rust"
           h="Authorization: token $FORGEJO_TOKEN"
           notes="$RUNNER_TEMP/notes.md"
           if release="$(curl -sf -H "$h" "$api/releases/tags/$TAG")"; then

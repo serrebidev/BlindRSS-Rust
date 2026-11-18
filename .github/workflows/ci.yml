@@ -28,7 +28,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [wsl-linux, windows-latest, macos-latest]
+        os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@v5
 
@@ -78,66 +78,6 @@ jobs:
         shell: bash
         run: echo "${RUNNER_TEMP}\\msys64\\usr\\bin" >> "$GITHUB_PATH"
 
-      # Host runners (macOS, Windows) start every job in a fresh,
-      # randomly named work folder, so rust-cache never matched
-      # there: its cache version hashes the absolute target path
-      # ("No cache found" on every v0.1.86 leg, full wxWidgets
-      # rebuilds). target/ points at a fixed per-repo folder on
-      # the runner instead and builds reuse the previous run
-      # directly. Two jobs on one folder take turns: cargo locks it. Owner-approved 2026-11-10.
-      # CARGO_TARGET_DIR is the folder's real path: CMake caches
-      # absolute paths, and the path through the link changes
-      # with every work folder ("CMakeCache.txt directory ... is
-      # different"). The link keeps target/... references working.
-      # ponytail: the folder only grows; delete it on the runner
-      # when disk gets tight (next build is cold once).
-      - name: Persistent target folder (Windows host runner)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $dir = 'C:/forgejo-runner/cargo-target/BlindRSS-Rust'
-          New-Item -ItemType Directory -Force $dir | Out-Null
-          if (Test-Path target) { cmd /c rmdir /s /q target }
-          New-Item -ItemType Junction -Path target -Target $dir | Out-Null
-          Add-Content -Path $env:GITHUB_ENV -Value "CARGO_TARGET_DIR=$dir"
-
-      - name: Persistent target folder (macOS host runner)
-        if: runner.os == 'macOS'
-        shell: bash
-        run: |
-          dir="$HOME/forgejo-runner/cargo-target/BlindRSS-Rust"
-          mkdir -p "$dir"
-          rm -rf target
-          ln -s "$dir" target
-          echo "CARGO_TARGET_DIR=$dir" >> "$GITHUB_ENV"
-
-      # Linux builds run on desknasbox's WSL (the wsl-linux-x64
-      # runner, a host runner inside the PC's WSL2 Ubuntu —
-      # owner's standing build routing). Like the other host
-      # runners it starts each job in a fresh work folder, so
-      # rust-cache never matched there either; same treatment
-      # (owner-approved 2026-11-10): target/ points at a fixed
-      # per-repo folder on the runner and builds reuse the
-      # previous run directly. CARGO_TARGET_DIR is the folder's
-      # real path: CMake caches absolute paths, and the path
-      # through the link changes with every work folder. The
-      # link keeps target/... references working. Builds still
-      # happen inside the release containers per the routing
-      # rules where a script provides them; this job's direct
-      # cargo steps run on the WSL host like the other host
-      # runners' jobs. ponytail: the folder only grows; delete
-      # it on the runner when disk gets tight (next build is
-      # cold once).
-      - name: Persistent target folder (Linux host runner)
-        if: runner.os == 'Linux'
-        shell: bash
-        run: |
-          dir="$HOME/forgejo-runner/cargo-target/BlindRSS-Rust"
-          mkdir -p "$dir"
-          rm -rf target
-          ln -s "$dir" target
-          echo "CARGO_TARGET_DIR=$dir" >> "$GITHUB_ENV"
-
       # A restored rust-cache tree can lack the WebView2 SDK lib
       # (its download lives in the wx cmake tree, which the cache
       # round-trip drops) while cargo still treats wxdragon-sys
@@ -175,20 +115,5 @@ jobs:
           sudo apt-get install -y vlc
           cargo test -p blindrss installed_vlc_plays_and_seeks_a_silent_wave -- --ignored
 
-      # Drop only the link, never the shared folder behind it,
-      # before the runner deletes the work folder.
-      - name: Unlink persistent target folder (Windows)
-        if: always() && runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          if (Test-Path target) { (Get-Item target).Delete() }
-
-      - name: Unlink persistent target folder (macOS)
-        if: always() && runner.os == 'macOS'
-        shell: bash
-        run: rm -f target
-
-      - name: Unlink persistent target folder (Linux)
-        if: always() && runner.os == 'Linux'
-        shell: bash
-        run: rm -f target
+      # Ephemeral GitHub runners: the work folder is deleted
+      # with the job, so nothing to unlink (owner 2026-11-18).
