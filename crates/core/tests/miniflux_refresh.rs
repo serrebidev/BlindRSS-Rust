@@ -186,7 +186,19 @@ fn force_retries_one_failure_but_respects_repeated_feed_backoff() {
 
 #[test]
 fn soft_deadline_returns_without_cancelling_slow_requests() {
-    let (base, requests, _) = server(204, Duration::from_millis(150));
+    // 500 ms per PUT (was 150 ms): with 2 workers and 7 feeds
+    // the pool needs at least 4 sequential waves, so it cannot
+    // finish in under 2 s — a hard lower bound, since a sleep
+    // only ever runs long under load, never short. The return
+    // bound below is 1 s (was 250 ms): still half the earliest
+    // possible completion, so passing it still proves the call
+    // returned at the 20 ms soft deadline instead of waiting
+    // for the pool, but a busy shared runner (the v0.1.119
+    // Forgejo Windows leg flaked at 250 ms, run 1043) can no
+    // longer stall a release on scheduling jitter before the
+    // deadline even starts. The completion wait rises with
+    // the delay for the same reason (4 s -> 15 s).
+    let (base, requests, _) = server(204, Duration::from_millis(500));
     let mut cfg = config();
     cfg.set_path("miniflux_refresh_soft_deadline_s", serde_json::json!(0.02));
     let client = MinifluxClient::new(&base, "secret").with_refresh_config(&cfg);
@@ -195,9 +207,9 @@ fn soft_deadline_returns_without_cancelling_slow_requests() {
         .request_refresh(true)
         .unwrap()
         .expect("background stragglers");
-    assert!(started.elapsed() < Duration::from_millis(250));
+    assert!(started.elapsed() < Duration::from_secs(1));
     pending
-        .recv_timeout(Duration::from_secs(4))
+        .recv_timeout(Duration::from_secs(15))
         .unwrap()
         .unwrap();
     assert_eq!(
