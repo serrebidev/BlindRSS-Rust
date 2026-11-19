@@ -9,6 +9,11 @@ on:
         description: Existing tag to build and publish, e.g. v0.1.84
         required: true
         type: string
+      dry_run:
+        description: Build and sign only; publish nothing
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -322,6 +327,7 @@ jobs:
       # Forgejo has no softprops action: reuse the tag's draft (or create
       # one), replace same-named assets, then publish it.
       - name: Publish the Forgejo release
+        if: ${{ !inputs.dry_run }}
         shell: bash
         env:
           FORGEJO_TOKEN: ${{ secrets.FORGEJO_TOKEN }}
