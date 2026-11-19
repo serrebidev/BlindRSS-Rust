@@ -9123,3 +9123,44 @@ a handler.
 Python binds Find / Find Next / Find Previous to the content control. The Rust
 frame CHAR_HOOK ran them from any focus; it now passes Ctrl+F, F3, Ctrl+G and
 Shift+F3 to the focused control unless the article text has focus.
+
+## Release recovery v0.1.120 — the v0.1.118/v0.1.119 gap closed (2026-11-18, VERIFIED)
+
+Tags v0.1.118 and v0.1.119 existed but never published: Forgejo release
+run 1043 (v0.1.119) failed on the Windows package leg only (macOS and
+Linux passed, Publish skipped) on exactly one test,
+`soft_deadline_returns_without_cancelling_slow_requests`
+(crates/core/tests/miniflux_refresh.rs), which panicked on
+`started.elapsed() < Duration::from_millis(250)`. The other 10 tests in
+the file passed, and the v0.1.118/v0.1.119 changes are About-dialog /
+README / credits only — nothing touches Miniflux refresh or timing.
+
+Flake verdict, with evidence: the unmodified test passed 10/10 locally,
+and the GitHub-cloud migration dry run 44435393789 (release.yml for
+v0.1.119, GitHub runners) passed all three package legs including
+Windows, where the same test ran in the Validate step. Run 1043 was a
+timing flake under shared Forgejo Windows runner load; the production
+soft-deadline code is unchanged.
+
+Fix (commit 2539fe6): the test is now load-tolerant by construction.
+The mock PUT delay rises 150 ms -> 500 ms, so with 2 workers and 7
+feeds the pool cannot finish in under 2 s (a sleep only runs long
+under load, never short). The return bound rises 250 ms -> 1 s —
+still half the earliest possible completion, so it still proves the
+call returned at the 20 ms soft deadline instead of waiting for the
+pool. The completion wait rises 4 s -> 15 s to match.
+
+Ship (commit bde2483, tag v0.1.120 — v0.1.118/v0.1.119 not re-tagged):
+local gate green (fmt --check, clippy --locked --workspace
+--all-targets -D warnings, cargo test --locked --workspace 1129
+passed / 0 failed, cargo build -p blindrss). GitHub release run
+44441532135 conclusion success: Package windows/ubuntu/macos all
+success (each leg runs fmt + clippy + the full test suite), Publish
+success. Verified by direct Forgejo API reads: release v0.1.120
+exists, draft=false, exactly the 7 contract assets, body is the
+CHANGELOG 0.1.120 section (which carries the 0.1.118/0.1.119 notes
+for upgraders from v0.1.117), /releases/latest returns v0.1.120.
+Downloaded BlindRSS.tar.gz signature VALID against
+crates/core/assets/minisign.pub with the tamper control rejecting a
+flipped byte, and `cargo xtask update-check 0.1.117` reports 0.1.117
+would be offered v0.1.120 and verified the download.
