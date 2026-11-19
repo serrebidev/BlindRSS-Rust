@@ -6,6 +6,11 @@ as `0.1.2-0.1.3`. Each release's section below is its Forgejo release note,
 taken from this file by the release workflow. The in-app updater shows the
 same text.
 
+## 0.1.120
+
+- This release carries the changes from 0.1.118 and 0.1.119, whose builds never published: Help > About names the author and has a button for each link — the Forgejo and GitHub repositories, the projects site, the Telegram channel and the full credits — and Tab reaches each one, with Enter opening it.
+- The README follows the shared layout and credits the libraries, vendored code and upstream projects BlindRSS uses.
+
 ## 0.1.119
 
 - Help > About names the author and has a button for each link: the Forgejo and GitHub repositories, the projects site, the Telegram channel and the full credits. Tab reaches each one and Enter opens it.
