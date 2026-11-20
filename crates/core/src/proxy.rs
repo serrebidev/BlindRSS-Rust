@@ -266,7 +266,9 @@ fn serve_ffmpeg_mp3(stream: &mut std::net::TcpStream, url: &str, af: Option<&str
         return respond(stream, "503 Unavailable", &[], b"ffmpeg not found");
     };
     let mut cmd = std::process::Command::new(&ffmpeg);
-    cmd.args(["-v", "error", "-i", url]);
+    cmd.args(["-v", "error"])
+        .args(crate::silence::ffmpeg_http_reconnect_args(url))
+        .args(["-i", url]);
     if let Some(af) = af {
         cmd.args(["-af", af]);
     }

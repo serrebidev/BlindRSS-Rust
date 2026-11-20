@@ -128,6 +128,12 @@ fn start_raop(
             args.push("-ss".into());
             args.push(format!("{start:.3}"));
         }
+        // RAOP streams in real time: a paced reader (see the helper).
+        args.extend(
+            blindrss_core::silence::ffmpeg_http_reconnect_args(&url)
+                .iter()
+                .map(|a| a.to_string()),
+        );
         args.extend([
             "-i".into(),
             url,

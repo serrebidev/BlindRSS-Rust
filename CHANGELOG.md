@@ -6,6 +6,12 @@ as `0.1.2-0.1.3`. Each release's section below is its Forgejo release note,
 taken from this file by the release workflow. The in-app updater shows the
 same text.
 
+## 0.1.121
+
+- Skip Silence no longer replays part of a podcast. On m4a episodes a skip could jump back as much as a minute, because the player landed on the start of a large block of audio instead of the exact spot. Every seek, including your own, now lands where it is aimed.
+- Skip Silence now skips far more on streamed podcasts. Streamed episodes used stricter built-in settings instead of yours, and waited 5 seconds between skips. On one 87 minute episode that meant 52 silences found instead of 302. Streamed episodes now use your Skip Silence settings and the normal 2.5 second wait.
+- Skip Silence no longer stops working partway through long streamed episodes. The silence scan reads the episode slowly, and some podcast servers drop slow connections after about 6 minutes, which ended the scan early. It now reconnects and carries on. The same fix covers playback through the built-in conversion route and AirPlay casting, which could stop early the same way.
+
 ## 0.1.120
 
 - This release carries the changes from 0.1.118 and 0.1.119, whose builds never published: Help > About names the author and has a button for each link — the Forgejo and GitHub repositories, the projects site, the Telegram channel and the full credits — and Tab reaches each one, with Enter opening it.

@@ -30,6 +30,29 @@ pub fn find_ffmpeg() -> Option<PathBuf> {
     crate::dependency::find_tool("ffmpeg")
 }
 
+/// ffmpeg input options for any reader of remote media that
+/// consumes at playback pace (silence scan, /play and EQ
+/// transcodes, AirPlay casting). Such readers drain the socket
+/// slowly, and CDNs reset slow connections (CloudFront: about
+/// 6 min in). Without these ffmpeg logs "partial file", exits 0,
+/// and the stream just ends early. Empty for non-http sources,
+/// which reject the options.
+pub fn ffmpeg_http_reconnect_args(source: &str) -> &'static [&'static str] {
+    let lower = source.to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        &[
+            "-reconnect",
+            "1",
+            "-reconnect_on_network_error",
+            "1",
+            "-reconnect_delay_max",
+            "5",
+        ]
+    } else {
+        &[]
+    }
+}
+
 /// Parse ffmpeg silencedetect stderr into raw (start, end)
 /// ranges in seconds. An unmatched trailing start is dropped.
 /// Retained from the pre-Task-21 detector; the silencedetect
@@ -457,10 +480,13 @@ pub struct SilenceScanConfig {
 /// exactly as Python's silence worker resolves them:
 /// `core/config.py` DEFAULT_CONFIG supplies the effective
 /// defaults (Python's config loader merges them into every
-/// config), and remote sources get Python's conservative
-/// adjustments (VAD aggressiveness 0, threshold capped at
-/// -52 dB, minimum silence at least 1200 ms, merge gap at
-/// most 200 ms, 8000 Hz decode, 1 thread).
+/// config). Remote sources decode at 8000 Hz on 1 thread
+/// (cost only). Deliberate divergence: Python also forced
+/// remote detection to VAD aggressiveness 0, a -52 dB
+/// threshold cap, a 1200 ms minimum and a 200 ms merge gap.
+/// Those caps ignored the user's settings and cut one 87 min
+/// podcast from 308 skips to 52; they dated from VLC fast
+/// seeks that replayed audio on every skip (see PARITY.md).
 #[derive(Clone, Debug)]
 pub struct SilenceScanSettings {
     pub scan: SilenceScanConfig,
@@ -479,22 +505,14 @@ pub struct SilenceScanSettings {
 
 impl SilenceScanSettings {
     pub fn from_config(cfg: &crate::config::Config, is_remote: bool) -> Self {
-        let mut vad_aggressiveness = cfg.get_i64("silence_vad_aggressiveness", 2);
-        let mut threshold_db = cfg
+        let vad_aggressiveness = cfg.get_i64("silence_vad_aggressiveness", 2);
+        let threshold_db = cfg
             .raw()
             .get("silence_skip_threshold_db")
             .and_then(|v| v.as_f64())
             .unwrap_or(-38.0);
-        let mut min_silence_ms = cfg.get_i64("silence_skip_min_ms", 700);
-        let mut merge_gap_ms = cfg.get_i64("silence_skip_merge_gap_ms", 260);
-        if is_remote {
-            if vad_aggressiveness > 0 {
-                vad_aggressiveness = 0;
-            }
-            threshold_db = threshold_db.min(-52.0);
-            min_silence_ms = min_silence_ms.max(1200);
-            merge_gap_ms = merge_gap_ms.min(200);
-        }
+        let min_silence_ms = cfg.get_i64("silence_skip_min_ms", 700);
+        let merge_gap_ms = cfg.get_i64("silence_skip_merge_gap_ms", 260);
         let sample_rate = if is_remote {
             cfg.get_i64("silence_scan_remote_sample_rate", 8000)
         } else {
@@ -565,6 +583,12 @@ fn ffmpeg_args(source: &str, cfg: &SilenceScanConfig) -> Vec<String> {
     }
     let lower = source.to_ascii_lowercase();
     if lower.starts_with("http://") || lower.starts_with("https://") {
+        // Paced reader: see ffmpeg_http_reconnect_args. Not in Python.
+        args.extend(
+            ffmpeg_http_reconnect_args(source)
+                .iter()
+                .map(|a| a.to_string()),
+        );
         if cfg.headers.is_empty() {
             if !cfg.default_user_agent.is_empty() {
                 args.push("-user_agent".into());
@@ -1063,7 +1087,12 @@ impl SilenceSkipPolicy {
         if pos_ms + 500 < self.floor_ms {
             return None;
         }
-        let cooldown = Duration::from_millis(if ctx.is_remote { 5000 } else { 2500 });
+        // One 2.5 s cooldown for local and remote. Python used 5 s for
+        // remote, which dropped 67 of 302 silences on a streamed
+        // podcast. Seeks land in under 300 ms now, and the floor and
+        // loop guard below already block re-skips from a stale
+        // position, so remote needs no extra cooldown.
+        let cooldown = Duration::from_millis(2500);
         if self
             .last_skip_at
             .is_some_and(|ts| now.duration_since(ts) < cooldown)
@@ -1145,5 +1174,35 @@ impl SilenceSkipPolicy {
 
     pub fn verify_active(&self) -> bool {
         self.verify.is_some()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A paced remote scan reads the socket at playback speed, and
+    /// CDNs reset such slow connections (CloudFront did after about
+    /// 6 min). Without `-reconnect` ffmpeg logged "partial file",
+    /// exited 0, and the scan ended 12 min into an 87 min podcast,
+    /// so nothing past that point was ever skipped.
+    #[test]
+    fn http_scans_reconnect_and_local_scans_do_not() {
+        let cfg = SilenceScanSettings::from_config(&crate::config::Config::default(), true).scan;
+        let http = ffmpeg_args("https://cdn.example/ep.m4a", &cfg);
+        let input = http.iter().position(|a| a == "-i").unwrap();
+        let before_input = &http[..input];
+        for flag in ["-reconnect", "-reconnect_on_network_error"] {
+            let at = before_input
+                .iter()
+                .position(|a| a == flag)
+                .unwrap_or_else(|| panic!("{flag} missing: {http:?}"));
+            assert_eq!(before_input[at + 1], "1");
+        }
+        let local = ffmpeg_args("C:/podcasts/ep.m4a", &cfg);
+        assert!(
+            !local.iter().any(|a| a.starts_with("-reconnect")),
+            "{local:?}"
+        );
     }
 }

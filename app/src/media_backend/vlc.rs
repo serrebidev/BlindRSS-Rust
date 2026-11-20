@@ -224,7 +224,11 @@ fn instance_args(cfg: &Config, windows: bool) -> Vec<String> {
         "--quiet".to_owned(),
         "--no-video-title-show".to_owned(),
         "--no-snapshot-preview".to_owned(),
-        "--input-fast-seek".to_owned(),
+        // No --input-fast-seek (Python passes it): fast seeks land
+        // MP4 audio on the containing chunk's start, and podcast
+        // m4a files carry ~65 s chunks, so every silence skip
+        // replayed up to a minute. Accurate seeks cost nothing
+        // that matters for audio.
     ];
     if windows {
         let volume = cfg.get_i64("volume", 100).clamp(0, 100);
@@ -723,7 +727,11 @@ mod tests {
             args.iter().filter(|a| *a == "--no-plugins-cache").count(),
             1
         );
-        assert!(args.contains(&"--input-fast-seek".to_owned()));
+        // Deliberate divergence from Python: no --input-fast-seek. It
+        // lands MP4 seeks on the chunk start, and podcast m4a files
+        // carry ~65 s chunks, so a silence skip replayed up to a
+        // minute of audio.
+        assert!(!args.iter().any(|a| a.contains("fast-seek")));
         assert!(args.contains(&"--http-reconnect".to_owned()));
         assert!(args.contains(&"--network-caching=500".to_owned()));
         assert!(args.contains(&"--file-caching=500".to_owned()));

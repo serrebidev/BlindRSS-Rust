@@ -686,7 +686,9 @@ fn skip_policy_cooldown_and_user_seek_pause() {
         ),
         Some(20_000)
     );
-    // Remote pause is 2.5 s and remote cooldown is 5 s.
+    // Remote pause is 2.5 s. Remote cooldown matches local (2.5 s):
+    // seeks land accurately and fast now, and Python's 5 s dropped
+    // 67 of 302 silences on one streamed podcast.
     let mut p = SilenceSkipPolicy::new();
     p.note_user_seek(t0, true);
     let mut ctx = skip_ctx();
@@ -700,11 +702,11 @@ fn skip_policy_cooldown_and_user_seek_pause() {
         Some(20_000)
     );
     assert_eq!(
-        p.evaluate(&ranges, 30_500, t0 + Duration::from_millis(7000), &ctx),
+        p.evaluate(&ranges, 30_500, t0 + Duration::from_millis(4600), &ctx),
         None
     );
     assert_eq!(
-        p.evaluate(&ranges, 30_500, t0 + Duration::from_millis(7700), &ctx),
+        p.evaluate(&ranges, 30_500, t0 + Duration::from_millis(5200), &ctx),
         Some(40_000)
     );
 }
@@ -858,4 +860,40 @@ fn redact_url_for_log_strips_credentials_queries_and_signed_paths() {
     cfg.set_path("range_cache_debug", serde_json::json!(true));
     let rc = blindrss_core::rangecache::RangeCacheConfig::from_app_config(&cfg);
     assert!(rc.debug);
+}
+
+/// Remote media honours the user's detector settings. The old
+/// remote caps (-52 dB, aggressiveness 0, 1200 ms minimum,
+/// 200 ms merge gap) cut one 87 min podcast from 308 skips to 52.
+/// Only the cost knobs (decode rate, threads) differ for remote.
+#[test]
+fn remote_silence_scan_keeps_user_detector_settings() {
+    use blindrss_core::silence::SilenceScanSettings;
+    let mut cfg = blindrss_core::config::Config::default();
+    cfg.set_path("silence_skip_threshold_db", serde_json::json!(-38.0));
+    cfg.set_path("silence_vad_aggressiveness", serde_json::json!(2));
+    cfg.set_path("silence_skip_min_ms", serde_json::json!(700));
+    cfg.set_path("silence_skip_merge_gap_ms", serde_json::json!(260));
+    let local = SilenceScanSettings::from_config(&cfg, false).scan;
+    let remote = SilenceScanSettings::from_config(&cfg, true).scan;
+    assert_eq!(remote.threshold_db, -38.0);
+    assert_eq!(remote.vad_aggressiveness, 2);
+    assert_eq!(remote.min_silence_ms, 700);
+    assert_eq!(remote.merge_gap_ms, 260);
+    assert_eq!(
+        (
+            remote.threshold_db,
+            remote.vad_aggressiveness,
+            remote.min_silence_ms,
+            remote.merge_gap_ms
+        ),
+        (
+            local.threshold_db,
+            local.vad_aggressiveness,
+            local.min_silence_ms,
+            local.merge_gap_ms
+        )
+    );
+    assert_eq!(remote.sample_rate, 8000);
+    assert_eq!(remote.threads, Some(1));
 }

@@ -4336,7 +4336,9 @@ with padding where Python EXPANDS them.
   aggressiveness forced to 0, threshold capped at
   −52 dB, minimum silence at least 1200 ms, merge gap at
   most 200 ms, threads 1 (2 local), low priority default
-  on, lead 300 s.
+  on, lead 300 s. (Superseded 2026-11-19: remote keeps
+  only the 8000 Hz rate and 1 thread; see "Skip Silence
+  replay fix" below.)
 - Player lifecycle (app/src/player.rs): the scan is
   QUEUED at deliver and at queue advance
   (`queue_silence_scan`), STARTED by the 1 s tick only
@@ -4363,7 +4365,8 @@ with padding where Python EXPANDS them.
   blocks, not-ready/empty blocks, the user-seek pause
   (1.2 s local / 2.5 s remote), slider dragging,
   position + 500 ms behind the floor, and the post-skip
-  cooldown (2.5 s local / 5.0 s remote). Hit arithmetic:
+  cooldown (2.5 s local / 5.0 s remote; 2.5 s for both
+  since 2026-11-19). Hit arithmetic:
   break at pos < start − 1000; containment
   start − 100 ≤ pos ≤ end − 100; target = end +
   resume_backoff (remote-capped at 1000 ms); floor
@@ -9164,3 +9167,66 @@ Downloaded BlindRSS.tar.gz signature VALID against
 crates/core/assets/minisign.pub with the tamper control rejecting a
 flipped byte, and `cargo xtask update-check 0.1.117` reports 0.1.117
 would be offered v0.1.120 and verified the download.
+
+## Skip Silence replay fix — no `--input-fast-seek` (2026-11-19)
+
+User report: Skip Silence "repeated a part" of Podventures in
+Odyssey A13E02 (Anchor-hosted AAC m4a, 87 min). Reproduced in the
+real player: a probe build played the episode from 0:00 with
+libVLC's `afile` output recording what the player produced, and a
+trace of every tick position and seek. The first silence skip
+(target 233.7 s) landed at 196.5 s, and alignment of the recorded
+output against the decoded source showed source time jumping
+233 s -> 196 s: 37 s replayed. The landing re-seek went to the same
+place.
+
+Cause: the instance flag `--input-fast-seek` (ported from Python
+`core/vlc_instance.py::_build_args`). VLC's MP4 demuxer honours a
+fast seek by restarting at the start of the chunk that holds the
+target. This file has 81 chunks for 225,895 AAC frames (stsc 2821
+frames per chunk, about 65.5 s each); 196.5 s is exactly 3 x 65.5 s.
+Any m4a with long chunks replays up to one chunk per skip, and the
+same applies to user seeks.
+
+Resolution: the Rust instance args drop `--input-fast-seek`, a
+deliberate divergence from Python (which carries the same bug).
+Accurate seeks cost nothing that matters for audio. The
+`instance_args_mirror_python_off_windows` test now asserts the flag
+is absent (red before the fix, green after).
+
+Follow-up, same report ("those are all the skips"): streamed
+podcasts barely skipped. `SilenceScanSettings::from_config`
+applied Python's remote caps (VAD aggressiveness 0, threshold
+capped at -52 dB, minimum silence at least 1200 ms, merge gap at
+most 200 ms) over the user's own settings. Whole-file scans of the
+same episode: remote caps 52 silences / 84 s; the user's settings
+(-38 dB, aggressiveness 2, 700 ms) 308 / 358 s at 16 kHz and
+302 / 353 s at the remote 8 kHz rate. The caps are gone; remote
+keeps only the cost knobs (8000 Hz decode, 1 thread). The skip
+policy's remote cooldown (5 s) then dropped 67 of the 302 in a
+policy simulation, against 19 at the local 2.5 s; with accurate
+seeks landing in under 300 ms, and the floor and loop guard
+already blocking stale-position re-skips, remote now uses the same
+2.5 s cooldown (283 skips, 304 s saved in simulation). Both are
+deliberate divergences from Python. Tests:
+`remote_silence_scan_keeps_user_detector_settings` (new, red
+before the fix) and `skip_policy_cooldown_and_user_seek_pause`
+(remote cooldown assertions moved to 2.5 s, red before the fix).
+
+Second follow-up: the silence scan of a streamed episode ended 12-13
+min in (`Done Ok(39)` at playback 7:52), so nothing later was ever
+skipped. Reproduced outside the app with the scanner's exact ffmpeg
+args and pacing (300 s lead, real-time clock): about 6 min into the
+slow read, CloudFront reset the TLS connection (`IO error: Error
+number -10054`), ffmpeg logged `partial file`, and exited 0 after
+11:09 of audio; the scanner took that as a complete scan. With
+`-reconnect 1 -reconnect_on_network_error 1 -reconnect_delay_max 5`
+the same run logged `Will reconnect at 11090845` and kept decoding.
+`silence::ffmpeg_http_reconnect_args` now carries those options for
+every reader of remote media at playback pace: the silence scan, the
+proxy's /play and EQ transcodes (`serve_ffmpeg_mp3`, same exposure:
+long podcasts through them could stop after a few minutes), and the
+AirPlay RAOP sender. Non-http sources get none (ffmpeg rejects them).
+Not in Python, which has the same gap. Test:
+`silence::tests::http_scans_reconnect_and_local_scans_do_not` (red
+before the fix).
