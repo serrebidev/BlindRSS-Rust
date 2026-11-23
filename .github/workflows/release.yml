@@ -282,104 +282,31 @@ jobs:
       actions: read
       contents: read
     steps:
-      # CHANGELOG.md at the tag supplies the release notes.
-      - uses: actions/checkout@v7.0.1
-        with:
-          ref: ${{ inputs.release_tag || github.ref }}
-
-      - name: Download and verify GitHub build artifacts
+      # Uploading from this runner is the slow path: the runner is an
+      # ocean away and one connection in ~20 crawls at 0.4 MB/s while
+      # the server itself answers in ~1s. Instead the publish runs on
+      # the server (forgejo-artifact-publish.sh, forced command for a
+      # dedicated key), which pulls the artifacts at ~65 MB/s and
+      # uploads them to Forgejo over localhost.
+      - name: Hand off to the server-side publisher
+        shell: bash
         env:
+          FORGEJO_PUBLISH_SSH_KEY: ${{ secrets.FORGEJO_PUBLISH_SSH_KEY }}
           GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          repository="repos/$GITHUB_REPOSITORY"
-          uploads="$(gh api "$repository/actions/runs/$GITHUB_RUN_ID/artifacts")"
-          mkdir -p artifacts
-          for platform in Windows Linux macOS; do
-            name="BlindRSS-$TAG-$platform"
-            entry="$(jq -cer --arg name "$name" '[.artifacts[] | select(.name == $name)] | if length == 1 then .[0] else error("expected one " + $name + " artifact") end' <<<"$uploads")"
-            id="$(jq -er '.id' <<<"$entry")"
-            digest="$(jq -er '.digest | select(test("^sha256:[0-9a-f]{64}$")) | sub("^sha256:"; "")' <<<"$entry")"
-            archive="$RUNNER_TEMP/$name.zip"
-            gh api "$repository/actions/artifacts/$id/zip" >"$archive"
-            printf '%s  %s\n' "$digest" "$archive" | sha256sum --check
-            unzip -qn "$archive" -d artifacts
-          done
-
-      # A leg that failed must not publish: every asset and
-      # its signature has to be there (BlindRadio's rule).
-      - name: Verify every asset and signature arrived
-        shell: bash
-        run: |
-          for wanted in BlindRSS.zip BlindRSS.zip.minisig BlindRSS.tar.gz BlindRSS.tar.gz.minisig BlindRSS.dmg BlindRSS.dmg.minisig; do
-            test -f "artifacts/$wanted" || { echo "missing: $wanted"; exit 1; }
-          done
-
-      - name: Checksums
-        run: cd artifacts && sha256sum *.zip *.tar.gz *.dmg *.minisig > SHA256SUMS
-
-      # The release body is the tag's section of CHANGELOG.md
-      # (BlindRadio's rule). A missing section fails the
-      # publish instead of shipping GitHub's auto-generated
-      # compare link as the notes.
-      - name: Extract release notes from CHANGELOG.md
-        shell: bash
-        run: |
-          python3 - "$TAG" <<'PY'
-          import os, sys
-          version = sys.argv[1].lstrip("v")
-          head = f"## {version}"
-          notes, inside = [], False
-          for line in open("CHANGELOG.md").read().splitlines():
-              if line.startswith("## "):
-                  inside = line.strip() == head
-                  if inside:
-                      continue
-                  if notes:
-                      break
-              if inside:
-                  notes.append(line)
-          notes = "\n".join(notes).strip()
-          if not notes:
-              sys.exit(f"no {head} section in CHANGELOG.md")
-          with open(os.path.join(os.environ["RUNNER_TEMP"], "notes.md"), "w") as f:
-              f.write(notes + "\n")
-          PY
-
-      # Forgejo has no softprops action: reuse the tag's draft (or create
-      # one), replace same-named assets, then publish it.
-      - name: Publish the Forgejo release
-        if: ${{ !inputs.dry_run }}
-        shell: bash
-        env:
           FORGEJO_TOKEN: ${{ secrets.FORGEJO_TOKEN }}
         run: |
           set -euo pipefail
-          api="https://git.serrebiradio.com/api/v1/repos/serrebi/BlindRSS-Rust"
-          h="Authorization: token $FORGEJO_TOKEN"
-          notes="$RUNNER_TEMP/notes.md"
-          if release="$(curl -sf -H "$h" "$api/releases/tags/$TAG")"; then
-            id="$(echo "$release" | jq -r .id)"
-            jq -n --rawfile body "$notes" --arg name "BlindRSS $TAG" '{name: $name, body: $body}' |
-              curl -sf -o /dev/null -X PATCH -H "$h" -H 'Content-Type: application/json' -d @- "$api/releases/$id"
-          else
-            release="$(jq -n --rawfile body "$notes" --arg tag "$TAG" --arg name "BlindRSS $TAG" \
-              '{tag_name: $tag, name: $name, body: $body, draft: true}' |
-              curl -sf -H "$h" -H 'Content-Type: application/json' -d @- "$api/releases")"
-            id="$(echo "$release" | jq -r .id)"
-          fi
-          for file in artifacts/*.zip artifacts/*.tar.gz artifacts/*.dmg artifacts/*.minisig artifacts/SHA256SUMS; do
-            name="$(basename "$file")"
-            old="$(echo "$release" | jq -r --arg n "$name" '.assets[]? | select(.name == $n) | .id')"
-            [ -z "$old" ] || curl -sf -X DELETE -H "$h" "$api/releases/$id/assets/$old"
-            printf 'Uploading %s (%s bytes) at %s UTC\n' "$name" "$(wc -c < "$file")" "$(date -u +%FT%T)"
-            curl -sfS -o /dev/null \
-              -w 'HTTP %{http_code}, uploaded %{size_upload} bytes, connect %{time_connect}s, first byte %{time_starttransfer}s, total %{time_total}s\n' \
-              -H "$h" -F "attachment=@$file" "$api/releases/$id/assets?name=$name"
-            echo "Attached $name"
-          done
-          curl -sf -o /dev/null -X PATCH -H "$h" -H 'Content-Type: application/json' \
-            -d '{"draft": false, "prerelease": false}' "$api/releases/$id"
-          latest="$(curl -sf "$api/releases/latest" | jq -r .tag_name)"
-          echo "/releases/latest is $latest"
-          [ "$latest" = "$TAG" ]
+          key="$RUNNER_TEMP/forgejo-publish-key"
+          printf '%s\n' "$FORGEJO_PUBLISH_SSH_KEY" > "$key"
+          chmod 600 "$key"
+          dry="${{ inputs.dry_run && '1' || '0' }}"
+          printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
+            "$GH_TOKEN" "$FORGEJO_TOKEN" "serrebi/BlindRSS-Rust" \
+            "$GITHUB_RUN_ID" "$TAG" "$dry" "$GITHUB_REPOSITORY" \
+            | ssh -i "$key" -o StrictHostKeyChecking=accept-new root@git.serrebiradio.com
+
+      # Everything else (artifact pull, digest checks, release
+      # notes from the tag's CHANGELOG section, checksums,
+      # upload, publish) happens inside the server-side
+      # publisher, which also enforces the "every asset and its
+      # signature arrived" rule before publishing.
