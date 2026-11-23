@@ -274,16 +274,33 @@ jobs:
     name: Publish release
     needs: package
     runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
     steps:
       # CHANGELOG.md at the tag supplies the release notes.
       - uses: actions/checkout@v7.0.1
         with:
           ref: ${{ inputs.release_tag || github.ref }}
 
-      - uses: actions/download-artifact@v8.0.2
-        with:
-          path: artifacts
-          merge-multiple: true
+      - name: Download and verify GitHub build artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          repository="repos/$GITHUB_REPOSITORY"
+          uploads="$(gh api "$repository/actions/runs/$GITHUB_RUN_ID/artifacts")"
+          mkdir -p artifacts
+          for platform in Windows Linux macOS; do
+            name="BlindRSS-$TAG-$platform"
+            entry="$(jq -cer --arg name "$name" '[.artifacts[] | select(.name == $name)] | if length == 1 then .[0] else error("expected one " + $name + " artifact") end' <<<"$uploads")"
+            id="$(jq -er '.id' <<<"$entry")"
+            digest="$(jq -er '.digest | select(test("^sha256:[0-9a-f]{64}$")) | sub("^sha256:"; "")' <<<"$entry")"
+            archive="$RUNNER_TEMP/$name.zip"
+            gh api "$repository/actions/artifacts/$id/zip" >"$archive"
+            printf '%s  %s\n' "$digest" "$archive" | sha256sum --check
+            unzip -qn "$archive" -d artifacts
+          done
 
       # A leg that failed must not publish: every asset and
       # its signature has to be there (BlindRadio's rule).
