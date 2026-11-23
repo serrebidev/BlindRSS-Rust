@@ -6,6 +6,12 @@ as `0.1.2-0.1.3`. Each release's section below is its Forgejo release note,
 taken from this file by the release workflow. The in-app updater shows the
 same text.
 
+## 0.1.123
+
+- Updated the libraries used by BlindRSS, including wxDragon 0.9.25 and the bundled VLC 3.0.24 playback engine on Windows and macOS.
+- Linux release builds install the VLC playback libraries and plugins directly. Release logs now show timing for each asset upload.
+- Fixed the release build failure caused by a packaging library update.
+
 ## 0.1.122
 
 - Updated the libraries used by BlindRSS, including wxDragon 0.9.25 and the bundled VLC 3.0.24 playback engine on Windows and macOS.

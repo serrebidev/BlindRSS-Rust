@@ -204,7 +204,7 @@ checksum = "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06"
 
 [[package]]
 name = "blindrss"
-version = "0.1.122"
+version = "0.1.123"
 dependencies = [
  "blindrss-core",
  "flate2",
@@ -2944,7 +2944,7 @@ dependencies = [
 [[package]]
 name = "ship-shape"
 version = "0.6.0"
-source = "git+https://git.serrebiradio.com/serrebi/ship-shape?rev=82034b7eb3c68af0256f1102d005bc7e57483150#82034b7eb3c68af0256f1102d005bc7e57483150"
+source = "git+https://git.serrebiradio.com/serrebi/ship-shape?rev=a02488d9df6a824675d77855bfe193703872c2ee#a02488d9df6a824675d77855bfe193703872c2ee"
 dependencies = [
  "homeport",
  "minisign-verify",
