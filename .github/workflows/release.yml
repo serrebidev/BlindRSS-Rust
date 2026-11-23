@@ -107,33 +107,14 @@ jobs:
         shell: bash
         run: echo "${RUNNER_TEMP}\\msys64\\usr\\bin" >> "$GITHUB_PATH"
 
-      # Same guard as ci.yml: a restored cache can lack the
-      # WebView2 SDK lib while wxdragon-sys looks fresh (LNK1104).
-      - name: Restore WebView2 SDK if the cache dropped it (Windows)
+      # The cached SDK may live outside the restored wxWidgets build tree.
+      # Give MSVC its location without discarding cached Rust artifacts.
+      - name: Add cached WebView2 SDK to MSVC library path
         if: runner.os == 'Windows'
-        shell: bash
+        shell: pwsh
         run: |
-          if ! find -H target/release -name 'WebView2LoaderStatic.lib' 2>/dev/null | grep -q .; then
-            echo "WebView2LoaderStatic.lib missing from the restored cache; recreating it from the WebView2 cache"
-            dirs=""
-            for out in target/release/build/wxdragon-sys-*/output; do
-              [ -e "$out" ] || continue
-              while IFS= read -r line; do
-                case "$line" in
-                  *rustc-link-search=native=*WebView2*) dirs="$dirs${line##*native=}$'\n'" ;;
-                esac
-              done < "$out"
-            done
-            if [ -n "$dirs" ]; then
-              for dir in $dirs; do
-                mkdir -p "$dir"
-                cp webview2-lib/x64/WebView2LoaderStatic.lib "$dir/"
-              done
-            else
-              echo "link path unknown; wiping the release profile"
-              rm -rf target/release
-            fi
-          fi
+          $sdk = Get-Item -LiteralPath webview2-lib/x64/WebView2LoaderStatic.lib -ErrorAction Stop
+          "LIB=$($sdk.DirectoryName);${env:LIB}" >> $env:GITHUB_ENV
 
       # No Validate step: ci.yml already runs fmt, clippy and tests
       # on the same commit, so re-running them here only repeated
