@@ -94,9 +94,8 @@ jobs:
         shell: bash
         run: |
           if ! find -H target/release -name 'WebView2LoaderStatic.lib' 2>/dev/null | grep -q .; then
-            echo "WebView2LoaderStatic.lib missing; cleaning wxdragon-sys to re-run its build script"
-            cargo clean -p wxdragon-sys || true
-            cargo clean -p wxdragon || true
+            echo "WebView2LoaderStatic.lib missing; removing the stale wxdragon-sys build to re-download the SDK"
+            rm -rf target/release/build/wxdragon-sys-* target/release/.fingerprint/wxdragon-sys-* target/release/deps/libwxdragon_sys-*
           fi
 
       # No Validate step: ci.yml already runs fmt, clippy and tests

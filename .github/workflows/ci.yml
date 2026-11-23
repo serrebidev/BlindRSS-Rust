@@ -93,9 +93,8 @@ jobs:
         shell: bash
         run: |
           if ! find -H target/debug -name 'WebView2LoaderStatic.lib' 2>/dev/null | grep -q .; then
-            echo "WebView2LoaderStatic.lib missing; cleaning wxdragon-sys to re-run its build script"
-            cargo clean -p wxdragon-sys || true
-            cargo clean -p wxdragon || true
+            echo "WebView2LoaderStatic.lib missing; removing the stale wxdragon-sys build to re-download the SDK"
+            rm -rf target/debug/build/wxdragon-sys-* target/debug/.fingerprint/wxdragon-sys-* target/debug/deps/libwxdragon_sys-*
           fi
 
       - name: Format
