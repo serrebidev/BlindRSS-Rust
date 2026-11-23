@@ -110,7 +110,15 @@ jobs:
         run: |
           if ! find -H target/debug -name 'WebView2LoaderStatic.lib' 2>/dev/null | grep -q .; then
             echo "WebView2LoaderStatic.lib missing from the restored cache; recreating it from the WebView2 cache"
-            dirs=$(sed -n 's/.*rustc-link-search=native=//p' target/debug/build/wxdragon-sys-*/output 2>/dev/null | grep -i webview2 | tr -d '\r' | sort -u)
+            dirs=""
+            for out in target/debug/build/wxdragon-sys-*/output; do
+              [ -e "$out" ] || continue
+              while IFS= read -r line; do
+                case "$line" in
+                  *rustc-link-search=native=*WebView2*) dirs="$dirs${line##*native=}$'\n'" ;;
+                esac
+              done < "$out"
+            done
             if [ -n "$dirs" ]; then
               for dir in $dirs; do
                 mkdir -p "$dir"
