@@ -44,6 +44,10 @@ jobs:
         with:
           components: clippy,rustfmt
 
+      - uses: Swatinem/rust-cache@v2.9.3
+        with:
+          key: ${{ matrix.os }}
+
       - name: Install wxWidgets build dependencies
         if: runner.os == 'Linux'
         run: |
@@ -94,10 +98,6 @@ jobs:
             cargo clean -p wxdragon-sys || true
             cargo clean -p wxdragon || true
           fi
-
-      - uses: Swatinem/rust-cache@v2.9.3
-        with:
-          key: ${{ matrix.os }}
 
       # No Validate step: ci.yml already runs fmt, clippy and tests
       # on the same commit, so re-running them here only repeated
