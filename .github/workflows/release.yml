@@ -55,7 +55,9 @@ jobs:
             libgstreamer-plugins-bad1.0-dev libwebkit2gtk-4.1-dev \
             libsecret-1-dev libnotify-dev libsdl2-dev \
             gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-libav gstreamer1.0-x \
-            libvlc5 libvlccore9 vlc-plugin-base ffmpeg cmake ninja-build
+            libvlc5 libvlc-bin libvlccore9 vlc-plugin-base vlc-plugin-video-output \
+            vlc-plugin-access-extra vlc-plugin-notify vlc-plugin-samba \
+            vlc-plugin-video-splitter vlc-plugin-visualization ffmpeg cmake ninja-build
 
       # Same patois/gettext requirement as ci.yml: without
       # msgfmt the release binary ships no translations.
@@ -116,6 +118,7 @@ jobs:
             mkdir -p dist/BlindRSS/vlc/lib dist/BlindRSS/vlc/plugins
             cp -L /usr/lib/x86_64-linux-gnu/libvlc.so.5 /usr/lib/x86_64-linux-gnu/libvlccore.so.* dist/BlindRSS/vlc/lib/
             cp -r /usr/lib/x86_64-linux-gnu/vlc/plugins/. dist/BlindRSS/vlc/plugins/
+            test -f dist/BlindRSS/vlc/plugins/video_output/libxcb_x11_plugin.so
           elif [ "$RUNNER_OS" = "Windows" ]; then
             curl -fL -o vlc-win.zip https://download.videolan.org/pub/videolan/vlc/3.0.24/win64/vlc-3.0.24-win64.zip
             7z x vlc-win.zip -ovlc-win > /dev/null
