@@ -18,7 +18,7 @@ jobs:
       TAG: ${{ inputs.release_tag }}
       CARGO_TERM_COLOR: always
     steps:
-    - uses: actions/checkout@v7
+    - uses: actions/checkout@v7.0.1
       with:
         ref: ${{ inputs.release_tag }}
     - uses: dtolnay/rust-toolchain@stable
@@ -30,8 +30,8 @@ jobs:
         cargo fmt --all --check
         cargo clippy --locked --workspace --all-targets -- -D warnings
         cargo test --locked --workspace
-    - name: Build release binary
-      run: cargo build --release --locked -p blindrss
+    - name: Build release binaries
+      run: cargo build --release --locked --workspace
     - name: Bundle libVLC
       shell: bash
       run: |
@@ -40,18 +40,18 @@ jobs:
           cp -L /usr/lib/x86_64-linux-gnu/libvlc.so.5 /usr/lib/x86_64-linux-gnu/libvlccore.so.* dist/BlindRSS/vlc/lib/
           cp -r /usr/lib/x86_64-linux-gnu/vlc/plugins/. dist/BlindRSS/vlc/plugins/
         elif [ "$RUNNER_OS" = "Windows" ]; then
-          curl -fL -o vlc-win.zip https://download.videolan.org/pub/videolan/vlc/3.0.21/win64/vlc-3.0.21-win64.zip
+          curl -fL -o vlc-win.zip https://download.videolan.org/pub/videolan/vlc/3.0.24/win64/vlc-3.0.24-win64.zip
           7z x vlc-win.zip -ovlc-win > /dev/null
           mkdir -p dist/BlindRSS/vlc/plugins
-          cp vlc-win/vlc-3.0.21/libvlc.dll vlc-win/vlc-3.0.21/libvlccore.dll dist/BlindRSS/vlc/
-          cp -r vlc-win/vlc-3.0.21/plugins/. dist/BlindRSS/vlc/plugins/
+          cp vlc-win/vlc-3.0.24/libvlc.dll vlc-win/vlc-3.0.24/libvlccore.dll dist/BlindRSS/vlc/
+          cp -r vlc-win/vlc-3.0.24/plugins/. dist/BlindRSS/vlc/plugins/
         elif [ "$RUNNER_OS" = "macOS" ]; then
-          curl -fL -o vlc.dmg https://download.videolan.org/pub/videolan/vlc/3.0.21/macosx/vlc-3.0.21-arm64.dmg
-          hdiutil attach vlc.dmg -mountpoint "$RUNNER_TEMP/vlc-mnt" -nobrowse
+          curl -fL -o vlc.dmg https://download.videolan.org/pub/videolan/vlc/3.0.24/macosx/vlc-3.0.24-arm64.dmg
+          diskutil image attach --readOnly --nobrowse --mountPoint "$RUNNER_TEMP/vlc-mnt" vlc.dmg
           mkdir -p dist/BlindRSS/vlc/lib dist/BlindRSS/vlc/plugins
           cp -a "$RUNNER_TEMP/vlc-mnt/VLC.app/Contents/MacOS/lib/"libvlc*.dylib "$RUNNER_TEMP/vlc-mnt/VLC.app/Contents/MacOS/lib/"libvlccore*.dylib dist/BlindRSS/vlc/lib/
           cp -r "$RUNNER_TEMP/vlc-mnt/VLC.app/Contents/MacOS/plugins/." dist/BlindRSS/vlc/plugins/
-          hdiutil detach "$RUNNER_TEMP/vlc-mnt"
+          diskutil eject "$RUNNER_TEMP/vlc-mnt"
         fi
     - name: Package
       shell: bash
@@ -133,8 +133,8 @@ jobs:
           # the bundle folder, so the .app sits at the dmg
           # root and the fixed asset name holds.
           VERSION="${TAG#v}"
-          cargo xtask bundle-app BlindRSS bundle "$VERSION"
-          hdiutil create -volname BlindRSS -srcfolder bundle -ov -format UDZO BlindRSS.dmg
+          ../target/release/xtask bundle-app BlindRSS bundle "$VERSION"
+          diskutil image create from --format UDZO --volumeName BlindRSS bundle BlindRSS.dmg
         fi
     - name: Sign release assets (minisign)
       shell: bash
@@ -144,7 +144,7 @@ jobs:
       run: |
         files=$(ls dist/BlindRSS.zip dist/BlindRSS.tar.gz dist/BlindRSS.dmg 2>/dev/null || true)
         test -n "$files"
-        echo "$files" | xargs cargo xtask sign
+        echo "$files" | xargs ./target/release/xtask sign
     - name: Attach to the Forgejo release
       env:
         FORGEJO_TOKEN: ${{ secrets.FORGEJO_TOKEN }}
@@ -158,7 +158,10 @@ jobs:
           name="$(basename "$file")"
           old="$(echo "$release" | jq -r --arg n "$name" '.assets[] | select(.name == $n) | .id')"
           [ -z "$old" ] || curl -sf -X DELETE -H "$h" "$api/releases/$id/assets/$old"
-          curl -sf -o /dev/null -H "$h" -F "attachment=@$file" "$api/releases/$id/assets?name=$name"
+          printf 'Uploading %s (%s bytes) at %s UTC\n' "$name" "$(wc -c < "$file")" "$(date -u +%FT%T)"
+          curl -sfS -o /dev/null \
+            -w 'HTTP %{http_code}, uploaded %{size_upload} bytes, connect %{time_connect}s, first byte %{time_starttransfer}s, total %{time_total}s\n' \
+            -H "$h" -F "attachment=@$file" "$api/releases/$id/assets?name=$name"
           echo "Attached $name to $TAG"
         done
 

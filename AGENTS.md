@@ -24,7 +24,7 @@ stated here and in `docs/PARITY.md`.
 - Never edit `.github/workflows/` without the owner's direct OK.
 
 ## System Overview
-- Stack: Rust (edition 2024), wxDragon 0.9.24 (wxWidgets GUI), SQLite via
+- Stack: Rust (edition 2024), wxDragon 0.9.25 (wxWidgets GUI), SQLite via
   rusqlite (bundled), feed-rs for feed parsing, ureq (rustls) for HTTP.
 - Workspace: `app/` is the `blindrss` binary (GUI: `main.rs`, `player.rs`,
   `settings.rs`, `dialogs.rs`, `help.rs`, `keys.rs`, `hotkey.rs`,

@@ -13,4 +13,4 @@ opt-level = 2
 [patch.crates-io]
 # ship-shape fork: configurable API base URL for
 # Forgejo-hosted releases (upstream: accessware/ship-shape).
-ship-shape = { git = "https://git.serrebiradio.com/serrebi/ship-shape", rev = "cff6bdb5596676723b3a0890b1b030c8edac0d28" }
+ship-shape = { git = "https://git.serrebiradio.com/serrebi/ship-shape", rev = "82034b7eb3c68af0256f1102d005bc7e57483150" }

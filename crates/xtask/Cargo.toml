@@ -9,7 +9,7 @@ publish = false
 [dependencies]
 minisign = "0.10"
 # The check the updater itself makes on a download.
-minisign-verify = "0.2"
+minisign-verify = "0.3"
 # update-check drives the same updater config the app uses
 # (resolved to the Forgejo fork by [patch.crates-io]).
-ship-shape = "0.5"
+ship-shape = "0.6"

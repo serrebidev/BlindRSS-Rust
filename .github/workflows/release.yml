@@ -36,7 +36,7 @@ jobs:
       matrix:
         os: [windows-latest, ubuntu-latest, xcode-27]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7.0.1
         with:
           ref: ${{ inputs.release_tag || github.ref }}
 
@@ -48,14 +48,14 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
+          sudo apt-get install -y --no-install-recommends \
             libclang-dev pkg-config libgtk-3-dev libpng-dev libjpeg-dev \
             libgl1-mesa-dev libglu1-mesa-dev libxkbcommon-dev libexpat1-dev libtiff-dev \
             libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
             libgstreamer-plugins-bad1.0-dev libwebkit2gtk-4.1-dev \
             libsecret-1-dev libnotify-dev libsdl2-dev \
             gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-libav gstreamer1.0-x \
-            vlc ffmpeg cmake ninja-build
+            libvlc5 libvlccore9 vlc-plugin-base ffmpeg cmake ninja-build
 
       # Same patois/gettext requirement as ci.yml: without
       # msgfmt the release binary ships no translations.
@@ -65,7 +65,7 @@ jobs:
 
       - name: Install gettext (patois catalog compilation, Windows)
         if: runner.os == 'Windows'
-        uses: msys2/setup-msys2@v2
+        uses: msys2/setup-msys2@v2.34.0
         with:
           msystem: MSYS
           # inherit puts usr/bin on PATH for the cargo steps;
@@ -117,18 +117,18 @@ jobs:
             cp -L /usr/lib/x86_64-linux-gnu/libvlc.so.5 /usr/lib/x86_64-linux-gnu/libvlccore.so.* dist/BlindRSS/vlc/lib/
             cp -r /usr/lib/x86_64-linux-gnu/vlc/plugins/. dist/BlindRSS/vlc/plugins/
           elif [ "$RUNNER_OS" = "Windows" ]; then
-            curl -fL -o vlc-win.zip https://download.videolan.org/pub/videolan/vlc/3.0.21/win64/vlc-3.0.21-win64.zip
+            curl -fL -o vlc-win.zip https://download.videolan.org/pub/videolan/vlc/3.0.24/win64/vlc-3.0.24-win64.zip
             7z x vlc-win.zip -ovlc-win > /dev/null
             mkdir -p dist/BlindRSS/vlc/plugins
-            cp vlc-win/vlc-3.0.21/libvlc.dll vlc-win/vlc-3.0.21/libvlccore.dll dist/BlindRSS/vlc/
-            cp -r vlc-win/vlc-3.0.21/plugins/. dist/BlindRSS/vlc/plugins/
+            cp vlc-win/vlc-3.0.24/libvlc.dll vlc-win/vlc-3.0.24/libvlccore.dll dist/BlindRSS/vlc/
+            cp -r vlc-win/vlc-3.0.24/plugins/. dist/BlindRSS/vlc/plugins/
           elif [ "$RUNNER_OS" = "macOS" ]; then
-            curl -fL -o vlc.dmg https://download.videolan.org/pub/videolan/vlc/3.0.21/macosx/vlc-3.0.21-arm64.dmg
-            hdiutil attach vlc.dmg -mountpoint "$RUNNER_TEMP/vlc-mnt" -nobrowse
+            curl -fL -o vlc.dmg https://download.videolan.org/pub/videolan/vlc/3.0.24/macosx/vlc-3.0.24-arm64.dmg
+            diskutil image attach --readOnly --nobrowse --mountPoint "$RUNNER_TEMP/vlc-mnt" vlc.dmg
             mkdir -p dist/BlindRSS/vlc/lib dist/BlindRSS/vlc/plugins
             cp -a "$RUNNER_TEMP/vlc-mnt/VLC.app/Contents/MacOS/lib/"libvlc*.dylib "$RUNNER_TEMP/vlc-mnt/VLC.app/Contents/MacOS/lib/"libvlccore*.dylib dist/BlindRSS/vlc/lib/
             cp -r "$RUNNER_TEMP/vlc-mnt/VLC.app/Contents/MacOS/plugins/." dist/BlindRSS/vlc/plugins/
-            hdiutil detach "$RUNNER_TEMP/vlc-mnt"
+            diskutil eject "$RUNNER_TEMP/vlc-mnt"
           fi
 
       # Fixed ship-shape asset names (owner decision 2026-11-03,
@@ -237,7 +237,7 @@ jobs:
             # root and the fixed asset name holds.
             VERSION="${TAG#v}"
             ../target/release/xtask bundle-app BlindRSS bundle "$VERSION"
-            hdiutil create -volname BlindRSS -srcfolder bundle -ov -format UDZO BlindRSS.dmg
+            diskutil image create from --format UDZO --volumeName BlindRSS bundle BlindRSS.dmg
           fi
 
       # Every asset carries its minisign signature, so the
@@ -258,8 +258,9 @@ jobs:
           echo "$files" | xargs "$xtask" sign
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.2
         with:
+          compression-level: 0
           name: BlindRSS-${{ env.TAG }}-${{ runner.os }}
           path: |
             dist/BlindRSS.zip
@@ -275,11 +276,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       # CHANGELOG.md at the tag supplies the release notes.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
         with:
           ref: ${{ inputs.release_tag || github.ref }}
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8.0.2
         with:
           path: artifacts
           merge-multiple: true
@@ -350,7 +351,10 @@ jobs:
             name="$(basename "$file")"
             old="$(echo "$release" | jq -r --arg n "$name" '.assets[]? | select(.name == $n) | .id')"
             [ -z "$old" ] || curl -sf -X DELETE -H "$h" "$api/releases/$id/assets/$old"
-            curl -sf -o /dev/null -H "$h" -F "attachment=@$file" "$api/releases/$id/assets?name=$name"
+            printf 'Uploading %s (%s bytes) at %s UTC\n' "$name" "$(wc -c < "$file")" "$(date -u +%FT%T)"
+            curl -sfS -o /dev/null \
+              -w 'HTTP %{http_code}, uploaded %{size_upload} bytes, connect %{time_connect}s, first byte %{time_starttransfer}s, total %{time_total}s\n' \
+              -H "$h" -F "attachment=@$file" "$api/releases/$id/assets?name=$name"
             echo "Attached $name"
           done
           curl -sf -o /dev/null -X PATCH -H "$h" -H 'Content-Type: application/json' \

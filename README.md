@@ -15,7 +15,7 @@ Design records: audit, research, benchmarks, and the staged plan live in
 the migration workspace (`blindrss-rust-migration/reports/` on the
 maintainer's machine); the key decisions:
 
-- GUI: wxDragon 0.9.24 (wxWidgets), BlindFB workspace shape.
+- GUI: wxDragon 0.9.25 (wxWidgets), BlindFB workspace shape.
 - Data: opens the existing Python `rss.db` and `config.json` in place.
   No re-setup, no destructive migration; Python can keep using the same
   database (dual-run safe).
