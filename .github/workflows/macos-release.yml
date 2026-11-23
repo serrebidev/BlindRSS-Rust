@@ -26,7 +26,7 @@ jobs:
         components: clippy,rustfmt
     - uses: Swatinem/rust-cache@v2.9.3
       with:
-        key: macos
+        key: macos-release
     # No Validate step: ci.yml already gates the same commit.
     - name: Build release binaries
       run: cargo build --release --locked --workspace

@@ -38,7 +38,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2.9.3
         with:
-          key: ${{ matrix.os }}
+          key: ${{ matrix.os }}-debug
 
       - name: Cache WebView2 SDK (Windows)
         if: runner.os == 'Windows'

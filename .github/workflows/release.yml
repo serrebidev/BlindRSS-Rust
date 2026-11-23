@@ -46,7 +46,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2.9.3
         with:
-          key: ${{ matrix.os }}
+          key: ${{ matrix.os }}-release
 
       # The wx cmake tree (and the WebView2 SDK config downloads into
       # it) does not survive the rust-cache round-trip, so the link
