@@ -24,12 +24,10 @@ jobs:
     - uses: dtolnay/rust-toolchain@stable
       with:
         components: clippy,rustfmt
-    - name: Validate release
-      shell: bash
-      run: |
-        cargo fmt --all --check
-        cargo clippy --locked --workspace --all-targets -- -D warnings
-        cargo test --locked --workspace
+    - uses: Swatinem/rust-cache@v2.9.3
+      with:
+        key: macos
+    # No Validate step: ci.yml already gates the same commit.
     - name: Build release binaries
       run: cargo build --release --locked --workspace
     - name: Bundle libVLC

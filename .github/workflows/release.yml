@@ -95,12 +95,13 @@ jobs:
             cargo clean -p wxdragon || true
           fi
 
-      - name: Validate release
-        shell: bash
-        run: |
-          cargo fmt --all --check
-          cargo clippy --locked --workspace --all-targets -- -D warnings
-          cargo test --locked --workspace
+      - uses: Swatinem/rust-cache@v2.9.3
+        with:
+          key: ${{ matrix.os }}
+
+      # No Validate step: ci.yml already runs fmt, clippy and tests
+      # on the same commit, so re-running them here only repeated
+      # ~15-25 minutes per leg.
 
       # Build the signing/bundling tool with the app so wxWidgets uses one feature set.
       - name: Build release binaries
