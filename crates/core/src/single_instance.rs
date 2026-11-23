@@ -76,6 +76,7 @@ fn create_state_file(path: &std::path::Path, state: &InstanceState) -> std::io::
 /// without the transfer the running copy cannot raise itself.
 #[cfg(target_os = "windows")]
 fn allow_set_foreground_window(pid: u32) {
+    #[link(name = "user32")]
     unsafe extern "system" {
         fn AllowSetForegroundWindow(pid: u32) -> i32;
     }
