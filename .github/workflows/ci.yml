@@ -40,6 +40,22 @@ jobs:
         with:
           key: ${{ matrix.os }}
 
+      - name: Cache WebView2 SDK (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/cache@v4
+        id: webview2-cache
+        with:
+          path: webview2-lib
+          key: webview2-1.0.4370.26
+
+      - name: Download WebView2 SDK (Windows)
+        if: runner.os == 'Windows' && steps.webview2-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          mkdir -p webview2-lib/x64
+          curl -fL -o webview2.nupkg https://www.nuget.org/api/v2/package/Microsoft.Web.WebView2/1.0.4370.26
+          unzip -o -j webview2.nupkg 'build/native/x64/WebView2LoaderStatic.lib' -d webview2-lib/x64
+
       - name: Install wxWidgets build dependencies
         if: runner.os == 'Linux'
         run: |
@@ -93,8 +109,17 @@ jobs:
         shell: bash
         run: |
           if ! find -H target/debug -name 'WebView2LoaderStatic.lib' 2>/dev/null | grep -q .; then
-            echo "WebView2LoaderStatic.lib missing from the restored cache; wiping the debug profile to re-download the SDK"
-            rm -rf target/debug
+            echo "WebView2LoaderStatic.lib missing from the restored cache; recreating it from the WebView2 cache"
+            dirs=$(sed -n 's/.*rustc-link-search=native=//p' target/debug/build/wxdragon-sys-*/output 2>/dev/null | grep -i webview2 | tr -d '\r' | sort -u)
+            if [ -n "$dirs" ]; then
+              for dir in $dirs; do
+                mkdir -p "$dir"
+                cp webview2-lib/x64/WebView2LoaderStatic.lib "$dir/"
+              done
+            else
+              echo "link path unknown; wiping the debug profile"
+              rm -rf target/debug
+            fi
           fi
 
       - name: Format
