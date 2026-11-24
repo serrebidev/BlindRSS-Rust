@@ -2545,6 +2545,7 @@ const M_PRUNE: i32 = 2143;
 const M_UPDATE: i32 = 2144;
 const M_HELP: i32 = 2151;
 const M_CHANGELOG: i32 = 2251;
+const M_REPORT_ISSUE: i32 = 2252;
 const M_COPY_URL: i32 = 2152;
 const M_COPY_MEDIA: i32 = 2153;
 const M_COPY_FEED_URL: i32 = 2154;
@@ -8618,6 +8619,16 @@ fn main() {
             restore_focus(&state_help.borrow(), &tree_help, &list_help);
         });
 
+        // Help > Report an Issue on GitHub.
+        let frame_report = frame;
+        let state_report = state.clone();
+        let tree_report = tree;
+        let list_report = list;
+        let act_report_issue: Rc<dyn Fn()> = Rc::new(move || {
+            help::report_issue(&frame_report);
+            restore_focus(&state_report.borrow(), &tree_report, &list_report);
+        });
+
         // Help > View Changelog: the full release history in
         // the changelog viewer (Brandon's request, 2026-11-10).
         let frame_changelog = frame;
@@ -10395,6 +10406,11 @@ fn main() {
                 "Announce &Unread Count",
                 "Announce how many articles and podcasts are unread",
             )
+            .append_item(
+                M_REPORT_ISSUE,
+                "Report an &Issue on GitHub...",
+                "Describe a problem or an idea, then send it as a GitHub issue",
+            )
             .append_item(M_ABOUT, "&About", "About BlindRSS")
             .build();
         let menu_bar = MenuBar::builder()
@@ -10498,6 +10514,7 @@ fn main() {
             (M_UPDATE, act_update.clone()),
             (M_HELP, act_help.clone()),
             (M_CHANGELOG, act_changelog.clone()),
+            (M_REPORT_ISSUE, act_report_issue.clone()),
             (M_FILTER_ALL, act_filter_all.clone()),
             (M_FILTER_UNREAD, act_filter_unread.clone()),
             (M_FILTER_READ, act_filter_read.clone()),

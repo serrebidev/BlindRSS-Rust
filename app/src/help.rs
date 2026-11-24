@@ -290,9 +290,88 @@ pub fn show_help_topic(frame: &Frame, locale: &str, topic_id: Option<&str>) {
     dialog.destroy();
 }
 
+/// Help > Report an issue: title and description asked here, where the screen
+/// reader knows the boxes, then GitHub's new-issue page opens with both filled
+/// in and the version line added. GitHub needs the user's own account, so the
+/// last step, Create, is theirs in the browser.
+pub fn report_issue(frame: &Frame) {
+    let title = t("Report an issue");
+    let Some(summary) = ask_issue_text(
+        frame,
+        &t("Issue title: one line saying what went wrong or what you would like"),
+        &title,
+        TextEntryDialogStyle::Default,
+    )
+    .filter(|text| !text.is_empty()) else {
+        return;
+    };
+    let Some(details) = ask_issue_text(
+        frame,
+        &t(
+            "Describe what you did, what happened, and what you expected.\nYour browser then opens GitHub with this filled in. Sign in and press Create.",
+        ),
+        &title,
+        TextEntryDialogStyle::Default | TextEntryDialogStyle::MultiLine,
+    ) else {
+        return;
+    };
+    launch_default_browser(&issue_url(&summary, &details), BrowserLaunchFlags::Default);
+}
+
+/// Trimmed text, or None on Cancel. Multiline: Enter is a new line, Tab reaches OK.
+fn ask_issue_text(
+    frame: &Frame,
+    message: &str,
+    title: &str,
+    style: TextEntryDialogStyle,
+) -> Option<String> {
+    let dialog = TextEntryDialog::builder(frame, message, title)
+        .with_style(style)
+        .build();
+    let value = (dialog.show_modal() == ID_OK).then(|| dialog.get_value().unwrap_or_default());
+    dialog.destroy();
+    value.map(|text| text.trim().to_owned())
+}
+
+fn issue_url(summary: &str, details: &str) -> String {
+    let body = format!(
+        "{details}\n\n---\nBlindRSS {} on {} {}",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+    );
+    format!(
+        "https://github.com/serrebidev/BlindRSS-Rust/issues/new?title={}&body={}",
+        query_encode(summary),
+        query_encode(&body)
+    )
+}
+
+/// Percent-encode a query value: everything but unreserved ASCII, as UTF-8 bytes.
+fn query_encode(text: &str) -> String {
+    text.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn issue_link_carries_title_body_and_version() {
+        let url = issue_url("Photo & video", "Line 1\nПривет");
+        assert!(url.starts_with(
+            "https://github.com/serrebidev/BlindRSS-Rust/issues/new?title=Photo%20%26%20video&body=Line%201%0A%D0%9F"
+        ));
+        assert!(url.contains(&query_encode(env!("CARGO_PKG_VERSION"))));
+        assert!(!url[url.find('?').unwrap()..].contains(['\n', ' ', '#']));
+    }
 
     #[test]
     fn changelog_page_embedded_with_this_version() {

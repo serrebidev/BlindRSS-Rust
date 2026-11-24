@@ -8068,3 +8068,18 @@ msgstr ""
 #: providers/youtube_account.py:81
 msgid "Recommendations"
 msgstr ""
+
+msgid "Report an &Issue on GitHub..."
+msgstr ""
+
+msgid "Describe a problem or an idea, then send it as a GitHub issue"
+msgstr ""
+
+msgid "Report an issue"
+msgstr ""
+
+msgid "Issue title: one line saying what went wrong or what you would like"
+msgstr ""
+
+msgid "Describe what you did, what happened, and what you expected.\nYour browser then opens GitHub with this filled in. Sign in and press Create."
+msgstr ""

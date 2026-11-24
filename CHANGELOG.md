@@ -6,6 +6,10 @@ as `0.1.2-0.1.3`. Each release's section below is its Forgejo release note,
 taken from this file by the release workflow. The in-app updater shows the
 same text.
 
+## 0.1.124
+
+- Help, Report an Issue on GitHub asks for a title and a description in accessible dialogs, then opens GitHub's new issue page with both filled in and your BlindRSS version and system added. Sign in on GitHub and press Create.
+
 ## 0.1.123
 
 - Updated the libraries used by BlindRSS, including wxDragon 0.9.25 and the bundled VLC 3.0.24 playback engine on Windows and macOS.
