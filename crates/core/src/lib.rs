@@ -78,6 +78,7 @@ pub mod user_agents;
 pub mod videosearch;
 pub mod windows_shortcuts;
 pub mod youtube_account;
+pub mod youtube_innertube;
 pub mod youtube_session;
 pub mod ytdlp_recovery;
 pub mod ytfull;

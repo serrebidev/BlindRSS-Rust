@@ -6,6 +6,10 @@ as `0.1.2-0.1.3`. Each release's section below is its Forgejo release note,
 taken from this file by the release workflow. The in-app updater shows the
 same text.
 
+## 0.1.125
+
+- YouTube videos start playing much faster. BlindRSS now asks YouTube's own app interface for the audio stream directly, the method used by the foo_ytpyp foobar2000 component, instead of running yt-dlp first. yt-dlp is still used for other sites, for video downloads, and as a backup when this fails.
+
 ## 0.1.124
 
 - Help, Report an Issue on GitHub asks for a title and a description in accessible dialogs, then opens GitHub's new issue page with both filled in and your BlindRSS version and system added. Sign in on GitHub and press Create.

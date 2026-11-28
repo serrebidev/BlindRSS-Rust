@@ -250,6 +250,14 @@ Python `core/casting.py`, in that order.
   types). Activation parity with Python's `_should_play_in_player`:
   downloaded file, yt-dlp-supported URL (image extensions rejected),
   playable enclosure, then media detected in article content.
+- `youtube_innertube.rs`: YouTube playback without yt-dlp (port of
+  foo_ytpyp's lib_YTPYP, MIT; same as Python `core/youtube_innertube.py`).
+  InnerTube `player` as VISIONOS (24 h visitorData), IOS, then ANDROID_VR
+  returns plain googlevideo audio URLs in ~0.1 s. Keep the `cpn` nonce or
+  googlevideo throttles/cuts the stream. `stream_url_with_config` and
+  `play_cache::fetch_youtube_audio` (8 MB ranged GETs) try it first;
+  yt-dlp is the fallback and keeps other sites, video downloads, full text
+  and listings (InnerTube listings carry no upload dates).
 - `proxy.rs`: the local media proxy. `/stream` serves progressively in
   chunks (never buffer a whole file before the first byte); `/play`
   transcodes through ffmpeg to MP3 for backends that refuse podcast

@@ -141,6 +141,10 @@ pub fn stream_url(url: &str) -> Result<String, String> {
 /// (Audit 11 A11-11; Python gui/player.py derives it the same
 /// way for `_extract_ytdlp_info_via_cli`).
 pub fn stream_url_with_config(url: &str, cfg: &crate::config::Config) -> Result<String, String> {
+    // YouTube: InnerTube app clients (foo_ytpyp's method) first; yt-dlp is the fallback.
+    if let Some(stream) = crate::youtube_innertube::resolve_audio(url) {
+        return Ok(stream.url);
+    }
     let exe = find_ytdlp().ok_or("yt-dlp not found (install it or set BLINDRSS_YTDLP)")?;
     let cookie_file = std::env::var("BLINDRSS_YTDLP_COOKIES")
         .ok()

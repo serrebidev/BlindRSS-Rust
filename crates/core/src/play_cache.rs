@@ -172,6 +172,12 @@ pub fn fetch_youtube_audio(
     if let Some(hit) = fetch_cached_audio(dir, url) {
         return Ok(hit);
     }
+    if youtube_media_id(url).is_some()
+        && let Ok(path) = crate::youtube_innertube::download_audio(url, dir)
+    {
+        prune(dir, max_mb);
+        return Ok(path);
+    }
     let exe = crate::media::find_ytdlp().ok_or("yt-dlp not found")?;
     let cookie_file = std::env::var("BLINDRSS_YTDLP_COOKIES")
         .ok()
